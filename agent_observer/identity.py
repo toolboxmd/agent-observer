@@ -175,13 +175,15 @@ def match_embedded(con: sqlite3.Connection, body: str) -> str | None:
 
 
 def refresh_session_versions(con: sqlite3.Connection) -> int:
-    """Fill agentsmd_version from the instruction hash where the path gave none."""
+    """Set agentsmd_version from the AGENTS.md hash wherever it resolves.
+
+    The core instruction hash is the contract a person evaluates, so it
+    decides the version; a versioned plugin path is the fallback only."""
     cur = con.execute(
         "UPDATE sessions SET agentsmd_version=(SELECT version FROM"
         " agentsmd_versions v WHERE v.sha256=sessions.instructions_sha256)"
-        " WHERE agentsmd_version IS NULL AND instructions_sha256 IS NOT NULL"
-        " AND EXISTS (SELECT 1 FROM agentsmd_versions v"
-        " WHERE v.sha256=sessions.instructions_sha256)")
+        " WHERE instructions_sha256 IS NOT NULL AND EXISTS (SELECT 1 FROM"
+        " agentsmd_versions v WHERE v.sha256=sessions.instructions_sha256)")
     con.commit()
     return cur.rowcount
 
@@ -193,18 +195,30 @@ class SessionIdentity:
         self.block = None
         self.path_versions: dict[str, int] = {}
         self.embedded: list[str] = []
+        self.loaded_hashes: list[str] = []
 
     def observe_text(self, text: str) -> None:
         if not text:
             return
-        if self.block is None:
+        if self.block is None or self.block.get("status") == "unparsed":
             block = parse_direction_block(text)
-            if block:
+            if block and (self.block is None or block.get("status") != "unparsed"):
                 self.block = block
         if not self.embedded and "<INSTRUCTIONS>" in text:
             match = INSTRUCTIONS_RE.search(text)
             if match:
                 self.embedded.append(match.group(1))
+
+    def observe_loaded_instructions(self, content: str) -> None:
+        """Instruction file text as the host loaded it. Hosts may drop the
+        final newline, so both spellings are candidates; only a hash that
+        names a release is kept."""
+        if not content:
+            return
+        for text in (content, content if content.endswith("\n") else content + "\n"):
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if digest not in self.loaded_hashes:
+                self.loaded_hashes.append(digest)
 
     def observe_path(self, path: str) -> None:
         version = version_from_path(path)
@@ -222,7 +236,15 @@ class SessionIdentity:
             fields["preferences_sha256"] = self.block.get("preferences_sha256")
             fields["direction_status"] = self.block.get("status")
             evidence["direction_block"] = self.block
-        if self.embedded and not self.block and con is not None:
+        if self.loaded_hashes and not self.block and con is not None:
+            for digest in self.loaded_hashes:
+                if con.execute("SELECT 1 FROM agentsmd_versions WHERE sha256=?",
+                               (digest,)).fetchone():
+                    fields["instructions_sha256"] = digest
+                    evidence["loaded_instructions_match"] = digest
+                    break
+        if self.embedded and not self.block and con is not None \
+                and "instructions_sha256" not in fields:
             digest = match_embedded(con, self.embedded[0])
             if digest:
                 fields["instructions_sha256"] = digest
