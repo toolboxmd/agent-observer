@@ -77,6 +77,179 @@ TARGET_KEYS = ("target_file", "path", "file_path", "file", "command",
 EXCERPT_LEN = 300
 ERROR_EXCERPT_LEN = 200
 
+# Fail-closed ledger string gate for native identifiers (tool, call, event,
+# prompt and session ids, model names, skill names): short tokens without
+# free-text markers. Anything else is dropped, never stringified.
+_SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.\-/:]{1,200}$")
+# Location objects carrying these keys bear message/output-style free text
+# and must not reach any ledger column, even when a valid path is present
+# alongside them.
+_FREE_TEXT_LOCATION_KEYS = frozenset({
+    "message", "output", "content", "text", "error", "error_text",
+    "arguments", "args", "result", "data",
+})
+
+# Closed value sets for enum-shaped event fields. Fail closed: only these
+# exact strings persist in their field. Anything else, even token-shaped,
+# is dropped (a lexical check alone cannot tell free text from an enum).
+_TOOL_CALL_STATUS_VALUES = frozenset({"completed", "failed", "success"})
+_OUTCOME_VALUES = frozenset({"success", "completed", "failed", "error"})
+_DECISION_VALUES = frozenset({"allow", "deny"})
+_RETRY_TYPE_VALUES = frozenset({"failed"})
+_RETRY_ERROR_TYPE_VALUES = frozenset({"api"})
+_SUBAGENT_TYPE_VALUES = frozenset({"general-purpose"})
+_SESSION_REL_VALUES = frozenset({"primary", "subagent"})
+_TOOL_KIND_VALUES = frozenset({"read"})
+_PHASE_VALUES = frozenset({"requested"})
+# Numeric detail fields: counts, durations, line/turn numbers, window sizes.
+_NUMERIC_DETAIL_KEYS = frozenset({
+    "tokens_used", "context_window", "percentage", "count", "duration_ms",
+    "wait_ms", "turn_number",
+})
+# Detail fields holding native identifiers, model names or skill names.
+_IDENTIFIER_DETAIL_KEYS = frozenset({
+    "tool", "subagent_id", "parent_session_id", "child_session_id",
+    "parent_prompt_id", "model_id", "skill",
+})
+# Every detail key the adapter may persist; anything else is dropped.
+_DETAIL_ALLOW_KEYS = frozenset({
+    "tool", "kind", "status", "outcome", "decision", "phase", "type",
+    "error_type", "subagent_type", "subagent_id", "parent_session_id",
+    "child_session_id", "parent_prompt_id", "tokens_used", "context_window",
+    "percentage", "count", "duration_ms", "wait_ms", "turn_number",
+    "model_id", "session_relationship", "paths", "lines", "skill",
+})
+
+
+def _safe_token(value) -> str | None:
+    """Validated native-identifier string, or None when it must not persist."""
+    if not isinstance(value, str) or not value:
+        return None
+    if not _SAFE_TOKEN_RE.match(value):
+        return None
+    return value
+
+
+def _valid_enum(value, allowed: frozenset) -> str | None:
+    """Closed-set enum string, or None for anything not in the set."""
+    if isinstance(value, str) and value in allowed:
+        return value
+    return None
+
+
+def _sanitize_detail(detail) -> dict | None:
+    """Field-validated event detail mapping.
+
+    Keys must be allowlisted and every value must fit its field: closed
+    enum sets for statuses, kinds, outcomes, decisions, retry/error types
+    and session relationships; identifier-shaped strings for tool names,
+    ids, models and skills; numbers/booleans for counts and durations;
+    string lists for paths and string-to-integer maps for lines. Unknown
+    keys and invalid values (including token-shaped free text in an enum
+    field and arbitrary list/dict contents) are dropped. Never stringifies.
+    """
+    if not isinstance(detail, dict):
+        return None
+    out: dict = {}
+    for key, value in detail.items():
+        if key not in _DETAIL_ALLOW_KEYS:
+            continue
+        if key == "paths":
+            if isinstance(value, list):
+                clean = [p for p in value
+                         if isinstance(p, str) and p][:64]
+                if clean:
+                    out[key] = clean
+        elif key == "lines":
+            if isinstance(value, dict):
+                clean = {k: v for k, v in value.items()
+                         if isinstance(k, str) and k
+                         and isinstance(v, int)
+                         and not isinstance(v, bool)}
+                if clean:
+                    out[key] = clean
+        elif key in _NUMERIC_DETAIL_KEYS:
+            if isinstance(value, bool):
+                out[key] = value
+            elif isinstance(value, (int, float)):
+                out[key] = value
+        elif key in _IDENTIFIER_DETAIL_KEYS:
+            safe = _safe_token(value)
+            if safe is not None:
+                out[key] = safe
+        elif key == "kind":
+            safe = _valid_enum(value, _TOOL_KIND_VALUES)
+            if safe is not None:
+                out[key] = safe
+        elif key == "status":
+            safe = _valid_enum(value, _TOOL_CALL_STATUS_VALUES)
+            if safe is not None:
+                out[key] = safe
+        elif key == "outcome":
+            safe = _valid_enum(value, _OUTCOME_VALUES)
+            if safe is not None:
+                out[key] = safe
+        elif key == "decision":
+            safe = _valid_enum(value, _DECISION_VALUES)
+            if safe is not None:
+                out[key] = safe
+        elif key == "phase":
+            safe = _valid_enum(value, _PHASE_VALUES)
+            if safe is not None:
+                out[key] = safe
+        elif key == "type":
+            safe = _valid_enum(value, _RETRY_TYPE_VALUES)
+            if safe is not None:
+                out[key] = safe
+        elif key == "error_type":
+            safe = _valid_enum(value, _RETRY_ERROR_TYPE_VALUES)
+            if safe is not None:
+                out[key] = safe
+        elif key == "subagent_type":
+            safe = _valid_enum(value, _SUBAGENT_TYPE_VALUES)
+            if safe is not None:
+                out[key] = safe
+        elif key == "session_relationship":
+            safe = _valid_enum(value, _SESSION_REL_VALUES)
+            if safe is not None:
+                out[key] = safe
+    return out or None
+
+
+def _record_error_once(src, stats, ordinal: int, category: str,
+                       excerpt: str) -> bool:
+    """Insert one import_errors row, deduplicated by source/ordinal/category.
+
+    Replay paths re-read the whole updates.jsonl on every growth, so without
+    this guard a malformed record would gain a duplicate row per sync. A
+    genuinely new ordinal or a new fixed category still gets its own row.
+    Returns True when a new row was inserted.
+    """
+    existing = src.con.execute(
+        "SELECT 1 FROM import_errors WHERE harness=? AND source_path=?"
+        " AND ordinal_num=? AND error=?",
+        (src.harness, src.path, ordinal, category)).fetchone()
+    if existing is not None:
+        return False
+    src.error(ordinal, category, excerpt)
+    if stats is not None:
+        stats["malformed"] = stats.get("malformed", 0) + 1
+    return True
+
+
+def _valid_native_id(value) -> str | None:
+    """Native call/event/prompt/session identifier, or None when invalid."""
+    return _safe_token(value)
+
+
+def _valid_prompt_index(value):
+    """Prompt index as a stable key, or None when it must not persist."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    return _safe_token(value)
+
 
 def _remove_direction_block(text: str) -> str:
     """Direction block through its close, or through end when unterminated."""
@@ -231,8 +404,11 @@ def _extract_prompt_id(obj: dict, update: dict) -> str | None:
     for d in candidates:
         for key in ("prompt_id", "promptId"):
             value = d.get(key)
-            if value:
-                return str(value)
+            # Fail closed: only plain string identifiers persist; dicts,
+            # lists and other shapes are never stringified into ledger keys.
+            if isinstance(value, str) and value:
+                if _safe_token(value) is not None:
+                    return value
     return None
 
 
@@ -345,11 +521,14 @@ def _safe_target(raw) -> str | None:
         return None
     for key in TARGET_KEYS:
         value = raw.get(key)
-        if value:
-            text = str(value)
-            text = SECRET_SK_RE.sub("[redacted]", text)
-            text = SECRET_TOKEN_RE.sub("[redacted]", text)
-            return text[:500]
+        # Fail closed: only plain strings persist; dicts/lists are never
+        # stringified into the ledger.
+        if not isinstance(value, str) or not value:
+            continue
+        text = value
+        text = SECRET_SK_RE.sub("[redacted]", text)
+        text = SECRET_TOKEN_RE.sub("[redacted]", text)
+        return text[:500]
     return None
 
 
@@ -379,19 +558,16 @@ _GENERIC_SAFE_UPDATE_KEYS = frozenset({
 
 
 def _whitelisted_update_detail(kind: str, update: dict) -> dict | None:
-    """Only allowlisted lifecycle scalars for one update kind."""
+    """Only allowlisted lifecycle fields for one update kind.
+
+    Keys are restricted to the kind's allowlist and every value passes the
+    field rules in _sanitize_detail: closed enum sets for types, statuses
+    and kinds, identifier shapes for ids, numbers for counters. Anything
+    else is dropped rather than stringified.
+    """
     allow = _UPDATE_DETAIL_ALLOW.get(kind, _GENERIC_SAFE_UPDATE_KEYS)
-    out: dict = {}
-    for key in allow:
-        if key not in update:
-            continue
-        value = update[key]
-        if isinstance(value, str):
-            if value:
-                out[key] = value[:200]
-        elif isinstance(value, (int, float, bool)) or value is None:
-            out[key] = value
-    return out or None
+    picked = {key: update[key] for key in allow if key in update}
+    return _sanitize_detail(picked)
 
 
 class _Reader:
@@ -415,6 +591,10 @@ class _Reader:
         self.last_ts = ts if self.last_ts is None else max(self.last_ts, ts)
 
     def event(self, src: JsonlSource, family, native_id, ordinal, ts, **kw):
+        # Central fail-closed gate: every detail mapping is field-validated
+        # before it reaches the ledger, no matter which producer built it.
+        if "detail" in kw:
+            kw["detail"] = _sanitize_detail(kw["detail"])
         insert_event(self.con, self.stats, source_id=src.source_id,
                      session_key=self.session_key, family=family,
                      native_id=native_id, ordinal=ordinal, ts=ts, **kw)
@@ -433,23 +613,31 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
 
     summary = _read_json(os.path.join(session_dir, "summary.json")) or {}
     info = summary.get("info") if isinstance(summary.get("info"), dict) else {}
-    if info.get("id"):
-        r.native_sid = str(info["id"])
-        r.session_key = f"{HARNESS}:{r.native_sid}"
+    if isinstance(info.get("id"), str) and info.get("id"):
+        if _safe_token(info["id"]) is not None:
+            r.native_sid = info["id"]
+            r.session_key = f"{HARNESS}:{r.native_sid}"
     group_name = os.path.basename(os.path.dirname(session_dir.rstrip(os.sep)))
     fallback_dir = urllib.parse.unquote(group_name)
-    project_dir = (summary.get("git_root_dir") or info.get("cwd")
-                   or fallback_dir or None)
+    project_dir = (summary.get("git_root_dir") if isinstance(
+        summary.get("git_root_dir"), str) else None) or (
+            info.get("cwd") if isinstance(info.get("cwd"), str) else None) \
+        or fallback_dir or None
     if isinstance(project_dir, str):
         project_dir = project_dir.rstrip("/") or None
-    if summary.get("head_branch"):
-        r.meta["git_branch"] = str(summary["head_branch"])
+    if isinstance(summary.get("head_branch"), str) and summary.get(
+            "head_branch"):
+        r.meta["git_branch"] = summary["head_branch"][:200]
     if project_dir:
         r.meta["project_dir"] = str(project_dir)
     if summary.get("session_kind") == "subagent":
         r.meta["role"] = "subagent"
-    model_fallback = summary.get("current_model_id")
-    effort = summary.get("reasoning_effort")
+    model_fallback = summary.get("current_model_id") if isinstance(
+        summary.get("current_model_id"), str) and _safe_token(
+            summary.get("current_model_id")) is not None else None
+    effort = summary.get("reasoning_effort") if isinstance(
+        summary.get("reasoning_effort"), str) and _safe_token(
+            summary.get("reasoning_effort")) is not None else None
     for key in ("created_at", "last_active_at", "updated_at"):
         ts = iso_ts(summary.get(key))
         if ts is not None:
@@ -488,43 +676,37 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         for ordinal, obj, line in updates_src.records():
             stats["lines"] += 1
             if obj is None or not isinstance(obj, dict):
-                stats["malformed"] += 1
-                updates_src.error(
-                    ordinal, "malformed_json",
+                _record_error_once(
+                    updates_src, stats, ordinal, "malformed_json",
                     _safe_unparsable("malformed_json"))
                 continue
             try:
                 _ingest_update(r, updates_src, obj, ordinal)
             except _AdapterError as exc:
-                stats["malformed"] += 1
-                updates_src.error(
-                    ordinal, exc.category,
+                _record_error_once(
+                    updates_src, stats, ordinal, exc.category,
                     _safe_error_excerpt(exc.category, obj))
             except (KeyError, TypeError, ValueError, AttributeError):
-                stats["malformed"] += 1
-                updates_src.error(
-                    ordinal, "schema_error",
+                _record_error_once(
+                    updates_src, stats, ordinal, "schema_error",
                     _safe_error_excerpt("schema_error", obj))
     if events_src is not None and (events_new or not known):
         for ordinal, obj, line in events_src.records():
             stats["lines"] += 1
             if obj is None or not isinstance(obj, dict):
-                stats["malformed"] += 1
-                events_src.error(
-                    ordinal, "malformed_json",
+                _record_error_once(
+                    events_src, stats, ordinal, "malformed_json",
                     _safe_unparsable("malformed_json"))
                 continue
             try:
                 _ingest_event(r, events_src, obj, ordinal)
             except _AdapterError as exc:
-                stats["malformed"] += 1
-                events_src.error(
-                    ordinal, exc.category,
+                _record_error_once(
+                    events_src, stats, ordinal, exc.category,
                     _safe_error_excerpt(exc.category, obj))
             except (KeyError, TypeError, ValueError, AttributeError):
-                stats["malformed"] += 1
-                events_src.error(
-                    ordinal, "schema_error",
+                _record_error_once(
+                    events_src, stats, ordinal, "schema_error",
                     _safe_error_excerpt("schema_error", obj))
     # Late chat metadata reclassifies provisional submissions even when only
     # events.jsonl grew and updates.jsonl did not. Runs silently (no duplicate
@@ -598,13 +780,18 @@ def _read_chat(session_dir: str, r: _Reader) -> dict:
                 for body in USER_RULE_RE.findall(text):
                     r.identity.observe_loaded_instructions(body.strip())
             if kind == "user" and obj.get("prompt_index") is not None:
-                idx = str(obj["prompt_index"])
+                idx = _valid_prompt_index(obj.get("prompt_index"))
+                if idx is None:
+                    chat["reliable"] = False
+                    continue
                 chat["seen"].add(idx)
                 if obj.get("synthetic_reason"):
                     chat["synthetic"].add(idx)
             if kind == "assistant" and obj.get("reasoning_effort") \
                     and chat["effort"] is None:
-                chat["effort"] = obj["reasoning_effort"]
+                effort = obj.get("reasoning_effort")
+                if isinstance(effort, str) and _safe_token(effort) is not None:
+                    chat["effort"] = effort
     return chat
 
 
@@ -636,10 +823,11 @@ def _turn_models(events_path: str | None) -> list:
         except ValueError:
             continue
         if isinstance(obj, dict) and obj.get("type") == "turn_started" \
-                and obj.get("model_id"):
+                and isinstance(obj.get("model_id"), str) \
+                and _safe_token(obj.get("model_id")) is not None:
             ts = iso_ts(obj.get("ts"))
             if ts is not None:
-                models.append((ts, str(obj["model_id"])))
+                models.append((ts, obj["model_id"]))
     models.sort()
     return models
 
@@ -691,12 +879,12 @@ def _collect_prompts(path: str, record_error=None) -> tuple[dict, list, list]:
             meta = update.get("_meta") if isinstance(
                 update.get("_meta"), dict) else {}
             pidx = meta.get("promptIndex")
-            if pidx is None:
+            key = _valid_prompt_index(pidx)
+            if key is None:
                 if record_error is not None:
                     record_error(
                         ordinal, "user chunk without promptIndex", obj)
                 continue
-            key = str(pidx)
             pid = _extract_prompt_id(obj, update)
             entry = prompts.get(key)
             if entry is None:
@@ -716,10 +904,14 @@ def _collect_prompts(path: str, record_error=None) -> tuple[dict, list, list]:
                 if entry.get("first_obj") is None:
                     entry["first_obj"] = obj
             entry["texts"].append(_content_text(update.get("content")))
-            if entry["model"] is None and meta.get("modelId"):
-                entry["model"] = str(meta["modelId"])
+            if entry["model"] is None and isinstance(
+                    meta.get("modelId"), str) and _safe_token(
+                        meta.get("modelId")) is not None:
+                entry["model"] = meta["modelId"]
         elif kind == "turn_completed":
-            pid = update.get("prompt_id") or update.get("promptId")
+            raw_pid = update.get("prompt_id") or update.get("promptId")
+            pid = raw_pid if isinstance(
+                raw_pid, str) and _safe_token(raw_pid) is not None else None
             if not pid:
                 if record_error is not None:
                     record_error(
@@ -771,7 +963,6 @@ def _upsert_submission(con, r: _Reader, src, chat: dict, key: str,
                 "UPDATE submissions SET text_hash=?, text_excerpt=?"
                 " WHERE native_id=?", (digest, new_sanitized, native_id))
         else:
-            r.stats["malformed"] += 1
             if record_error is not None:
                 record_error(
                     entry["first"], "conflicting prompt",
@@ -825,7 +1016,11 @@ def _reclassify_existing(con, r: _Reader, session_dir: str,
         updates_path, record_error=None)
     completions_by_id = {}
     for ordinal, update, ts, obj, method in completions_ordered:
-        pid = str(update.get("prompt_id") or update.get("promptId"))
+        raw_pid = update.get("prompt_id") or update.get("promptId")
+        pid = raw_pid if isinstance(
+            raw_pid, str) and _safe_token(raw_pid) is not None else None
+        if pid is None:
+            continue
         if pid not in completions_by_id:
             completions_by_id[pid] = (ordinal, update, ts, obj, method)
     before = con.total_changes
@@ -852,28 +1047,36 @@ def _replay_updates(con, r: _Reader, src: JsonlSource, chat: dict,
     """
 
     def record_error(ordinal: int, category: str, obj) -> None:
-        r.stats["malformed"] += 1
         if category == "user chunk without promptIndex":
-            src.error(ordinal, "missing_prompt_index",
-                      _safe_error_excerpt("missing_prompt_index", obj))
+            _record_error_once(
+                src, r.stats, ordinal, "missing_prompt_index",
+                _safe_error_excerpt("missing_prompt_index", obj))
         elif category == "turn_completed without prompt_id":
-            src.error(ordinal, "missing_prompt_id",
-                      _safe_error_excerpt("missing_prompt_id", obj))
+            _record_error_once(
+                src, r.stats, ordinal, "missing_prompt_id",
+                _safe_error_excerpt("missing_prompt_id", obj))
         elif category == "conflicting prompt id":
-            src.error(ordinal, "conflicting_prompt",
-                      _safe_error_excerpt("conflicting_prompt", obj))
+            _record_error_once(
+                src, r.stats, ordinal, "conflicting_prompt",
+                _safe_error_excerpt("conflicting_prompt", obj))
         elif category == "conflicting prompt":
-            src.error(ordinal, "conflicting_prompt",
-                      _safe_conflict_excerpt("conflicting_prompt"))
+            _record_error_once(
+                src, r.stats, ordinal, "conflicting_prompt",
+                _safe_conflict_excerpt("conflicting_prompt"))
         else:
-            src.error(ordinal, "schema_error",
-                      _safe_error_excerpt("schema_error", obj))
+            _record_error_once(
+                src, r.stats, ordinal, "schema_error",
+                _safe_error_excerpt("schema_error", obj))
 
     prompts, order, completions_ordered = _collect_prompts(
         src.path, record_error=record_error)
     completions_by_id: dict = {}
     for ordinal, update, ts, obj, method in completions_ordered:
-        pid = str(update.get("prompt_id") or update.get("promptId"))
+        raw_pid = update.get("prompt_id") or update.get("promptId")
+        pid = raw_pid if isinstance(
+            raw_pid, str) and _safe_token(raw_pid) is not None else None
+        if pid is None:
+            continue
         if pid not in completions_by_id:
             completions_by_id[pid] = (ordinal, update, ts, obj, method)
         else:
@@ -903,7 +1106,11 @@ def _replay_updates(con, r: _Reader, src: JsonlSource, chat: dict,
         _upsert_submission(con, r, src, chat, key, prompts[key],
                            completions_by_id, record_error)
     for ordinal, update, ts, obj, method in completions_ordered:
-        pid = str(update.get("prompt_id") or update.get("promptId"))
+        raw_pid = update.get("prompt_id") or update.get("promptId")
+        pid = raw_pid if isinstance(
+            raw_pid, str) and _safe_token(raw_pid) is not None else None
+        if pid is None:
+            continue
         chunk_model = pid_to_model.get(pid)
         _store_response(con, r, src, ordinal, update, ts,
                         _usage_model(update), model_fallback, chunk_model,
@@ -916,23 +1123,39 @@ def _usage_model(update: dict):
     if isinstance(usage, dict):
         model_usage = usage.get("modelUsage")
         if isinstance(model_usage, dict) and len(model_usage) == 1:
-            return next(iter(model_usage))
+            name = next(iter(model_usage))
+            if isinstance(name, str) and _safe_token(name) is not None:
+                return name
+    return None
+
+
+def _valid_model(value):
+    if isinstance(value, str) and value and _safe_token(value) is not None:
+        return value
     return None
 
 
 def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
                     update: dict, ts, usage_model, summary_model, chunk_model,
                     effort, turn_models, outer_obj=None) -> None:
-    prompt_id = update.get("prompt_id") or update.get("promptId")
-    if not prompt_id:
+    raw_pid = update.get("prompt_id") or update.get("promptId")
+    if not isinstance(raw_pid, str) or _safe_token(raw_pid) is None:
         return
-    prompt_id = str(prompt_id)
+    prompt_id = raw_pid
     response_id = f"{HARNESS}:{r.native_sid}:{prompt_id}"
     usage = update.get("usage") if isinstance(update.get("usage"), dict) \
         else {}
-    model = _model_at(ts, turn_models, usage_model, summary_model,
+    usage_model = _valid_model(usage_model)
+    summary_model = _valid_model(summary_model)
+    chunk_model = _valid_model(chunk_model)
+    valid_effort = _valid_model(effort)
+    # Turn-model entries are pre-validated; drop anything unexpected.
+    safe_turns = [(t, m) for t, m in turn_models
+                  if isinstance(m, str) and _safe_token(m) is not None]
+    model = _model_at(ts, safe_turns, usage_model, summary_model,
                       chunk_model)
     counters = {key: usage.get(native) if isinstance(usage.get(native), int)
+                and not isinstance(usage.get(native), bool)
                 else None for key, native in
                 (("input_tokens", "inputTokens"),
                  ("cached_input_tokens", "cachedReadTokens"),
@@ -947,7 +1170,7 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
         " output_tokens, reasoning_output_tokens, total_tokens, semantics)"
         " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (response_id, src.source_id, HARNESS, r.session_key, response_id,
-         r.native_sid, ordinal, ts, model, effort, counters["input_tokens"],
+         r.native_sid, ordinal, ts, model, valid_effort, counters["input_tokens"],
          counters["cached_input_tokens"],
          counters["cache_write_input_tokens"], counters["output_tokens"],
          counters["reasoning_output_tokens"], counters["total_tokens"],
@@ -965,12 +1188,12 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
     for key in counters:
         old, new = existing[key], counters[key]
         if old is not None and new is not None and old != new:
-            r.stats["malformed"] += 1
             if isinstance(outer_obj, dict):
                 shape = _safe_error_excerpt("conflicting_usage", outer_obj)
             else:
                 shape = _safe_conflict_excerpt("conflicting_usage")
-            src.error(ordinal, "conflicting_usage", shape)
+            _record_error_once(src, r.stats, ordinal, "conflicting_usage",
+                               shape)
             return
     fill = {key: counters[key] for key in counters
             if existing[key] is None and counters[key] is not None}
@@ -1019,16 +1242,18 @@ def _ingest_update(r: _Reader, src: JsonlSource, obj: dict,
         return
     elif kind in COMPACTION_KINDS:
         r.stats["compactions"] += 1
-        event_id = params.get("_meta", {}).get("eventId") \
-            if isinstance(params.get("_meta"), dict) else None
+        event_id = _valid_native_id(
+            params.get("_meta", {}).get("eventId")
+            if isinstance(params.get("_meta"), dict) else None)
         r.event(src, "compaction", event_id or f"{kind}:{ordinal}", ordinal,
                 ts, name=kind,
                 detail=_whitelisted_update_detail(kind, update))
     elif kind in EXTENSION_KINDS:
         if kind == "subagent_spawned":
             _subagent_link(r, update)
-        event_id = params.get("_meta", {}).get("eventId") \
-            if isinstance(params.get("_meta"), dict) else None
+        event_id = _valid_native_id(
+            params.get("_meta", {}).get("eventId")
+            if isinstance(params.get("_meta"), dict) else None)
         r.event(src, "lifecycle", event_id or f"{kind}:{ordinal}", ordinal,
                 ts, name=kind,
                 detail=_whitelisted_update_detail(kind, update))
@@ -1039,27 +1264,37 @@ def _ingest_update(r: _Reader, src: JsonlSource, obj: dict,
 def _turn_id(r: _Reader, params: dict):
     meta = params.get("_meta") if isinstance(params, dict) else None
     prompt_id = meta.get("promptId") if isinstance(meta, dict) else None
-    if prompt_id:
+    if isinstance(prompt_id, str) and _safe_token(prompt_id) is not None:
         return f"{HARNESS}:{r.native_sid}:{prompt_id}"
     return None
 
 
 def _tool_name(update: dict):
+    # Fail closed: titles are never stringified. Only an identifier-shaped
+    # title or tool name persists; anything else falls back to "unknown"
+    # without preserving the source value.
     title = update.get("title")
-    if title:
-        return str(title)[:200]
+    if isinstance(title, str) and title:
+        safe = _safe_token(title)
+        if safe is not None:
+            return safe
     meta = update.get("_meta") if isinstance(update.get("_meta"), dict) \
         else {}
     tool = meta.get("x.ai/tool") if isinstance(meta, dict) else None
     name = tool.get("name") if isinstance(tool, dict) else None
-    return str(name)[:200] if name else "unknown"
+    if isinstance(name, str) and name:
+        safe = _safe_token(name)
+        if safe is not None:
+            return safe
+    return "unknown"
 
 
 def _tool_call(r: _Reader, src: JsonlSource, update: dict, params: dict,
                ordinal: int, ts) -> None:
-    call_id = update.get("toolCallId")
-    if not call_id:
+    raw_call = update.get("toolCallId")
+    if not isinstance(raw_call, str) or _safe_token(raw_call) is None:
         raise _AdapterError("schema_error")
+    call_id = raw_call
     raw = update.get("rawInput")
     name = _tool_name(update)
     meta = update.get("_meta") if isinstance(update.get("_meta"), dict) \
@@ -1068,56 +1303,70 @@ def _tool_call(r: _Reader, src: JsonlSource, update: dict, params: dict,
     raw_tool = tool.get("name") if isinstance(tool, dict) else None
     raw_kind = tool.get("kind") if isinstance(tool, dict) else None
     detail = {}
-    if isinstance(raw_tool, str) and raw_tool:
-        detail["tool"] = raw_tool[:200]
-    elif raw_tool is not None and not isinstance(raw_tool, str):
-        detail["tool"] = str(raw_tool)[:200]
-    if isinstance(raw_kind, str) and raw_kind:
-        detail["kind"] = raw_kind[:200]
-    elif raw_kind is not None and not isinstance(raw_kind, str):
-        detail["kind"] = str(raw_kind)[:200]
+    safe_tool = _safe_token(raw_tool)
+    if safe_tool is not None:
+        detail["tool"] = safe_tool
+    safe_kind = _valid_enum(raw_kind, _TOOL_KIND_VALUES)
+    if safe_kind is not None:
+        detail["kind"] = safe_kind
     r.event(src, "tool_call", call_id, ordinal, ts,
-            turn_id=_turn_id(r, params), name=name[:200],
+            turn_id=_turn_id(r, params), name=name,
             target=_safe_target(raw),
-            fingerprint=fingerprint(
-                name, json.dumps(raw, sort_keys=True, default=str)[:4000]),
+            fingerprint=fingerprint(call_id, name,
+                                    _safe_target(raw) or ""),
             detail=detail or None)
 
 
 def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
                       params: dict, ordinal: int, ts) -> None:
-    call_id = update.get("toolCallId")
-    if not call_id:
+    raw_call = update.get("toolCallId")
+    if not isinstance(raw_call, str) or _safe_token(raw_call) is None:
         raise _AdapterError("schema_error")
+    call_id = raw_call
     turn_id = _turn_id(r, params)
     locations = update.get("locations")
     if update.get("kind") == "read" and isinstance(locations, list) \
             and locations:
-        paths = [loc.get("path") for loc in locations
-                 if isinstance(loc, dict) and loc.get("path")]
+        # Fail closed: every location must be a plain {"path": str} shape
+        # with an optional integer line. A location bearing message/output
+        # style free-text keys, a non-string path, or a non-integer line is
+        # dropped entirely and never stringified into any ledger column.
+        paths: list[str] = []
+        lines: dict[str, int] = {}
+        for loc in locations:
+            if not isinstance(loc, dict):
+                continue
+            if any(k in loc for k in _FREE_TEXT_LOCATION_KEYS):
+                continue
+            path = loc.get("path")
+            if not isinstance(path, str) or not path:
+                continue
+            paths.append(path)
+            line = loc.get("line")
+            if isinstance(line, bool):
+                continue
+            if isinstance(line, int):
+                lines[path] = line
         if paths:
             for path in paths:
-                r.identity.observe_path(str(path))
-            skill = skill_from_path(str(paths[0]))
+                r.identity.observe_path(path)
+            skill = skill_from_path(paths[0])
             # A second location in the same call may name the Skill while the
             # first does not; the Skill read is the identity evidence.
             if skill is None:
                 for path in paths[1:]:
-                    skill = skill_from_path(str(path))
+                    skill = skill_from_path(path)
                     if skill is not None:
                         break
-            lines = {str(loc["path"]): loc.get("line") for loc in locations
-                     if isinstance(loc, dict) and loc.get("path")
-                     and loc.get("line") is not None}
-            detail = {"paths": [str(p) for p in paths]}
+            detail = {"paths": list(paths)}
             if lines:
-                detail["lines"] = lines
+                detail["lines"] = dict(lines)
             if skill:
                 detail["skill"] = skill
             r.event(src, "skill_read" if skill else "read", call_id,
                     ordinal, ts, turn_id=turn_id,
-                    name=skill or os.path.basename(str(paths[0])),
-                    target=str(paths[0]),
+                    name=skill or os.path.basename(paths[0]),
+                    target=paths[0],
                     fingerprint=fingerprint(call_id, paths),
                     detail=detail)
     status = update.get("status")
@@ -1130,7 +1379,11 @@ def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
 def _subagent_link(r: _Reader, update: dict) -> None:
     parent = update.get("parent_session_id")
     child = update.get("child_session_id") or update.get("subagent_id")
-    if parent and child and str(child) == r.native_sid:
+    if not isinstance(parent, str) or _safe_token(parent) is None:
+        return
+    if not isinstance(child, str) or _safe_token(child) is None:
+        return
+    if child == r.native_sid:
         r.parent_key = f"{HARNESS}:{parent}"
     if parent and child:
         # The child row may be imported before or after this record; the
@@ -1138,7 +1391,7 @@ def _subagent_link(r: _Reader, update: dict) -> None:
         # unknowns.
         try:
             db.upsert_session(r.con, f"{HARNESS}:{child}", HARNESS,
-                              str(child), None,
+                              child, None,
                               parent_session_key=f"{HARNESS}:{parent}")
         except (sqlite3.DatabaseError, ValueError):
             pass
@@ -1155,52 +1408,51 @@ def _ingest_event(r: _Reader, src: JsonlSource, obj: dict,
     r.note_ts(ts)
     if kind == "turn_started":
         detail = {}
-        if isinstance(obj.get("turn_number"), int):
-            detail["turn_number"] = obj.get("turn_number")
-        if isinstance(obj.get("model_id"), str) and obj.get("model_id"):
-            detail["model_id"] = obj.get("model_id")[:200]
-        if isinstance(obj.get("session_relationship"), str) \
-                and obj.get("session_relationship"):
-            detail["session_relationship"] = \
-                obj.get("session_relationship")[:200]
+        turn_number = obj.get("turn_number")
+        if isinstance(turn_number, int) and not isinstance(turn_number, bool):
+            detail["turn_number"] = turn_number
+        model_id = _safe_token(obj.get("model_id"))
+        if model_id is not None:
+            detail["model_id"] = model_id
+        rel = _valid_enum(obj.get("session_relationship"),
+                          _SESSION_REL_VALUES)
+        if rel is not None:
+            detail["session_relationship"] = rel
         r.event(src, "lifecycle", f"turn_started:{ordinal}", ordinal, ts,
                 name="turn_started", detail=detail or None)
     elif kind == "turn_ended":
-        outcome = obj.get("outcome")
-        detail = {"outcome": outcome[:200]} \
-            if isinstance(outcome, str) and outcome else None
+        outcome = _valid_enum(obj.get("outcome"), _OUTCOME_VALUES)
+        detail = {"outcome": outcome} if outcome is not None else None
         r.event(src, "lifecycle", f"turn_ended:{ordinal}", ordinal, ts,
                 name="turn_ended",
-                status=outcome[:200] if isinstance(outcome, str) else None,
+                status=outcome,
                 detail=detail)
     elif kind == "tool_started":
-        tool = obj.get("tool_name")
-        tool_s = tool[:200] if isinstance(tool, str) and tool else "unknown"
-        detail = {"tool": tool[:200]} \
-            if isinstance(tool, str) and tool else None
+        tool_s = _safe_token(obj.get("tool_name")) or "unknown"
+        detail = {"tool": _safe_token(obj.get("tool_name"))} \
+            if _safe_token(obj.get("tool_name")) is not None else None
         r.event(src, "lifecycle", f"tool_started:{ordinal}", ordinal, ts,
                 name=tool_s, detail=detail)
     elif kind == "tool_completed":
         _tool_completed(r, src, obj, ordinal, ts)
     elif kind == "permission_requested":
-        tool = obj.get("tool_name")
-        tool_s = tool[:200] if isinstance(tool, str) and tool else "unknown"
+        tool_s = _safe_token(obj.get("tool_name")) or "unknown"
         detail = {"phase": "requested"}
-        if isinstance(tool, str) and tool:
-            detail["tool"] = tool[:200]
+        safe_tool = _safe_token(obj.get("tool_name"))
+        if safe_tool is not None:
+            detail["tool"] = safe_tool
         r.event(src, "permission", f"permission:{ordinal}", ordinal, ts,
                 name=tool_s, detail=detail)
     elif kind == "permission_resolved":
-        tool = obj.get("tool_name")
-        tool_s = tool[:200] if isinstance(tool, str) and tool else "unknown"
-        decision = obj.get("decision")
-        decision_s = decision[:200] \
-            if isinstance(decision, str) and decision else None
-        wait = obj.get("wait_ms") \
-            if isinstance(obj.get("wait_ms"), int) else None
+        tool_s = _safe_token(obj.get("tool_name")) or "unknown"
+        decision_s = _valid_enum(obj.get("decision"), _DECISION_VALUES)
+        wait = obj.get("wait_ms")
+        if isinstance(wait, bool) or not isinstance(wait, int):
+            wait = None
         detail = {}
-        if isinstance(tool, str) and tool:
-            detail["tool"] = tool[:200]
+        safe_tool = _safe_token(obj.get("tool_name"))
+        if safe_tool is not None:
+            detail["tool"] = safe_tool
         if decision_s is not None:
             detail["decision"] = decision_s
         if wait is not None:
@@ -1214,43 +1466,50 @@ def _ingest_event(r: _Reader, src: JsonlSource, obj: dict,
 
 def _tool_completed(r: _Reader, src: JsonlSource, obj: dict, ordinal: int,
                     ts) -> None:
-    call_id = obj.get("tool_call_id")
-    if not call_id:
+    raw_call = obj.get("tool_call_id")
+    if not isinstance(raw_call, str) or _safe_token(raw_call) is None:
         raise _AdapterError("schema_error")
+    call_id = raw_call
     outcome = obj.get("outcome")
     status = "ok" if outcome in ("success", "completed") else "error"
-    duration = obj.get("duration_ms") \
-        if isinstance(obj.get("duration_ms"), int) else None
+    duration = obj.get("duration_ms")
+    if isinstance(duration, bool) or not isinstance(duration, int):
+        duration = None
     row = r.con.execute(
         "SELECT id, status, duration_ms, detail_json FROM events"
         " WHERE session_key=? AND family='tool_result' AND native_id=?",
-        (r.session_key, str(call_id))).fetchone()
+        (r.session_key, call_id)).fetchone()
     if row is None:
-        tool = obj.get("tool_name")
-        tool_s = tool[:200] if isinstance(tool, str) and tool else "unknown"
+        tool_s = _safe_token(obj.get("tool_name")) or "unknown"
         detail = {}
-        if isinstance(tool, str) and tool:
-            detail["tool"] = tool[:200]
-        if isinstance(outcome, str) and outcome:
-            detail["outcome"] = outcome[:200]
+        safe_tool = _safe_token(obj.get("tool_name"))
+        if safe_tool is not None:
+            detail["tool"] = safe_tool
+        safe_outcome = _valid_enum(outcome, _OUTCOME_VALUES)
+        if safe_outcome is not None:
+            detail["outcome"] = safe_outcome
         r.event(src, "tool_result", call_id, ordinal, ts,
                 name=tool_s, status=status,
                 duration_ms=duration,
                 detail=detail or None)
         return
     try:
-        detail = json.loads(row["detail_json"]) if row["detail_json"] else {}
+        loaded = json.loads(row["detail_json"]) if row["detail_json"] else {}
     except ValueError:
-        detail = {}
+        loaded = {}
+    # Scrub any legacy values that predate strict field validation:
+    # unknown keys, token-shaped free text in enum fields and arbitrary
+    # nested list/dict contents are dropped, never stringified.
+    detail = _sanitize_detail(loaded) or {}
     changed = False
+    if json.dumps(detail, sort_keys=True)[:4000] != (row["detail_json"] or ""):
+        changed = True
     if row["duration_ms"] is None and duration is not None:
         changed = True
     if row["status"] is None and status:
         changed = True
-    tool = obj.get("tool_name")
-    tool_s = tool[:200] if isinstance(tool, str) and tool else None
-    outcome_s = outcome[:200] \
-        if isinstance(outcome, str) and outcome else None
+    tool_s = _safe_token(obj.get("tool_name"))
+    outcome_s = _valid_enum(outcome, _OUTCOME_VALUES)
     for key, value in (("tool", tool_s), ("outcome", outcome_s)):
         if value is not None and key not in detail:
             detail[key] = value

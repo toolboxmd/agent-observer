@@ -787,3 +787,345 @@ class GrokAdapterTest(LedgerCase):
                          "fixture-grok-preferences")
         self.assertEqual(sess["direction_status"], "ready")
         con.close()
+
+    def test_malformed_tool_and_location_shapes_never_persist(self):
+        tmp = os.path.join(self.tmp.name, "evilshape")
+        shutil.copytree(ROOT, tmp)
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        sdir = os.path.join(tmp, "%2Fredacted%2Frepo", sid)
+        tool_secret = "SECRET-TOOL-SENTINEL-a1b2c3 sk-fake-secret-tool-111"
+        meta_secret = "SECRET-META-SENTINEL-d4e5f6"
+        target_secret = "SECRET-TARGET-SENTINEL-777"
+        loc_secret = "SECRET-LOC-SENTINEL-eee sk-fake-secret-loc-222"
+        loc_msg = "SECRET-LOCMSG-fff output payload free text"
+        callid_secret = "SECRET-CALLID-SENTINEL-999"
+        evil_tool = {
+            "timestamp": 1788800300,
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call-evil-1",
+                    "title": {"message": tool_secret},
+                    "rawInput": {"target_file": {"message": target_secret}},
+                    "_meta": {"x.ai/tool": {
+                        "name": {"nested": meta_secret},
+                        "kind": ["SECRET-KIND-ddd"]}},
+                },
+                "_meta": {"eventId": "evil-1", "promptId": "p-aaa"},
+            },
+        }
+        evil_read = {
+            "timestamp": 1788800301,
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-evil-1",
+                    "kind": "read",
+                    "locations": [
+                        {"path": {"message": loc_secret},
+                         "message": loc_msg},
+                        {"path": "/redacted/repo/ok.txt",
+                         "message": "SECRET-LOCBAD-ggg should not persist",
+                         "output": "SECRET-LOCFAIL-hhh"},
+                    ],
+                },
+                "_meta": {"eventId": "evil-2", "promptId": "p-aaa"},
+            },
+        }
+        evil_callid = {
+            "timestamp": 1788800302,
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": {"id": callid_secret},
+                    "title": "read_file",
+                    "rawInput": {"target_file": "/redacted/repo/ok.txt"},
+                },
+                "_meta": {"eventId": "evil-3", "promptId": "p-aaa"},
+            },
+        }
+        evil_event = {
+            "ts": "2026-09-01T10:00:11Z",
+            "type": "tool_started",
+            "tool_name": {"message": tool_secret},
+        }
+        with open(os.path.join(sdir, "updates.jsonl"), "a") as fh:
+            fh.write(json.dumps(evil_tool) + "\n")
+            fh.write(json.dumps(evil_read) + "\n")
+            fh.write(json.dumps(evil_callid) + "\n")
+        with open(os.path.join(sdir, "events.jsonl"), "a") as fh:
+            fh.write(json.dumps(evil_event) + "\n")
+        con = self._isolated_con("evilshape")
+        grok.sync(con, root=tmp)
+        sentinels = (tool_secret, "sk-fake-secret-tool-111", meta_secret,
+                     target_secret, loc_secret, "sk-fake-secret-loc-222",
+                     loc_msg, callid_secret, "SECRET-KIND-ddd",
+                     "SECRET-LOCBAD-ggg", "SECRET-LOCFAIL-hhh")
+        texts = self._all_text_values(con)
+        self.assertTrue(texts)
+        for table, col, val in texts:
+            for sentinel in sentinels:
+                self.assertNotIn(sentinel, val,
+                                 f"{table}.{col} leaks malformed shape")
+        # The non-string tool name must not survive as an event name,
+        # target, fingerprint, or detail value; the read locations must
+        # not survive as paths, names, targets, or detail either.
+        for row in con.execute(
+                "SELECT name, target, fingerprint, detail_json FROM events"
+                " WHERE session_key=?", (S1,)):
+            blob = " ".join(v or "" for v in
+                            (row["name"], row["target"], row["fingerprint"],
+                             row["detail_json"]))
+            for sentinel in sentinels:
+                self.assertNotIn(sentinel, blob,
+                                 "events row leaks malformed shape")
+        # Valid fixture behavior is preserved.
+        call = con.execute(
+            "SELECT name, target FROM events WHERE session_key=?"
+            " AND family='tool_call' AND native_id='call-read-1'",
+            (S1,)).fetchone()
+        self.assertIsNotNone(call)
+        self.assertEqual(call["name"], "read_file")
+        self.assertEqual(call["target"],
+                         "/redacted/repo/skills/ops/SKILL.md")
+        # Any quarantine uses only a fixed category and shape-only excerpt.
+        allowed = {"malformed_json", "schema_error", "unknown_method",
+                   "unknown_update", "missing_prompt_index",
+                   "missing_prompt_id", "conflicting_prompt",
+                   "conflicting_usage", "unknown_event"}
+        errors = list(con.execute(
+            "SELECT error, line_excerpt FROM import_errors"))
+        for row in errors:
+            self.assertIn(row["error"], allowed)
+            self.assertLessEqual(len(row["line_excerpt"] or ""), 200)
+            for sentinel in sentinels:
+                self.assertNotIn(sentinel, row["line_excerpt"] or "")
+                self.assertNotIn(sentinel, row["error"] or "")
+            self.assertNotIn("target_file", row["line_excerpt"] or "")
+        con.close()
+
+    def test_growing_updates_does_not_duplicate_replay_errors(self):
+        tmp = os.path.join(self.tmp.name, "replaydedup")
+        shutil.copytree(ROOT, tmp)
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        sdir = os.path.join(tmp, "%2Fredacted%2Frepo", sid)
+        updates_path = os.path.join(sdir, "updates.jsonl")
+        malformed = {
+            "timestamp": 1788800400,
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": "dedup probe"},
+                },
+            },
+        }
+        with open(updates_path, "a") as fh:
+            fh.write(json.dumps(malformed) + "\n")
+        con = self._isolated_con("replaydedup")
+        grok.sync(con, root=tmp)
+        first = list(con.execute(
+            "SELECT source_path, ordinal_num, error FROM import_errors"
+            " WHERE error='missing_prompt_index'"))
+        self.assertEqual(len(first), 1)
+        first_path = first[0]["source_path"]
+        first_ordinal = first[0]["ordinal_num"]
+        n_errors_first = con.execute(
+            "SELECT COUNT(*) n FROM import_errors").fetchone()["n"]
+        # Grow the same file with a valid completion for the open prompt.
+        completion = {"timestamp": 1788800401,
+                      "method": "_x.ai/session/update",
+                      "params": {"sessionId": sid,
+                                 "update": {"sessionUpdate": "turn_completed",
+                                            "prompt_id": "p-eee",
+                                            "stop_reason": "end_turn",
+                                            "usage": {"inputTokens": 700,
+                                                      "outputTokens": 70,
+                                                      "totalTokens": 770}},
+                                 "_meta": {"eventId": "dedup-grow-1"}}}
+        with open(updates_path, "a") as fh:
+            fh.write(json.dumps(completion) + "\n")
+        second = grok.sync(con, root=tmp)
+        self.assertEqual(second["responses_inserted"], 1)
+        again = list(con.execute(
+            "SELECT source_path, ordinal_num, error FROM import_errors"
+            " WHERE error='missing_prompt_index'"))
+        self.assertEqual(len(again), 1)
+        self.assertEqual(again[0]["source_path"], first_path)
+        self.assertEqual(again[0]["ordinal_num"], first_ordinal)
+        self.assertEqual(
+            con.execute(
+                "SELECT COUNT(*) n FROM import_errors").fetchone()["n"],
+            n_errors_first)
+        # A genuinely new malformed ordinal still gets its own row.
+        malformed2 = dict(malformed)
+        malformed2["timestamp"] = 1788800402
+        with open(updates_path, "a") as fh:
+            fh.write(json.dumps(malformed2) + "\n")
+        grok.sync(con, root=tmp)
+        final = list(con.execute(
+            "SELECT ordinal_num FROM import_errors"
+            " WHERE error='missing_prompt_index' ORDER BY ordinal_num"))
+        self.assertEqual(len(final), 2)
+        self.assertNotEqual(final[0]["ordinal_num"], final[1]["ordinal_num"])
+        con.close()
+
+    def test_token_shaped_free_text_in_enum_fields_never_persists(self):
+        # Token-shaped strings (no whitespace) pass a lexical check but are
+        # not closed-enum values, so they must be dropped from every event
+        # detail and status column.
+        tmp = os.path.join(self.tmp.name, "tokenenum")
+        shutil.copytree(ROOT, tmp)
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        sdir = os.path.join(tmp, "%2Fredacted%2Frepo", sid)
+        evil_outcome = "EVIL-OUTCOME-abc123"
+        evil_decision = "EVIL-DECISION-abc123"
+        evil_type = "EVIL-TYPE-abc123"
+        evil_err = "EVIL-ERR-abc123"
+        evil_rel = "EVIL-REL-abc123"
+        evil_status = "EVIL-STATUS-abc123"
+        retry = {
+            "timestamp": 1788800500,
+            "method": "_x.ai/session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {"sessionUpdate": "retry_state",
+                           "type": evil_type, "error_type": evil_err},
+                "_meta": {"eventId": "token-retry-1"},
+            },
+        }
+        with open(os.path.join(sdir, "updates.jsonl"), "a") as fh:
+            fh.write(json.dumps(retry) + "\n")
+        with open(os.path.join(sdir, "events.jsonl"), "a") as fh:
+            fh.write(json.dumps({
+                "ts": "2026-09-01T10:00:11Z", "type": "turn_ended",
+                "outcome": evil_outcome}) + "\n")
+            fh.write(json.dumps({
+                "ts": "2026-09-01T10:00:12Z", "type": "permission_resolved",
+                "tool_name": "read_file", "decision": evil_decision,
+                "wait_ms": 3}) + "\n")
+            fh.write(json.dumps({
+                "ts": "2026-09-01T10:00:13Z", "type": "turn_started",
+                "turn_number": 9, "model_id": "grok-4.6",
+                "session_relationship": evil_rel}) + "\n")
+            fh.write(json.dumps({
+                "ts": "2026-09-01T10:00:14Z", "type": "tool_completed",
+                "tool_name": "read_file", "tool_call_id": "call-evil-enum-1",
+                "duration_ms": 9, "outcome": evil_outcome}) + "\n")
+            fh.write(json.dumps({
+                "ts": "2026-09-01T10:00:15Z", "type": "tool_started",
+                "tool_name": "read_file"}) + "\n")
+        con = self._isolated_con("tokenenum")
+        grok.sync(con, root=tmp)
+        sentinels = (evil_outcome, evil_decision, evil_type, evil_err,
+                     evil_rel, evil_status)
+        for table, col, val in self._all_text_values(con):
+            for sentinel in sentinels:
+                self.assertNotIn(sentinel, val,
+                                 f"{table}.{col} leaks enum free text")
+        # The evil outcome/decision survive in no status column either.
+        for row in con.execute(
+                "SELECT status, detail_json FROM events"
+                " WHERE session_key=?", (S1,)):
+            blob = (row["status"] or "") + (row["detail_json"] or "")
+            for sentinel in sentinels:
+                self.assertNotIn(sentinel, blob,
+                                 "events row leaks enum free text")
+        # Valid enum behavior is preserved: real outcomes, decisions,
+        # relationships, retry types and tool identities still persist.
+        ended = [r for r in con.execute(
+            "SELECT status, detail_json FROM events WHERE session_key=?"
+            " AND family='lifecycle' AND name='turn_ended'", (S1,))]
+        self.assertTrue(any(
+            r["status"] == "completed"
+            and '"outcome": "completed"' in (r["detail_json"] or "")
+            for r in ended))
+        resolved = [r for r in con.execute(
+            "SELECT status, detail_json FROM events WHERE session_key=?"
+            " AND family='permission' AND status='allow'", (S1,))]
+        self.assertEqual(len(resolved), 1)
+        self.assertIn('"decision": "allow"',
+                      resolved[0]["detail_json"] or "")
+        self.assertIn('"wait_ms": 3', con.execute(
+            "SELECT detail_json FROM events WHERE session_key=?"
+            " AND family='permission' AND status IS NULL",
+            (S1,)).fetchone()["detail_json"] or "")
+        started = con.execute(
+            "SELECT detail_json FROM events WHERE session_key=?"
+            " AND family='lifecycle' AND name='turn_started'"
+            " AND detail_json LIKE '%\"turn_number\": 9%'",
+            (S1,)).fetchone()
+        self.assertIsNotNone(started)
+        self.assertIn('"model_id": "grok-4.6"',
+                      started["detail_json"] or "")
+        self.assertNotIn("session_relationship",
+                         started["detail_json"] or "")
+        retry_rows = list(con.execute(
+            "SELECT detail_json FROM events WHERE session_key=?"
+            " AND family='lifecycle' AND name='retry_state'", (S1,)))
+        self.assertEqual(len(retry_rows), 2)
+        con.close()
+
+    def test_legacy_malformed_detail_is_scrubbed_and_persisted(self):
+        # A tool_result row written before strict field validation keeps
+        # unknown keys, enum free text and arbitrary nested contents until
+        # a tool_completed enrichment arrives. Sanitization must drop the
+        # junk, keep valid fields, and persist even when neither duration
+        # nor status changes.
+        tmp = os.path.join(self.tmp.name, "legacydetail")
+        shutil.copytree(ROOT, tmp)
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        sdir = os.path.join(tmp, "%2Fredacted%2Frepo", sid)
+        con = self._isolated_con("legacydetail")
+        grok.sync(con, root=tmp)
+        dirty = {"tool": "read_file", "outcome": "success",
+                 "message": "EVIL-LEGACY-MSG-abc123",
+                 "mystery_key": "EVIL-LEGACY-KEY-abc123",
+                 "status": "EVIL-LEGACY-STATUS-abc123",
+                 "paths": ["/ok/path", {"nested": "EVIL-LEGACY-NEST-abc123"},
+                           123],
+                 "lines": {"/ok/path": "notanint", "/other": 7}}
+        con.execute(
+            "INSERT INTO events(source_id, session_key, ordinal_num, ts,"
+            " family, native_id, name, status, duration_ms, detail_json)"
+            " VALUES(NULL, ?, 999, 1788800600.0, 'tool_result',"
+            " 'call-legacy-1', 'read_file', 'ok', 5, ?)",
+            (S1, json.dumps(dirty, sort_keys=True)))
+        con.commit()
+        with open(os.path.join(sdir, "events.jsonl"), "a") as fh:
+            fh.write(json.dumps({
+                "ts": "2026-09-01T10:00:16Z", "type": "tool_completed",
+                "tool_name": "read_file", "tool_call_id": "call-legacy-1",
+                "duration_ms": 5, "outcome": "success"}) + "\n")
+        grok.sync(con, root=tmp)
+        row = con.execute(
+            "SELECT status, duration_ms, detail_json FROM events"
+            " WHERE session_key=? AND family='tool_result'"
+            " AND native_id='call-legacy-1'", (S1,)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(row["duration_ms"], 5)
+        detail = json.loads(row["detail_json"])
+        for sentinel in ("EVIL-LEGACY-MSG-abc123", "EVIL-LEGACY-KEY-abc123",
+                         "EVIL-LEGACY-STATUS-abc123",
+                         "EVIL-LEGACY-NEST-abc123"):
+            self.assertNotIn(sentinel, row["detail_json"])
+            for table, col, val in self._all_text_values(con):
+                self.assertNotIn(sentinel, val,
+                                 f"{table}.{col} leaks legacy detail")
+        self.assertNotIn("mystery_key", detail)
+        self.assertNotIn("message", detail)
+        self.assertNotIn("status", detail)
+        # Valid fields and valid nested contents survive the scrub.
+        self.assertEqual(detail.get("tool"), "read_file")
+        self.assertEqual(detail.get("outcome"), "success")
+        self.assertEqual(detail.get("paths"), ["/ok/path"])
+        self.assertEqual(detail.get("lines"), {"/other": 7})
+        con.close()
