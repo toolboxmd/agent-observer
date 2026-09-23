@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 
@@ -90,10 +91,14 @@ class JsonlSource:
                 self.last_ordinal = ordinal - 1
 
     def error(self, ordinal, message: str, line: str = "") -> None:
+        # Privacy fails closed: the error column holds only a fixed safe
+        # category derived from the leading token of the message. Never
+        # persist str(exc), exception text, type values, IDs or record
+        # values here; structural detail stays in line_excerpt only.
         self.con.execute(
             "INSERT INTO import_errors(harness, source_path, ordinal_num, error,"
             " line_excerpt, created_at) VALUES(?,?,?,?,?,?)",
-            (self.harness, self.path, ordinal, message,
+            (self.harness, self.path, ordinal, _safe_category(message),
              _redacted_excerpt(line, message), now()))
 
     def finish(self, session_id: str | None = None,
@@ -119,18 +124,33 @@ class JsonlSource:
                 "unchanged": self.unchanged}
 
 
-def _redacted_excerpt(line: str, message: str) -> str:
-    """Structural metadata only, never raw line text.
+def _safe_category(message: str) -> str:
+    """Fixed safe error category for import_errors.error.
 
-    Contract rule 7: malformed lines may carry tool output, file contents
-    or preference contents, so nothing from the line body is stored. The
-    excerpt holds the error category plus, when the line parses as JSON,
-    its sorted top-level keys and type/subtype values, capped at 200 chars.
+    The category is the leading token of the message (text before the
+    first colon, first whitespace-separated token), lowercased and
+    restricted to [a-z_] with at most 40 characters. Anything else
+    fails closed to "import_error", so exception text, type values,
+    IDs and other record values never reach the ledger.
     """
-    category = (message or "import_error").split(":")[0].strip() or "import_error"
-    # Keep the category to a safe token; anything else in the message stays
-    # in the error column, never in the excerpt.
-    category = "".join(c if (c.isalnum() or c in ("_", "-")) else "_" for c in category)[:60]
+    raw = (message or "").split(":")[0].strip().split()
+    token = raw[0].lower()[:40] if raw else ""
+    if token and re.fullmatch(r"[a-z_]+", token):
+        return token
+    return "import_error"
+
+
+def _redacted_excerpt(line: str, message: str) -> str:
+    """Structural metadata only, never raw line text or record values.
+
+    Contract rules 6 and 7: malformed lines may carry tool output, file
+    contents or preference contents, so nothing from the line body or
+    its values is stored. The excerpt holds the safe error category
+    plus, when the line parses as a JSON object, its sanitized sorted
+    top-level key names and the JSON shape, capped at 200 chars.
+    Type, subtype, ID and other values are never stored.
+    """
+    category = _safe_category(message)
     if not line or not line.strip():
         return category[:200]
     try:
@@ -142,13 +162,14 @@ def _redacted_excerpt(line: str, message: str) -> str:
             keys = sorted(str(k) for k in obj.keys())
         except Exception:
             return category[:200]
-        parts = [category, f"keys={','.join(keys)[:120]}"]
-        for field in ("type", "subtype"):
-            value = obj.get(field)
-            if isinstance(value, str) and value:
-                safe = "".join(c if (c.isalnum() or c in ("_", "-", ".", "/")) else "_"
-                               for c in value)[:60]
-                parts.append(f"{field}={safe}")
+        safe_keys = []
+        for key in keys:
+            cleaned = "".join(
+                c if (c.isalnum() or c in ("_", "-", ".", "/")) else "_"
+                for c in key)[:40]
+            if cleaned:
+                safe_keys.append(cleaned)
+        parts = [category, f"keys={','.join(safe_keys)[:120]}"]
         return " ".join(parts)[:200]
     if isinstance(obj, list):
         return f"{category} json_type=list"[:200]

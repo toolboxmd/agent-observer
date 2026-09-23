@@ -98,3 +98,23 @@ class LedgerSecretScanTest(LedgerCase):
                 for row in self.query(f"SELECT {column} FROM {table}"):
                     self.assertNotIn(secret, row[column] or "",
                                      f"{table}.{column}")
+        for row in self.query(
+                "SELECT error FROM import_errors"):
+            self.assertRegex(row["error"] or "", r"\A[a-z_]{1,40}\Z")
+
+    def test_type_and_exception_secrets_never_reach_ledger(self):
+        import_codex_file(
+            self.con, fixture("codex-secret-type-quarantine.jsonl"))
+        for secret in ("SECRET-TYPE-7c3a9e1b2f", "SECRET-PAYLOAD-2b7e9a01"):
+            text_columns = {
+                "import_errors": ("error", "line_excerpt"),
+                "submissions": ("text_excerpt",),
+                "events": ("name", "target", "detail_json"),
+                "responses": ("model", "semantics"),
+                "sessions": ("project_dir", "identity_json"),
+            }
+            for table, columns in text_columns.items():
+                for column in columns:
+                    for row in self.query(f"SELECT {column} FROM {table}"):
+                        self.assertNotIn(secret, row[column] or "",
+                                         f"{table}.{column}")

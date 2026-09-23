@@ -98,7 +98,8 @@ class CodexFallbackTest(LedgerCase):
         self.assertEqual(stats["responses_inserted"], 1)
         errors = self.query("SELECT error FROM import_errors")
         self.assertEqual(len(errors), 1)
-        self.assertIn("resp-conf-001", errors[0]["error"])
+        self.assertEqual(errors[0]["error"], "schema_error")
+        self.assertNotIn("resp-conf-001", errors[0]["error"])
         row = self.query(
             "SELECT cached_input_tokens, total_tokens FROM responses"
             " WHERE response_id='codex:resp-conf-001'")[0]
@@ -198,7 +199,8 @@ class ClaudeStreamingTest(LedgerCase):
         self.assertEqual(totals["total_tokens"], 1160 + 1135)
         errors = self.query("SELECT error FROM import_errors")
         self.assertEqual(len(errors), 1)
-        self.assertIn("msg-stream", errors[0]["error"])
+        self.assertEqual(errors[0]["error"], "schema_error")
+        self.assertNotIn("msg-stream", errors[0]["error"])
 
     def test_full_reimport_of_streamed_session_adds_nothing(self):
         claude.import_claude_file(self.con, fixture("claude-streaming.jsonl"))
@@ -353,7 +355,8 @@ class ClaudeIncrementalTest(LedgerCase):
         self.assertEqual(_row(self, "claude:msg-next")["total_tokens"], 1135)
         errors = self.query("SELECT error FROM import_errors")
         self.assertEqual(len(errors), 1)
-        self.assertIn("msg-incr", errors[0]["error"])
+        self.assertEqual(errors[0]["error"], "schema_error")
+        self.assertNotIn("msg-incr", errors[0]["error"])
         totals = report.scope_totals(self.con, {"claude:sess-incr"})
         self.assertEqual(totals["total_tokens"], 1160 + 1135)
         self.assertEqual(totals["responses"], 2)
