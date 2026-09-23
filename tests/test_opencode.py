@@ -263,6 +263,98 @@ class OpencodeAdapterTest(unittest.TestCase):
         self.assertEqual(gen["opencode:msg_u1"], 1)
         self.assertEqual(gen["opencode:msg_cu1"], 0)
 
+    def test_child_session_excerpt_is_empty(self):
+        rows = self.q("SELECT * FROM submissions WHERE native_id=?",
+                      ("opencode:msg_cu1",))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "synthetic")
+        self.assertEqual(rows[0]["is_genuine"], 0)
+        # Child prompts are agent-generated: no child text enters excerpts.
+        self.assertEqual(rows[0]["text_excerpt"], "")
+        self.assertNotIn("child prompt", rows[0]["text_excerpt"] or "")
+
+    def test_truncated_direction_block_leaks_nothing(self):
+        sentinel = "SECRET_TRUNCATED_DIRECTION_zzz_qqq"
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_trunc", None, "/repo", "Trunc", "1.2.3", None,
+                        "build", T0 + 700, T0 + 700, None))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_trunc_u", "ses_trunc", T0 + 700, T0 + 700,
+                        json.dumps({"role": "user",
+                                    "time": {"created": T0 + 700}})))
+        truncated = ("Please do work "
+                     "<<<AGENTSMD_PROJECT_DIRECTION_V1>>>"
+                     '{"status":"ready"} ' + sentinel +
+                     " trailing without close")
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_trunc_t", "msg_trunc_u", "ses_trunc",
+                        T0 + 700, T0 + 700,
+                        json.dumps({"type": "text", "text": truncated})))
+        native.commit()
+        native.close()
+        opencode.sync(self.con, source=self.db_file)
+        # The sentinel appears in no ledger table and no submission excerpt.
+        self._assert_no_secret_anywhere((sentinel,))
+        subs = self.q("SELECT native_id, text_excerpt FROM submissions")
+        for row in subs:
+            self.assertNotIn(sentinel, row["text_excerpt"] or "")
+        trunc = [r for r in subs
+                 if r["native_id"] == "opencode:msg_trunc_u"]
+        self.assertEqual(len(trunc), 1)
+        self.assertNotIn(sentinel, trunc[0]["text_excerpt"] or "")
+        self.assertNotIn("<<<AGENTSMD_PROJECT_DIRECTION_V1>>>",
+                         trunc[0]["text_excerpt"] or "")
+        self.assertIn("Please do work", trunc[0]["text_excerpt"] or "")
+
+    def test_missing_id_part_quarantined_and_later_parts_import(self):
+        sentinel = "SECRET_MISSING_ID_HASH_zzz_qqq"
+        native = sqlite3.connect(self.db_file)
+        # Malformed patch part without an id: empty string is the only
+        # missing-id value the PRIMARY KEY column can store.
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("", "msg_a1", "ses_parent", T0 + 800, T0 + 800,
+                        json.dumps({"type": "patch", "hash": sentinel,
+                                    "files": ["/repo/a.txt"]})))
+        # A later valid part in the same session must still import.
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_valid_after", "msg_a1", "ses_parent",
+                        T0 + 801, T0 + 801,
+                        json.dumps({"type": "compaction"})))
+        # A later session (sorts after ses_parent) must still import.
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_zzz_late", None, "/repo", "Late", "1.2.3",
+                        None, "build", T0 + 802, T0 + 802, None))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_zzz_a", "ses_zzz_late", T0 + 802, T0 + 802,
+                        _msg("assistant", T0 + 802, T0 + 812,
+                             _tokens(2, 2, 0, 0, 0))))
+        native.execute("UPDATE session SET time_updated=? WHERE id=?",
+                       (T0 + 802, "ses_parent"))
+        native.commit()
+        native.close()
+        stats = opencode.sync(self.con, source=self.db_file)
+        self.assertGreaterEqual(stats["malformed"], 1)
+        errs = self.q("SELECT * FROM import_errors WHERE error=?",
+                      ("part_missing_id",))
+        self.assertTrue(errs)
+        for row in errs:
+            self.assertLessEqual(len(row["line_excerpt"] or ""), 200)
+            self.assertNotIn(sentinel, row["line_excerpt"] or "")
+            self.assertIn("type=patch", row["line_excerpt"] or "")
+        self._assert_no_secret_anywhere((sentinel,))
+        # The later valid part in the same session imported.
+        late_part = self.q("SELECT * FROM events WHERE family='compaction'"
+                           " AND native_id=?", ("p_valid_after",))
+        self.assertEqual(len(late_part), 1)
+        # The later session imported.
+        late_resp = self.q("SELECT * FROM responses WHERE response_id=?",
+                           ("opencode:msg_zzz_a",))
+        self.assertEqual(len(late_resp), 1)
+        late_sess = self.q("SELECT * FROM sessions WHERE session_key=?",
+                           ("opencode:ses_zzz_late",))
+        self.assertEqual(len(late_sess), 1)
+
     def test_tool_call_result_join_target_status_duration_size(self):
         calls = {r["native_id"] for r in self.q(
             "SELECT native_id FROM events WHERE family='tool_call'")}

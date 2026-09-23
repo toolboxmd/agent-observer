@@ -47,8 +47,10 @@ CAPABILITIES = [
 # Privacy: the full AgentsMD direction block (which carries preference
 # contents) is stripped from submission excerpts. Identity observation still
 # sees the full text so instructions_sha256 / preferences_sha256 keep working.
+_DIRECTION_OPEN = "<<<AGENTSMD_PROJECT_DIRECTION_V1>>>"
+_DIRECTION_CLOSE = "<<<END_AGENTSMD_PROJECT_DIRECTION_V1>>>"
 _DIRECTION_SPAN_RE = re.compile(
-    r"<<<AGENTSMD_PROJECT_DIRECTION_V1>>>.*?<<<END_AGENTSMD_PROJECT_DIRECTION_V1>>>",
+    re.escape(_DIRECTION_OPEN) + r".*?" + re.escape(_DIRECTION_CLOSE),
     re.S)
 _INSTRUCTIONS_RE = re.compile(
     r"<INSTRUCTIONS>\n?(.*?)(?:</INSTRUCTIONS>|\Z)", re.S)
@@ -227,10 +229,25 @@ def _oops(con: sqlite3.Connection, stats: dict, src_path: str,
 
 
 def _sanitize_user_text(text: str) -> str:
-    """Human-only excerpt text with direction/instruction blocks removed."""
+    """Human-only excerpt text with direction/instruction blocks removed.
+
+    Direction blocks fail closed: text from the opening marker is removed
+    through the closing marker, or through the end of the text when the
+    closing marker is missing (truncated block).
+    """
     if not isinstance(text, str):
         return ""
-    cleaned = _DIRECTION_SPAN_RE.sub("", text)
+    cleaned = text
+    while True:
+        start = cleaned.find(_DIRECTION_OPEN)
+        if start == -1:
+            break
+        end = cleaned.find(_DIRECTION_CLOSE,
+                           start + len(_DIRECTION_OPEN))
+        if end == -1:
+            cleaned = cleaned[:start]
+            break
+        cleaned = cleaned[:start] + cleaned[end + len(_DIRECTION_CLOSE):]
     cleaned = _INSTRUCTIONS_RE.sub("", cleaned)
     return cleaned.strip()
 
@@ -607,16 +624,23 @@ def _ingest_submission(con, stats, identity, abs_db_path, source_id,
     if not texts:
         return
     body = "".join(texts)
-    if sess.get("parent_id"):
+    is_child = bool(sess.get("parent_id"))
+    if is_child:
         kind = "synthetic"
     elif flags and all(flags):
         kind = "synthetic"
     else:
         kind = "genuine"
-    # Excerpt uses only the human's own (non-synthetic) parts with the
-    # AgentsMD direction block and instruction bodies removed.
-    human_texts = [t for t, flag in zip(texts, flags) if not flag]
-    excerpt_src = _sanitize_user_text("".join(human_texts))
+    # Child sessions are sub-agent turns: their prompts are agent-generated,
+    # so no child text ever enters the human excerpt. The row/kind semantics
+    # and identity observation above stay intact.
+    if is_child:
+        excerpt_src = ""
+    else:
+        # Excerpt uses only the human's own (non-synthetic) parts with the
+        # AgentsMD direction block and instruction bodies removed.
+        human_texts = [t for t, flag in zip(texts, flags) if not flag]
+        excerpt_src = _sanitize_user_text("".join(human_texts))
     excerpt = excerpt_src[:300]
     digest = text_hash(excerpt_src)
     cur = con.execute(
@@ -652,6 +676,10 @@ def _ingest_part(con, stats, identity, abs_db_path, source_id, session_key,
         return
     ptype = data.get("type")
     ts = iso_ts(part.get("time_created"))
+    if not part_id or (isinstance(part_id, str) and not part_id.strip()):
+        _oops(con, stats, abs_db_path, ordinal, "part_missing_id",
+              _sanitized_excerpt(part_id, data, role=role, ptype=ptype))
+        return
     if ptype == "tool":
         _ingest_tool(con, stats, identity, abs_db_path, source_id,
                       session_key, sess, roles, part, data, ordinal, ts)
