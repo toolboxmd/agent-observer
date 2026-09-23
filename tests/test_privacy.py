@@ -15,10 +15,11 @@ import tempfile
 import unittest
 from unittest import mock
 
-from agent_observer import db, privacy
+from agent_observer import db, privacy, report
 from agent_observer.adapters import claude
 from agent_observer.adapters.codex import import_codex_file
-from agent_observer.ingest import JsonlSource, insert_event
+from agent_observer.ingest import (JsonlSource, MissingNativeId,
+                                   insert_event)
 from tests.helpers import FIXTURES, LedgerCase, fixture
 
 
@@ -288,6 +289,380 @@ class PrivacyFixtureScanTest(LedgerCase):
         self.assertEqual(parsed["paths"], sorted(parsed["paths"]))
 
 
+class CodexMainSessionTest(LedgerCase):
+    """Rule 1 main-session gate: parent keeps an excerpt, child/worker and
+    unknown rollouts keep none, even for genuine-looking user messages."""
+
+    def test_gate_requires_a_proven_main_thread(self):
+        main = {"thread_source": "user", "session_id": "s",
+                "thread_id": "s"}
+        self.assertTrue(privacy.is_main_session(**main))
+        self.assertTrue(privacy.is_main_session(
+            **{**main, "observed_thread_ids": ("s",)}))
+        # Unknown thread identity fails closed, even with session and
+        # source known.
+        for bad in (None, "", 123, ["s"]):
+            self.assertFalse(privacy.is_main_session(
+                thread_source="user", session_id="s", thread_id=bad))
+        # A divergent own thread fails closed.
+        self.assertFalse(privacy.is_main_session(
+            **{**main, "thread_id": "worker"}))
+        self.assertFalse(privacy.is_main_session(
+            **{**main, "observed_thread_ids": ("worker",)}))
+        self.assertFalse(privacy.is_main_session(
+            **{**main, "observed_thread_ids": (None,)}))
+        self.assertFalse(privacy.is_main_session(
+            **{**main, "observed_thread_ids": "s"}))
+        # Any other source, or a missing session, fails closed.
+        self.assertFalse(privacy.is_main_session(
+            **{**main, "thread_source": "spawned"}))
+        self.assertFalse(privacy.is_main_session(
+            **{**main, "thread_source": None}))
+        self.assertFalse(privacy.is_main_session(
+            **{**main, "session_id": ""}))
+        self.assertFalse(privacy.is_main_session(
+            **{**main, "session_id": None}))
+
+    def test_parent_main_session_keeps_its_excerpt(self):
+        self.sync("codex-parent.jsonl")
+        row = self.query(
+            "SELECT kind, text_excerpt, is_genuine FROM submissions"
+            " WHERE native_id='codex:msg-scope-sub-p1'")[0]
+        self.assertEqual(row["kind"], "genuine")
+        self.assertEqual(row["text_excerpt"],
+                         "Research how we track usage across harnesses.")
+
+    def test_child_worker_message_keeps_no_excerpt(self):
+        self.sync("codex-child-message.jsonl")
+        row = self.query(
+            "SELECT kind, text_excerpt, is_genuine, text_hash, session_key"
+            " FROM submissions"
+            " WHERE native_id='codex:msg-child-sub-01'")[0]
+        # Authorship is still genuine human input, but a divergent own
+        # thread proves a worker rollout, so no excerpt is stored. Hash,
+        # kind and accounting behavior are preserved.
+        self.assertEqual(row["kind"], "genuine")
+        self.assertEqual(row["text_excerpt"], "")
+        self.assertEqual(row["session_key"],
+                         "codex:thread-fixture-childmsg-worker")
+        self.assertTrue(row["text_hash"])
+        self.assertEqual(
+            report.scope_totals(self.con)["responses"], 1)
+
+    def test_unknown_metadata_keeps_no_excerpt(self):
+        self.sync("codex-unknown-message.jsonl")
+        row = self.query(
+            "SELECT kind, text_excerpt FROM submissions"
+            " WHERE native_id='codex:msg-unknown-sub-01'")[0]
+        self.assertEqual(row["kind"], "genuine")
+        self.assertEqual(row["text_excerpt"], "")
+
+    def test_message_before_thread_identity_keeps_its_excerpt(self):
+        # The user message is the first line; the session_meta proving the
+        # main session comes after. The prescan judges with the whole
+        # portion known, so the excerpt survives the ordering.
+        self.sync("codex-early-message.jsonl")
+        row = self.query(
+            "SELECT kind, text_excerpt FROM submissions"
+            " WHERE native_id='codex:msg-early-sub-01'")[0]
+        self.assertEqual(row["kind"], "genuine")
+        self.assertEqual(row["text_excerpt"],
+                         "Please summarize the early status for the review.")
+
+    def test_stale_version_corrects_child_excerpt_in_place(self):
+        leaky = staticmethod(
+            lambda text, **kw: text[:300] if isinstance(text, str) else "")
+        with mock.patch.object(privacy, "PRIVACY_VERSION", 0), \
+                mock.patch.object(privacy, "submission_excerpt", leaky):
+            import_codex_file(self.con, fixture("codex-child-message.jsonl"))
+        leaked = self.query(
+            "SELECT text_excerpt FROM submissions"
+            " WHERE native_id='codex:msg-child-sub-01'")[0]["text_excerpt"]
+        self.assertTrue(leaked)
+        before = self.query("SELECT COUNT(*) n FROM submissions")[0]["n"]
+        errors_before = self.query(
+            "SELECT COUNT(*) n FROM import_errors")[0]["n"]
+        import_codex_file(self.con, fixture("codex-child-message.jsonl"))
+        after = self.query(
+            "SELECT text_excerpt, kind, text_hash FROM submissions"
+            " WHERE native_id='codex:msg-child-sub-01'")[0]
+        self.assertEqual(after["text_excerpt"], "")
+        self.assertEqual(after["kind"], "genuine")
+        self.assertTrue(after["text_hash"])
+        self.assertEqual(
+            self.query("SELECT COUNT(*) n FROM submissions")[0]["n"], before)
+        self.assertEqual(
+            self.query("SELECT COUNT(*) n FROM import_errors")[0]["n"],
+            errors_before)
+
+    def test_incremental_import_keeps_empty_until_identity_proves_main(self):
+        import os
+        from agent_observer.adapters.codex import import_codex_file
+        path = os.path.join(self.tmp.name, "rollout-child-live.jsonl")
+        with open(fixture("codex-child-message.jsonl")) as fh:
+            lines = fh.readlines()
+        with open(path, "w") as fh:
+            fh.writelines(lines[:3])
+        import_codex_file(self.con, path)
+        first = self.query(
+            "SELECT text_excerpt, session_key FROM submissions"
+            " WHERE native_id='codex:msg-child-sub-01'")[0]
+        # Session id and thread source alone prove nothing: with no native
+        # thread identity the excerpt stays empty instead of provisional.
+        self.assertEqual(first["text_excerpt"], "")
+        with open(path, "a") as fh:
+            fh.writelines(lines[3:])
+        import_codex_file(self.con, path)
+        row = self.query(
+            "SELECT text_excerpt, session_key FROM submissions"
+            " WHERE native_id='codex:msg-child-sub-01'")[0]
+        # The appended usage proves a worker thread; persisted metadata
+        # plus the new portion fail closed, and the row is reconciled to
+        # the worker session key without duplication.
+        self.assertEqual(row["text_excerpt"], "")
+        self.assertEqual(row["session_key"],
+                         "codex:thread-fixture-childmsg-worker")
+        self.assertEqual(
+            self.query("SELECT COUNT(*) n FROM submissions")[0]["n"], 1)
+
+
+class EventPrivacyTest(LedgerCase):
+    """Rule 6 through the central writer: per-family native_id, name and
+    status validation for Codex and Claude events alike."""
+
+    def _source(self):
+        self.con.execute(
+            "INSERT INTO sources(harness, path, sha256, imported_at)"
+            " VALUES('codex','p','x',0)")
+        return self.con.execute(
+            "SELECT id FROM sources WHERE harness='codex'").fetchone()["id"]
+
+    def test_native_id_wrong_type_is_quarantined_never_stringified(self):
+        self.assertIsNone(privacy.filter_native_id("tool_call", 123))
+        self.assertIsNone(privacy.filter_native_id("tool_call", ["a"]))
+        self.assertIsNone(privacy.filter_native_id("tool_call", None))
+        self.assertIsNone(privacy.filter_native_id("tool_call", ""))
+        self.assertEqual(
+            privacy.filter_native_id("tool_call", "call-1"), "call-1")
+        source_id = self._source()
+        stats: dict = {}
+        with self.assertRaises(MissingNativeId):
+            insert_event(self.con, stats, source_id=source_id,
+                         session_key="codex:s", family="tool_call",
+                         native_id=123, name="exec")
+        self.assertEqual(
+            self.query("SELECT COUNT(*) n FROM events")[0]["n"], 0)
+
+    def test_numeric_native_id_through_codex_is_missing_id(self):
+        import json as _json
+        import os
+        path = os.path.join(self.tmp.name, "numeric-id.jsonl")
+        with open(path, "w") as fh:
+            fh.write(_json.dumps({
+                "ordinal": 0,
+                "payload": {"cli_version": "0.155.0",
+                            "session_id": "sess-num-01",
+                            "thread_source": "user"},
+                "timestamp": "2026-09-15T14:00:00.000Z",
+                "type": "session_meta"}) + "\n")
+            fh.write(_json.dumps({
+                "ordinal": 1,
+                "payload": {"call_id": 123, "id": 456,
+                            "output": "ok",
+                            "type": "function_call_output"},
+                "timestamp": "2026-09-15T14:00:01.000Z",
+                "type": "response_item"}) + "\n")
+        stats = import_codex_file(self.con, path)
+        self.assertEqual(stats["malformed"], 1)
+        rows = self.query("SELECT error FROM import_errors")
+        self.assertEqual([r["error"] for r in rows], ["missing_id"])
+        for row in self.query("SELECT native_id FROM events"):
+            self.assertNotIn("123", row["native_id"])
+
+    def test_names_follow_closed_per_family_sets(self):
+        # Canonical protocol and command-kind names survive per family.
+        self.assertEqual(
+            privacy.filter_event_name("assistant_message",
+                                      "assistant_message"),
+            "assistant_message")
+        self.assertEqual(
+            privacy.filter_event_name("compaction", "context_compaction"),
+            "context_compaction")
+        self.assertEqual(
+            privacy.filter_event_name("compaction", "compact_boundary"),
+            "compact_boundary")
+        for name in ("task_complete", "turn_aborted", "turn_duration",
+                     "subagent_activity", "thread_goal_updated",
+                     "collab.unknown"):
+            self.assertEqual(
+                privacy.filter_event_name("lifecycle", name), name)
+        for name in ("exec", "Bash", "function_call_output",
+                     "custom_tool_call_output", "image_view", "web_search",
+                     "mcp.unknown", "dynamic.unknown", "unknown"):
+            self.assertEqual(
+                privacy.filter_event_name("tool_result", name), name)
+        self.assertEqual(
+            privacy.filter_event_name("file_change", "file_change"),
+            "file_change")
+        # Arbitrary identifier-shaped instance values are dropped for every
+        # family, even with no spaces: tool and skill names, file
+        # basenames, server paths and structured prefixes.
+        cases = (
+            ("tool_call", "collaboration.spawn_agent"),
+            ("tool_call", "exec"),
+            ("tool_call", "secret_token"),
+            ("tool_result", "secret_token"),
+            ("tool_result", "unknown_tool"),
+            ("tool_result", "Read"),
+            ("tool_result", "mcp.cua_repl.js"),
+            ("tool_result", "dynamic.secret"),
+            ("tool_result", "done <b>x</b>"),
+            ("file_change", "Edit"),
+            ("read", "AGENTS.md"),
+            ("read", "notes.md"),
+            ("skill_read", "SKILL.md"),
+            ("skill_read", "operations"),
+            ("skill_invoke", "agentsmd:operations"),
+            ("skill_invoke", "wayfinder"),
+            ("permission", "Bash"),
+            ("permission", "Read"),
+            ("lifecycle", "collab.spawn_agent"),
+            ("lifecycle", "custom prose status"),
+            ("assistant_message", "chat"),
+            ("compaction", "compact"),
+        )
+        for family, name in cases:
+            self.assertIsNone(
+                privacy.filter_event_name(family, name), (family, name))
+        self.assertIsNone(privacy.filter_event_name("tool_call", 42))
+        self.assertIsNone(privacy.filter_event_name("tool_call", ""))
+        self.assertIsNone(privacy.filter_event_name("tool_call", None))
+        self.assertIsNone(privacy.filter_event_name("nope", "exec"))
+
+    def test_statuses_follow_closed_per_family_sets(self):
+        self.assertEqual(
+            privacy.filter_event_status("tool_result", "completed"),
+            "completed")
+        self.assertEqual(
+            privacy.filter_event_status("lifecycle", "cancelled"), "cancelled")
+        self.assertEqual(
+            privacy.filter_event_status("permission", "denied"), "denied")
+        self.assertIsNone(
+            privacy.filter_event_status("tool_result", "started"))
+        self.assertIsNone(
+            privacy.filter_event_status("tool_result", "weird prose"))
+        self.assertIsNone(
+            privacy.filter_event_status("tool_result", 0))
+        self.assertIsNone(
+            privacy.filter_event_status("compaction", "completed"))
+        self.assertIsNone(
+            privacy.filter_event_status("tool_result", None))
+
+    def test_central_writer_routes_every_protected_field(self):
+        source_id = self._source()
+        stats: dict = {}
+        insert_event(self.con, stats, source_id=source_id,
+                     session_key="codex:s", family="tool_result",
+                     native_id="call-9", name="hello world",
+                     status="weird prose", target="/p/x.py",
+                     detail={"exit_code": 1, "note": "prose"})
+        row = self.query("SELECT * FROM events WHERE native_id='call-9'")[0]
+        self.assertIsNone(row["name"])
+        self.assertIsNone(row["status"])
+        self.assertEqual(row["target"], "/p/x.py")
+        import json as _json
+        self.assertEqual(_json.loads(row["detail_json"]), {"exit_code": 1})
+
+    def test_stale_reimport_corrects_every_protected_event_field(self):
+        self.sync("codex-mini.jsonl")
+        before = {(r["family"], r["native_id"]): dict(r) for r in self.query(
+            "SELECT family, native_id, name, target, status, detail_json"
+            " FROM events")}
+        count_before = self.query(
+            "SELECT COUNT(*) n FROM events")[0]["n"]
+        self.assertTrue(before)
+        victim_family, victim_native = sorted(before)[0]
+        self.con.execute(
+            "UPDATE events SET name='Hello World prose', status='weird prose',"
+            " target='leaked target', detail_json='{\"note\": \"prose\"}'"
+            " WHERE family=? AND native_id=?",
+            (victim_family, victim_native))
+        self.con.execute(
+            "UPDATE sources SET privacy_version=0 WHERE harness='codex'")
+        self.con.commit()
+        stats = import_codex_file(
+            self.con, fixture("codex-mini.jsonl"), full=True)
+        self.assertGreaterEqual(stats.get("events_updated", 0), 1)
+        row = self.query(
+            "SELECT family, native_id, name, target, status, detail_json"
+            " FROM events WHERE family=? AND native_id=?",
+            (victim_family, victim_native))[0]
+        # Every protected field is re-derived through privacy.py: prose is
+        # gone, valid values are restored, rows are not duplicated.
+        self.assertNotIn("prose", (row["name"] or "") + (row["status"] or ""))
+        self.assertEqual(
+            self.query("SELECT COUNT(*) n FROM events")[0]["n"], count_before)
+        if before[(victim_family, victim_native)]["name"] is not None:
+            self.assertEqual(
+                row["name"],
+                before[(victim_family, victim_native)]["name"])
+        else:
+            self.assertIsNone(row["name"])
+
+
+class NullOrdinalDedupTest(LedgerCase):
+    """import_errors deduplicates on the structural source ordinal, so a
+    record with ordinal:null never adds a duplicate row."""
+
+    def test_null_native_ordinals_deduplicate_across_resyncs(self):
+        from agent_observer.adapters.codex import import_codex_file
+        first = import_codex_file(
+            self.con, fixture("codex-null-ordinal.jsonl"))
+        self.assertEqual(first["malformed"], 2)
+        self.assertEqual(first["responses_inserted"], 1)
+        errors = self.query(
+            "SELECT ordinal_num, error, line_excerpt FROM import_errors"
+            " ORDER BY ordinal_num")
+        self.assertEqual(
+            [(r["ordinal_num"], r["error"]) for r in errors],
+            [(1, "unsupported_schema"), (2, "malformed_usage")])
+        for row in errors:
+            self.assertIsNotNone(row["ordinal_num"])
+        # A forced full re-read under the same version adds no rows.
+        import_codex_file(
+            self.con, fixture("codex-null-ordinal.jsonl"), full=True)
+        again = self.query(
+            "SELECT ordinal_num, error, line_excerpt FROM import_errors"
+            " ORDER BY ordinal_num")
+        self.assertEqual(
+            [(r["ordinal_num"], r["error"], r["line_excerpt"])
+             for r in again],
+            [(r["ordinal_num"], r["error"], r["line_excerpt"])
+             for r in errors])
+
+    def test_none_ordinal_is_null_safe_directly(self):
+        import os
+        import tempfile
+        edge = os.path.join(tempfile.gettempdir(),
+                            "agent-observer-null-ordinal-edge.jsonl")
+        with open(edge, "w") as fh:
+            fh.write("{}\n")
+        try:
+            src = JsonlSource(self.con, "codex", edge)
+            list(src.records())
+            src.error(None, "schema_error", '{"type": "x"}')
+            src.error(None, "schema_error", '{"type": "x"}')
+            self.con.commit()
+            rows = self.query(
+                "SELECT ordinal_num, error FROM import_errors"
+                " WHERE source_path=?", (edge,))
+            self.assertEqual(len(rows), 1)
+            self.assertIsNone(rows[0]["ordinal_num"])
+            self.assertEqual(rows[0]["error"], "schema_error")
+        finally:
+            os.remove(edge)
+
+
 class PrivacyVersionTest(LedgerCase):
     LEAKY = {
         "submission_excerpt": staticmethod(
@@ -441,6 +816,31 @@ class PrivacyUnitTest(unittest.TestCase):
             privacy.submission_excerpt("Gardez ceci <élan drop",
                                        is_genuine=True),
             "Gardez ceci")
+
+    def test_unicode_numerals_are_not_markers(self):
+        # U+2460 is a numeral, not a letter: '<' plus isalpha() is False,
+        # so the text is kept whole.
+        self.assertFalse("①".isalpha())
+        self.assertEqual(
+            privacy.submission_excerpt("Total <① item", is_genuine=True),
+            "Total <① item")
+        self.assertEqual(
+            privacy.assistant_excerpt("Total <① item"), "Total <① item")
+        self.assertFalse(privacy.contains_marker("Total <① item"))
+        # A Unicode letter still marks: '<' plus isalpha() is True.
+        self.assertTrue("é".isalpha())
+        self.assertEqual(
+            privacy.submission_excerpt("Gardez ceci <élan drop",
+                                       is_genuine=True),
+            "Gardez ceci")
+        self.assertEqual(privacy.assistant_excerpt("fini <élan"), "")
+        self.assertTrue(privacy.contains_marker("a <é b"))
+        self.assertTrue(privacy.contains_marker("a </ b"))
+        self.assertTrue(privacy.contains_marker("a <! b"))
+        self.assertTrue(privacy.contains_marker("a <<< b"))
+        self.assertFalse(privacy.contains_marker("a < b and 3 < 4"))
+        self.assertFalse(privacy.contains_marker("a << b"))
+        self.assertFalse(privacy.contains_marker(None))
 
     def test_submission_excerpt_collapses_whitespace_and_caps_length(self):
         self.assertEqual(

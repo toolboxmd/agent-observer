@@ -110,12 +110,21 @@ class JsonlSource:
         # column holds exactly one closed category (anything else maps to
         # the fallback), and the excerpt holds only sorted top-level key
         # names. The same record re-read under the same version never adds
-        # a duplicate row.
+        # a duplicate row. Deduplication is NULL-safe: a record whose
+        # native ordinal is absent (None) is keyed with IS NULL, so callers
+        # must still prefer the structural source ordinal they were
+        # yielded, which is never None.
         safe = privacy.error_category(category)
-        exists = self.con.execute(
-            "SELECT 1 FROM import_errors WHERE harness=? AND source_path=?"
-            " AND ordinal_num=? AND error=?",
-            (self.harness, self.path, ordinal, safe)).fetchone()
+        if ordinal is None:
+            exists = self.con.execute(
+                "SELECT 1 FROM import_errors WHERE harness=? AND source_path=?"
+                " AND ordinal_num IS NULL AND error=?",
+                (self.harness, self.path, safe)).fetchone()
+        else:
+            exists = self.con.execute(
+                "SELECT 1 FROM import_errors WHERE harness=? AND source_path=?"
+                " AND ordinal_num=? AND error=?",
+                (self.harness, self.path, ordinal, safe)).fetchone()
         if exists is not None:
             return
         self.con.execute(
@@ -126,7 +135,8 @@ class JsonlSource:
 
     def finish(self, session_id: str | None = None,
                thread_id: str | None = None,
-               cli_version: str | None = None) -> dict:
+               cli_version: str | None = None,
+               thread_source: str | None = None) -> dict:
         with open(self.path, "rb") as fh:
             tail = _tail_sha(fh, self.end_offset) if self.end_offset else None
         fingerprint = hashlib.sha256(
@@ -138,11 +148,13 @@ class JsonlSource:
             " import_ms=?, session_id=COALESCE(?, session_id),"
             " thread_id=COALESCE(?, thread_id),"
             " cli_version=COALESCE(?, cli_version),"
+            " thread_source=COALESCE(?, thread_source),"
             " privacy_version=? WHERE id=?",
             (fingerprint, self.size, self.end_offset, tail, self.end_offset,
              ordinal_max, now(),
              int((time.monotonic() - self.started) * 1000),
-             session_id, thread_id, cli_version, privacy.PRIVACY_VERSION,
+             session_id, thread_id, cli_version, thread_source,
+             privacy.PRIVACY_VERSION,
              self.source_id))
         return {"source_id": self.source_id, "sha256": fingerprint,
                 "ordinal_max": ordinal_max, "incremental": self.incremental,
@@ -156,13 +168,20 @@ def insert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
                  fingerprint=None, detail=None, update: bool = False) -> None:
     """Insert one event under its natural key; a repeat is a no-op.
 
-    Detail and target pass through agent_observer/privacy.py rule 6: only
-    allowlisted keys with correctly typed values persist. When update is
-    true (a source re-imported under newer privacy rules), an existing row's
-    target and detail are corrected in place instead of kept stale.
+    Every protected field passes through agent_observer/privacy.py rule 6:
+    native_id must be a non-empty string of the family-expected type (never
+    stringified; a wrong type raises MissingNativeId and is quarantined as
+    missing_id), name and status must belong to the family's closed sets,
+    and only allowlisted detail keys with correctly typed values persist.
+    When update is true (a source re-imported under newer privacy rules),
+    an existing row's name, target, status and detail are corrected in
+    place instead of kept stale.
     """
-    if not native_id:
+    native = privacy.filter_native_id(family, native_id)
+    if not native:
         raise MissingNativeId(f"{family} event missing native identity")
+    safe_name = privacy.filter_event_name(family, name)
+    safe_status = privacy.filter_event_status(family, status)
     safe_target = privacy.filter_target(target)
     filtered = privacy.filter_detail(family, detail)
     # The size bound applies before serialization: shrinking list values
@@ -185,15 +204,16 @@ def insert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
         " family, native_id, turn_id, name, target, status, duration_ms,"
         " size_bytes, truncated, fingerprint, detail_json)"
         " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (source_id, session_key, ordinal, ts, family, str(native_id), turn_id,
-         name, safe_target, status, duration_ms, size_bytes, truncated,
-         fingerprint, payload))
+        (source_id, session_key, ordinal, ts, family, native, turn_id,
+         safe_name, safe_target, safe_status, duration_ms, size_bytes,
+         truncated, fingerprint, payload))
     if cur.rowcount == 0:
         if update:
             con.execute(
-                "UPDATE events SET target=?, detail_json=?"
+                "UPDATE events SET name=?, target=?, status=?, detail_json=?"
                 " WHERE session_key=? AND family=? AND native_id=?",
-                (safe_target, payload, session_key, family, str(native_id)))
+                (safe_name, safe_target, safe_status, payload, session_key,
+                 family, native))
             stats["events_updated"] = stats.get("events_updated", 0) + 1
         else:
             stats["events_duplicate"] = stats.get("events_duplicate", 0) + 1

@@ -23,18 +23,46 @@ import re
 
 # Rule 3: bump when any rule in this module changes meaning. A stored source
 # version that differs forces a full re-import with in-place correction.
-PRIVACY_VERSION = 1
+PRIVACY_VERSION = 2
 
 SUBMISSION_EXCERPT_CHARS = 300
 ASSISTANT_EXCERPT_CHARS = 400
 LINE_EXCERPT_CHARS = 200
 DETAIL_JSON_CHARS = 4000
 
-# Rule 1/2 marker: '<' followed by a letter (Unicode-aware), '/' or '!',
-# or '<<<'. Plain '<' before whitespace, digits, punctuation or the end of
-# text is kept, as is a bare '<<'.
-_TAG_LIKE_RE = re.compile(r"<[^\W\d_]|</|<!|<<<")
+# Rule 1/2 marker: '<' followed by a letter (str.isalpha, so Unicode
+# numerals such as U+2460 are not letters), '/' or '!', or '<<<'. Plain
+# '<' before whitespace, digits, punctuation or the end of text is kept,
+# as is a bare '<<'.
 _WS_RE = re.compile(r"\s+")
+
+
+def _marker_at(text: str, index: int) -> bool:
+    """Whether a tag-like marker starts at text[index] (which holds '<')."""
+    if text.startswith("<<<", index):
+        return True
+    nxt = index + 1
+    if nxt >= len(text):
+        return False
+    ch = text[nxt]
+    return ch == "/" or ch == "!" or ch.isalpha()
+
+
+def _marker_pos(text: str) -> int | None:
+    """Offset of the first tag-like marker in text, or None when absent."""
+    start = 0
+    while True:
+        idx = text.find("<", start)
+        if idx == -1:
+            return None
+        if _marker_at(text, idx):
+            return idx
+        start = idx + 1
+
+
+def contains_marker(value: object) -> bool:
+    """Whether a string holds a tag-like marker or '<<<' anywhere."""
+    return isinstance(value, str) and _marker_pos(value) is not None
 
 
 def submission_excerpt(text: object, *, is_genuine: bool,
@@ -44,9 +72,45 @@ def submission_excerpt(text: object, *, is_genuine: bool,
         return ""
     if not isinstance(text, str) or not text:
         return ""
-    match = _TAG_LIKE_RE.search(text)
-    head = text[:match.start()] if match else text
+    match = _marker_pos(text)
+    head = text[:match] if match is not None else text
     return _WS_RE.sub(" ", head).strip()[:SUBMISSION_EXCERPT_CHARS]
+
+
+def is_main_session(*, thread_source: object = None,
+                    session_id: object = None, thread_id: object = None,
+                    observed_thread_ids: object = ()) -> bool:
+    """Rule 1 main-session gate shared by every adapter; fail closed.
+
+    True only when the source proves a human-owned main thread: the native
+    thread/source metadata says thread_source is exactly "user", and the
+    native thread identity is a non-empty string equal to session_id, as is
+    every observed own-thread identity. A divergent own thread means a
+    child or worker rollout; a missing or mistyped thread identity means
+    unknown. Both yield False, so no excerpt is stored — including a
+    partial import that knows session_id and thread_source but not yet the
+    thread identity. Referenced worker threads (spawn targets recorded
+    beside a main thread) are not own-thread identities and must never be
+    passed here; only the rollout's own thread identity counts.
+    """
+    if thread_source != "user":
+        return False
+    if not isinstance(session_id, str) or not session_id:
+        return False
+    if not isinstance(thread_id, str) or not thread_id:
+        return False
+    if thread_id != session_id:
+        return False
+    if isinstance(observed_thread_ids, (list, tuple, set, frozenset)):
+        observed = list(observed_thread_ids)
+    elif observed_thread_ids is None:
+        observed = []
+    else:
+        return False
+    for tid in observed:
+        if not isinstance(tid, str) or not tid or tid != session_id:
+            return False
+    return True
 
 
 def assistant_excerpt(text: object) -> str:
@@ -54,7 +118,7 @@ def assistant_excerpt(text: object) -> str:
     if not isinstance(text, str) or not text:
         return ""
     span = text[-ASSISTANT_EXCERPT_CHARS:]
-    if _TAG_LIKE_RE.search(span) or "<<<" in span:
+    if _marker_pos(span) is not None:
         return ""
     return span
 
@@ -166,7 +230,7 @@ def _valid_excerpt(value: object) -> str | None:
     if not isinstance(value, str) or not value:
         return None
     span = value[-ASSISTANT_EXCERPT_CHARS:]
-    if _TAG_LIKE_RE.search(span) or "<<<" in span:
+    if _marker_pos(span) is not None:
         return None
     return span
 
@@ -213,3 +277,93 @@ def filter_detail(family: str, detail: object) -> dict:
             if kept is not None:
                 out[key] = kept
     return out
+
+
+# Rule 6, event identity: every family expects a native identifier of one
+# type only — a non-empty string. Anything else (None, numbers, dicts,
+# lists) is invalid, never stringified into the ledger; the central event
+# writer quarantines such an event as missing_id.
+def filter_native_id(family: str, value: object) -> str | None:
+    """The validated native event id, or None when it has the wrong type."""
+    _ = family
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+# Rule 6, event names: closed per-family enums of canonical name/kind
+# values. The members are exactly what the adapters emit as protocol
+# tokens (message and compaction markers, lifecycle kinds, response-item
+# types, fixed dynamic-tool mappings, unknown-kind fallbacks) plus the
+# command-tool kinds the analysis detectors classify on. Native instance
+# values — tool and skill names, file basenames, server or tool paths such
+# as secret_token, unknown_tool, dynamic.secret or AGENTS.md — are never
+# members, so they fail closed to NULL even when identifier-shaped. Event
+# identity still travels in native_id, and paths/commands in target.
+EVENT_NAME_ENUMS: dict[str, frozenset] = {
+    "assistant_message": frozenset({"assistant_message"}),
+    "compaction": frozenset({"context_compaction", "compact_boundary"}),
+    "lifecycle": frozenset({
+        "task_complete", "turn_aborted", "turn_duration",
+        "subagent_activity", "thread_goal_updated", "api_error",
+        "stop_hook_summary", "informational", "Plan", "HookPrompt",
+        "EnteredReviewMode", "ExitedReviewMode", "collab.unknown",
+    }),
+    "tool_call": frozenset(),
+    "tool_result": frozenset({
+        "bash", "Bash", "exec", "shell", "run_terminal_cmd", "run_command",
+        "function_call_output", "custom_tool_call_output",
+        "image_view", "web_search", "mcp.unknown", "dynamic.unknown",
+        "unknown",
+    }),
+    "file_change": frozenset({"file_change"}),
+    "read": frozenset(),
+    "skill_read": frozenset(),
+    "skill_invoke": frozenset(),
+    "permission": frozenset(),
+}
+
+
+def filter_event_name(family: str, value: object) -> str | None:
+    """The validated event name, or None for a wrong type/unknown value."""
+    if not isinstance(value, str) or not value:
+        return None
+    allowed = EVENT_NAME_ENUMS.get(family)
+    if not allowed:
+        return None
+    if value in allowed:
+        return value
+    return None
+
+
+# Rule 6, event statuses: closed per-family enums. None stays None (no
+# status); any other value of the wrong type or outside the family set is
+# dropped, never stringified or passed through.
+_COMMON_STATUS = frozenset({
+    "ok", "error", "denied", "completed", "success", "failed", "failure",
+})
+EVENT_STATUS_ENUMS: dict[str, frozenset] = {
+    "tool_call": _COMMON_STATUS | frozenset({"cancelled"}),
+    "tool_result": _COMMON_STATUS | frozenset({"cancelled"}),
+    "read": _COMMON_STATUS | frozenset({"cancelled"}),
+    "skill_read": _COMMON_STATUS | frozenset({"cancelled"}),
+    "lifecycle": frozenset(
+        {"completed", "cancelled", "denied", "ok", "error"}),
+    "permission": frozenset({"denied"}),
+    "file_change": frozenset(),
+    "compaction": frozenset(),
+    "assistant_message": frozenset(),
+    "skill_invoke": frozenset(),
+}
+
+
+def filter_event_status(family: str, value: object) -> str | None:
+    """The validated event status, or None when absent or not allowed."""
+    if value is None:
+        return None
+    allowed = EVENT_STATUS_ENUMS.get(family)
+    if not allowed:
+        return None
+    if isinstance(value, str) and value in allowed:
+        return value
+    return None

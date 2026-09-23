@@ -471,11 +471,13 @@ def _submission(r: _Reader, native_id, ordinal, ts, kind: str, text: str) -> Non
     # Privacy rule 1 via agent_observer/privacy.py: only a genuine
     # main-session human submission keeps an excerpt. Interrupt, synthetic,
     # command and scaffolding kinds keep an empty excerpt, as does any text
-    # from a child sub-agent session, so file and preference contents can
-    # never persist. Identity extraction already saw the complete text.
+    # from a child sub-agent session or from a record with no native
+    # session identity (fail closed when unknown), so file and preference
+    # contents can never persist. Identity extraction already saw the
+    # complete text.
     excerpt = privacy.submission_excerpt(
         text, is_genuine=kind == "genuine",
-        is_main_session=r.agent_id is None)
+        is_main_session=r.agent_id is None and r.native_session is not None)
     genuine = 1 if kind == "genuine" else 0
     cur = r.con.execute(
         "INSERT OR IGNORE INTO submissions(native_id, source_id, session_key,"

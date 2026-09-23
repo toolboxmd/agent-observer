@@ -170,6 +170,7 @@ class _Reader:
         self.stats = stats
         self.session_id = src.row["session_id"]
         self.thread_id = src.row["thread_id"]
+        self.thread_source = src.row["thread_source"]
         self.cli_version = src.row["cli_version"]
         self.identity = SessionIdentity()
         self.model = None
@@ -178,6 +179,12 @@ class _Reader:
         self.last_ts = None
         self.meta: dict = {}
         self.token_counts: list = []
+        # Every own-thread identity seen so far (persisted plus prescanned
+        # plus streamed): the main-session gate fails closed on divergence.
+        # Referenced worker threads (spawn targets) never enter this set.
+        self.observed_threads: set = set()
+        if isinstance(self.thread_id, str) and self.thread_id:
+            self.observed_threads.add(self.thread_id)
 
     @property
     def session_key(self) -> str:
@@ -186,12 +193,85 @@ class _Reader:
             return f"{HARNESS}:{native}"
         return f"{HARNESS}:file:{os.path.basename(self.src.path)}"
 
+    @property
+    def is_main(self) -> bool:
+        """Privacy rule 1 gate via agent_observer/privacy.py.
+
+        Only a proven human main session keeps submission excerpts; child
+        and worker rollouts and unknown metadata keep none.
+        """
+        return privacy.is_main_session(
+            thread_source=self.thread_source,
+            session_id=self.session_id,
+            thread_id=self.thread_id,
+            observed_thread_ids=tuple(self.observed_threads))
+
     def event(self, obj, family, native_id, **kw):
         insert_event(self.con, self.stats, source_id=self.src.source_id,
                      session_key=self.session_key, family=family,
                      native_id=native_id, ordinal=obj.get("ordinal"),
                      ts=iso_ts(obj.get("timestamp")),
                      update=self.src.privacy_stale, **kw)
+
+
+def _prescan_thread_meta(path: str, start_offset: int) -> dict:
+    """Own-thread identity in the not-yet-imported file portion.
+
+    Reads complete lines from start_offset (the same framing as
+    JsonlSource.records) and returns the first session_id, thread_id and
+    thread_source plus every observed own-thread identity, in file order.
+    A user message that precedes the native thread identity is therefore
+    judged with that identity already known. Referenced worker threads
+    (spawn targets) are not own-thread identities and are ignored.
+    """
+    first_session = None
+    first_thread = None
+    first_source = None
+    observed: list = []
+
+    def _note_thread(value) -> None:
+        if value is not None and value not in observed:
+            observed.append(value)
+
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(start_offset)
+            for raw in fh:
+                if not raw.endswith(b"\n"):
+                    break
+                text = raw.decode("utf-8", "replace")
+                if not text.strip():
+                    continue
+                try:
+                    obj = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                payload = obj.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                if obj.get("type") == "session_meta":
+                    if first_session is None:
+                        first_session = (payload.get("session_id")
+                                         or payload.get("id"))
+                    if first_thread is None and payload.get("id"):
+                        first_thread = payload["id"]
+                    if first_source is None and payload.get("thread_source"):
+                        first_source = payload["thread_source"]
+                    if payload.get("id") is not None:
+                        _note_thread(payload["id"])
+                if payload.get("thread_id") is not None:
+                    _note_thread(payload["thread_id"])
+                    if first_thread is None:
+                        first_thread = payload["thread_id"]
+                if payload.get("session_id") is not None and \
+                        first_session is None:
+                    first_session = payload["session_id"]
+    except OSError:
+        pass
+    return {"session_id": first_session, "thread_id": first_thread,
+            "thread_source": first_source, "observed_thread_ids": observed}
 
 
 def import_codex_file(con: sqlite3.Connection, path: str,
@@ -208,6 +288,18 @@ def import_codex_file(con: sqlite3.Connection, path: str,
     }
     src = JsonlSource(con, HARNESS, path, full=full)
     reader = _Reader(con, src, stats)
+    # Seed the rollout's own thread identity before any row is written, so
+    # a genuine user message keeps its excerpt only when the whole new
+    # portion (plus persisted metadata) already proves a human main
+    # session, and the session key is stable from the first insert.
+    pre = _prescan_thread_meta(path, src.start_offset)
+    if reader.session_id is None:
+        reader.session_id = pre["session_id"]
+    if reader.thread_id is None:
+        reader.thread_id = pre["thread_id"]
+    if reader.thread_source is None:
+        reader.thread_source = pre["thread_source"]
+    reader.observed_threads.update(pre["observed_thread_ids"])
     for ordinal, obj, line in src.records():
         stats["lines"] += 1
         if obj is None or not isinstance(obj, dict):
@@ -217,32 +309,54 @@ def import_codex_file(con: sqlite3.Connection, path: str,
                       line)
             continue
         try:
-            _ingest_record(reader, obj)
+            _ingest_record(reader, obj, ordinal)
         except _UsageConflict:
             stats["malformed"] += 1
-            src.error(obj.get("ordinal", ordinal), "usage_conflict", line)
+            src.error(ordinal, "usage_conflict", line)
             continue
         except _MalformedUsage:
             stats["malformed"] += 1
-            src.error(obj.get("ordinal", ordinal), "malformed_usage", line)
+            src.error(ordinal, "malformed_usage", line)
             continue
         except MissingNativeId:
             stats["malformed"] += 1
-            src.error(obj.get("ordinal", ordinal), "missing_id", line)
+            src.error(ordinal, "missing_id", line)
             continue
         except _UnsupportedSchema:
             stats["malformed"] += 1
-            src.error(obj.get("ordinal", ordinal), "unsupported_schema", line)
+            src.error(ordinal, "unsupported_schema", line)
             continue
         except (KeyError, TypeError, ValueError, AttributeError):
             stats["malformed"] += 1
-            src.error(obj.get("ordinal", ordinal), "schema_error", line)
+            src.error(ordinal, "schema_error", line)
             continue
         ts = iso_ts(obj.get("timestamp"))
         if ts is not None:
             reader.first_ts = ts if reader.first_ts is None else min(reader.first_ts, ts)
             reader.last_ts = ts if reader.last_ts is None else max(reader.last_ts, ts)
     _flush_token_counts(reader)
+    if not src.privacy_stale:
+        # Same-version imports reconcile this source's submissions with the
+        # final rollout identity: rows stored before the native thread
+        # identity arrived carry a stale session key, and a rollout that
+        # proves to be a child, worker or unknown source keeps no
+        # excerpts. Clearing needs no native text, only stores less. Stale
+        # privacy-version re-imports already correct every row in place
+        # above, so they skip this net.
+        key_fix = con.execute(
+            "UPDATE submissions SET session_key=? WHERE source_id=?"
+            " AND session_key!=?",
+            (reader.session_key, src.source_id, reader.session_key))
+        if key_fix.rowcount:
+            stats["submissions_updated"] = \
+                stats.get("submissions_updated", 0) + key_fix.rowcount
+        if not reader.is_main:
+            cleared = con.execute(
+                "UPDATE submissions SET text_excerpt='' WHERE source_id=?"
+                " AND text_excerpt!=''", (src.source_id,))
+            if cleared.rowcount:
+                stats["submissions_updated"] = \
+                    stats.get("submissions_updated", 0) + cleared.rowcount
     fields = {"started_at": reader.first_ts, "ended_at": reader.last_ts,
               **reader.meta, **reader.identity.fields(con)}
     db.upsert_session(con, reader.session_key, HARNESS,
@@ -250,13 +364,14 @@ def import_codex_file(con: sqlite3.Connection, path: str,
                       **fields)
     stats.update(src.finish(session_id=reader.session_id,
                             thread_id=reader.thread_id,
-                            cli_version=reader.cli_version))
+                            cli_version=reader.cli_version,
+                            thread_source=reader.thread_source))
     stats["session_key"] = reader.session_key
     con.commit()
     return stats
 
 
-def _ingest_record(r: _Reader, obj: dict) -> None:
+def _ingest_record(r: _Reader, obj: dict, ordinal: int) -> None:
     rtype = obj.get("type")
     if rtype not in ("session_meta", "event_msg", "response_item",
                      "token_usage_record", "turn_context", "compacted",
@@ -269,6 +384,9 @@ def _ingest_record(r: _Reader, obj: dict) -> None:
     if rtype == "session_meta":
         r.session_id = payload.get("session_id") or payload.get("id") or r.session_id
         r.thread_id = payload.get("id") or r.thread_id
+        r.thread_source = payload.get("thread_source") or r.thread_source
+        if payload.get("id") is not None and payload.get("id") not in r.observed_threads:
+            r.observed_threads.add(payload["id"])
         r.cli_version = payload.get("cli_version") or r.cli_version
         git = payload.get("git") or {}
         r.meta.update({k: v for k, v in {
@@ -279,6 +397,9 @@ def _ingest_record(r: _Reader, obj: dict) -> None:
         }.items() if v})
         return
     if isinstance(payload, dict):
+        if payload.get("thread_id") is not None and \
+                payload["thread_id"] not in r.observed_threads:
+            r.observed_threads.add(payload["thread_id"])
         if payload.get("thread_id") and r.thread_id is None:
             r.thread_id = payload["thread_id"]
         if payload.get("session_id") and r.session_id is None:
@@ -290,7 +411,7 @@ def _ingest_record(r: _Reader, obj: dict) -> None:
     elif rtype == "turn_context":
         _ingest_turn(r, obj)
     elif rtype == "event_msg":
-        _ingest_event_msg(r, obj)
+        _ingest_event_msg(r, obj, ordinal)
     elif rtype == "compacted":
         _ingest_compacted(r, obj)
     # world_state and inter_agent_communication_metadata carry no ledger rows
@@ -352,8 +473,8 @@ def _flush_token_counts(r: _Reader) -> None:
             " WHERE session_key=? AND semantics=?",
             (r.session_key, TOKEN_COUNT_SEMANTICS)).fetchone()
         previous = row["t"] or 0
-        for obj, info in r.token_counts:
-            ordinal = obj.get("ordinal", 0)
+        for struct_ordinal, obj, info in r.token_counts:
+            ordinal = struct_ordinal
             try:
                 if not isinstance(info, dict):
                     raise _MalformedUsage("malformed usage")
@@ -542,11 +663,14 @@ def _ingest_response_item(r: _Reader, obj: dict) -> None:
         kind = _submission_kind(p)
         native = p.get("id") or f"ordinal:{obj.get('ordinal')}"
         # Privacy rule 1 via agent_observer/privacy.py: only a genuine
-        # main-session human submission keeps an excerpt, truncated at the
-        # first tag-like marker. Identity extraction above already saw the
-        # complete text.
+        # human submission of a proven main session keeps an excerpt,
+        # truncated at the first tag-like marker. The main-session gate
+        # reads the prescanned native thread/source metadata (fail closed
+        # when unknown), so a child or worker rollout with a
+        # genuine-looking message still stores nothing. Identity extraction
+        # above already saw the complete text.
         excerpt = privacy.submission_excerpt(
-            text, is_genuine=kind == "genuine", is_main_session=True)
+            text, is_genuine=kind == "genuine", is_main_session=r.is_main)
         genuine = 1 if kind == "genuine" else 0
         cur = r.con.execute(
             "INSERT OR IGNORE INTO submissions(native_id, source_id,"
@@ -603,7 +727,7 @@ def _ingest_response_item(r: _Reader, obj: dict) -> None:
                 name=ptype, size_bytes=size)
 
 
-def _ingest_event_msg(r: _Reader, obj: dict) -> None:
+def _ingest_event_msg(r: _Reader, obj: dict, ordinal: int) -> None:
     p = obj["payload"]
     etype = p.get("type")
     turn_id = f"{HARNESS}:{p['turn_id']}" if p.get("turn_id") else None
@@ -637,14 +761,12 @@ def _ingest_event_msg(r: _Reader, obj: dict) -> None:
             content = result.get("content") or []
             size = sum(len(str(c.get("text", ""))) for c in content
                        if isinstance(c, dict))
-            server = item.get("server")
-            tool = item.get("tool")
-            if isinstance(server, str) and isinstance(tool, str):
-                mcp_name = f"mcp.{server}.{tool}"
-            else:
-                mcp_name = "mcp.unknown"
+            # Privacy rule 6: the MCP server and tool are instance values,
+            # not canonical kinds, so every MCP call normalizes to the
+            # canonical unknown-kind member; the call stays joinable on its
+            # native id.
             r.event(obj, "tool_result", item.get("id"), turn_id=turn_id,
-                    name=mcp_name,
+                    name="mcp.unknown",
                     status=item.get("status"), size_bytes=size)
         elif itype == "SubAgentActivity":
             r.event(obj, "lifecycle", item.get("id"), turn_id=turn_id,
@@ -668,24 +790,21 @@ def _ingest_event_msg(r: _Reader, obj: dict) -> None:
                     name="context_compaction")
         elif itype == "CollabAgentToolCall":
             # Sub-agent collaboration (spawn, send, wait): the dispatch edge
-            # between threads, kept with its native thread identities.
-            collab_tool = item.get("tool")
-            collab_name = (f"collab.{collab_tool}"
-                           if isinstance(collab_tool, str) and collab_tool
-                           else "collab.unknown")
+            # between threads, kept with its native thread identities. The
+            # native tool is an instance value, so the name normalizes to
+            # the canonical unknown-kind member (privacy rule 6).
             r.event(obj, "lifecycle", item.get("id"), turn_id=turn_id,
-                    name=collab_name,
+                    name="collab.unknown",
                     status=item.get("status"))
         elif itype in ("ImageView", "WebSearch", "DynamicToolCall",
                        "FunctionCallOutput"):
             raw_target = item.get("path") or item.get("tool")
             target = raw_target if isinstance(raw_target, str) else None
-            raw_tool = item.get("tool")
+            # Fixed native mappings stay canonical; an arbitrary dynamic
+            # tool normalizes to the unknown-kind member (privacy rule 6).
             dynamic_name = ({"ImageView": "image_view", "WebSearch": "web_search",
                              "FunctionCallOutput": "function_call_output"}.get(itype)
-                            or (f"dynamic.{raw_tool}"
-                                if isinstance(raw_tool, str) and raw_tool
-                                else "dynamic.unknown"))
+                            or "dynamic.unknown")
             r.event(obj, "tool_result", item.get("call_id") or item.get("id"),
                     turn_id=turn_id,
                     name=dynamic_name,
@@ -720,7 +839,10 @@ def _ingest_event_msg(r: _Reader, obj: dict) -> None:
             return
         # Collect for validated flush; missing halves, malformed shapes and
         # counters quarantine there without losing later valid checkpoints.
-        r.token_counts.append((obj, info_raw))
+        # The structural source ordinal travels along so deferred errors
+        # deduplicate NULL-safely instead of passing a native ordinal that
+        # may be absent.
+        r.token_counts.append((ordinal, obj, info_raw))
     elif etype == "thread_settings_applied":
         return
     elif etype == "turn_aborted":

@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS sources (
   cli_version TEXT,
   session_id TEXT,
   thread_id TEXT,
+  thread_source TEXT,
   ordinal_max INTEGER NOT NULL DEFAULT -1,
   raw_bytes INTEGER NOT NULL DEFAULT 0,
   imported_at REAL NOT NULL,
@@ -373,6 +374,8 @@ def init_db(con: sqlite3.Connection) -> None:
     columns = {row["name"] for row in con.execute("PRAGMA table_info(sources)")}
     if "privacy_version" not in columns:
         con.execute("ALTER TABLE sources ADD COLUMN privacy_version INTEGER")
+    if "thread_source" not in columns:
+        con.execute("ALTER TABLE sources ADD COLUMN thread_source TEXT")
     con.execute(
         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES "
         "('schema_version', ?), ('event_contract_version', ?), "
