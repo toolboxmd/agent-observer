@@ -23,7 +23,7 @@ import re
 import sqlite3
 import urllib.parse
 
-from .. import db
+from .. import db, privacy
 from ..identity import SessionIdentity, skill_from_path
 from ..ingest import JsonlSource, fingerprint, insert_event, iso_ts, text_hash
 
@@ -33,7 +33,7 @@ DEFAULT_ROOT = os.path.expanduser("~/.grok/sessions")
 
 CAPABILITIES = [
     ("model_usage", True, "one responses row per turn_completed prompt_id; input includes cached reads, output includes reasoning"),
-    ("tool_calls", True, "tool_call records with title, safe target and argument fingerprint; raw input never stored"),
+    ("tool_calls", True, "tool_call records with validated native tool name, safe target and argument fingerprint; raw input never stored"),
     ("tool_results", True, "tool_call_update status joined with events.jsonl tool_completed duration and outcome on toolCallId"),
     ("read_evidence", True, "tool_call_update kind=read locations as read events with paths and line metadata"),
     ("skill_file_reads", True, "reads under an installed Skill directory as skill_read with the skill name"),
@@ -59,23 +59,12 @@ TERMINAL_TOOL_STATUS = {"completed": "ok", "failed": "error", "success": "ok"}
 SKIP_EVENT_TYPES = frozenset({"phase_changed", "loop_started", "first_token"})
 
 USER_RULE_RE = re.compile(r"<user_rule>(.*?)</user_rule>", re.S)
-DIRECTION_BLOCK_RE = re.compile(
-    r"<<<AGENTSMD_PROJECT_DIRECTION_V1>>>.*?<<<END_AGENTSMD_PROJECT_DIRECTION_V1>>>",
-    re.S)
-USER_QUERY_TAG_RE = re.compile(r"</?user_query\s*>", re.I)
-GENERIC_BLOCK_RE = re.compile(r"<<<.*?>>>", re.S)
-DIRECTION_OPEN = "<<<AGENTSMD_PROJECT_DIRECTION_V1>>>"
-DIRECTION_CLOSE = "<<<END_AGENTSMD_PROJECT_DIRECTION_V1>>>"
-_USER_RULE_OPEN_RE = re.compile(r"<user_rule\b[^>]*>", re.I)
-_USER_RULE_CLOSE_RE = re.compile(r"</user_rule\s*>", re.I)
-_INSTRUCTIONS_OPEN_RE = re.compile(r"<instructions\b[^>]*>", re.I)
-_INSTRUCTIONS_CLOSE_RE = re.compile(r"</instructions\s*>", re.I)
 SECRET_SK_RE = re.compile(r"sk-[A-Za-z0-9\-_]{8,}")
 SECRET_TOKEN_RE = re.compile(r"SECRET[A-Za-z0-9\-_]*")
-TARGET_KEYS = ("target_file", "path", "file_path", "file", "command",
-               "url", "pattern")
-EXCERPT_LEN = 300
-ERROR_EXCERPT_LEN = 200
+# Event targets come only from validated path or command fields. Pattern
+# and URL values are never targets (rule 6: targets follow the same type
+# rules as detail, so only paths and commands persist).
+TARGET_KEYS = ("target_file", "path", "file_path", "file", "command")
 
 # Fail-closed ledger string gate for native identifiers (tool, call, event,
 # prompt and session ids, model names, skill names): short tokens without
@@ -89,36 +78,13 @@ _FREE_TEXT_LOCATION_KEYS = frozenset({
     "arguments", "args", "result", "data",
 })
 
-# Closed value sets for enum-shaped event fields. Fail closed: only these
-# exact strings persist in their field. Anything else, even token-shaped,
-# is dropped (a lexical check alone cannot tell free text from an enum).
-_TOOL_CALL_STATUS_VALUES = frozenset({"completed", "failed", "success"})
+# Closed value sets for enum-shaped event status columns. Fail closed: only
+# these exact strings persist in their column. Anything else, even
+# token-shaped, is dropped (a lexical check alone cannot tell free text
+# from an enum). Event detail itself is filtered by agent_observer/privacy.py
+# rule 6 through the ingest path, so the adapter builds no detail allowlist.
 _OUTCOME_VALUES = frozenset({"success", "completed", "failed", "error"})
 _DECISION_VALUES = frozenset({"allow", "deny"})
-_RETRY_TYPE_VALUES = frozenset({"failed"})
-_RETRY_ERROR_TYPE_VALUES = frozenset({"api"})
-_SUBAGENT_TYPE_VALUES = frozenset({"general-purpose"})
-_SESSION_REL_VALUES = frozenset({"primary", "subagent"})
-_TOOL_KIND_VALUES = frozenset({"read"})
-_PHASE_VALUES = frozenset({"requested"})
-# Numeric detail fields: counts, durations, line/turn numbers, window sizes.
-_NUMERIC_DETAIL_KEYS = frozenset({
-    "tokens_used", "context_window", "percentage", "count", "duration_ms",
-    "wait_ms", "turn_number",
-})
-# Detail fields holding native identifiers, model names or skill names.
-_IDENTIFIER_DETAIL_KEYS = frozenset({
-    "tool", "subagent_id", "parent_session_id", "child_session_id",
-    "parent_prompt_id", "model_id", "skill",
-})
-# Every detail key the adapter may persist; anything else is dropped.
-_DETAIL_ALLOW_KEYS = frozenset({
-    "tool", "kind", "status", "outcome", "decision", "phase", "type",
-    "error_type", "subagent_type", "subagent_id", "parent_session_id",
-    "child_session_id", "parent_prompt_id", "tokens_used", "context_window",
-    "percentage", "count", "duration_ms", "wait_ms", "turn_number",
-    "model_id", "session_relationship", "paths", "lines", "skill",
-})
 
 
 def _safe_token(value) -> str | None:
@@ -137,101 +103,26 @@ def _valid_enum(value, allowed: frozenset) -> str | None:
     return None
 
 
-def _sanitize_detail(detail) -> dict | None:
-    """Field-validated event detail mapping.
-
-    Keys must be allowlisted and every value must fit its field: closed
-    enum sets for statuses, kinds, outcomes, decisions, retry/error types
-    and session relationships; identifier-shaped strings for tool names,
-    ids, models and skills; numbers/booleans for counts and durations;
-    string lists for paths and string-to-integer maps for lines. Unknown
-    keys and invalid values (including token-shaped free text in an enum
-    field and arbitrary list/dict contents) are dropped. Never stringifies.
-    """
-    if not isinstance(detail, dict):
-        return None
-    out: dict = {}
-    for key, value in detail.items():
-        if key not in _DETAIL_ALLOW_KEYS:
-            continue
-        if key == "paths":
-            if isinstance(value, list):
-                clean = [p for p in value
-                         if isinstance(p, str) and p][:64]
-                if clean:
-                    out[key] = clean
-        elif key == "lines":
-            if isinstance(value, dict):
-                clean = {k: v for k, v in value.items()
-                         if isinstance(k, str) and k
-                         and isinstance(v, int)
-                         and not isinstance(v, bool)}
-                if clean:
-                    out[key] = clean
-        elif key in _NUMERIC_DETAIL_KEYS:
-            if isinstance(value, bool):
-                out[key] = value
-            elif isinstance(value, (int, float)):
-                out[key] = value
-        elif key in _IDENTIFIER_DETAIL_KEYS:
-            safe = _safe_token(value)
-            if safe is not None:
-                out[key] = safe
-        elif key == "kind":
-            safe = _valid_enum(value, _TOOL_KIND_VALUES)
-            if safe is not None:
-                out[key] = safe
-        elif key == "status":
-            safe = _valid_enum(value, _TOOL_CALL_STATUS_VALUES)
-            if safe is not None:
-                out[key] = safe
-        elif key == "outcome":
-            safe = _valid_enum(value, _OUTCOME_VALUES)
-            if safe is not None:
-                out[key] = safe
-        elif key == "decision":
-            safe = _valid_enum(value, _DECISION_VALUES)
-            if safe is not None:
-                out[key] = safe
-        elif key == "phase":
-            safe = _valid_enum(value, _PHASE_VALUES)
-            if safe is not None:
-                out[key] = safe
-        elif key == "type":
-            safe = _valid_enum(value, _RETRY_TYPE_VALUES)
-            if safe is not None:
-                out[key] = safe
-        elif key == "error_type":
-            safe = _valid_enum(value, _RETRY_ERROR_TYPE_VALUES)
-            if safe is not None:
-                out[key] = safe
-        elif key == "subagent_type":
-            safe = _valid_enum(value, _SUBAGENT_TYPE_VALUES)
-            if safe is not None:
-                out[key] = safe
-        elif key == "session_relationship":
-            safe = _valid_enum(value, _SESSION_REL_VALUES)
-            if safe is not None:
-                out[key] = safe
-    return out or None
-
-
 def _record_error_once(src, stats, ordinal: int, category: str,
-                       excerpt: str) -> bool:
+                        line: str = "") -> bool:
     """Insert one import_errors row, deduplicated by source/ordinal/category.
 
-    Replay paths re-read the whole updates.jsonl on every growth, so without
-    this guard a malformed record would gain a duplicate row per sync. A
-    genuinely new ordinal or a new fixed category still gets its own row.
-    Returns True when a new row was inserted.
+    The category and line pass through the ingest path, which applies
+    agent_observer/privacy.py rules 4 and 5: the error column holds exactly
+    one closed category (anything else maps to the fallback) and the excerpt
+    holds only sorted top-level key names. The deduplication lookup uses the
+    same mapped category so a replay never adds a duplicate row. A genuinely
+    new ordinal or a new fixed category still gets its own row. Returns True
+    when a new row was inserted.
     """
+    safe = privacy.error_category(category)
     existing = src.con.execute(
         "SELECT 1 FROM import_errors WHERE harness=? AND source_path=?"
         " AND ordinal_num=? AND error=?",
-        (src.harness, src.path, ordinal, category)).fetchone()
+        (src.harness, src.path, ordinal, safe)).fetchone()
     if existing is not None:
         return False
-    src.error(ordinal, category, excerpt)
+    src.error(ordinal, category, line)
     if stats is not None:
         stats["malformed"] = stats.get("malformed", 0) + 1
     return True
@@ -251,137 +142,12 @@ def _valid_prompt_index(value):
     return _safe_token(value)
 
 
-def _remove_direction_block(text: str) -> str:
-    """Direction block through its close, or through end when unterminated."""
-    while True:
-        start = text.find(DIRECTION_OPEN)
-        if start == -1:
-            return text
-        end = text.find(DIRECTION_CLOSE, start + len(DIRECTION_OPEN))
-        if end == -1:
-            return text[:start]
-        text = text[:start] + text[end + len(DIRECTION_CLOSE):]
-
-
-def _remove_tag_block(text: str, open_re, close_re) -> str:
-    """Matched tag pair through its close, or through end when unterminated."""
-    while True:
-        m = open_re.search(text)
-        if m is None:
-            return text
-        c = close_re.search(text, m.end())
-        if c is None:
-            return text[:m.start()]
-        text = text[:m.start()] + text[c.end():]
-
-
-def _remove_generic_blocks(text: str) -> str:
-    """Any <<<...>>> through its close, or through end when unterminated."""
-    while True:
-        start = text.find("<<<")
-        if start == -1:
-            return text
-        end = text.find(">>>", start + 3)
-        if end == -1:
-            return text[:start]
-        text = text[:start] + text[end + 3:]
-
-
-def _sanitize_human_text(text: str) -> str:
-    """Human's own text without injected instruction or preference content.
-
-    Fail-closed: every recognized injected or system block is removed from
-    its opening marker through its closing marker, or through the end of the
-    record when the closing marker is missing. Covers the AgentsMD direction
-    block, <user_rule> bodies, <INSTRUCTIONS> bodies and any other <<<...>>>
-    block. The <user_query> wrapper tags are removed but the inner human text
-    is kept, then secret-looking tokens are redacted. Full native text still
-    feeds SessionIdentity; only this sanitized form reaches the ledger.
-    """
-    if not text:
-        return ""
-    cleaned = _remove_direction_block(text)
-    cleaned = _remove_tag_block(cleaned, _USER_RULE_OPEN_RE,
-                                _USER_RULE_CLOSE_RE)
-    cleaned = _remove_tag_block(cleaned, _INSTRUCTIONS_OPEN_RE,
-                                _INSTRUCTIONS_CLOSE_RE)
-    cleaned = USER_QUERY_TAG_RE.sub("", cleaned)
-    cleaned = _remove_generic_blocks(cleaned)
-    cleaned = SECRET_SK_RE.sub("[redacted]", cleaned)
-    cleaned = SECRET_TOKEN_RE.sub("[redacted]", cleaned)
-    return cleaned.strip()
-
-
-def _build_excerpt(full_text: str, is_genuine: bool) -> str:
-    """At most 300 chars of genuine human text; empty for non-genuine."""
-    if not is_genuine:
-        return ""
-    return _sanitize_human_text(full_text)[:EXCERPT_LEN]
-
-
-def _type_name(value) -> str:
-    if isinstance(value, dict):
-        return "dict"
-    if isinstance(value, list):
-        return "list"
-    if isinstance(value, str):
-        return "str"
-    if isinstance(value, bool):
-        return "bool"
-    if isinstance(value, int):
-        return "int"
-    if isinstance(value, float):
-        return "float"
-    if value is None:
-        return "none"
-    return "other"
-
-
 class _AdapterError(ValueError):
     """Fixed-category adapter failure; never carries record values."""
 
     def __init__(self, category: str):
         super().__init__(category)
         self.category = category
-
-
-def _shape_parts(obj) -> tuple[str, str, str]:
-    """Sorted top-level field names plus value types, never values."""
-    if not isinstance(obj, dict):
-        return "", "?", "?"
-    try:
-        keys = sorted(str(k)[:64] for k in obj.keys())
-    except Exception:
-        keys = []
-    method_t = _type_name(obj.get("method"))
-    update_t = "?"
-    params = obj.get("params")
-    if isinstance(params, dict):
-        upd = params.get("update")
-        if isinstance(upd, dict):
-            update_t = _type_name(upd.get("sessionUpdate"))
-        else:
-            update_t = _type_name(upd)
-    else:
-        update_t = _type_name(params)
-    return ",".join(keys)[:160], method_t, update_t
-
-
-def _safe_error_excerpt(category: str, obj) -> str:
-    """Fixed category plus bounded shape metadata, never record values."""
-    keys_s, method_t, update_t = _shape_parts(obj)
-    base = f"{category} keys=[{keys_s}] method={method_t} update={update_t}"
-    return base[:ERROR_EXCERPT_LEN]
-
-
-def _safe_unparsable(category: str) -> str:
-    return f"{category} unparsable method=? update=?"[:ERROR_EXCERPT_LEN]
-
-
-def _safe_conflict_excerpt(category: str, *args, **kwargs) -> str:
-    """Fixed category plus generic shape; ignores any record-derived args."""
-    base = f"{category} keys=[method,params] method=str update=str"
-    return base[:ERROR_EXCERPT_LEN]
 
 
 def _extract_prompt_id(obj: dict, update: dict) -> str | None:
@@ -412,8 +178,16 @@ def _extract_prompt_id(obj: dict, update: dict) -> str | None:
     return None
 
 
-def _classify_prompt(prompt_idx: str, chat: dict) -> tuple[str, int]:
-    """Evidence-aware kind/is_genuine; provisional when chat is unreliable."""
+def _classify_prompt(prompt_idx: str, chat: dict,
+                     is_main_session: bool = True) -> tuple[str, int]:
+    """Evidence-aware kind/is_genuine; provisional when chat is unreliable.
+
+    A child or subagent session is never genuine: its prompts are dispatched
+    by the parent agent, not typed by a human, so they classify as synthetic
+    with an empty excerpt even when chat history marks them as user prompts.
+    """
+    if not is_main_session:
+        return "synthetic", 0
     if not chat.get("reliable"):
         return "unknown", 0
     if prompt_idx in chat.get("synthetic", set()):
@@ -532,42 +306,12 @@ def _safe_target(raw) -> str | None:
     return None
 
 
-# Whitelisted lifecycle metadata for event detail_json. Only identifiers,
-# types, statuses, counts, durations, timestamps and model names survive;
-# free-text fields (output, content, message, text, arguments, error bodies,
-# tool result contents) are never persisted.
-_UPDATE_DETAIL_ALLOW = {
-    "auto_compact_started": frozenset(
-        {"tokens_used", "context_window", "percentage"}),
-    "auto_compact_completed": frozenset(
-        {"tokens_used", "context_window", "percentage"}),
-    "retry_state": frozenset({"type", "error_type"}),
-    "subagent_spawned": frozenset(
-        {"subagent_id", "parent_session_id", "parent_prompt_id",
-         "child_session_id", "subagent_type"}),
-    "subagent_finished": frozenset(
-        {"subagent_id", "parent_session_id", "child_session_id",
-         "status", "subagent_type"}),
-}
-_GENERIC_SAFE_UPDATE_KEYS = frozenset({
-    "type", "status", "error_type", "kind", "subagent_type", "subagent_id",
-    "parent_session_id", "child_session_id", "parent_prompt_id",
-    "tokens_used", "context_window", "percentage", "count", "duration_ms",
-    "model_id",
-})
-
-
-def _whitelisted_update_detail(kind: str, update: dict) -> dict | None:
-    """Only allowlisted lifecycle fields for one update kind.
-
-    Keys are restricted to the kind's allowlist and every value passes the
-    field rules in _sanitize_detail: closed enum sets for types, statuses
-    and kinds, identifier shapes for ids, numbers for counters. Anything
-    else is dropped rather than stringified.
-    """
-    allow = _UPDATE_DETAIL_ALLOW.get(kind, _GENERIC_SAFE_UPDATE_KEYS)
-    picked = {key: update[key] for key in allow if key in update}
-    return _sanitize_detail(picked)
+# Whitelisted lifecycle metadata reached event detail_json through an
+# adapter-private allowlist. That allowlist is gone: every event detail now
+# passes through agent_observer/privacy.py rule 6 in the ingest path, which
+# keeps only its own per-family allowlist. The adapter keeps extracting and
+# validating native identifiers, paths, commands, statuses and event
+# families for ledger columns; free-text detail never persists.
 
 
 class _Reader:
@@ -591,13 +335,25 @@ class _Reader:
         self.last_ts = ts if self.last_ts is None else max(self.last_ts, ts)
 
     def event(self, src: JsonlSource, family, native_id, ordinal, ts, **kw):
-        # Central fail-closed gate: every detail mapping is field-validated
-        # before it reaches the ledger, no matter which producer built it.
-        if "detail" in kw:
-            kw["detail"] = _sanitize_detail(kw["detail"])
+        # Every target and detail mapping passes through
+        # agent_observer/privacy.py rule 6 in insert_event. On a privacy
+        # version re-import the existing row's target and detail are
+        # corrected in place instead of kept stale.
         insert_event(self.con, self.stats, source_id=src.source_id,
                      session_key=self.session_key, family=family,
-                     native_id=native_id, ordinal=ordinal, ts=ts, **kw)
+                     native_id=native_id, ordinal=ordinal, ts=ts,
+                     update=src.privacy_stale, **kw)
+
+    @property
+    def is_main_session(self) -> bool:
+        """False for subagent and child sessions, from kind or parent link.
+
+        summary.json session_kind marks spawned subagents; the parent link
+        covers a child named by a subagent_spawned record. Either signal
+        forces submissions non-genuine with an empty excerpt.
+        """
+        return self.meta.get("role") != "subagent" \
+            and self.parent_key is None
 
 
 def import_grok_session(con: sqlite3.Connection, session_dir: str,
@@ -671,47 +427,49 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         stats["session_key"] = r.session_key
         return stats
 
+    # A parent link discovered while ingesting this sync's own updates means
+    # the replay above computed submissions as a main session; reclassify to
+    # correct those rows to non-genuine in place.
+    parent_before = r.parent_key
     if updates_src is not None and (updates_new or not known):
         _replay_updates(con, r, updates_src, chat, model_fallback, effort)
         for ordinal, obj, line in updates_src.records():
             stats["lines"] += 1
             if obj is None or not isinstance(obj, dict):
                 _record_error_once(
-                    updates_src, stats, ordinal, "malformed_json",
-                    _safe_unparsable("malformed_json"))
+                    updates_src, stats, ordinal, "malformed_json", line)
                 continue
             try:
                 _ingest_update(r, updates_src, obj, ordinal)
             except _AdapterError as exc:
                 _record_error_once(
-                    updates_src, stats, ordinal, exc.category,
-                    _safe_error_excerpt(exc.category, obj))
+                    updates_src, stats, ordinal, exc.category, line)
             except (KeyError, TypeError, ValueError, AttributeError):
                 _record_error_once(
-                    updates_src, stats, ordinal, "schema_error",
-                    _safe_error_excerpt("schema_error", obj))
+                    updates_src, stats, ordinal, "schema_error", line)
     if events_src is not None and (events_new or not known):
         for ordinal, obj, line in events_src.records():
             stats["lines"] += 1
             if obj is None or not isinstance(obj, dict):
                 _record_error_once(
-                    events_src, stats, ordinal, "malformed_json",
-                    _safe_unparsable("malformed_json"))
+                    events_src, stats, ordinal, "malformed_json", line)
                 continue
             try:
                 _ingest_event(r, events_src, obj, ordinal)
             except _AdapterError as exc:
                 _record_error_once(
-                    events_src, stats, ordinal, exc.category,
-                    _safe_error_excerpt(exc.category, obj))
+                    events_src, stats, ordinal, exc.category, line)
             except (KeyError, TypeError, ValueError, AttributeError):
                 _record_error_once(
-                    events_src, stats, ordinal, "schema_error",
-                    _safe_error_excerpt("schema_error", obj))
+                    events_src, stats, ordinal, "schema_error", line)
     # Late chat metadata reclassifies provisional submissions even when only
     # events.jsonl grew and updates.jsonl did not. Runs silently (no duplicate
-    # import_errors) and never duplicates rows.
-    if known:
+    # import_errors) and never duplicates rows. A parent link discovered
+    # while ingesting this sync's own updates also reclassifies: the replay
+    # above ran before the link existed, so those rows were computed as a
+    # main session and must be corrected to non-genuine in place.
+    if known or (r.parent_key is not None
+                 and r.parent_key != parent_before):
         _reclassify_existing(con, r, session_dir, chat)
 
     fields = {"started_at": r.first_ts, "ended_at": r.last_ts, **r.meta,
@@ -850,12 +608,13 @@ def _collect_prompts(path: str, record_error=None) -> tuple[dict, list, list]:
     Validates method before building any prompt/completion entry so an
     unsupported method never creates ledger state. Invalid JSON and
     non-dict lines are skipped silently here; the incremental ingest loop
-    quarantines them once with a safe shape. Missing promptIndex/prompt_id
+    quarantines them once with the raw line. Missing promptIndex/prompt_id
     are reported through record_error when provided (replay path) and
     skipped silently otherwise (reclassification path avoids duplicates).
+    Categories are the closed privacy.py set (missing_id, schema_error).
     Returns (prompts, order, completions_ordered) where completions_ordered
-    holds (ordinal, update, ts, outer_obj, method) and prompts values hold
-    texts, model, first, ts, prompt_id and first_obj for safe shapes.
+    holds (ordinal, update, ts, outer_obj, method, raw_line) and prompts
+    values hold texts, model, first, ts and prompt_id.
     """
     prompts: dict = {}
     order: list = []
@@ -882,15 +641,13 @@ def _collect_prompts(path: str, record_error=None) -> tuple[dict, list, list]:
             key = _valid_prompt_index(pidx)
             if key is None:
                 if record_error is not None:
-                    record_error(
-                        ordinal, "user chunk without promptIndex", obj)
+                    record_error(ordinal, "missing_id", raw)
                 continue
             pid = _extract_prompt_id(obj, update)
             entry = prompts.get(key)
             if entry is None:
                 entry = {"texts": [], "model": None, "first": ordinal,
-                         "ts": iso_ts(obj.get("timestamp")), "prompt_id": pid,
-                         "first_obj": obj}
+                         "ts": iso_ts(obj.get("timestamp")), "prompt_id": pid}
                 prompts[key] = entry
                 order.append(key)
             else:
@@ -899,10 +656,7 @@ def _collect_prompts(path: str, record_error=None) -> tuple[dict, list, list]:
                 elif pid is not None and entry.get("prompt_id") is not None \
                         and pid != entry["prompt_id"]:
                     if record_error is not None:
-                        record_error(
-                            ordinal, "conflicting prompt id", obj)
-                if entry.get("first_obj") is None:
-                    entry["first_obj"] = obj
+                        record_error(ordinal, "schema_error", raw)
             entry["texts"].append(_content_text(update.get("content")))
             if entry["model"] is None and isinstance(
                     meta.get("modelId"), str) and _safe_token(
@@ -914,23 +668,37 @@ def _collect_prompts(path: str, record_error=None) -> tuple[dict, list, list]:
                 raw_pid, str) and _safe_token(raw_pid) is not None else None
             if not pid:
                 if record_error is not None:
-                    record_error(
-                        ordinal, "turn_completed without prompt_id", obj)
+                    record_error(ordinal, "missing_id", raw)
                 continue
             completions_ordered.append(
                 (ordinal, update, iso_ts(obj.get("timestamp")), obj,
-                 obj.get("method")))
+                 obj.get("method"), raw))
         else:
             continue
     return prompts, order, completions_ordered
 
 
 def _upsert_submission(con, r: _Reader, src, chat: dict, key: str,
-                       entry: dict, completions_by_id: dict,
-                       record_error) -> None:
+                       entry: dict, completions_by_id: dict) -> None:
+    """Insert or converge one submission row under its native prompt key.
+
+    The excerpt comes from agent_observer/privacy.py rule 1: empty unless a
+    genuine main-session human submission, otherwise the human text up to
+    the first tag-like marker with whitespace collapsed at 300 chars. Child
+    and subagent sessions are never genuine. Full native text still feeds
+    the usage hash; only the privacy excerpt reaches the ledger.
+
+    Every relevant re-sync recomputes text_hash, text_excerpt, kind and
+    is_genuine and updates the existing row in place when any of them
+    differs: appended text, late chat evidence, a privacy version re-import
+    and evidence that became unknown all converge instead of preserving
+    stale values. Turn bindings only fill unknowns.
+    """
     full_text = "".join(entry["texts"])
-    kind, is_genuine = _classify_prompt(key, chat)
-    excerpt = _build_excerpt(full_text, bool(is_genuine))
+    is_main = r.is_main_session
+    kind, is_genuine = _classify_prompt(key, chat, is_main)
+    excerpt = privacy.submission_excerpt(
+        full_text, is_genuine=bool(is_genuine), is_main_session=is_main)
     pid = entry.get("prompt_id")
     turn_id = (f"{HARNESS}:{r.native_sid}:{pid}"
                if pid and pid in completions_by_id else None)
@@ -950,45 +718,16 @@ def _upsert_submission(con, r: _Reader, src, chat: dict, key: str,
         if cur.rowcount:
             r.stats["submissions_inserted"] += 1
         return
-    # Existing row: follow appended text, allow reclassification, fill turn.
-    if digest != existing["text_hash"]:
-        new_sanitized = excerpt
-        old_excerpt = existing["text_excerpt"] or ""
-        # Growth means the sanitized form extends the stored one (empty
-        # provisional excerpts are a prefix of any reclassified excerpt).
-        if new_sanitized.startswith(old_excerpt) or old_excerpt == "":
-            # For synthetic/provisional both excerpts are empty; still
-            # follow the hash so later comparisons see the latest text.
-            con.execute(
-                "UPDATE submissions SET text_hash=?, text_excerpt=?"
-                " WHERE native_id=?", (digest, new_sanitized, native_id))
-        else:
-            if record_error is not None:
-                record_error(
-                    entry["first"], "conflicting prompt",
-                    entry.get("first_obj"))
-            # Do not apply divergent text; keep original hash/excerpt.
-    # Reclassification: reliable chat evidence updates kind/excerpt even
-    # when the full text hash is unchanged. Never downgrade a definitive
-    # genuine/synthetic row merely because later chat is unreliable or
-    # silent for that index.
-    if chat.get("reliable"):
-        if kind in ("genuine", "synthetic") and \
-                (existing["kind"] != kind or
-                 (existing["is_genuine"] or 0) != is_genuine or
-                 (existing["text_excerpt"] or "") != excerpt):
-            # Allow provisional->definitive and definitive->definitive
-            # flips; keep provisional when desired is unknown.
-            con.execute(
-                "UPDATE submissions SET kind=?, is_genuine=?, text_excerpt=?"
-                " WHERE native_id=?", (kind, is_genuine, excerpt, native_id))
-    else:
-        # Unreliable chat: only ensure provisional rows stay empty-excerpt.
-        if existing["kind"] in (None, "", "unknown") and \
-                (existing["text_excerpt"] or "") != "":
-            con.execute(
-                "UPDATE submissions SET text_excerpt=? WHERE native_id=?",
-                ("", native_id))
+    if digest != existing["text_hash"] \
+            or (existing["text_excerpt"] or "") != excerpt \
+            or existing["kind"] != kind \
+            or (existing["is_genuine"] or 0) != is_genuine:
+        con.execute(
+            "UPDATE submissions SET text_hash=?, text_excerpt=?, kind=?,"
+            " is_genuine=? WHERE native_id=?",
+            (digest, excerpt, kind, is_genuine, native_id))
+        r.stats["submissions_updated"] = \
+            r.stats.get("submissions_updated", 0) + 1
     if turn_id and not existing["turn_id"]:
         con.execute("UPDATE submissions SET turn_id=? WHERE native_id=?",
                     (turn_id, native_id))
@@ -1006,16 +745,13 @@ def _reclassify_existing(con, r: _Reader, session_dir: str,
     updates_path = os.path.join(session_dir, "updates.jsonl")
     if not os.path.isfile(updates_path):
         return 0
-    # Source id for any late insert (normally rows already exist).
-    src_holder = None
-    try:
-        src_holder = JsonlSource(con, HARNESS, updates_path)
-    except (OSError, sqlite3.DatabaseError):
-        src_holder = None
+    # The reader's updates source carries the ledger source id; building a
+    # second JsonlSource here would repeat its privacy-stale import_errors
+    # replacement and wipe the errors this sync just recorded.
     prompts, order, completions_ordered = _collect_prompts(
         updates_path, record_error=None)
     completions_by_id = {}
-    for ordinal, update, ts, obj, method in completions_ordered:
+    for ordinal, update, ts, obj, method, raw in completions_ordered:
         raw_pid = update.get("prompt_id") or update.get("promptId")
         pid = raw_pid if isinstance(
             raw_pid, str) and _safe_token(raw_pid) is not None else None
@@ -1025,8 +761,8 @@ def _reclassify_existing(con, r: _Reader, session_dir: str,
             completions_by_id[pid] = (ordinal, update, ts, obj, method)
     before = con.total_changes
     for key in order:
-        _upsert_submission(con, r, src_holder, chat, key, prompts[key],
-                           completions_by_id, record_error=None)
+        _upsert_submission(con, r, r.updates_src, chat, key, prompts[key],
+                           completions_by_id)
     # Finish without advancing offsets when we only reclassified: do not
     # call finish() here because sources offsets belong to the incremental
     # loops. Just report whether anything changed.
@@ -1046,32 +782,16 @@ def _replay_updates(con, r: _Reader, src: JsonlSource, chat: dict,
     completions still store one response row by their own key.
     """
 
-    def record_error(ordinal: int, category: str, obj) -> None:
-        if category == "user chunk without promptIndex":
-            _record_error_once(
-                src, r.stats, ordinal, "missing_prompt_index",
-                _safe_error_excerpt("missing_prompt_index", obj))
-        elif category == "turn_completed without prompt_id":
-            _record_error_once(
-                src, r.stats, ordinal, "missing_prompt_id",
-                _safe_error_excerpt("missing_prompt_id", obj))
-        elif category == "conflicting prompt id":
-            _record_error_once(
-                src, r.stats, ordinal, "conflicting_prompt",
-                _safe_error_excerpt("conflicting_prompt", obj))
-        elif category == "conflicting prompt":
-            _record_error_once(
-                src, r.stats, ordinal, "conflicting_prompt",
-                _safe_conflict_excerpt("conflicting_prompt"))
-        else:
-            _record_error_once(
-                src, r.stats, ordinal, "schema_error",
-                _safe_error_excerpt("schema_error", obj))
+    def record_error(ordinal: int, category: str, line: str = "") -> None:
+        # Categories arrive closed (missing_id, schema_error); the ingest
+        # path maps anything else to the fallback and keeps only sorted
+        # top-level key names from the raw line.
+        _record_error_once(src, r.stats, ordinal, category, line)
 
     prompts, order, completions_ordered = _collect_prompts(
         src.path, record_error=record_error)
     completions_by_id: dict = {}
-    for ordinal, update, ts, obj, method in completions_ordered:
+    for ordinal, update, ts, obj, method, raw in completions_ordered:
         raw_pid = update.get("prompt_id") or update.get("promptId")
         pid = raw_pid if isinstance(
             raw_pid, str) and _safe_token(raw_pid) is not None else None
@@ -1104,8 +824,8 @@ def _replay_updates(con, r: _Reader, src: JsonlSource, chat: dict,
         os.path.join(os.path.dirname(src.path), "events.jsonl"))
     for key in order:
         _upsert_submission(con, r, src, chat, key, prompts[key],
-                           completions_by_id, record_error)
-    for ordinal, update, ts, obj, method in completions_ordered:
+                           completions_by_id)
+    for ordinal, update, ts, obj, method, raw in completions_ordered:
         raw_pid = update.get("prompt_id") or update.get("promptId")
         pid = raw_pid if isinstance(
             raw_pid, str) and _safe_token(raw_pid) is not None else None
@@ -1114,8 +834,7 @@ def _replay_updates(con, r: _Reader, src: JsonlSource, chat: dict,
         chunk_model = pid_to_model.get(pid)
         _store_response(con, r, src, ordinal, update, ts,
                         _usage_model(update), model_fallback, chunk_model,
-                        effort or chat.get("effort"), turn_models,
-                        outer_obj=obj)
+                        effort or chat.get("effort"), turn_models, raw)
 
 
 def _usage_model(update: dict):
@@ -1137,7 +856,7 @@ def _valid_model(value):
 
 def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
                     update: dict, ts, usage_model, summary_model, chunk_model,
-                    effort, turn_models, outer_obj=None) -> None:
+                    effort, turn_models, raw_line: str = "") -> None:
     raw_pid = update.get("prompt_id") or update.get("promptId")
     if not isinstance(raw_pid, str) or _safe_token(raw_pid) is None:
         return
@@ -1188,12 +907,11 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
     for key in counters:
         old, new = existing[key], counters[key]
         if old is not None and new is not None and old != new:
-            if isinstance(outer_obj, dict):
-                shape = _safe_error_excerpt("conflicting_usage", outer_obj)
-            else:
-                shape = _safe_conflict_excerpt("conflicting_usage")
-            _record_error_once(src, r.stats, ordinal, "conflicting_usage",
-                               shape)
+            # A rewritten completion under the same prompt id: quarantine
+            # under the closed usage_conflict category with only the raw
+            # line's top-level key names, never counters or ids.
+            _record_error_once(src, r.stats, ordinal, "usage_conflict",
+                               raw_line)
             return
     fill = {key: counters[key] for key in counters
             if existing[key] is None and counters[key] is not None}
@@ -1215,12 +933,12 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
 def _ingest_update(r: _Reader, src: JsonlSource, obj: dict,
                    ordinal: int) -> None:
     if obj.get("method") not in METHODS:
-        raise _AdapterError("unknown_method")
+        raise _AdapterError("unknown_record")
     params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
     update = params.get("update") if isinstance(params, dict) else {}
     if not isinstance(update, dict) or \
             not isinstance(update.get("sessionUpdate"), str):
-        raise _AdapterError("unknown_update")
+        raise _AdapterError("unknown_record")
     ts = iso_ts(obj.get("timestamp"))
     r.note_ts(ts)
     kind = update["sessionUpdate"]
@@ -1246,8 +964,7 @@ def _ingest_update(r: _Reader, src: JsonlSource, obj: dict,
             params.get("_meta", {}).get("eventId")
             if isinstance(params.get("_meta"), dict) else None)
         r.event(src, "compaction", event_id or f"{kind}:{ordinal}", ordinal,
-                ts, name=kind,
-                detail=_whitelisted_update_detail(kind, update))
+                ts, name=kind)
     elif kind in EXTENSION_KINDS:
         if kind == "subagent_spawned":
             _subagent_link(r, update)
@@ -1255,10 +972,9 @@ def _ingest_update(r: _Reader, src: JsonlSource, obj: dict,
             params.get("_meta", {}).get("eventId")
             if isinstance(params.get("_meta"), dict) else None)
         r.event(src, "lifecycle", event_id or f"{kind}:{ordinal}", ordinal,
-                ts, name=kind,
-                detail=_whitelisted_update_detail(kind, update))
+                ts, name=kind)
     else:
-        raise _AdapterError("unknown_update")
+        raise _AdapterError("unknown_record")
 
 
 def _turn_id(r: _Reader, params: dict):
@@ -1270,14 +986,10 @@ def _turn_id(r: _Reader, params: dict):
 
 
 def _tool_name(update: dict):
-    # Fail closed: titles are never stringified. Only an identifier-shaped
-    # title or tool name persists; anything else falls back to "unknown"
-    # without preserving the source value.
-    title = update.get("title")
-    if isinstance(title, str) and title:
-        safe = _safe_token(title)
-        if safe is not None:
-            return safe
+    # Fail closed: native free-text titles are never stored and never
+    # stringified. Only the validated native tool name (x.ai/tool) persists
+    # as the event name; when it is absent or malformed the name is the safe
+    # "unknown" value without preserving the title.
     meta = update.get("_meta") if isinstance(update.get("_meta"), dict) \
         else {}
     tool = meta.get("x.ai/tool") if isinstance(meta, dict) else None
@@ -1297,24 +1009,12 @@ def _tool_call(r: _Reader, src: JsonlSource, update: dict, params: dict,
     call_id = raw_call
     raw = update.get("rawInput")
     name = _tool_name(update)
-    meta = update.get("_meta") if isinstance(update.get("_meta"), dict) \
-        else {}
-    tool = meta.get("x.ai/tool") if isinstance(meta, dict) else {}
-    raw_tool = tool.get("name") if isinstance(tool, dict) else None
-    raw_kind = tool.get("kind") if isinstance(tool, dict) else None
-    detail = {}
-    safe_tool = _safe_token(raw_tool)
-    if safe_tool is not None:
-        detail["tool"] = safe_tool
-    safe_kind = _valid_enum(raw_kind, _TOOL_KIND_VALUES)
-    if safe_kind is not None:
-        detail["kind"] = safe_kind
+    target = _safe_target(raw)
+    # Tool_call keeps no detail under privacy.py rule 6; the validated name,
+    # path-or-command target and argument fingerprint are the ledger columns.
     r.event(src, "tool_call", call_id, ordinal, ts,
-            turn_id=_turn_id(r, params), name=name,
-            target=_safe_target(raw),
-            fingerprint=fingerprint(call_id, name,
-                                    _safe_target(raw) or ""),
-            detail=detail or None)
+            turn_id=_turn_id(r, params), name=name, target=target,
+            fingerprint=fingerprint(call_id, name, target or ""))
 
 
 def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
@@ -1332,7 +1032,6 @@ def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
         # style free-text keys, a non-string path, or a non-integer line is
         # dropped entirely and never stringified into any ledger column.
         paths: list[str] = []
-        lines: dict[str, int] = {}
         for loc in locations:
             if not isinstance(loc, dict):
                 continue
@@ -1342,11 +1041,6 @@ def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
             if not isinstance(path, str) or not path:
                 continue
             paths.append(path)
-            line = loc.get("line")
-            if isinstance(line, bool):
-                continue
-            if isinstance(line, int):
-                lines[path] = line
         if paths:
             for path in paths:
                 r.identity.observe_path(path)
@@ -1358,22 +1052,23 @@ def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
                     skill = skill_from_path(path)
                     if skill is not None:
                         break
-            detail = {"paths": list(paths)}
-            if lines:
-                detail["lines"] = dict(lines)
-            if skill:
-                detail["skill"] = skill
+            if skill is not None and _safe_token(skill) is None:
+                skill = None
+            # Read events keep no detail under privacy.py rule 6; the first
+            # validated path is the target. A skill_read keeps only the
+            # validated skill name as detail.
             r.event(src, "skill_read" if skill else "read", call_id,
                     ordinal, ts, turn_id=turn_id,
                     name=skill or os.path.basename(paths[0]),
                     target=paths[0],
                     fingerprint=fingerprint(call_id, paths),
-                    detail=detail)
+                    detail={"skill": skill} if skill else None)
     status = update.get("status")
     if isinstance(status, str) and status in TERMINAL_TOOL_STATUS:
+        # Tool results keep no detail under privacy.py rule 6; the mapped
+        # terminal status is the ledger column.
         r.event(src, "tool_result", call_id, ordinal, ts, turn_id=turn_id,
-                name=_tool_name(update), status=TERMINAL_TOOL_STATUS[status],
-                detail={"status": status})
+                name=_tool_name(update), status=TERMINAL_TOOL_STATUS[status])
 
 
 def _subagent_link(r: _Reader, update: dict) -> None:
@@ -1407,61 +1102,35 @@ def _ingest_event(r: _Reader, src: JsonlSource, obj: dict,
     ts = iso_ts(obj.get("ts"))
     r.note_ts(ts)
     if kind == "turn_started":
-        detail = {}
-        turn_number = obj.get("turn_number")
-        if isinstance(turn_number, int) and not isinstance(turn_number, bool):
-            detail["turn_number"] = turn_number
-        model_id = _safe_token(obj.get("model_id"))
-        if model_id is not None:
-            detail["model_id"] = model_id
-        rel = _valid_enum(obj.get("session_relationship"),
-                          _SESSION_REL_VALUES)
-        if rel is not None:
-            detail["session_relationship"] = rel
+        # Lifecycle, permission and compaction events keep no detail under
+        # privacy.py rule 6. Validated names, statuses and durations are the
+        # ledger columns; anything else is dropped, never stringified.
         r.event(src, "lifecycle", f"turn_started:{ordinal}", ordinal, ts,
-                name="turn_started", detail=detail or None)
+                name="turn_started")
     elif kind == "turn_ended":
         outcome = _valid_enum(obj.get("outcome"), _OUTCOME_VALUES)
-        detail = {"outcome": outcome} if outcome is not None else None
         r.event(src, "lifecycle", f"turn_ended:{ordinal}", ordinal, ts,
-                name="turn_ended",
-                status=outcome,
-                detail=detail)
+                name="turn_ended", status=outcome)
     elif kind == "tool_started":
         tool_s = _safe_token(obj.get("tool_name")) or "unknown"
-        detail = {"tool": _safe_token(obj.get("tool_name"))} \
-            if _safe_token(obj.get("tool_name")) is not None else None
         r.event(src, "lifecycle", f"tool_started:{ordinal}", ordinal, ts,
-                name=tool_s, detail=detail)
+                name=tool_s)
     elif kind == "tool_completed":
         _tool_completed(r, src, obj, ordinal, ts)
     elif kind == "permission_requested":
         tool_s = _safe_token(obj.get("tool_name")) or "unknown"
-        detail = {"phase": "requested"}
-        safe_tool = _safe_token(obj.get("tool_name"))
-        if safe_tool is not None:
-            detail["tool"] = safe_tool
         r.event(src, "permission", f"permission:{ordinal}", ordinal, ts,
-                name=tool_s, detail=detail)
+                name=tool_s)
     elif kind == "permission_resolved":
         tool_s = _safe_token(obj.get("tool_name")) or "unknown"
         decision_s = _valid_enum(obj.get("decision"), _DECISION_VALUES)
         wait = obj.get("wait_ms")
         if isinstance(wait, bool) or not isinstance(wait, int):
             wait = None
-        detail = {}
-        safe_tool = _safe_token(obj.get("tool_name"))
-        if safe_tool is not None:
-            detail["tool"] = safe_tool
-        if decision_s is not None:
-            detail["decision"] = decision_s
-        if wait is not None:
-            detail["wait_ms"] = wait
         r.event(src, "permission", f"permission:{ordinal}", ordinal, ts,
-                name=tool_s, status=decision_s, duration_ms=wait,
-                detail=detail or None)
+                name=tool_s, status=decision_s, duration_ms=wait)
     else:
-        raise _AdapterError("unknown_event")
+        raise _AdapterError("unknown_record")
 
 
 def _tool_completed(r: _Reader, src: JsonlSource, obj: dict, ordinal: int,
@@ -1481,42 +1150,26 @@ def _tool_completed(r: _Reader, src: JsonlSource, obj: dict, ordinal: int,
         (r.session_key, call_id)).fetchone()
     if row is None:
         tool_s = _safe_token(obj.get("tool_name")) or "unknown"
-        detail = {}
-        safe_tool = _safe_token(obj.get("tool_name"))
-        if safe_tool is not None:
-            detail["tool"] = safe_tool
-        safe_outcome = _valid_enum(outcome, _OUTCOME_VALUES)
-        if safe_outcome is not None:
-            detail["outcome"] = safe_outcome
         r.event(src, "tool_result", call_id, ordinal, ts,
-                name=tool_s, status=status,
-                duration_ms=duration,
-                detail=detail or None)
+                name=tool_s, status=status, duration_ms=duration)
         return
     try:
         loaded = json.loads(row["detail_json"]) if row["detail_json"] else {}
     except ValueError:
         loaded = {}
-    # Scrub any legacy values that predate strict field validation:
-    # unknown keys, token-shaped free text in enum fields and arbitrary
-    # nested list/dict contents are dropped, never stringified.
-    detail = _sanitize_detail(loaded) or {}
-    changed = False
-    if json.dumps(detail, sort_keys=True)[:4000] != (row["detail_json"] or ""):
-        changed = True
+    # Scrub any legacy values through privacy.py rule 6: only allowlisted
+    # tool_result keys with correctly typed values survive, so unknown keys
+    # and free text are dropped, never stringified.
+    detail = privacy.filter_detail("tool_result", loaded)
+    payload = json.dumps(detail, sort_keys=True) if detail else None
+    changed = payload != row["detail_json"]
     if row["duration_ms"] is None and duration is not None:
         changed = True
     if row["status"] is None and status:
         changed = True
-    tool_s = _safe_token(obj.get("tool_name"))
-    outcome_s = _valid_enum(outcome, _OUTCOME_VALUES)
-    for key, value in (("tool", tool_s), ("outcome", outcome_s)):
-        if value is not None and key not in detail:
-            detail[key] = value
-            changed = True
     if changed:
         r.con.execute(
             "UPDATE events SET duration_ms=COALESCE(duration_ms, ?),"
             " status=COALESCE(status, ?), detail_json=? WHERE id=?",
-            (duration, status, json.dumps(detail, sort_keys=True)[:4000],
+            (duration, status, payload,
              row["id"]))

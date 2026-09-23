@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 
-from agent_observer import report
+from agent_observer import privacy, report
 from agent_observer.adapters import grok
 from tests.helpers import FIXTURES, LedgerCase
 
@@ -109,7 +109,12 @@ class GrokAdapterTest(LedgerCase):
                 if e["native_id"] == "call-read-1"][0]
         self.assertEqual(call["name"], "read_file")
         self.assertEqual(call["target"], "/redacted/repo/skills/ops/SKILL.md")
-        self.assertNotIn("target_file", call["detail_json"])
+        # Rule 6: tool_call keeps no detail; raw argument keys never persist.
+        self.assertIsNone(call["detail_json"])
+        for row in (call,):
+            blob = " ".join(v or "" for v in
+                            (row["name"], row["target"], row["detail_json"]))
+            self.assertNotIn("target_file", blob)
         results = {e["native_id"]: e for e in by["tool_result"]}
         self.assertIn("call-read-1", results)
         # tool_completed duration enriches the update-stream result in place.
@@ -235,19 +240,18 @@ class GrokAdapterTest(LedgerCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["total_tokens"], 1200)
         conflicts = self.query(
-            "SELECT * FROM import_errors WHERE error='conflicting_usage'")
+            "SELECT * FROM import_errors WHERE error='usage_conflict'")
         self.assertEqual(len(conflicts), 1)
-        # Fixed category only, safe shape only, no record values, bounded.
+        # Closed category only with a key-only excerpt: sorted top-level key
+        # names, never counters, ids or other record values, bounded.
         err = conflicts[0]
-        self.assertEqual(err["error"], "conflicting_usage")
+        self.assertEqual(err["error"], "usage_conflict")
+        self.assertEqual(err["line_excerpt"], "method,params,timestamp")
         self.assertLessEqual(len(err["line_excerpt"] or ""), 200)
         self.assertNotIn("1201", err["line_excerpt"] or "")
         self.assertNotIn("1201", err["error"] or "")
         self.assertNotIn("p-aaa", err["error"] or "")
         self.assertNotIn("p-aaa", err["line_excerpt"] or "")
-        self.assertIn("method=", err["line_excerpt"] or "")
-        self.assertIn("update=", err["line_excerpt"] or "")
-        self.assertIn("keys=", err["line_excerpt"] or "")
 
     # --- Requirement-level privacy and excerpt tests ---
 
@@ -361,25 +365,26 @@ class GrokAdapterTest(LedgerCase):
             self.assertLessEqual(len(row["line_excerpt"] or ""), 200)
         con.close()
 
-    def test_excerpt_sanitized_length_and_empty_for_non_genuine(self):
+    def test_excerpt_first_marker_truncation_and_empty_for_non_genuine(self):
         rows = {r["native_id"]: r for r in self.query(
             "SELECT native_id, kind, is_genuine, text_excerpt FROM submissions"
             " WHERE session_key=?", (S1,))}
-        # Genuine prompts keep at most 300 chars of human text, sanitized.
+        # Spec rule 1: the fixture prompts start with a tag-like marker, so
+        # genuine human text keeps nothing after it. Classification still
+        # distinguishes genuine from synthetic; excerpts stay bounded and
+        # marker-free.
         for idx in ("0", "1", "3", "4"):
             nid = f"{S1}:prompt:{idx}"
             row = rows[nid]
             self.assertEqual(row["kind"], "genuine")
             self.assertEqual(row["is_genuine"], 1)
             excerpt = row["text_excerpt"] or ""
+            self.assertEqual(excerpt, "")
             self.assertLessEqual(len(excerpt), 300)
             self.assertNotIn("<user_query>", excerpt)
             self.assertNotIn("<user_rule>", excerpt)
             self.assertNotIn("INSTALLED BODY", excerpt)
             self.assertNotIn("AGENTSMD_PROJECT_DIRECTION_V1", excerpt)
-        self.assertIn("Implement the widget", rows[f"{S1}:prompt:0"]["text_excerpt"])
-        self.assertIn("Now the second prompt",
-                      rows[f"{S1}:prompt:1"]["text_excerpt"])
         # Synthetic prompts have empty excerpts.
         synth = rows[f"{S1}:prompt:2"]
         self.assertEqual(synth["kind"], "synthetic")
@@ -472,7 +477,7 @@ class GrokAdapterTest(LedgerCase):
             (f"{S1}:p-ddd",)).fetchone()["n"]
         self.assertEqual(n, 1)
         conflicts = list(con.execute(
-            "SELECT * FROM import_errors WHERE error='conflicting_usage'"))
+            "SELECT * FROM import_errors WHERE error='usage_conflict'"))
         self.assertEqual(len(conflicts), 0)
         con.close()
 
@@ -522,17 +527,19 @@ class GrokAdapterTest(LedgerCase):
             self.assertNotIn("sk-fake-secret-999", row["error"] or "")
             self.assertNotIn("session/unknown", row["error"] or "")
             self.assertNotIn("session/unknown", row["line_excerpt"] or "")
-        # Unknown method value never appears anywhere; error is fixed only.
+        # Unknown record values never appear anywhere; the error is the
+        # closed unknown_record category with a key-only line excerpt.
         for table, col, val in self._all_text_values(con):
             self.assertNotIn("session/unknown", val,
                              f"{table}.{col} leaks unknown method value")
-        self.assertTrue(any((r["error"] or "") == "unknown_method"
+        self.assertTrue(any((r["error"] or "") == "unknown_record"
                             for r in errors))
-        # Fixed categories only, never exception text or record values.
-        allowed = {"malformed_json", "schema_error", "unknown_method",
-                   "unknown_update", "missing_prompt_index",
-                   "missing_prompt_id", "conflicting_prompt",
-                   "conflicting_usage", "unknown_event"}
+        unknowns = [r for r in errors if r["error"] == "unknown_record"]
+        self.assertTrue(unknowns)
+        for row in unknowns:
+            self.assertEqual(row["line_excerpt"], "method,params,timestamp")
+        # Closed categories only, never exception text or record values.
+        allowed = set(privacy.ERROR_CATEGORIES) | {privacy.ERROR_FALLBACK}
         for row in errors:
             self.assertIn(row["error"], allowed)
         con.close()
@@ -572,8 +579,9 @@ class GrokAdapterTest(LedgerCase):
         self.assertEqual(len(after), n_before)
         self.assertEqual(after[f"{S1}:prompt:0"]["kind"], "genuine")
         self.assertEqual(after[f"{S1}:prompt:0"]["is_genuine"], 1)
-        self.assertIn("Implement the widget",
-                      after[f"{S1}:prompt:0"]["text_excerpt"])
+        # The fixture prompt starts with a tag-like marker, so the genuine
+        # excerpt is empty under first-marker truncation.
+        self.assertEqual(after[f"{S1}:prompt:0"]["text_excerpt"], "")
         self.assertEqual(after[f"{S1}:prompt:0"]["turn_id"], f"{S1}:p-aaa")
         self.assertEqual(after[f"{S1}:prompt:2"]["kind"], "synthetic")
         self.assertEqual(after[f"{S1}:prompt:2"]["text_excerpt"], "")
@@ -609,8 +617,10 @@ class GrokAdapterTest(LedgerCase):
             " FROM submissions")}
         self.assertEqual(len(after), n_before)
         self.assertEqual(after[f"{S1}:prompt:1"]["kind"], "genuine")
-        self.assertIn("Now the second prompt",
-                      after[f"{S1}:prompt:1"]["text_excerpt"])
+        self.assertEqual(after[f"{S1}:prompt:1"]["is_genuine"], 1)
+        # The fixture prompt starts with a tag-like marker, so the genuine
+        # excerpt is empty under first-marker truncation.
+        self.assertEqual(after[f"{S1}:prompt:1"]["text_excerpt"], "")
         con.close()
 
     def test_unterminated_blocks_of_each_kind_leak_nothing(self):
@@ -733,7 +743,7 @@ class GrokAdapterTest(LedgerCase):
                              f"{table}.{col} leaks unknown event value")
         unknowns = list(con.execute(
             "SELECT error, line_excerpt FROM import_errors"
-            " WHERE error='unknown_event'"))
+            " WHERE error='unknown_record'"))
         self.assertTrue(unknowns)
         for row in unknowns:
             self.assertNotIn(secret, row["line_excerpt"] or "")
@@ -774,8 +784,9 @@ class GrokAdapterTest(LedgerCase):
         self.assertEqual(len(after), n_before)
         self.assertEqual(after[f"{S1}:prompt:0"]["kind"], "genuine")
         self.assertEqual(after[f"{S1}:prompt:0"]["is_genuine"], 1)
-        self.assertIn("Implement the widget",
-                      after[f"{S1}:prompt:0"]["text_excerpt"])
+        # The fixture prompt starts with a tag-like marker, so the genuine
+        # excerpt is empty under first-marker truncation.
+        self.assertEqual(after[f"{S1}:prompt:0"]["text_excerpt"], "")
         self.assertEqual(after[f"{S1}:prompt:0"]["turn_id"], f"{S1}:p-aaa")
         sess = con.execute(
             "SELECT instructions_sha256, preferences_sha256,"
@@ -894,11 +905,8 @@ class GrokAdapterTest(LedgerCase):
         self.assertEqual(call["name"], "read_file")
         self.assertEqual(call["target"],
                          "/redacted/repo/skills/ops/SKILL.md")
-        # Any quarantine uses only a fixed category and shape-only excerpt.
-        allowed = {"malformed_json", "schema_error", "unknown_method",
-                   "unknown_update", "missing_prompt_index",
-                   "missing_prompt_id", "conflicting_prompt",
-                   "conflicting_usage", "unknown_event"}
+        # Any quarantine uses only a closed category and a key-only excerpt.
+        allowed = set(privacy.ERROR_CATEGORIES) | {privacy.ERROR_FALLBACK}
         errors = list(con.execute(
             "SELECT error, line_excerpt FROM import_errors"))
         for row in errors:
@@ -933,7 +941,7 @@ class GrokAdapterTest(LedgerCase):
         grok.sync(con, root=tmp)
         first = list(con.execute(
             "SELECT source_path, ordinal_num, error FROM import_errors"
-            " WHERE error='missing_prompt_index'"))
+            " WHERE error='missing_id'"))
         self.assertEqual(len(first), 1)
         first_path = first[0]["source_path"]
         first_ordinal = first[0]["ordinal_num"]
@@ -956,7 +964,7 @@ class GrokAdapterTest(LedgerCase):
         self.assertEqual(second["responses_inserted"], 1)
         again = list(con.execute(
             "SELECT source_path, ordinal_num, error FROM import_errors"
-            " WHERE error='missing_prompt_index'"))
+            " WHERE error='missing_id'"))
         self.assertEqual(len(again), 1)
         self.assertEqual(again[0]["source_path"], first_path)
         self.assertEqual(again[0]["ordinal_num"], first_ordinal)
@@ -972,7 +980,7 @@ class GrokAdapterTest(LedgerCase):
         grok.sync(con, root=tmp)
         final = list(con.execute(
             "SELECT ordinal_num FROM import_errors"
-            " WHERE error='missing_prompt_index' ORDER BY ordinal_num"))
+            " WHERE error='missing_id' ORDER BY ordinal_num"))
         self.assertEqual(len(final), 2)
         self.assertNotEqual(final[0]["ordinal_num"], final[1]["ordinal_num"])
         con.close()
@@ -1038,47 +1046,50 @@ class GrokAdapterTest(LedgerCase):
             for sentinel in sentinels:
                 self.assertNotIn(sentinel, blob,
                                  "events row leaks enum free text")
-        # Valid enum behavior is preserved: real outcomes, decisions,
-        # relationships, retry types and tool identities still persist.
+        # Valid statuses still persist in ledger columns while rule 6 keeps
+        # lifecycle and permission detail empty: only the per-family
+        # allowlist survives, so outcomes, decisions, durations and model
+        # metadata live in status/duration columns or not at all.
         ended = [r for r in con.execute(
             "SELECT status, detail_json FROM events WHERE session_key=?"
             " AND family='lifecycle' AND name='turn_ended'", (S1,))]
-        self.assertTrue(any(
-            r["status"] == "completed"
-            and '"outcome": "completed"' in (r["detail_json"] or "")
-            for r in ended))
+        self.assertTrue(any(r["status"] == "completed" for r in ended))
+        for r in ended:
+            self.assertIsNone(r["detail_json"])
         resolved = [r for r in con.execute(
-            "SELECT status, detail_json FROM events WHERE session_key=?"
-            " AND family='permission' AND status='allow'", (S1,))]
+            "SELECT status, duration_ms, detail_json FROM events"
+            " WHERE session_key=? AND family='permission'"
+            " AND status='allow'", (S1,))]
         self.assertEqual(len(resolved), 1)
-        self.assertIn('"decision": "allow"',
-                      resolved[0]["detail_json"] or "")
-        self.assertIn('"wait_ms": 3', con.execute(
+        self.assertIsNone(resolved[0]["detail_json"])
+        waited = [r for r in con.execute(
+            "SELECT status, duration_ms, detail_json FROM events"
+            " WHERE session_key=? AND family='permission'"
+            " AND duration_ms=3", (S1,))]
+        self.assertEqual(len(waited), 1)
+        self.assertIsNone(waited[0]["status"])
+        self.assertIsNone(waited[0]["detail_json"])
+        started = list(con.execute(
             "SELECT detail_json FROM events WHERE session_key=?"
-            " AND family='permission' AND status IS NULL",
-            (S1,)).fetchone()["detail_json"] or "")
-        started = con.execute(
-            "SELECT detail_json FROM events WHERE session_key=?"
-            " AND family='lifecycle' AND name='turn_started'"
-            " AND detail_json LIKE '%\"turn_number\": 9%'",
-            (S1,)).fetchone()
-        self.assertIsNotNone(started)
-        self.assertIn('"model_id": "grok-4.6"',
-                      started["detail_json"] or "")
-        self.assertNotIn("session_relationship",
-                         started["detail_json"] or "")
+            " AND family='lifecycle' AND name='turn_started'", (S1,)))
+        self.assertTrue(len(started) >= 2)
+        for r in started:
+            self.assertIsNone(r["detail_json"])
         retry_rows = list(con.execute(
             "SELECT detail_json FROM events WHERE session_key=?"
             " AND family='lifecycle' AND name='retry_state'", (S1,)))
         self.assertEqual(len(retry_rows), 2)
+        for r in retry_rows:
+            self.assertIsNone(r["detail_json"])
         con.close()
 
     def test_legacy_malformed_detail_is_scrubbed_and_persisted(self):
-        # A tool_result row written before strict field validation keeps
-        # unknown keys, enum free text and arbitrary nested contents until
-        # a tool_completed enrichment arrives. Sanitization must drop the
-        # junk, keep valid fields, and persist even when neither duration
-        # nor status changes.
+        # A tool_result row written before privacy.py rule 6 keeps unknown
+        # keys, enum free text and arbitrary nested contents until a
+        # tool_completed enrichment arrives. The rule-6 filter must drop
+        # everything the tool_result allowlist does not name (it names only
+        # exit codes, so tool/outcome/paths/lines go too) and persist the
+        # correction even when neither duration nor status changes.
         tmp = os.path.join(self.tmp.name, "legacydetail")
         shutil.copytree(ROOT, tmp)
         sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
@@ -1112,20 +1123,431 @@ class GrokAdapterTest(LedgerCase):
         self.assertIsNotNone(row)
         self.assertEqual(row["status"], "ok")
         self.assertEqual(row["duration_ms"], 5)
-        detail = json.loads(row["detail_json"])
         for sentinel in ("EVIL-LEGACY-MSG-abc123", "EVIL-LEGACY-KEY-abc123",
                          "EVIL-LEGACY-STATUS-abc123",
                          "EVIL-LEGACY-NEST-abc123"):
-            self.assertNotIn(sentinel, row["detail_json"])
+            self.assertNotIn(sentinel, row["detail_json"] or "")
             for table, col, val in self._all_text_values(con):
                 self.assertNotIn(sentinel, val,
                                  f"{table}.{col} leaks legacy detail")
-        self.assertNotIn("mystery_key", detail)
-        self.assertNotIn("message", detail)
-        self.assertNotIn("status", detail)
-        # Valid fields and valid nested contents survive the scrub.
-        self.assertEqual(detail.get("tool"), "read_file")
-        self.assertEqual(detail.get("outcome"), "success")
-        self.assertEqual(detail.get("paths"), ["/ok/path"])
-        self.assertEqual(detail.get("lines"), {"/other": 7})
+        # Rule 6 keeps no tool_result detail here: the scrubbed payload is
+        # empty, persisted as NULL like a fresh insert.
+        self.assertIsNone(row["detail_json"])
+        con.close()
+
+    # --- Privacy-spec regression coverage (planner ruling 2026-09-23) ---
+
+    def _append_prompt(self, sdir, sid, idx, pid, text, chat_text=None):
+        with open(os.path.join(sdir, "updates.jsonl"), "a") as fh:
+            fh.write(json.dumps({
+                "timestamp": 1788801000 + idx,
+                "method": "session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": {"type": "text", "text": text},
+                        "_meta": {"modelId": "grok-4.6",
+                                  "promptIndex": idx},
+                    },
+                    "_meta": {"eventId": f"reg-{idx}",
+                              "promptId": pid},
+                },
+            }) + "\n")
+            fh.write(json.dumps({
+                "timestamp": 1788801010 + idx,
+                "method": "_x.ai/session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {"sessionUpdate": "turn_completed",
+                               "prompt_id": pid,
+                               "stop_reason": "end_turn",
+                               "usage": {"inputTokens": 10,
+                                         "outputTokens": 1,
+                                         "totalTokens": 11}},
+                    "_meta": {"eventId": f"reg-c-{idx}"},
+                },
+            }) + "\n")
+        with open(os.path.join(sdir, "chat_history.jsonl"), "a") as fh:
+            fh.write(json.dumps({
+                "type": "user",
+                "content": [{"type": "text",
+                             "text": chat_text if chat_text is not None
+                             else text}],
+                "prompt_index": idx,
+            }) + "\n")
+
+    def test_genuine_excerpt_truncates_first_marker_collapses_whitespace(self):
+        # Rule 1: human text up to the first tag-like marker only, with
+        # whitespace collapsed before the 300-character limit.
+        tmp = os.path.join(self.tmp.name, "excerpt")
+        shutil.copytree(ROOT, tmp)
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        sdir = os.path.join(tmp, "%2Fredacted%2Frepo", sid)
+        self._append_prompt(
+            sdir, sid, 30, "p-t30",
+            "  Fix the widget\n\tnext line  with   spaces "
+            "<user_rule>INSTALLED-BODY-SENTINEL-qqq</user_rule> tail "
+            "<<<GEN-SENTINEL-qqq>>> more")
+        # Collapse-before-truncate proof: 200 "ab" lines are 600 raw chars
+        # but collapse to a 599-char single line, so the stored 300-char
+        # excerpt keeps newlines out and differs from truncating raw first.
+        self._append_prompt(
+            sdir, sid, 31, "p-t31", "ab\n" * 200 + "TAIL <b> injected")
+        con = self._isolated_con("excerpt")
+        grok.sync(con, root=tmp)
+        row = con.execute(
+            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            " WHERE native_id=?", (f"{S1}:prompt:30",)).fetchone()
+        self.assertEqual(row["kind"], "genuine")
+        self.assertEqual(row["is_genuine"], 1)
+        self.assertEqual(row["text_excerpt"],
+                         "Fix the widget next line with spaces")
+        for table, col, val in self._all_text_values(con):
+            self.assertNotIn("INSTALLED-BODY-SENTINEL-qqq", val,
+                             f"{table}.{col} leaks post-marker text")
+            self.assertNotIn("GEN-SENTINEL-qqq", val,
+                             f"{table}.{col} leaks post-marker text")
+        wide = con.execute(
+            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            " WHERE native_id=?", (f"{S1}:prompt:31",)).fetchone()
+        self.assertEqual(wide["kind"], "genuine")
+        self.assertEqual(wide["is_genuine"], 1)
+        self.assertEqual(wide["text_excerpt"], "ab " * 100)
+        self.assertEqual(len(wide["text_excerpt"]), 300)
+        self.assertNotIn("\n", wide["text_excerpt"])
+        self.assertNotIn("TAIL", wide["text_excerpt"])
+        con.close()
+
+    def test_child_session_prompts_are_never_genuine(self):
+        # Rule 1: subagent and child sessions store no excerpt even when
+        # chat history marks their prompts as user prompts, including a
+        # parent link discovered in the session's own updates.
+        tmp = os.path.join(self.tmp.name, "child")
+        group = os.path.join(tmp, "%2Fchildgroup")
+        sid = "02childsession-cccc-4b5c-8d6e-000000000003"
+        sdir = os.path.join(group, sid)
+        os.makedirs(sdir)
+        with open(os.path.join(sdir, "summary.json"), "w") as fh:
+            fh.write(json.dumps({
+                "info": {"id": sid, "cwd": "/redacted/repo"},
+                "created_at": "2026-09-01T11:00:00Z",
+                "current_model_id": "grok-4.6",
+                "session_kind": "subagent",
+            }))
+        text = "Human leading child text <tag> injected tail"
+        with open(os.path.join(sdir, "updates.jsonl"), "w") as fh:
+            fh.write(json.dumps({
+                "timestamp": 1788802000,
+                "method": "session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": {"type": "text", "text": text},
+                        "_meta": {"modelId": "grok-4.6",
+                                  "promptIndex": 0},
+                    },
+                    "_meta": {"eventId": "child-1", "promptId": "p-c1"},
+                },
+            }) + "\n")
+            fh.write(json.dumps({
+                "timestamp": 1788802001,
+                "method": "_x.ai/session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {"sessionUpdate": "subagent_spawned",
+                               "subagent_id": sid,
+                               "parent_session_id": "parent-sid-aaa",
+                               "parent_prompt_id": "p-x",
+                               "child_session_id": sid},
+                    "_meta": {"eventId": "child-link"},
+                },
+            }) + "\n")
+            fh.write(json.dumps({
+                "timestamp": 1788802002,
+                "method": "_x.ai/session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {"sessionUpdate": "turn_completed",
+                               "prompt_id": "p-c1",
+                               "stop_reason": "end_turn",
+                               "usage": {"inputTokens": 5,
+                                         "outputTokens": 1,
+                                         "totalTokens": 6}},
+                    "_meta": {"eventId": "child-2"},
+                },
+            }) + "\n")
+        with open(os.path.join(sdir, "chat_history.jsonl"), "w") as fh:
+            fh.write(json.dumps({
+                "type": "user",
+                "content": [{"type": "text", "text": text}],
+                "prompt_index": 0,
+            }) + "\n")
+        con = self._isolated_con("child")
+        grok.sync(con, root=tmp)
+        key = f"grok:{sid}"
+        row = con.execute(
+            "SELECT kind, is_genuine, text_excerpt, turn_id FROM submissions"
+            " WHERE session_key=?", (key,)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["kind"], "synthetic")
+        self.assertEqual(row["is_genuine"], 0)
+        self.assertEqual(row["text_excerpt"], "")
+        sess = con.execute(
+            "SELECT parent_session_key, role FROM sessions"
+            " WHERE session_key=?", (key,)).fetchone()
+        self.assertEqual(sess["parent_session_key"], "grok:parent-sid-aaa")
+        self.assertEqual(sess["role"], "subagent")
+        for table, col, val in self._all_text_values(con):
+            self.assertNotIn("Human leading child text", val,
+                             f"{table}.{col} leaks child prompt text")
+        con.close()
+
+    def test_resync_rewrites_text_and_downgrades_unknown_in_place(self):
+        # Rule 3: non-prefix text changes recompute hash and excerpt in
+        # place, and evidence that becomes unknown downgrades the row
+        # instead of preserving the stale genuine values.
+        tmp = os.path.join(self.tmp.name, "rewrite")
+        shutil.copytree(ROOT, tmp)
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        sdir = os.path.join(tmp, "%2Fredacted%2Frepo", sid)
+        con = self._isolated_con("rewrite")
+        grok.sync(con, root=tmp)
+        nid = f"{S1}:prompt:3"
+        before = con.execute(
+            "SELECT text_hash, text_excerpt, kind, is_genuine FROM submissions"
+            " WHERE native_id=?", (nid,)).fetchone()
+        n_errors = con.execute(
+            "SELECT COUNT(*) n FROM import_errors").fetchone()["n"]
+        path = os.path.join(sdir, "updates.jsonl")
+        with open(path) as fh:
+            lines = fh.read().splitlines()
+        rewritten = []
+        for line in lines:
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                rewritten.append(line)
+                continue
+            params = obj.get("params") if isinstance(
+                obj.get("params"), dict) else {}
+            update = params.get("update") if isinstance(params, dict) \
+                else {}
+            meta = update.get("_meta") if isinstance(
+                update.get("_meta"), dict) else {}
+            if isinstance(update, dict) and update.get("sessionUpdate") == \
+                    "user_message_chunk" and meta.get("promptIndex") == 3:
+                update["content"] = {
+                    "type": "text",
+                    "text": "Rewritten human leading <b>tail"}
+            rewritten.append(json.dumps(obj))
+        with open(path, "w") as fh:
+            fh.write("\n".join(rewritten) + "\n")
+        grok.sync(con, root=tmp, full=True)
+        after = con.execute(
+            "SELECT text_hash, text_excerpt, kind, is_genuine, turn_id"
+            " FROM submissions WHERE native_id=?", (nid,)).fetchone()
+        self.assertEqual(
+            con.execute("SELECT COUNT(*) n FROM submissions"
+                        " WHERE native_id=?", (nid,)).fetchone()["n"], 1)
+        self.assertNotEqual(after["text_hash"], before["text_hash"])
+        self.assertEqual(after["text_excerpt"], "Rewritten human leading")
+        self.assertEqual(after["kind"], "genuine")
+        self.assertEqual(after["is_genuine"], 1)
+        self.assertEqual(after["turn_id"], f"{S1}:p-ddd")
+        self.assertEqual(
+            con.execute(
+                "SELECT COUNT(*) n FROM import_errors").fetchone()["n"],
+            n_errors)
+        # Chat evidence disappears: the row downgrades to unknown in place.
+        os.remove(os.path.join(sdir, "chat_history.jsonl"))
+        grok.sync(con, root=tmp)
+        downgraded = con.execute(
+            "SELECT text_hash, text_excerpt, kind, is_genuine FROM submissions"
+            " WHERE native_id=?", (nid,)).fetchone()
+        self.assertEqual(downgraded["kind"], "unknown")
+        self.assertEqual(downgraded["is_genuine"], 0)
+        self.assertEqual(downgraded["text_excerpt"], "")
+        self.assertEqual(
+            con.execute("SELECT COUNT(*) n FROM submissions"
+                        " WHERE native_id=?", (nid,)).fetchone()["n"], 1)
+        con.close()
+
+    def test_privacy_version_reimport_corrects_rows_in_place(self):
+        # Rule 3: a version mismatch fully re-imports the source, updates
+        # excerpts, kinds, hashes, genuineness and event detail in place,
+        # and replaces that source's import_errors instead of duplicating.
+        tmp = os.path.join(self.tmp.name, "versionbump")
+        shutil.copytree(ROOT, tmp)
+        con = self._isolated_con("versionbump")
+        grok.sync(con, root=tmp)
+        before = {table: con.execute(
+            f"SELECT COUNT(*) n FROM {table}").fetchone()["n"]
+            for table in ("submissions", "events", "import_errors",
+                          "responses")}
+        errors_before = sorted(
+            (r["error"], r["ordinal_num"]) for r in con.execute(
+                "SELECT error, ordinal_num FROM import_errors"))
+        con.execute(
+            "UPDATE submissions SET text_hash='0000000000000000',"
+            " text_excerpt='STALE-EXCERPT', kind='unknown', is_genuine=0"
+            " WHERE native_id=?", (f"{S1}:prompt:0",))
+        con.execute(
+            "UPDATE events SET target='STALE-TARGET',"
+            " detail_json='{\"stale\": true}'"
+            " WHERE session_key=? AND family='tool_call'"
+            " AND native_id='call-read-1'", (S1,))
+        con.execute("UPDATE sources SET privacy_version=0"
+                    " WHERE harness='grok'")
+        con.commit()
+        session_dir = os.path.join(
+            tmp, "%2Fredacted%2Frepo",
+            "01fixture1-aaaa-4b5c-8d6e-000000000001")
+        stats = grok.import_grok_session(con, session_dir)
+        after = {table: con.execute(
+            f"SELECT COUNT(*) n FROM {table}").fetchone()["n"]
+            for table in ("submissions", "events", "import_errors",
+                          "responses")}
+        self.assertEqual(after, before)
+        sub = con.execute(
+            "SELECT text_hash, text_excerpt, kind, is_genuine FROM submissions"
+            " WHERE native_id=?", (f"{S1}:prompt:0",)).fetchone()
+        self.assertEqual(sub["kind"], "genuine")
+        self.assertEqual(sub["is_genuine"], 1)
+        self.assertEqual(sub["text_excerpt"], "")
+        self.assertNotEqual(sub["text_hash"], "0000000000000000")
+        evt = con.execute(
+            "SELECT target, detail_json FROM events WHERE session_key=?"
+            " AND family='tool_call' AND native_id='call-read-1'",
+            (S1,)).fetchone()
+        self.assertEqual(evt["target"],
+                         "/redacted/repo/skills/ops/SKILL.md")
+        self.assertIsNone(evt["detail_json"])
+        errors_after = sorted(
+            (r["error"], r["ordinal_num"]) for r in con.execute(
+                "SELECT error, ordinal_num FROM import_errors"))
+        self.assertEqual(errors_after, errors_before)
+        for row in con.execute("SELECT error FROM import_errors"):
+            self.assertIn(row["error"], set(privacy.ERROR_CATEGORIES)
+                          | {privacy.ERROR_FALLBACK})
+        # The re-imported session's sources carry the current version; a
+        # whole-root sync then converges the remaining session the same way.
+        versions = {r["privacy_version"] for r in con.execute(
+            "SELECT privacy_version FROM sources WHERE harness='grok'"
+            " AND path LIKE '%01fixture1-aaaa%'")}
+        self.assertEqual(versions, {privacy.PRIVACY_VERSION})
+        grok.sync(con, root=tmp)
+        versions = {r["privacy_version"] for r in con.execute(
+            "SELECT privacy_version FROM sources WHERE harness='grok'")}
+        self.assertEqual(versions, {privacy.PRIVACY_VERSION})
+        self.assertGreaterEqual(stats.get("submissions_updated", 0), 1)
+        self.assertGreaterEqual(stats.get("events_updated", 0), 1)
+        con.close()
+
+    def test_title_never_becomes_event_name(self):
+        # Rule 7: native free-text titles are not stored; only a validated
+        # native tool name becomes the event name, else safe "unknown".
+        tmp = os.path.join(self.tmp.name, "titles")
+        shutil.copytree(ROOT, tmp)
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        sdir = os.path.join(tmp, "%2Fredacted%2Frepo", sid)
+        calls = [
+            ("call-title-1", "EVIL-TITLE-SENTINEL-token",
+             {"version": 1, "name": "read_file", "kind": "read"}),
+            ("call-title-2", "Only Title Here", None),
+            ("call-title-3", None, None),
+        ]
+        with open(os.path.join(sdir, "updates.jsonl"), "a") as fh:
+            for call_id, title, tool in calls:
+                update = {"sessionUpdate": "tool_call",
+                          "toolCallId": call_id,
+                          "rawInput": {"target_file": "/redacted/repo/ok.txt"}}
+                if title is not None:
+                    update["title"] = title
+                if tool is not None:
+                    update["_meta"] = {"x.ai/tool": tool}
+                fh.write(json.dumps({
+                    "timestamp": 1788803000,
+                    "method": "session/update",
+                    "params": {"sessionId": sid, "update": update,
+                               "_meta": {"eventId": f"title-{call_id}"}},
+                }) + "\n")
+        con = self._isolated_con("titles")
+        grok.sync(con, root=tmp)
+        names = {r["native_id"]: r["name"] for r in con.execute(
+            "SELECT native_id, name FROM events WHERE session_key=?"
+            " AND family='tool_call' AND native_id LIKE 'call-title-%'",
+            (S1,))}
+        self.assertEqual(names, {"call-title-1": "read_file",
+                                 "call-title-2": "unknown",
+                                 "call-title-3": "unknown"})
+        for table, col, val in self._all_text_values(con):
+            self.assertNotIn("EVIL-TITLE-SENTINEL-token", val,
+                             f"{table}.{col} leaks title free text")
+            self.assertNotIn("Only Title Here", val,
+                             f"{table}.{col} leaks title free text")
+        con.close()
+
+    def test_pattern_and_url_never_become_targets(self):
+        # Rule 6: event targets are validated paths and commands only;
+        # pattern and url values are dropped entirely.
+        tmp = os.path.join(self.tmp.name, "targets")
+        shutil.copytree(ROOT, tmp)
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        sdir = os.path.join(tmp, "%2Fredacted%2Frepo", sid)
+        with open(os.path.join(sdir, "updates.jsonl"), "a") as fh:
+            fh.write(json.dumps({
+                "timestamp": 1788803100,
+                "method": "session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "call-pat-1",
+                        "rawInput": {
+                            "pattern": "PATTERN-SENTINEL-1-*.py",
+                            "url": "https://example.invalid/URL-SENTINEL-1",
+                        },
+                        "_meta": {"x.ai/tool": {"version": 1,
+                                                "name": "search_files"}},
+                    },
+                    "_meta": {"eventId": "target-pat-1"},
+                },
+            }) + "\n")
+            fh.write(json.dumps({
+                "timestamp": 1788803101,
+                "method": "session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "call-pat-2",
+                        "rawInput": {
+                            "target_file": "/redacted/repo/ok.txt",
+                            "pattern": "PATTERN-SENTINEL-2-*.py",
+                        },
+                        "_meta": {"x.ai/tool": {"version": 1,
+                                                "name": "search_files"}},
+                    },
+                    "_meta": {"eventId": "target-pat-2"},
+                },
+            }) + "\n")
+        con = self._isolated_con("targets")
+        grok.sync(con, root=tmp)
+        targets = {r["native_id"]: (r["target"], r["detail_json"])
+                   for r in con.execute(
+                       "SELECT native_id, target, detail_json FROM events"
+                       " WHERE session_key=? AND native_id LIKE 'call-pat-%'",
+                       (S1,))}
+        self.assertEqual(set(targets), {"call-pat-1", "call-pat-2"})
+        self.assertIsNone(targets["call-pat-1"][0])
+        self.assertEqual(targets["call-pat-2"][0], "/redacted/repo/ok.txt")
+        for target, detail in targets.values():
+            self.assertIsNone(detail)
+        for table, col, val in self._all_text_values(con):
+            for sentinel in ("PATTERN-SENTINEL-1", "PATTERN-SENTINEL-2",
+                             "URL-SENTINEL-1", "example.invalid"):
+                self.assertNotIn(sentinel, val,
+                                 f"{table}.{col} leaks pattern/url value")
         con.close()
