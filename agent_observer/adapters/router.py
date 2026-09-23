@@ -33,6 +33,20 @@ HARNESS = "router"
 ROUTER_SCHEMA_VERSION = 2
 DEFAULT_ROOT = os.path.expanduser("~/.local/state/model-router")
 
+# Closed privacy set for router import_errors.error and failed records.
+# Nothing appended, no exception names, messages, ids, versions, totals,
+# session keys or other record values.
+ERROR_CATEGORIES = frozenset({
+    "malformed_json",
+    "unknown_record",
+    "schema_error",
+    "missing_id",
+    "malformed_usage",
+    "usage_conflict",
+    "source_unreadable",
+    "unsupported_schema",
+})
+
 CAPABILITIES = [
     ("router_ledger", True, "router jobs, invocations and readings copied read-only; usage_json stays evidence on attempts, never native responses"),
     ("tool_calls", False, "no router tool-call import; native rollouts carry tool evidence"),
@@ -68,13 +82,13 @@ def sync(con: sqlite3.Connection, root: str | None = None,
     if db_path is None or not os.path.isfile(db_path):
         totals["failed"].append({
             "path": db_path or source or "",
-            "error": "jobs_db_missing"})
+            "error": "source_unreadable"})
     else:
         try:
             changed, invocations, bound = _sync_ledger(con, db_path, totals)
         except sqlite3.DatabaseError:
             totals["failed"].append({
-                "path": db_path, "error": "jobs_db_unreadable"})
+                "path": db_path, "error": "source_unreadable"})
             con.commit()
             return totals
         if totals["failed"]:
@@ -121,11 +135,13 @@ def _open_ro(path: str) -> sqlite3.Connection:
 
 def _record_error(con: sqlite3.Connection, source_path: str, error: str,
                   excerpt: str = "") -> None:
-    """Quarantine a sanitized category plus row shape, never row content.
+    """Quarantine a fixed category plus shape-only excerpt, never content.
 
     Re-imports of the same evidence are no-ops so errors never accumulate.
     """
-    error, excerpt = error[:200], excerpt[:200]
+    if error not in ERROR_CATEGORIES:
+        raise ValueError(f"unknown router error category: {error!r}")
+    error, excerpt = error[:200], (excerpt or "")[:200]
     if con.execute(
             "SELECT 1 FROM import_errors WHERE harness=? AND source_path=?"
             " AND error=? AND COALESCE(line_excerpt, '')=COALESCE(?, '')",
@@ -145,13 +161,20 @@ def _record_malformed(con: sqlite3.Connection, source_path: str, error: str,
         totals["malformed"] += 1
 
 
-def _shape(table: str, columns: tuple | list, native_id) -> str:
-    """Row shape for quarantine excerpts: table, native id, column names.
+def _shape_from_record(record: dict) -> str:
+    """Shape-only excerpt: sorted top-level key names, never values.
 
-    The native id follows the table so both survive the 200-character
-    excerpt cap even for wide source tables.
+    At most 200 characters. No table names, ids, roles, types, paths,
+    categories or other values.
     """
-    return f"{table} id={native_id} ({','.join(columns)})"
+    if not isinstance(record, dict):
+        return ""
+    return ",".join(sorted(str(k) for k in record.keys()))[:200]
+
+
+def _shape_from_columns(columns) -> str:
+    """Shape-only excerpt from source column names, sorted, max 200."""
+    return ",".join(sorted(str(c) for c in columns))[:200]
 
 
 def _sync_ledger(con: sqlite3.Connection, db_path: str, totals: dict
@@ -165,11 +188,9 @@ def _sync_ledger(con: sqlite3.Connection, db_path: str, totals: dict
     try:
         guard = _check_schema_version(src)
         if guard is not None:
-            error, table, id_col, native_id = guard
+            error, excerpt = guard
             totals["failed"].append({"path": db_path, "error": error})
-            _record_error(
-                con, db_path, error,
-                f"{table} id={native_id} columns({id_col},schema_version)")
+            _record_error(con, db_path, error, excerpt)
             return False, [], {}
         changed = False
         jobs = [dict(r) for r in src.execute("SELECT * FROM jobs")]
@@ -181,14 +202,16 @@ def _sync_ledger(con: sqlite3.Connection, db_path: str, totals: dict
                 changed = True
         totals["jobs"] = len(jobs)
         bound: dict[str, str] = {}
+        bound_pairs: set[tuple[str, str]] = set()
         for inv in invocations:
             if _import_invocation(con, db_path, inv, totals):
                 changed = True
             key = _binding_key(con, inv)
             if key is not None:
                 bound[inv["invocation_id"]] = key
+                bound_pairs.add((key, f"router:{inv.get('request_id')}"))
         totals["invocations"] = len(invocations)
-        totals["bindings"] = len(bound)
+        totals["bindings"] = len(bound_pairs)
         for reading in readings:
             if _import_reading(con, reading):
                 changed = True
@@ -201,25 +224,21 @@ def _sync_ledger(con: sqlite3.Connection, db_path: str, totals: dict
 def _check_schema_version(src: sqlite3.Connection) -> tuple | None:
     """Refuse the ledger unless invocations and events are all version 2.
 
-    Returns (error, table, id column, native id) so the quarantine row
-    carries a category plus the row's shape, never row content. The full
-    source column list cannot fit the 200-character excerpt cap, so the
-    shape names the guard-relevant source columns.
+    Returns (fixed category, shape-only excerpt) so the quarantine row
+    carries no ids, versions or other values, only sorted source column
+    names for the offending table.
     """
     for table, id_col in (("invocations", "invocation_id"), ("events", "id")):
-        cols = {r["name"] for r in
-                src.execute(f"PRAGMA table_info({table})").fetchall()}
-        if "schema_version" not in cols:
-            return (f"schema_guard: {table} has no schema_version",
-                    table, id_col, None)
+        info = list(src.execute(f"PRAGMA table_info({table})").fetchall())
+        cols = [r["name"] for r in info]
+        if "schema_version" not in set(cols):
+            return ("unsupported_schema", _shape_from_columns(cols))
         bad = src.execute(
             f"SELECT {id_col}, schema_version FROM {table}"
             f" WHERE schema_version IS NOT {ROUTER_SCHEMA_VERSION}"
             " LIMIT 1").fetchone()
         if bad is not None:
-            return (f"schema_guard: {table} {bad[0]}"
-                    f" schema_version={bad[1]}",
-                    table, id_col, bad[0])
+            return ("unsupported_schema", _shape_from_columns(cols))
     return None
 
 
@@ -243,10 +262,11 @@ def _valid_json_object(con: sqlite3.Connection, db_path: str, inv: dict,
     except (json.JSONDecodeError, ValueError, TypeError):
         obj = None
     if not isinstance(obj, dict):
+        category = ("malformed_usage" if column == "usage_json"
+                    else "malformed_json")
         _record_malformed(
-            con, db_path, f"malformed_{column}",
-            _shape("invocations", ("invocation_id", column),
-                   inv.get("invocation_id")), totals)
+            con, db_path, category,
+            _shape_from_record(inv), totals)
 
 
 def _block_class(block_reason) -> str | None:
@@ -325,9 +345,8 @@ def _import_job(con: sqlite3.Connection, db_path: str, job: dict,
     task = _parse_json_object(job.get("task_json"))
     if job.get("task_json") and task is None:
         _record_malformed(
-            con, db_path, "malformed_task_json",
-            _shape("jobs", ("request_id", "task_json"),
-                   job.get("request_id")), totals)
+            con, db_path, "malformed_json",
+            _shape_from_record(job), totals)
     issue = task.get("issue") if task else None
     goal = task.get("goal") if task else None
     if not isinstance(issue, str):
@@ -386,6 +405,25 @@ def _upsert_task(con: sqlite3.Connection, job: dict, issue,
     return True
 
 
+def _is_router_owned_outcome(row) -> bool:
+    """True only when the row is demonstrably router-created.
+
+    Router rows are unknown with no human fields and repairs that is
+    either NULL or its own router_status evidence. Any candidate,
+    proof_ref, corrections, non-unknown acceptance, or non-router
+    repairs marks a human row that must survive re-import byte-for-byte.
+    """
+    if row["acceptance_state"] != "unknown":
+        return False
+    if (row["candidate"] is not None or row["proof_ref"] is not None
+            or row["corrections"] is not None):
+        return False
+    repairs = row["repairs"]
+    if repairs is not None and not str(repairs).startswith("router_status:"):
+        return False
+    return True
+
+
 def _upsert_outcome(con: sqlite3.Connection, status, task_id: str) -> bool:
     """Every job holds an unknown outcome; human acceptance is never set."""
     evidence = f"router_status:{status}" if status else None
@@ -398,8 +436,9 @@ def _upsert_outcome(con: sqlite3.Connection, status, task_id: str) -> bool:
             " VALUES(?,?,?,?,?,?,?)",
             (task_id, None, None, "unknown", evidence, None, db.now()))
         return True
-    if row["acceptance_state"] != "unknown":
-        # A human-recorded outcome and its fields survive re-import.
+    if not _is_router_owned_outcome(row):
+        # A human-recorded outcome, including unknown with human
+        # fields, survives re-import byte-for-byte untouched.
         return False
     if row["repairs"] == evidence:
         return False
@@ -524,10 +563,20 @@ def _binding_key(con: sqlite3.Connection, inv: dict) -> str | None:
         return None
     task_id = f"router:{inv.get('request_id')}"
     evidence = f"router:{inv.get('request_id')}:{inv.get('invocation_id')}"
-    con.execute(
-        "INSERT OR IGNORE INTO session_assignments(session_key, task_id,"
-        " evidence, created_at) VALUES(?,?,?,?)",
-        (key, task_id, evidence, db.now()))
+    row = con.execute(
+        "SELECT evidence FROM session_assignments"
+        " WHERE session_key=? AND task_id=?",
+        (key, task_id)).fetchone()
+    if row is None:
+        con.execute(
+            "INSERT INTO session_assignments(session_key, task_id,"
+            " evidence, created_at) VALUES(?,?,?,?)",
+            (key, task_id, evidence, db.now()))
+    elif row["evidence"] != evidence:
+        con.execute(
+            "UPDATE session_assignments SET evidence=?"
+            " WHERE session_key=? AND task_id=?",
+            (evidence, key, task_id))
     return key
 
 
@@ -553,15 +602,22 @@ def _sync_rollouts(con: sqlite3.Connection, rollout_root: str, totals: dict,
     for pattern in patterns:
         paths.update(glob.glob(pattern, recursive=True))
     changed = False
+    seen: set[str] = set()
     for path in sorted(paths):
         try:
-            stats = _codex.import_codex_file(con, path, full=full)
+            canonical = os.path.realpath(path)
+        except OSError:
+            canonical = path
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        try:
+            stats = _codex.import_codex_file(con, canonical, full=full)
         except (OSError, sqlite3.DatabaseError, UnicodeDecodeError,
                 ValueError):
             totals["failed"].append(
-                {"path": path, "error": "rollout_import_failed"})
-            _record_error(con, path, "rollout_import_failed",
-                          f"codex rollout file {os.path.basename(path)}")
+                {"path": canonical, "error": "source_unreadable"})
+            _record_error(con, canonical, "source_unreadable", "")
             continue
         totals["rollouts"] += 1
         totals["responses_inserted"] += stats.get("responses_inserted", 0)
@@ -613,7 +669,15 @@ def _router_total(usage_text, session_key: str):
 def _reconcile_usage(con: sqlite3.Connection, db_path: str,
                      invocations: list[dict], bound: dict[str, str],
                      totals: dict) -> None:
-    """Record a usage_mismatch when the router total differs from native."""
+    """Record a usage_conflict when aggregate router differs from native.
+
+    Router totals are summed per session_key across all bound invocations,
+    then compared once with the summed native response total for that
+    session. One invocation is never compared against a whole shared
+    session, so Codex resumes sharing a session raise no false mismatch.
+    """
+    router_sums: dict[str, float] = {}
+    session_shapes: dict[str, set] = {}
     for inv in invocations:
         invocation_id = inv.get("invocation_id")
         session_key = bound.get(invocation_id)
@@ -623,11 +687,16 @@ def _reconcile_usage(con: sqlite3.Connection, db_path: str,
         if not (session_key.startswith("codex:")
                 or session_key.startswith("opencode:")):
             continue
-        if not con.execute("SELECT 1 FROM sessions WHERE session_key=?",
-                           (session_key,)).fetchone():
-            continue
         router_total = _router_total(usage_text, session_key)
         if router_total is None:
+            continue
+        router_sums[session_key] = router_sums.get(session_key, 0) + router_total
+        shape = session_shapes.setdefault(session_key, set())
+        if isinstance(inv, dict):
+            shape.update(str(k) for k in inv.keys())
+    for session_key, router_sum in router_sums.items():
+        if not con.execute("SELECT 1 FROM sessions WHERE session_key=?",
+                           (session_key,)).fetchone():
             continue
         row = con.execute(
             "SELECT SUM(total_tokens) AS total FROM responses"
@@ -635,10 +704,7 @@ def _reconcile_usage(con: sqlite3.Connection, db_path: str,
         native_total = row["total"] if row else None
         if native_total is None:
             continue
-        if router_total != native_total:
+        if router_sum != native_total:
+            excerpt = ",".join(sorted(session_shapes.get(session_key, ())))[:200]
             _record_malformed(
-                con, db_path,
-                f"usage_mismatch: router={router_total}"
-                f" native={native_total} session={session_key}",
-                _shape("invocations", ("invocation_id", "usage_json"),
-                       invocation_id), totals)
+                con, db_path, "usage_conflict", excerpt, totals)
