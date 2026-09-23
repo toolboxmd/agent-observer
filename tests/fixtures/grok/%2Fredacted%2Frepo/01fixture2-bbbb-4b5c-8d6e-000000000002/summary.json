@@ -1,0 +1,13 @@
+{
+  "info": {
+    "id": "01fixture2-bbbb-4b5c-8d6e-000000000002",
+    "cwd": "/redacted/repo"
+  },
+  "created_at": "2026-09-01T11:00:00Z",
+  "last_active_at": "2026-09-01T11:05:00Z",
+  "current_model_id": "grok-4.6",
+  "reasoning_effort": "medium",
+  "git_root_dir": "/redacted/repo",
+  "head_branch": "main",
+  "session_kind": "subagent"
+}
