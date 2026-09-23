@@ -1,0 +1,30 @@
+{
+  "$schema": "https://raw.githubusercontent.com/toolboxmd/marketplace/v0.3.0/schemas/project-record-v1.schema.json",
+  "id": "agent-observer",
+  "kind": "agent-module",
+  "outcome": "Make routine agent work on this Mac measurable across Codex, Claude Code, OpenCode and Grok Build, so routing and workflow decisions use reproducible evidence from real tasks.",
+  "factSources": {
+    "version": "VERSION",
+    "delivery": {
+      "codex": ".codex-plugin/plugin.json",
+      "claude-code": ".claude-plugin/plugin.json",
+      "grok-build": ".grok-plugin/plugin.json"
+    },
+    "skills": [
+      "skills/agent-observer/SKILL.md"
+    ],
+    "documentation": [
+      "README.md",
+      "docs/contracts.md"
+    ],
+    "requirements": [
+      "README.md"
+    ],
+    "proof": [
+      "tests/test_cli.py",
+      "tests/test_claude.py",
+      "tests/test_analysis.py",
+      "tests/test_import.py"
+    ]
+  }
+}
