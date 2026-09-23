@@ -1551,3 +1551,396 @@ class GrokAdapterTest(LedgerCase):
                 self.assertNotIn(sentinel, val,
                                  f"{table}.{col} leaks pattern/url value")
         con.close()
+
+    # --- Review repair regression coverage (2026-09-23 findings) ---
+
+    def _write_session(self, root_group, sid, summary, updates, events=None,
+                       chat=None):
+        sdir = os.path.join(root_group, sid)
+        os.makedirs(sdir, exist_ok=True)
+        with open(os.path.join(sdir, "summary.json"), "w") as fh:
+            fh.write(json.dumps(summary))
+        with open(os.path.join(sdir, "updates.jsonl"), "w") as fh:
+            for obj in updates:
+                fh.write(json.dumps(obj) + "\n")
+        with open(os.path.join(sdir, "events.jsonl"), "w") as fh:
+            for obj in (events or []):
+                fh.write(json.dumps(obj) + "\n")
+        if chat is not None:
+            with open(os.path.join(sdir, "chat_history.jsonl"), "w") as fh:
+                for obj in chat:
+                    fh.write(json.dumps(obj) + "\n")
+        return sdir
+
+    def test_child_detected_only_by_session_relationship(self):
+        # P1: a child proven solely by turn_started
+        # session_relationship='subagent' is synthetic with an empty excerpt,
+        # even with valid chat history and no summary kind or parent link.
+        tmp = os.path.join(self.tmp.name, "relchild")
+        group = os.path.join(tmp, "%2Frelgroup")
+        sid = "03relchild-cccc-4b5c-8d6e-000000000003"
+        text = "Human leading relationship text"
+        sdir = self._write_session(
+            group, sid,
+            {"info": {"id": sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-01T12:00:00Z",
+             "current_model_id": "grok-4.6",
+             "reasoning_effort": "medium"},
+            [{"timestamp": 1788804000, "method": "session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text", "text": text},
+                                    "_meta": {"modelId": "grok-4.6",
+                                              "promptIndex": 0}},
+                         "_meta": {"eventId": "rel-1", "promptId": "p-r1"}}},
+             {"timestamp": 1788804001, "method": "_x.ai/session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-r1",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 5,
+                                              "outputTokens": 1,
+                                              "totalTokens": 6}},
+                         "_meta": {"eventId": "rel-2"}}}],
+            [{"ts": "2026-09-01T12:00:01Z", "type": "turn_started",
+              "session_id": sid, "turn_number": 0, "model_id": "grok-4.6",
+              "session_relationship": "subagent"},
+             {"ts": "2026-09-01T12:00:02Z", "type": "turn_ended",
+              "outcome": "completed"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": text}],
+              "prompt_index": 0}])
+        con = self._isolated_con("relchild")
+        grok.sync(con, root=tmp)
+        key = f"grok:{sid}"
+        row = con.execute(
+            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            " WHERE session_key=?", (key,)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["kind"], "synthetic")
+        self.assertEqual(row["is_genuine"], 0)
+        self.assertEqual(row["text_excerpt"], "")
+        sess = con.execute(
+            "SELECT role FROM sessions WHERE session_key=?",
+            (key,)).fetchone()
+        self.assertEqual(sess["role"], "subagent")
+        for table, col, val in self._all_text_values(con):
+            self.assertNotIn("Human leading relationship text", val,
+                             f"{table}.{col} leaks child prompt text")
+        # Idempotent: a second sync writes nothing new.
+        again = grok.sync(con, root=tmp)
+        self.assertEqual(again["responses_inserted"], 0)
+        self.assertEqual(again["submissions_inserted"], 0)
+        con.close()
+
+    def test_child_import_order_parent_link_reclassifies(self):
+        # P1: the child is imported before its parent exists on disk. The
+        # parent's later subagent_spawned dispatch reclassifies the child's
+        # existing rows in place, and a later child re-sync converges via
+        # the persisted parent link without duplicates.
+        tmp = os.path.join(self.tmp.name, "orderchild")
+        group = os.path.join(tmp, "%2Fordergroup")
+        os.makedirs(group, exist_ok=True)
+        child_sid = "04orderchild-cccc-4b5c-8d6e-000000000004"
+        parent_sid = "04orderparent-aaaa-4b5c-8d6e-000000000005"
+        child_text = "Human leading order child text"
+        child_dir = self._write_session(
+            group, child_sid,
+            {"info": {"id": child_sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-01T13:00:00Z",
+             "current_model_id": "grok-4.6"},
+            [{"timestamp": 1788805000, "method": "session/update",
+              "params": {"sessionId": child_sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text",
+                                                "text": child_text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "ord-c-1",
+                                   "promptId": "p-o1"}}},
+             {"timestamp": 1788805001, "method": "_x.ai/session/update",
+              "params": {"sessionId": child_sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-o1",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 5,
+                                              "outputTokens": 1,
+                                              "totalTokens": 6}},
+                         "_meta": {"eventId": "ord-c-2"}}}],
+            [{"ts": "2026-09-01T13:00:01Z", "type": "turn_started",
+              "session_id": child_sid, "turn_number": 0,
+              "model_id": "grok-4.6",
+              "session_relationship": "primary"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": child_text}],
+              "prompt_index": 0}])
+        con = self._isolated_con("orderchild")
+        grok.import_grok_session(con, child_dir)
+        child_key = f"grok:{child_sid}"
+        first = con.execute(
+            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            " WHERE session_key=?", (child_key,)).fetchone()
+        # No child evidence yet: a genuine main-session prompt is kept.
+        # The fixture text has no tag-like marker, so the excerpt is the
+        # human text itself under privacy.py rule 1.
+        self.assertEqual(first["kind"], "genuine")
+        self.assertEqual(first["is_genuine"], 1)
+        self.assertEqual(first["text_excerpt"], child_text)
+        # The parent arrives later with a spawn record naming the child.
+        parent_dir = self._write_session(
+            group, parent_sid,
+            {"info": {"id": parent_sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-01T13:05:00Z",
+             "current_model_id": "grok-4.6"},
+            [{"timestamp": 1788805100, "method": "_x.ai/session/update",
+              "params": {"sessionId": parent_sid,
+                         "update": {"sessionUpdate": "subagent_spawned",
+                                    "subagent_id": child_sid,
+                                    "parent_session_id": parent_sid,
+                                    "parent_prompt_id": "p-x",
+                                    "child_session_id": child_sid},
+                         "_meta": {"eventId": "ord-p-1"}}}],
+            [],
+            None)
+        grok.import_grok_session(con, parent_dir)
+        sess = con.execute(
+            "SELECT parent_session_key FROM sessions WHERE session_key=?",
+            (child_key,)).fetchone()
+        self.assertEqual(sess["parent_session_key"], f"grok:{parent_sid}")
+        fixed = con.execute(
+            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            " WHERE session_key=?", (child_key,)).fetchone()
+        self.assertEqual(fixed["kind"], "synthetic")
+        self.assertEqual(fixed["is_genuine"], 0)
+        self.assertEqual(fixed["text_excerpt"], "")
+        self.assertEqual(
+            con.execute("SELECT COUNT(*) n FROM submissions"
+                        " WHERE session_key=?", (child_key,)).fetchone()["n"],
+            1)
+        # A later child re-sync with no new bytes stays synthetic via the
+        # persisted parent link, without duplicates or leaks.
+        grok.import_grok_session(con, child_dir)
+        again = con.execute(
+            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            " WHERE session_key=?", (child_key,)).fetchone()
+        self.assertEqual(again["kind"], "synthetic")
+        self.assertEqual(again["is_genuine"], 0)
+        self.assertEqual(again["text_excerpt"], "")
+        for table, col, val in self._all_text_values(con):
+            self.assertNotIn("Human leading order child text", val,
+                             f"{table}.{col} leaks child prompt text")
+        con.close()
+
+    def test_late_model_evidence_updates_response_in_place(self):
+        # P2: summary model/effort arriving after the first sync updates the
+        # existing response row in place, without duplicates, even when no
+        # JSONL bytes changed.
+        tmp = os.path.join(self.tmp.name, "latemodel")
+        group = os.path.join(tmp, "%2Flatemodel")
+        sid = "05latemodel-cccc-4b5c-8d6e-000000000006"
+        text = "Late model probe"
+        sdir = self._write_session(
+            group, sid,
+            {"info": {"id": sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-01T14:00:00Z",
+             "current_model_id": "grok-4.6",
+             "reasoning_effort": "medium"},
+            [{"timestamp": 1788806000, "method": "session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text", "text": text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "lm-1", "promptId": "p-lm1"}}},
+             {"timestamp": 1788806001, "method": "_x.ai/session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-lm1",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 10,
+                                              "outputTokens": 2,
+                                              "totalTokens": 12}},
+                         "_meta": {"eventId": "lm-2"}}}],
+            [{"ts": "2026-09-01T14:00:01Z", "type": "turn_ended",
+              "outcome": "completed"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": text}],
+              "prompt_index": 0}])
+        con = self._isolated_con("latemodel")
+        grok.sync(con, root=tmp)
+        key = f"grok:{sid}"
+        first = con.execute(
+            "SELECT model, effort, input_tokens, total_tokens FROM responses"
+            " WHERE response_id=?", (f"{key}:p-lm1",)).fetchone()
+        self.assertEqual(first["model"], "grok-4.6")
+        self.assertEqual(first["effort"], "medium")
+        self.assertEqual((first["input_tokens"], first["total_tokens"]),
+                         (10, 12))
+        # Late summary evidence changes model and effort with no JSONL
+        # growth. Full re-read is not required; the re-sync reconciles.
+        with open(os.path.join(sdir, "summary.json")) as fh:
+            summary = json.load(fh)
+        summary["current_model_id"] = "grok-4.7"
+        summary["reasoning_effort"] = "high"
+        with open(os.path.join(sdir, "summary.json"), "w") as fh:
+            fh.write(json.dumps(summary))
+        second = grok.sync(con, root=tmp)
+        self.assertEqual(second["responses_inserted"], 0)
+        rows = list(con.execute(
+            "SELECT model, effort, input_tokens, total_tokens FROM responses"
+            " WHERE session_key=?", (key,)))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["model"], "grok-4.7")
+        self.assertEqual(rows[0]["effort"], "high")
+        self.assertEqual((rows[0]["input_tokens"], rows[0]["total_tokens"]),
+                         (10, 12))
+        # A missing new value never clears a known one: removing effort
+        # from summary keeps the last valid effort.
+        del summary["reasoning_effort"]
+        with open(os.path.join(sdir, "summary.json"), "w") as fh:
+            fh.write(json.dumps(summary))
+        # Chat still lacks effort, so no valid new effort arrives.
+        grok.sync(con, root=tmp)
+        kept = con.execute(
+            "SELECT model, effort FROM responses WHERE response_id=?",
+            (f"{key}:p-lm1",)).fetchone()
+        self.assertEqual(kept["model"], "grok-4.7")
+        con.close()
+
+    def test_malformed_present_usage_quarantined(self):
+        # P2: present malformed usage (wrong types, booleans, non-dict
+        # shapes) is quarantined under malformed_usage with no partial row,
+        # while missing/null/empty usage stays absent (NULL, no error) and
+        # later valid records still import.
+        tmp = os.path.join(self.tmp.name, "badusage")
+        group = os.path.join(tmp, "%2Fbadusage")
+        sid = "06badusage-cccc-4b5c-8d6e-000000000007"
+        sdir = os.path.join(group, sid)
+        os.makedirs(sdir)
+        with open(os.path.join(sdir, "summary.json"), "w") as fh:
+            fh.write(json.dumps({
+                "info": {"id": sid, "cwd": "/redacted/repo"},
+                "created_at": "2026-09-01T15:00:00Z",
+                "current_model_id": "grok-4.6"}))
+        with open(os.path.join(sdir, "events.jsonl"), "w") as fh:
+            pass
+        with open(os.path.join(sdir, "chat_history.jsonl"), "w") as fh:
+            for idx in range(6):
+                fh.write(json.dumps({
+                    "type": "user",
+                    "content": [{"type": "text",
+                                 "text": f"probe {idx}"}],
+                    "prompt_index": idx}) + "\n")
+        completions = [
+            ("p-good1", {"inputTokens": 10, "outputTokens": 2,
+                         "totalTokens": 12}),
+            ("p-bad-str", {"inputTokens": "10", "outputTokens": 2,
+                           "totalTokens": 12}),
+            ("p-bad-bool", {"inputTokens": True, "outputTokens": 2,
+                            "totalTokens": 12}),
+            ("p-bad-shape", ["not", "a", "dict"]),
+            ("p-absent-null", None),
+            ("p-absent-empty", {}),
+        ]
+        with open(os.path.join(sdir, "updates.jsonl"), "w") as fh:
+            for idx, (pid, usage) in enumerate(completions):
+                fh.write(json.dumps({
+                    "timestamp": 1788807000 + idx,
+                    "method": "session/update",
+                    "params": {"sessionId": sid,
+                               "update": {"sessionUpdate":
+                                          "user_message_chunk",
+                                          "content": {"type": "text",
+                                                      "text": f"probe {idx}"},
+                                          "_meta": {"promptIndex": idx}},
+                               "_meta": {"eventId": f"bu-{idx}",
+                                         "promptId": pid}}}) + "\n")
+            for idx, (pid, usage) in enumerate(completions):
+                update = {"sessionUpdate": "turn_completed",
+                          "prompt_id": pid, "stop_reason": "end_turn"}
+                if usage is not None:
+                    update["usage"] = usage
+                # p-absent-null carries an explicit null usage value.
+                if pid == "p-absent-null":
+                    update["usage"] = None
+                fh.write(json.dumps({
+                    "timestamp": 1788807100 + idx,
+                    "method": "_x.ai/session/update",
+                    "params": {"sessionId": sid, "update": update,
+                               "_meta": {"eventId": f"bu-c-{idx}"}}}) + "\n")
+        con = self._isolated_con("badusage")
+        grok.sync(con, root=tmp)
+        key = f"grok:{sid}"
+        ids = sorted(
+            r["response_id"] for r in con.execute(
+                "SELECT response_id FROM responses WHERE session_key=?",
+                (key,)))
+        self.assertEqual(ids, sorted([
+            f"{key}:p-good1", f"{key}:p-absent-null",
+            f"{key}:p-absent-empty"]))
+        # Absent usages keep NULL counters without an error.
+        for pid in ("p-absent-null", "p-absent-empty"):
+            row = con.execute(
+                "SELECT input_tokens, total_tokens FROM responses"
+                " WHERE response_id=?", (f"{key}:{pid}",)).fetchone()
+            self.assertIsNone(row["input_tokens"])
+            self.assertIsNone(row["total_tokens"])
+        good = con.execute(
+            "SELECT input_tokens, output_tokens, total_tokens FROM responses"
+            " WHERE response_id=?", (f"{key}:p-good1",)).fetchone()
+        self.assertEqual((good["input_tokens"], good["output_tokens"],
+                          good["total_tokens"]), (10, 2, 12))
+        errors = list(con.execute(
+            "SELECT error, line_excerpt FROM import_errors"
+            " WHERE error='malformed_usage'"))
+        self.assertEqual(len(errors), 3)
+        allowed = set(privacy.ERROR_CATEGORIES) | {privacy.ERROR_FALLBACK}
+        for row in errors:
+            self.assertIn(row["error"], allowed)
+            self.assertEqual(row["error"], "malformed_usage")
+            self.assertEqual(row["line_excerpt"], "method,params,timestamp")
+            self.assertNotIn("p-bad", row["line_excerpt"] or "")
+            self.assertNotIn("10", row["line_excerpt"] or "")
+        # No record values, exception text or class names in errors: only
+        # the fixed category and key-only excerpts. Native prompt ids may
+        # still appear as submission turn_id identifiers (allowed ledger
+        # keys), but never inside import_errors.
+        for row in errors:
+            self.assertNotIn("p-bad", row["line_excerpt"] or "")
+            self.assertNotIn("p-bad", row["error"] or "")
+            self.assertNotIn("ValueError", row["error"] or "")
+            self.assertNotIn("_AdapterError", row["error"] or "")
+            self.assertNotIn("malformed_usage ", row["error"] or "")
+        # A later valid record for a new prompt still imports; replay does
+        # not duplicate the quarantine.
+        with open(os.path.join(sdir, "updates.jsonl"), "a") as fh:
+            fh.write(json.dumps({
+                "timestamp": 1788807200, "method": "session/update",
+                "params": {"sessionId": sid,
+                           "update": {"sessionUpdate": "user_message_chunk",
+                                      "content": {"type": "text",
+                                                  "text": "probe 6"},
+                                      "_meta": {"promptIndex": 6}},
+                           "_meta": {"eventId": "bu-6",
+                                     "promptId": "p-good2"}}}) + "\n")
+            fh.write(json.dumps({
+                "timestamp": 1788807201, "method": "_x.ai/session/update",
+                "params": {"sessionId": sid,
+                           "update": {"sessionUpdate": "turn_completed",
+                                      "prompt_id": "p-good2",
+                                      "stop_reason": "end_turn",
+                                      "usage": {"inputTokens": 7,
+                                                "outputTokens": 1,
+                                                "totalTokens": 8}},
+                           "_meta": {"eventId": "bu-c-6"}}}) + "\n")
+        with open(os.path.join(sdir, "chat_history.jsonl"), "a") as fh:
+            fh.write(json.dumps({
+                "type": "user",
+                "content": [{"type": "text", "text": "probe 6"}],
+                "prompt_index": 6}) + "\n")
+        second = grok.sync(con, root=tmp)
+        self.assertEqual(second["responses_inserted"], 1)
+        self.assertIsNotNone(con.execute(
+            "SELECT 1 FROM responses WHERE response_id=?",
+            (f"{key}:p-good2",)).fetchone())
+        self.assertEqual(len(list(con.execute(
+            "SELECT 1 FROM import_errors WHERE error='malformed_usage'"))), 3)
+        con.close()

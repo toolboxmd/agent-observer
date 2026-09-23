@@ -346,14 +346,315 @@ class _Reader:
 
     @property
     def is_main_session(self) -> bool:
-        """False for subagent and child sessions, from kind or parent link.
+        """False for subagent and child sessions, from every available signal.
 
-        summary.json session_kind marks spawned subagents; the parent link
-        covers a child named by a subagent_spawned record. Either signal
-        forces submissions non-genuine with an empty excerpt.
+        summary.json session_kind, a persisted sessions.parent_session_key,
+        a parent subagent_spawned dispatch (even when the child was imported
+        first) and events.jsonl turn_started with
+        session_relationship='subagent' all prove a child. Any signal forces
+        submissions non-genuine with an empty excerpt via privacy.py rule 1.
         """
         return self.meta.get("role") != "subagent" \
             and self.parent_key is None
+
+
+_GROK_USAGE_MAP = (
+    ("input_tokens", "inputTokens"),
+    ("cached_input_tokens", "cachedReadTokens"),
+    ("cache_write_input_tokens", "cacheCreationTokens"),
+    ("output_tokens", "outputTokens"),
+    ("reasoning_output_tokens", "reasoningTokens"),
+    ("total_tokens", "totalTokens"),
+)
+
+
+def _validated_usage_counters(update: dict) -> dict:
+    """Validated counter dict for a turn_completed update, or raise.
+
+    Codex-style absent versus malformed distinction, Grok-specific keys:
+    missing usage, null usage and an empty usage object are absent usage
+    and yield all-NULL counters without an error. A present malformed shape
+    (non-dict) or a malformed present counter (wrong type, including
+    booleans) raises _AdapterError('malformed_usage') before any SQL, so
+    the caller quarantines the completion and creates no partial row.
+    Unknown keys such as modelUsage or modelCalls are ignored; a None
+    counter value stays NULL.
+    """
+    if "usage" not in update:
+        return {key: None for key, _ in _GROK_USAGE_MAP}
+    raw = update.get("usage")
+    if raw is None:
+        return {key: None for key, _ in _GROK_USAGE_MAP}
+    if not isinstance(raw, dict):
+        raise _AdapterError("malformed_usage")
+    if not raw:
+        return {key: None for key, _ in _GROK_USAGE_MAP}
+    for _, native in _GROK_USAGE_MAP:
+        if native in raw:
+            value = raw[native]
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise _AdapterError("malformed_usage")
+    return {key: (raw.get(native) if isinstance(raw.get(native), int)
+                  and not isinstance(raw.get(native), bool) else None)
+            for key, native in _GROK_USAGE_MAP}
+
+
+def _has_any_counter(counters: dict | None) -> bool:
+    return bool(counters) and any(v is not None for v in counters.values())
+
+
+def _scan_updates_file_for_parent(updates_path: str,
+                                  native_sid: str) -> str | None:
+    """Parent session key from subagent_spawned records naming native_sid."""
+    if not updates_path or not os.path.isfile(updates_path):
+        return None
+    try:
+        lines = list(_complete_lines(updates_path))
+    except OSError:
+        return None
+    for _, raw in lines:
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("method") not in METHODS:
+            continue
+        params = obj.get("params") if isinstance(obj.get("params"), dict) \
+            else {}
+        update = params.get("update") if isinstance(params, dict) else {}
+        if not isinstance(update, dict):
+            continue
+        if update.get("sessionUpdate") != "subagent_spawned":
+            continue
+        parent = update.get("parent_session_id")
+        child = update.get("child_session_id") or update.get("subagent_id")
+        if not isinstance(parent, str) or _safe_token(parent) is None:
+            continue
+        if not isinstance(child, str) or _safe_token(child) is None:
+            continue
+        if child == native_sid:
+            return f"{HARNESS}:{parent}"
+    return None
+
+
+def _has_subagent_relationship(session_dir: str) -> bool:
+    """Whether events.jsonl proves this session is a subagent.
+
+    Any complete turn_started line with session_relationship exactly
+    'subagent' marks the session as a child, regardless of summary or
+    parent-link evidence. Other relationship values prove nothing.
+    """
+    events_path = os.path.join(session_dir, "events.jsonl")
+    if not os.path.isfile(events_path):
+        return False
+    try:
+        lines = list(_complete_lines(events_path))
+    except OSError:
+        return False
+    for _, raw in lines:
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") != "turn_started":
+            continue
+        if obj.get("session_relationship") == "subagent":
+            return True
+    return False
+
+
+def _find_parent_via_dispatches(session_dir: str,
+                                native_sid: str) -> str | None:
+    """Parent key from own or any sibling session's spawn records on disk.
+
+    Covers the import-order case: the child may be imported before its
+    parent session, but the parent's updates.jsonl already exists on disk.
+    Only subagent_spawned shapes are read; prompt text is never touched.
+    """
+    own = _scan_updates_file_for_parent(
+        os.path.join(session_dir, "updates.jsonl"), native_sid)
+    if own is not None:
+        return own
+    group_dir = os.path.dirname(os.path.abspath(session_dir.rstrip(os.sep)))
+    root = os.path.dirname(group_dir.rstrip(os.sep))
+    candidates: list[str] = []
+    try:
+        if root and os.path.isdir(root):
+            for sess_dir in discover(root):
+                if os.path.abspath(sess_dir) == os.path.abspath(session_dir):
+                    continue
+                candidates.append(sess_dir)
+        elif os.path.isdir(group_dir):
+            for child in sorted(os.listdir(group_dir)):
+                path = os.path.join(group_dir, child)
+                if os.path.abspath(path) == os.path.abspath(session_dir):
+                    continue
+                if os.path.isdir(path) and _looks_like_session(path):
+                    candidates.append(path)
+    except OSError:
+        return None
+    for sess_dir in candidates:
+        found = _scan_updates_file_for_parent(
+            os.path.join(sess_dir, "updates.jsonl"), native_sid)
+        if found is not None:
+            return found
+    return None
+
+
+def _precompute_child_status(con: sqlite3.Connection, r: _Reader,
+                             session_dir: str) -> None:
+    """Set parent link and subagent role before any replay.
+
+    Order: summary role (already in r.meta), persisted
+    sessions.parent_session_key/role, parent subagent_spawned dispatches on
+    disk (own file first, then siblings for import-order), and
+    events.jsonl turn_started session_relationship='subagent'. A proven
+    child is non-genuine with an empty excerpt via privacy.py rule 1.
+    """
+    try:
+        row = con.execute(
+            "SELECT parent_session_key, role FROM sessions WHERE session_key=?",
+            (r.session_key,)).fetchone()
+    except sqlite3.DatabaseError:
+        row = None
+    if row is not None:
+        try:
+            persisted_parent = row["parent_session_key"]
+        except (KeyError, TypeError, IndexError):
+            persisted_parent = None
+        try:
+            persisted_role = row["role"]
+        except (KeyError, TypeError, IndexError):
+            persisted_role = None
+        if persisted_parent and r.parent_key is None:
+            r.parent_key = persisted_parent
+        if persisted_role == "subagent" and r.meta.get("role") != "subagent":
+            r.meta["role"] = "subagent"
+    if r.parent_key is None and r.meta.get("role") != "subagent":
+        found = _find_parent_via_dispatches(session_dir, r.native_sid)
+        if found is not None:
+            r.parent_key = found
+    elif r.parent_key is None:
+        # Already proven via summary/persisted role, but a parent link may
+        # still exist on disk; record it for the session row.
+        found = _find_parent_via_dispatches(session_dir, r.native_sid)
+        if found is not None:
+            r.parent_key = found
+    if r.meta.get("role") != "subagent":
+        if _has_subagent_relationship(session_dir):
+            r.meta["role"] = "subagent"
+
+
+def _force_child_synthetic(con: sqlite3.Connection, stats: dict | None,
+                           child_key: str) -> int:
+    """Force existing submissions of a proven child to synthetic/empty.
+
+    Uses the shared privacy rule (empty excerpt for non-genuine) and never
+    touches free text: only kind, is_genuine and text_excerpt change, in
+    place, without duplicates. Returns rows changed.
+    """
+    empty = privacy.submission_excerpt("x", is_genuine=False,
+                                       is_main_session=False)
+    assert empty == ""
+    try:
+        cur = con.execute(
+            "UPDATE submissions SET kind='synthetic', is_genuine=0,"
+            " text_excerpt='' WHERE session_key=? AND (kind!='synthetic'"
+            " OR is_genuine!=0 OR text_excerpt!='')",
+            (child_key,))
+    except sqlite3.DatabaseError:
+        return 0
+    changed = cur.rowcount or 0
+    if changed and stats is not None:
+        stats["submissions_updated"] = \
+            stats.get("submissions_updated", 0) + changed
+    return changed
+
+
+def _reconcile_response_metadata(con: sqlite3.Connection, r: _Reader,
+                                 session_dir: str, model_fallback,
+                                 effort_combined) -> int:
+    """Update stale or NULL model/effort on existing responses in place.
+
+    Recomputes validated model and effort with the existing precedence
+    (turn_started stream, usage modelUsage, summary fallback, chunk model;
+    summary effort else chat effort) from current summary/events files.
+    Only a new valid value differing from the stored one updates the row;
+    a missing new value never clears a known one. Never inserts or
+    duplicates rows; counters and usage_conflict behavior are untouched.
+    Returns rows changed.
+    """
+    updates_path = os.path.join(session_dir, "updates.jsonl")
+    if not os.path.isfile(updates_path):
+        return 0
+    prompts, order, completions_ordered = _collect_prompts(
+        updates_path, record_error=None)
+    pid_to_model: dict = {}
+    for key in order:
+        pid = prompts[key].get("prompt_id")
+        if pid and pid not in pid_to_model and prompts[key].get("model"):
+            pid_to_model[pid] = prompts[key]["model"]
+    turn_models = _turn_models(os.path.join(session_dir, "events.jsonl"))
+    safe_turns = [(t, m) for t, m in turn_models
+                  if isinstance(m, str) and _safe_token(m) is not None]
+    first_per_pid: dict = {}
+    for _ordinal, update, ts, _obj, _method, _raw in completions_ordered:
+        raw_pid = update.get("prompt_id") or update.get("promptId")
+        pid = raw_pid if isinstance(raw_pid, str) \
+            and _safe_token(raw_pid) is not None else None
+        if pid is None:
+            continue
+        if pid not in first_per_pid:
+            first_per_pid[pid] = (update, ts)
+    valid_effort = _valid_model(effort_combined)
+    changed = 0
+    for pid, (update, ts) in first_per_pid.items():
+        response_id = f"{HARNESS}:{r.native_sid}:{pid}"
+        try:
+            existing = con.execute(
+                "SELECT model, effort FROM responses WHERE response_id=?",
+                (response_id,)).fetchone()
+        except sqlite3.DatabaseError:
+            continue
+        if existing is None:
+            continue
+        chunk_model = _valid_model(pid_to_model.get(pid))
+        usage_model = _valid_model(_usage_model(update))
+        summary_model = _valid_model(model_fallback)
+        new_model = _model_at(ts, safe_turns, usage_model, summary_model,
+                              chunk_model)
+        sets: list[str] = []
+        args: list = []
+        try:
+            old_model = existing["model"]
+        except (KeyError, TypeError, IndexError):
+            old_model = None
+        try:
+            old_effort = existing["effort"]
+        except (KeyError, TypeError, IndexError):
+            old_effort = None
+        if new_model is not None and old_model != new_model:
+            sets.append("model=?")
+            args.append(new_model)
+        if valid_effort is not None and old_effort != valid_effort:
+            sets.append("effort=?")
+            args.append(valid_effort)
+        if sets:
+            args.append(response_id)
+            try:
+                con.execute(
+                    f"UPDATE responses SET {', '.join(sets)}"
+                    " WHERE response_id=?", args)
+            except sqlite3.DatabaseError:
+                continue
+            changed += 1
+    return changed
 
 
 def import_grok_session(con: sqlite3.Connection, session_dir: str,
@@ -399,6 +700,11 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         if ts is not None:
             r.note_ts(ts)
 
+    # Child status is available before any replay: summary role is already
+    # in r.meta; persisted links, parent dispatches (import-order) and the
+    # turn_started subagent relationship complete it here.
+    _precompute_child_status(con, r, session_dir)
+
     updates_src = (JsonlSource(con, HARNESS, updates_path, full=full)
                    if os.path.isfile(updates_path) else None)
     events_src = (JsonlSource(con, HARNESS, events_path, full=full)
@@ -412,6 +718,9 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     chat = _read_chat(session_dir, r)
     if known and not updates_new and not events_new:
         reclassified = _reclassify_existing(con, r, session_dir, chat)
+        reconciled = _reconcile_response_metadata(
+            con, r, session_dir, model_fallback,
+            effort or chat.get("effort"))
         # Persist late identity even when no JSONL bytes changed.
         late_fields = {"started_at": r.first_ts, "ended_at": r.last_ts,
                        **r.meta, **r.identity.fields(con)}
@@ -423,7 +732,10 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             else (events_src.source_id if events_src is not None else None),
             **late_fields)
         con.commit()
-        stats["unchanged"] = not bool(reclassified)
+        stats["unchanged"] = not bool(reclassified or reconciled)
+        if reconciled:
+            stats["responses_updated"] = \
+                stats.get("responses_updated", 0) + reconciled
         stats["session_key"] = r.session_key
         return stats
 
@@ -464,13 +776,25 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                     events_src, stats, ordinal, "schema_error", line)
     # Late chat metadata reclassifies provisional submissions even when only
     # events.jsonl grew and updates.jsonl did not. Runs silently (no duplicate
-    # import_errors) and never duplicates rows. A parent link discovered
-    # while ingesting this sync's own updates also reclassifies: the replay
-    # above ran before the link existed, so those rows were computed as a
-    # main session and must be corrected to non-genuine in place.
+    # import_errors) and never duplicates rows. Child status was already
+    # precomputed before replay, so a parent link in this sync's own bytes
+    # wrote synthetic rows directly; this corrects rows from earlier syncs
+    # when late summary, persisted-link, dispatch or relationship evidence
+    # arrives.
     if known or (r.parent_key is not None
                  and r.parent_key != parent_before):
         _reclassify_existing(con, r, session_dir, chat)
+    replayed_updates = updates_src is not None and (updates_new or not known)
+    if not replayed_updates:
+        # Only events (or only summary/chat) changed: turn_started models,
+        # summary model/effort or chat effort may be new. Update existing
+        # response rows in place without duplicates or counter changes.
+        reconciled = _reconcile_response_metadata(
+            con, r, session_dir, model_fallback,
+            effort or chat.get("effort"))
+        if reconciled:
+            stats["responses_updated"] = \
+                stats.get("responses_updated", 0) + reconciled
 
     fields = {"started_at": r.first_ts, "ended_at": r.last_ts, **r.meta,
               **r.identity.fields(con)}
@@ -801,15 +1125,28 @@ def _replay_updates(con, r: _Reader, src: JsonlSource, chat: dict,
             completions_by_id[pid] = (ordinal, update, ts, obj, method)
         else:
             # Duplicate turn_completed: keep first binding but merge late
-            # usage when the first lacked it, so a repeated completion can
-            # fill NULL counters without shifting any prompt binding.
+            # usage when the first lacked valid counters or was malformed,
+            # so a repeated completion can fill NULL counters without
+            # shifting any prompt binding. A malformed first never blocks a
+            # later valid record for the same prompt id.
             _, first_update, _, _, _ = completions_by_id[pid]
-            first_usage = first_update.get("usage")
-            new_usage = update.get("usage")
-            if (not isinstance(first_usage, dict) or not first_usage) \
-                    and isinstance(new_usage, dict) and new_usage:
+            try:
+                first_counters = _validated_usage_counters(first_update)
+                first_has = _has_any_counter(first_counters)
+                first_ok = True
+            except _AdapterError:
+                first_has = False
+                first_ok = False
+            try:
+                new_counters = _validated_usage_counters(update)
+                new_has = _has_any_counter(new_counters)
+                new_ok = True
+            except _AdapterError:
+                new_has = False
+                new_ok = False
+            if (not first_ok or not first_has) and new_ok and new_has:
                 merged = dict(first_update)
-                merged["usage"] = new_usage
+                merged["usage"] = update.get("usage")
                 completions_by_id[pid] = (
                     completions_by_id[pid][0], merged,
                     completions_by_id[pid][2], completions_by_id[pid][3],
@@ -862,8 +1199,15 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
         return
     prompt_id = raw_pid
     response_id = f"{HARNESS}:{r.native_sid}:{prompt_id}"
-    usage = update.get("usage") if isinstance(update.get("usage"), dict) \
-        else {}
+    try:
+        counters = _validated_usage_counters(update)
+    except _AdapterError as exc:
+        # Present malformed usage: quarantine under the fixed category with
+        # only the raw line's top-level key names, never record values or
+        # exception text. No partial response row is created; later valid
+        # records for other (or the same) prompt ids still import.
+        _record_error_once(src, r.stats, ordinal, exc.category, raw_line)
+        return
     usage_model = _valid_model(usage_model)
     summary_model = _valid_model(summary_model)
     chunk_model = _valid_model(chunk_model)
@@ -873,15 +1217,6 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
                   if isinstance(m, str) and _safe_token(m) is not None]
     model = _model_at(ts, safe_turns, usage_model, summary_model,
                       chunk_model)
-    counters = {key: usage.get(native) if isinstance(usage.get(native), int)
-                and not isinstance(usage.get(native), bool)
-                else None for key, native in
-                (("input_tokens", "inputTokens"),
-                 ("cached_input_tokens", "cachedReadTokens"),
-                 ("cache_write_input_tokens", "cacheCreationTokens"),
-                 ("output_tokens", "outputTokens"),
-                 ("reasoning_output_tokens", "reasoningTokens"),
-                 ("total_tokens", "totalTokens"))}
     cur = con.execute(
         "INSERT OR IGNORE INTO responses(response_id, source_id, harness,"
         " session_key, turn_id, session_id, ordinal_num, ts, model, effort,"
@@ -899,8 +1234,8 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
         return
     existing = con.execute(
         "SELECT input_tokens, cached_input_tokens, cache_write_input_tokens,"
-        " output_tokens, reasoning_output_tokens, total_tokens FROM responses"
-        " WHERE response_id=?", (response_id,)).fetchone()
+        " output_tokens, reasoning_output_tokens, total_tokens, model, effort"
+        " FROM responses WHERE response_id=?", (response_id,)).fetchone()
     if existing is None:
         r.stats["responses_duplicate"] += 1
         return
@@ -927,6 +1262,30 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
              fill.get("cache_write_input_tokens"), fill.get("output_tokens"),
              fill.get("reasoning_output_tokens"), fill.get("total_tokens"),
              response_id))
+    # Late model or effort evidence updates the existing row in place with
+    # validated values, without duplicates. A missing new value never
+    # clears a known one; only a new valid differing value writes.
+    meta_sets: list[str] = []
+    meta_args: list = []
+    try:
+        old_model = existing["model"]
+    except (KeyError, TypeError, IndexError):
+        old_model = None
+    try:
+        old_effort = existing["effort"]
+    except (KeyError, TypeError, IndexError):
+        old_effort = None
+    if model is not None and old_model != model:
+        meta_sets.append("model=?")
+        meta_args.append(model)
+    if valid_effort is not None and old_effort != valid_effort:
+        meta_sets.append("effort=?")
+        meta_args.append(valid_effort)
+    if meta_sets:
+        meta_args.append(response_id)
+        con.execute(
+            f"UPDATE responses SET {', '.join(meta_sets)} WHERE response_id=?",
+            meta_args)
     r.stats["responses_duplicate"] += 1
 
 
@@ -1083,13 +1442,19 @@ def _subagent_link(r: _Reader, update: dict) -> None:
     if parent and child:
         # The child row may be imported before or after this record; the
         # parent link survives either order because session fields only fill
-        # unknowns.
+        # unknowns. When the parent arrives after the child, immediately
+        # reclassify the child's existing submissions to synthetic/empty in
+        # place (privacy.py rule 1), so import order never leaves genuine
+        # child rows behind.
         try:
             db.upsert_session(r.con, f"{HARNESS}:{child}", HARNESS,
                               child, None,
                               parent_session_key=f"{HARNESS}:{parent}")
         except (sqlite3.DatabaseError, ValueError):
             pass
+        child_key = f"{HARNESS}:{child}"
+        if child_key != r.session_key:
+            _force_child_synthetic(r.con, r.stats, child_key)
 
 
 def _ingest_event(r: _Reader, src: JsonlSource, obj: dict,
