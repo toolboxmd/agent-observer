@@ -237,3 +237,364 @@ class GrokAdapterTest(LedgerCase):
         conflicts = self.query(
             "SELECT * FROM import_errors WHERE error LIKE 'conflicting usage%'")
         self.assertEqual(len(conflicts), 1)
+        # Strengthened: safe shape only, no raw usage values, bounded.
+        err = conflicts[0]
+        self.assertLessEqual(len(err["line_excerpt"] or ""), 200)
+        self.assertNotIn("1201", err["line_excerpt"] or "")
+        self.assertNotIn("1201", err["error"] or "")
+        self.assertIn("method=", err["line_excerpt"] or "")
+        self.assertIn("update=", err["line_excerpt"] or "")
+        self.assertIn("keys=", err["line_excerpt"] or "")
+
+    # --- Requirement-level privacy and excerpt tests ---
+
+    def _isolated_con(self, name):
+        from agent_observer import db as _db
+        path = os.path.join(self.tmp.name, f"{name}.db")
+        con = _db.connect(path)
+        _db.init_db(con)
+        return con
+
+    def _all_text_values(self, con):
+        tables = [r["name"] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name NOT LIKE 'sqlite_%'")]
+        found = []
+        for table in tables:
+            cols = con.execute(f"PRAGMA table_info({table})").fetchall()
+            text_cols = [c["name"] for c in cols if c["type"] == "TEXT"]
+            for col in text_cols:
+                for row in con.execute(
+                        f'SELECT "{col}" v FROM "{table}" WHERE "{col}"'
+                        " IS NOT NULL"):
+                    found.append((table, col, row["v"] or ""))
+        return found
+
+    def test_privacy_no_injected_or_secret_in_any_text_column(self):
+        from agent_observer import db as _db
+        tmp = os.path.join(self.tmp.name, "privacy")
+        shutil.copytree(ROOT, tmp)
+        # Inject secret-looking and preference text inside injected wrappers
+        # plus a direction block, on a new prompt that must never leak.
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        sdir = os.path.join(tmp, "%2Fredacted%2Frepo", sid)
+        secret_prompt = {
+            "timestamp": 1788800050,
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": "<user_query>\nPrivacy probe human text\n</user_query>\n"
+                                "<user_rule>INSTALLED BODY SECRET-TOKEN-abc123"
+                                " sk-fake-secret-12345</user_rule>\n"
+                                "<<<AGENTSMD_PROJECT_DIRECTION_V1>>>\n"
+                                "{\"status\":\"ready\"}\n"
+                                "<<<END_AGENTSMD_PROJECT_DIRECTION_V1>>>",
+                    },
+                    "_meta": {"modelId": "grok-4.6", "promptIndex": 9},
+                },
+                "_meta": {"eventId": "privacy-1", "promptId": "p-priv"},
+            },
+        }
+        secret_completion = {
+            "timestamp": 1788800051,
+            "method": "_x.ai/session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "turn_completed",
+                    "prompt_id": "p-priv",
+                    "stop_reason": "end_turn",
+                    "usage": {"inputTokens": 10, "outputTokens": 1,
+                              "totalTokens": 11},
+                },
+                "_meta": {"eventId": "privacy-2"},
+            },
+        }
+        bad_line = {
+            "timestamp": 1788800052,
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": "malformed probe INSTALLED BODY"
+                                " sk-fake-secret-12345",
+                    },
+                },
+            },
+        }
+        # bad_line lacks promptIndex on purpose to force a quarantined shape.
+        with open(os.path.join(sdir, "updates.jsonl"), "a") as fh:
+            fh.write(json.dumps(secret_prompt) + "\n")
+            fh.write(json.dumps(secret_completion) + "\n")
+            fh.write(json.dumps(bad_line) + "\n")
+        con = self._isolated_con("privacy")
+        grok.sync(con, root=tmp)
+        texts = self._all_text_values(con)
+        self.assertTrue(texts)
+        for table, col, val in texts:
+            self.assertNotIn("INSTALLED BODY", val,
+                             f"{table}.{col} leaks preference")
+            self.assertNotIn("sk-fake-secret-12345", val,
+                             f"{table}.{col} leaks secret")
+            self.assertNotIn("SECRET-TOKEN-abc123", val,
+                             f"{table}.{col} leaks secret")
+            self.assertNotIn("AGENTSMD_PROJECT_DIRECTION_V1", val,
+                             f"{table}.{col} leaks direction block")
+            self.assertNotIn("<user_rule>", val,
+                             f"{table}.{col} leaks wrapper")
+        # import_errors specifically must hold only shapes, never raw lines.
+        for row in con.execute("SELECT error, line_excerpt FROM import_errors"):
+            for field in (row["error"] or "", row["line_excerpt"] or ""):
+                self.assertNotIn("INSTALLED BODY", field)
+                self.assertNotIn("sk-fake-secret", field)
+                self.assertNotIn("Privacy probe", field)
+            self.assertLessEqual(len(row["line_excerpt"] or ""), 200)
+        con.close()
+
+    def test_excerpt_sanitized_length_and_empty_for_non_genuine(self):
+        rows = {r["native_id"]: r for r in self.query(
+            "SELECT native_id, kind, is_genuine, text_excerpt FROM submissions"
+            " WHERE session_key=?", (S1,))}
+        # Genuine prompts keep at most 300 chars of human text, sanitized.
+        for idx in ("0", "1", "3", "4"):
+            nid = f"{S1}:prompt:{idx}"
+            row = rows[nid]
+            self.assertEqual(row["kind"], "genuine")
+            self.assertEqual(row["is_genuine"], 1)
+            excerpt = row["text_excerpt"] or ""
+            self.assertLessEqual(len(excerpt), 300)
+            self.assertNotIn("<user_query>", excerpt)
+            self.assertNotIn("<user_rule>", excerpt)
+            self.assertNotIn("INSTALLED BODY", excerpt)
+            self.assertNotIn("AGENTSMD_PROJECT_DIRECTION_V1", excerpt)
+        self.assertIn("Implement the widget", rows[f"{S1}:prompt:0"]["text_excerpt"])
+        self.assertIn("Now the second prompt",
+                      rows[f"{S1}:prompt:1"]["text_excerpt"])
+        # Synthetic prompts have empty excerpts.
+        synth = rows[f"{S1}:prompt:2"]
+        self.assertEqual(synth["kind"], "synthetic")
+        self.assertEqual(synth["is_genuine"], 0)
+        self.assertEqual(synth["text_excerpt"], "")
+
+    def test_duplicate_turn_completed_keeps_prompt_id_bindings(self):
+        tmp = os.path.join(self.tmp.name, "dupid")
+        shutil.copytree(ROOT, tmp)
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        path = os.path.join(tmp, "%2Fredacted%2Frepo", sid, "updates.jsonl")
+        with open(path) as fh:
+            lines = fh.read().splitlines()
+        # Duplicate the first completion (p-aaa) at the end with new eventId.
+        first = None
+        for line in lines:
+            if '"prompt_id": "p-aaa"' in line or '"prompt_id":"p-aaa"' in line:
+                first = line
+                break
+        self.assertIsNotNone(first)
+        dup = json.loads(first)
+        dup["params"]["_meta"]["eventId"] = "dup-p-aaa"
+        with open(path, "a") as fh:
+            fh.write(json.dumps(dup) + "\n")
+        con = self._isolated_con("dupid")
+        grok.sync(con, root=tmp)
+        subs = {r["native_id"]: r["turn_id"] for r in con.execute(
+            "SELECT native_id, turn_id FROM submissions"
+            " WHERE session_key=?", (S1,))}
+        self.assertEqual(subs[f"{S1}:prompt:0"], f"{S1}:p-aaa")
+        self.assertEqual(subs[f"{S1}:prompt:1"], f"{S1}:p-bbb")
+        self.assertEqual(subs[f"{S1}:prompt:2"], f"{S1}:p-ccc")
+        self.assertEqual(subs[f"{S1}:prompt:3"], f"{S1}:p-ddd")
+        # Open prompt stays unbound; duplicate never shifts bindings.
+        self.assertIsNone(subs[f"{S1}:prompt:4"])
+        resps = list(con.execute(
+            "SELECT response_id FROM responses WHERE session_key=?"
+            " ORDER BY response_id", (S1,)))
+        self.assertEqual([r["response_id"] for r in resps],
+                         [f"{S1}:p-aaa", f"{S1}:p-bbb", f"{S1}:p-ccc",
+                          f"{S1}:p-ddd"])
+        con.close()
+
+    def test_late_usage_fills_null_counters(self):
+        tmp = os.path.join(self.tmp.name, "lateusage")
+        shutil.copytree(ROOT, tmp)
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        sdir = os.path.join(tmp, "%2Fredacted%2Frepo", sid)
+        con = self._isolated_con("lateusage")
+        grok.sync(con, root=tmp)
+        row = con.execute(
+            "SELECT input_tokens, total_tokens FROM responses"
+            " WHERE response_id=?", (f"{S1}:p-ddd",)).fetchone()
+        self.assertIsNone(row["input_tokens"])
+        self.assertIsNone(row["total_tokens"])
+        late = {
+            "timestamp": 1788800060,
+            "method": "_x.ai/session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "turn_completed",
+                    "prompt_id": "p-ddd",
+                    "stop_reason": "end_turn",
+                    "usage": {"inputTokens": 400, "outputTokens": 40,
+                              "totalTokens": 440, "cachedReadTokens": 300,
+                              "cacheCreationTokens": 5, "reasoningTokens": 4,
+                              "modelUsage": {}},
+                },
+                "_meta": {"eventId": "late-p-ddd"},
+            },
+        }
+        with open(os.path.join(sdir, "updates.jsonl"), "a") as fh:
+            fh.write(json.dumps(late) + "\n")
+        second = grok.sync(con, root=tmp)
+        self.assertEqual(second["responses_inserted"], 0)
+        filled = con.execute(
+            "SELECT input_tokens, cached_input_tokens,"
+            " cache_write_input_tokens, output_tokens,"
+            " reasoning_output_tokens, total_tokens FROM responses"
+            " WHERE response_id=?", (f"{S1}:p-ddd",)).fetchone()
+        self.assertEqual(
+            (filled["input_tokens"], filled["cached_input_tokens"],
+             filled["cache_write_input_tokens"], filled["output_tokens"],
+             filled["reasoning_output_tokens"], filled["total_tokens"]),
+            (400, 300, 5, 40, 4, 440))
+        # No duplicate row and no conflict for a NULL->value fill.
+        n = con.execute(
+            "SELECT COUNT(*) n FROM responses WHERE response_id=?",
+            (f"{S1}:p-ddd",)).fetchone()["n"]
+        self.assertEqual(n, 1)
+        conflicts = list(con.execute(
+            "SELECT * FROM import_errors WHERE error LIKE 'conflicting usage%'"))
+        self.assertEqual(len(conflicts), 0)
+        con.close()
+
+    def test_unsupported_method_quarantined_with_safe_shape(self):
+        tmp = os.path.join(self.tmp.name, "badmethod")
+        shutil.copytree(ROOT, tmp)
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        sdir = os.path.join(tmp, "%2Fredacted%2Frepo", sid)
+        before_subs = self.query(
+            "SELECT COUNT(*) n FROM submissions WHERE session_key=?",
+            (S1,))[0]["n"]
+        probe_text = ("should never persist sk-fake-secret-999"
+                      " INSTALLED BODY probe")
+        bad = {
+            "timestamp": 1788800070,
+            "method": "session/unknown",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": probe_text},
+                    "_meta": {"promptIndex": 99},
+                },
+                "_meta": {"eventId": "bad-method-1"},
+            },
+        }
+        with open(os.path.join(sdir, "updates.jsonl"), "a") as fh:
+            fh.write(json.dumps(bad) + "\n")
+        con = self._isolated_con("badmethod")
+        grok.sync(con, root=tmp)
+        # No submission/response/event for the unsupported method payload.
+        self.assertEqual(
+            con.execute(
+                "SELECT COUNT(*) n FROM submissions WHERE native_id=?",
+                (f"{S1}:prompt:99",)).fetchone()["n"], 0)
+        for table, col, val in self._all_text_values(con):
+            self.assertNotIn("sk-fake-secret-999", val,
+                             f"{table}.{col} leaks unsupported payload")
+            self.assertNotIn("should never persist", val,
+                             f"{table}.{col} leaks unsupported payload")
+        errors = list(con.execute("SELECT error, line_excerpt FROM import_errors"))
+        self.assertTrue(errors)
+        for row in errors:
+            self.assertLessEqual(len(row["line_excerpt"] or ""), 200)
+            self.assertNotIn("sk-fake-secret-999", row["line_excerpt"] or "")
+            self.assertNotIn("should never persist", row["line_excerpt"] or "")
+            self.assertNotIn("sk-fake-secret-999", row["error"] or "")
+        # At least one safe shape mentions the unsupported method.
+        self.assertTrue(any("session/unknown" in (r["error"] or "") or
+                            "method=" in (r["line_excerpt"] or "")
+                            for r in errors))
+        con.close()
+
+    def _copy_session_without_chat(self, dest_root, sid):
+        src = os.path.join(
+            ROOT, "%2Fredacted%2Frepo", sid)
+        dst = os.path.join(dest_root, "%2Fredacted%2Frepo", sid)
+        os.makedirs(dst, exist_ok=True)
+        for name in ("updates.jsonl", "events.jsonl", "summary.json"):
+            shutil.copy(os.path.join(src, name), os.path.join(dst, name))
+
+    def test_missing_chat_then_valid_updates_row(self):
+        tmp = os.path.join(self.tmp.name, "missingchat")
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        self._copy_session_without_chat(tmp, sid)
+        con = self._isolated_con("missingchat")
+        grok.sync(con, root=tmp)
+        rows = {r["native_id"]: r for r in con.execute(
+            "SELECT native_id, kind, is_genuine, text_excerpt, turn_id"
+            " FROM submissions")}
+        # Without chat evidence every prompt stays provisional/non-genuine.
+        self.assertTrue(rows)
+        for nid, row in rows.items():
+            self.assertEqual(row["is_genuine"], 0)
+            self.assertEqual(row["text_excerpt"], "")
+            self.assertIn(row["kind"], ("unknown", "synthetic"))
+        n_before = len(rows)
+        # Later arrival of complete chat metadata updates rows in place.
+        shutil.copy(
+            os.path.join(ROOT, "%2Fredacted%2Frepo", sid, "chat_history.jsonl"),
+            os.path.join(tmp, "%2Fredacted%2Frepo", sid, "chat_history.jsonl"))
+        second = grok.sync(con, root=tmp)
+        after = {r["native_id"]: r for r in con.execute(
+            "SELECT native_id, kind, is_genuine, text_excerpt, turn_id"
+            " FROM submissions")}
+        self.assertEqual(len(after), n_before)
+        self.assertEqual(after[f"{S1}:prompt:0"]["kind"], "genuine")
+        self.assertEqual(after[f"{S1}:prompt:0"]["is_genuine"], 1)
+        self.assertIn("Implement the widget",
+                      after[f"{S1}:prompt:0"]["text_excerpt"])
+        self.assertEqual(after[f"{S1}:prompt:0"]["turn_id"], f"{S1}:p-aaa")
+        self.assertEqual(after[f"{S1}:prompt:2"]["kind"], "synthetic")
+        self.assertEqual(after[f"{S1}:prompt:2"]["text_excerpt"], "")
+        con.close()
+
+    def test_malformed_chat_then_valid_updates_row(self):
+        tmp = os.path.join(self.tmp.name, "badchat")
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        self._copy_session_without_chat(tmp, sid)
+        dst_chat = os.path.join(tmp, "%2Fredacted%2Frepo", sid,
+                                "chat_history.jsonl")
+        # Malformed JSON plus an unterminated trailing line: unreliable.
+        with open(dst_chat, "w") as fh:
+            fh.write('{"type": "user", "prompt_index": 0}\n')
+            fh.write('{not valid json\n')
+            fh.write('{"type": "user", "content": "trailing without newline",'
+                     ' "prompt_index": 1}')
+        con = self._isolated_con("badchat")
+        grok.sync(con, root=tmp)
+        rows = {r["native_id"]: r for r in con.execute(
+            "SELECT native_id, kind, is_genuine, text_excerpt FROM submissions")}
+        for row in rows.values():
+            self.assertEqual(row["is_genuine"], 0)
+            self.assertEqual(row["text_excerpt"], "")
+        n_before = len(rows)
+        # Valid metadata later reclassifies the same rows without duplicates.
+        shutil.copy(
+            os.path.join(ROOT, "%2Fredacted%2Frepo", sid, "chat_history.jsonl"),
+            dst_chat)
+        grok.sync(con, root=tmp)
+        after = {r["native_id"]: r for r in con.execute(
+            "SELECT native_id, kind, is_genuine, text_excerpt, turn_id"
+            " FROM submissions")}
+        self.assertEqual(len(after), n_before)
+        self.assertEqual(after[f"{S1}:prompt:1"]["kind"], "genuine")
+        self.assertIn("Now the second prompt",
+                      after[f"{S1}:prompt:1"]["text_excerpt"])
+        con.close()

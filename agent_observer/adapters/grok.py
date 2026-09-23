@@ -59,9 +59,120 @@ TERMINAL_TOOL_STATUS = {"completed": "ok", "failed": "error", "success": "ok"}
 SKIP_EVENT_TYPES = frozenset({"phase_changed", "loop_started", "first_token"})
 
 USER_RULE_RE = re.compile(r"<user_rule>(.*?)</user_rule>", re.S)
+DIRECTION_BLOCK_RE = re.compile(
+    r"<<<AGENTSMD_PROJECT_DIRECTION_V1>>>.*?<<<END_AGENTSMD_PROJECT_DIRECTION_V1>>>",
+    re.S)
+USER_QUERY_TAG_RE = re.compile(r"</?user_query\s*>", re.I)
+GENERIC_BLOCK_RE = re.compile(r"<<<.*?>>>", re.S)
+SECRET_SK_RE = re.compile(r"sk-[A-Za-z0-9\-_]{8,}")
+SECRET_TOKEN_RE = re.compile(r"SECRET[A-Za-z0-9\-_]*")
 TARGET_KEYS = ("target_file", "path", "file_path", "file", "command",
                "url", "pattern")
 EXCERPT_LEN = 300
+ERROR_EXCERPT_LEN = 200
+
+
+def _sanitize_human_text(text: str) -> str:
+    """Human's own text without injected instruction or preference content.
+
+    Removes the full AgentsMD direction block, <user_rule> bodies, the
+    <user_query> wrapper tags (keeping the inner human text) and any other
+    <<<...>>> injected block, then redacts secret-looking tokens. Full native
+    text still feeds SessionIdentity; only this sanitized form reaches the
+    ledger excerpt.
+    """
+    if not text:
+        return ""
+    cleaned = DIRECTION_BLOCK_RE.sub("", text)
+    cleaned = USER_RULE_RE.sub("", cleaned)
+    cleaned = USER_QUERY_TAG_RE.sub("", cleaned)
+    cleaned = GENERIC_BLOCK_RE.sub("", cleaned)
+    cleaned = SECRET_SK_RE.sub("[redacted]", cleaned)
+    cleaned = SECRET_TOKEN_RE.sub("[redacted]", cleaned)
+    return cleaned.strip()
+
+
+def _build_excerpt(full_text: str, is_genuine: bool) -> str:
+    """At most 300 chars of genuine human text; empty for non-genuine."""
+    if not is_genuine:
+        return ""
+    return _sanitize_human_text(full_text)[:EXCERPT_LEN]
+
+
+def _shape_parts(obj) -> tuple[str, str, str]:
+    """Sorted top-level keys, method and update type without any values."""
+    if not isinstance(obj, dict):
+        return "", "?", "?"
+    try:
+        keys = sorted(str(k) for k in obj.keys())
+    except Exception:
+        keys = []
+    method = obj.get("method")
+    method_s = method if isinstance(method, str) else "?"
+    update_s = "?"
+    params = obj.get("params")
+    if isinstance(params, dict):
+        upd = params.get("update")
+        if isinstance(upd, dict):
+            su = upd.get("sessionUpdate")
+            if isinstance(su, str):
+                update_s = su
+    return ",".join(keys), method_s, update_s
+
+
+def _safe_error_excerpt(category: str, obj) -> str:
+    """Error category plus bounded record shape, never raw text."""
+    keys_s, method_s, update_s = _shape_parts(obj)
+    base = f"{category} keys=[{keys_s}] method={method_s} update={update_s}"
+    return base[:ERROR_EXCERPT_LEN]
+
+
+def _safe_unparsable(category: str) -> str:
+    return f"{category} unparsable method=? update=?"[:ERROR_EXCERPT_LEN]
+
+
+def _safe_conflict_excerpt(category: str, method: str, update: str,
+                            extra: str = "") -> str:
+    base = f"{category} method={method} update={update}"
+    if extra:
+        base += f" {extra}"
+    return base[:ERROR_EXCERPT_LEN]
+
+
+def _extract_prompt_id(obj: dict, update: dict) -> str | None:
+    """Native prompt id from update, inner _meta or outer _meta."""
+    candidates: list[dict] = []
+    if isinstance(update, dict):
+        candidates.append(update)
+        inner = update.get("_meta")
+        if isinstance(inner, dict):
+            candidates.append(inner)
+    params = obj.get("params") if isinstance(obj, dict) else None
+    if isinstance(params, dict):
+        pmeta = params.get("_meta")
+        if isinstance(pmeta, dict):
+            candidates.append(pmeta)
+    if isinstance(obj, dict):
+        outer = obj.get("_meta")
+        if isinstance(outer, dict):
+            candidates.append(outer)
+    for d in candidates:
+        for key in ("prompt_id", "promptId"):
+            value = d.get(key)
+            if value:
+                return str(value)
+    return None
+
+
+def _classify_prompt(prompt_idx: str, chat: dict) -> tuple[str, int]:
+    """Evidence-aware kind/is_genuine; provisional when chat is unreliable."""
+    if not chat.get("reliable"):
+        return "unknown", 0
+    if prompt_idx in chat.get("synthetic", set()):
+        return "synthetic", 0
+    if prompt_idx in chat.get("seen", set()):
+        return "genuine", 1
+    return "unknown", 0
 
 
 def discover(root: str | None = None) -> list[str]:
@@ -252,37 +363,48 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                         (r.session_key,)).fetchone()
     updates_new = full or updates_src is None or not updates_src.unchanged
     events_new = full or events_src is None or not events_src.unchanged
+    chat = _read_chat(session_dir, r)
     if known and not updates_new and not events_new:
-        stats["unchanged"] = True
+        reclassified = _reclassify_existing(con, r, session_dir, chat)
+        if reclassified:
+            con.commit()
+        stats["unchanged"] = not bool(reclassified)
         stats["session_key"] = r.session_key
         return stats
 
-    chat = _read_chat(session_dir, r)
     if updates_src is not None and (updates_new or not known):
         _replay_updates(con, r, updates_src, chat, model_fallback, effort)
         for ordinal, obj, line in updates_src.records():
             stats["lines"] += 1
             if obj is None or not isinstance(obj, dict):
                 stats["malformed"] += 1
-                updates_src.error(ordinal, "json_error", line)
+                updates_src.error(
+                    ordinal, "json_error",
+                    _safe_unparsable("json_error"))
                 continue
             try:
                 _ingest_update(r, updates_src, obj, ordinal)
             except (KeyError, TypeError, ValueError, AttributeError) as exc:
                 stats["malformed"] += 1
-                updates_src.error(ordinal, f"schema_error: {exc}", line)
+                updates_src.error(
+                    ordinal, f"schema_error: {exc}",
+                    _safe_error_excerpt("schema_error", obj))
     if events_src is not None and (events_new or not known):
         for ordinal, obj, line in events_src.records():
             stats["lines"] += 1
             if obj is None or not isinstance(obj, dict):
                 stats["malformed"] += 1
-                events_src.error(ordinal, "json_error", line)
+                events_src.error(
+                    ordinal, "json_error",
+                    _safe_unparsable("json_error"))
                 continue
             try:
                 _ingest_event(r, events_src, obj, ordinal)
             except (KeyError, TypeError, ValueError, AttributeError) as exc:
                 stats["malformed"] += 1
-                events_src.error(ordinal, f"schema_error: {exc}", line)
+                events_src.error(
+                    ordinal, f"schema_error: {exc}",
+                    _safe_error_excerpt("schema_error", obj))
 
     fields = {"started_at": r.first_ts, "ended_at": r.last_ts, **r.meta,
               **r.identity.fields(con)}
@@ -309,22 +431,39 @@ def _read_chat(session_dir: str, r: _Reader) -> dict:
 
     The file is read-only metadata: prompt texts feed the instruction
     identity, never the ledger, and only the prompt_index marks survive.
+    Missing, malformed or unterminated files leave reliable=False so prompts
+    stay provisional (unknown, empty excerpt) until complete metadata arrives.
     """
-    chat = {"synthetic": set(), "effort": None}
+    chat = {"synthetic": set(), "seen": set(), "effort": None,
+            "reliable": True}
     path = os.path.join(session_dir, "chat_history.jsonl")
+    try:
+        with open(path, "rb") as bfh:
+            raw_bytes = bfh.read()
+    except OSError:
+        chat["reliable"] = False
+        return chat
+    if raw_bytes and not raw_bytes.endswith(b"\n"):
+        chat["reliable"] = False
     try:
         fh = open(path, encoding="utf-8", errors="replace")
     except OSError:
+        chat["reliable"] = False
         return chat
     with fh:
         for raw in fh:
-            if not raw.endswith("\n") or not raw.strip():
+            if not raw.strip():
+                continue
+            if not raw.endswith("\n"):
+                chat["reliable"] = False
                 continue
             try:
                 obj = json.loads(raw)
             except ValueError:
+                chat["reliable"] = False
                 continue
             if not isinstance(obj, dict):
+                chat["reliable"] = False
                 continue
             kind = obj.get("type")
             text = _content_text(obj.get("content"))
@@ -332,9 +471,11 @@ def _read_chat(session_dir: str, r: _Reader) -> dict:
                 r.identity.observe_text(text)
                 for body in USER_RULE_RE.findall(text):
                     r.identity.observe_loaded_instructions(body.strip())
-            if kind == "user" and obj.get("prompt_index") is not None \
-                    and obj.get("synthetic_reason"):
-                chat["synthetic"].add(str(obj["prompt_index"]))
+            if kind == "user" and obj.get("prompt_index") is not None:
+                idx = str(obj["prompt_index"])
+                chat["seen"].add(idx)
+                if obj.get("synthetic_reason"):
+                    chat["synthetic"].add(idx)
             if kind == "assistant" and obj.get("reasoning_effort") \
                     and chat["effort"] is None:
                 chat["effort"] = obj["reasoning_effort"]
@@ -389,25 +530,34 @@ def _model_at(ts, turn_models: list, *fallbacks):
     return model
 
 
-def _replay_updates(con, r: _Reader, src: JsonlSource, chat: dict,
-                    model_fallback, effort) -> None:
-    """Rebuild prompts and per-prompt usage from the whole updates.jsonl.
+def _collect_prompts(path: str, record_error=None) -> tuple[dict, list, list]:
+    """Prompts by promptIndex and completions in file order with ID links.
 
-    A growing file can extend an open prompt or finalize it on a later sync,
-    but the schema keeps only the text hash and a bounded excerpt, so the
-    full text is reconstructed here on every sync that saw new bytes. Every
-    insert is under a natural key, so the replay never duplicates rows.
+    Validates method before building any prompt/completion entry so an
+    unsupported method never creates ledger state. Invalid JSON and
+    non-dict lines are skipped silently here; the incremental ingest loop
+    quarantines them once with a safe shape. Missing promptIndex/prompt_id
+    are reported through record_error when provided (replay path) and
+    skipped silently otherwise (reclassification path avoids duplicates).
+    Returns (prompts, order, completions_ordered) where completions_ordered
+    holds (ordinal, update, ts, outer_obj, method) and prompts values hold
+    texts, model, first, ts, prompt_id and first_obj for safe shapes.
     """
     prompts: dict = {}
     order: list = []
-    completions: list = []
-    for ordinal, raw in _complete_lines(src.path):
+    completions_ordered: list = []
+    for ordinal, raw in _complete_lines(path):
         try:
             obj = json.loads(raw)
         except ValueError:
             continue
-        params = obj.get("params") if isinstance(obj, dict) else None
-        update = params.get("update") if isinstance(params, dict) else None
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("method") not in METHODS:
+            continue
+        params = obj.get("params") if isinstance(obj.get("params"), dict) \
+            else {}
+        update = params.get("update") if isinstance(params, dict) else {}
         if not isinstance(update, dict):
             continue
         kind = update.get("sessionUpdate")
@@ -416,74 +566,225 @@ def _replay_updates(con, r: _Reader, src: JsonlSource, chat: dict,
                 update.get("_meta"), dict) else {}
             pidx = meta.get("promptIndex")
             if pidx is None:
-                r.stats["malformed"] += 1
-                src.error(ordinal, "user chunk without promptIndex",
-                          raw)
+                if record_error is not None:
+                    record_error(
+                        ordinal, "user chunk without promptIndex", obj)
                 continue
             key = str(pidx)
+            pid = _extract_prompt_id(obj, update)
             entry = prompts.get(key)
             if entry is None:
                 entry = {"texts": [], "model": None, "first": ordinal,
-                         "ts": iso_ts(obj.get("timestamp"))}
+                         "ts": iso_ts(obj.get("timestamp")), "prompt_id": pid,
+                         "first_obj": obj}
                 prompts[key] = entry
                 order.append(key)
+            else:
+                if entry.get("prompt_id") is None and pid is not None:
+                    entry["prompt_id"] = pid
+                elif pid is not None and entry.get("prompt_id") is not None \
+                        and pid != entry["prompt_id"]:
+                    if record_error is not None:
+                        record_error(
+                            ordinal, "conflicting prompt id", obj)
+                if entry.get("first_obj") is None:
+                    entry["first_obj"] = obj
             entry["texts"].append(_content_text(update.get("content")))
             if entry["model"] is None and meta.get("modelId"):
                 entry["model"] = str(meta["modelId"])
         elif kind == "turn_completed":
-            if not update.get("prompt_id"):
-                r.stats["malformed"] += 1
-                src.error(ordinal, "turn_completed without prompt_id",
-                          raw)
+            pid = update.get("prompt_id") or update.get("promptId")
+            if not pid:
+                if record_error is not None:
+                    record_error(
+                        ordinal, "turn_completed without prompt_id", obj)
                 continue
-            completions.append((ordinal, update, iso_ts(obj.get("timestamp"))))
+            completions_ordered.append(
+                (ordinal, update, iso_ts(obj.get("timestamp")), obj,
+                 obj.get("method")))
+        else:
+            continue
+    return prompts, order, completions_ordered
+
+
+def _upsert_submission(con, r: _Reader, src, chat: dict, key: str,
+                       entry: dict, completions_by_id: dict,
+                       record_error) -> None:
+    full_text = "".join(entry["texts"])
+    kind, is_genuine = _classify_prompt(key, chat)
+    excerpt = _build_excerpt(full_text, bool(is_genuine))
+    pid = entry.get("prompt_id")
+    turn_id = (f"{HARNESS}:{r.native_sid}:{pid}"
+               if pid and pid in completions_by_id else None)
+    native_id = f"{HARNESS}:{r.native_sid}:prompt:{key}"
+    existing = con.execute(
+        "SELECT text_hash, text_excerpt, turn_id, kind, is_genuine"
+        " FROM submissions WHERE native_id=?", (native_id,)).fetchone()
+    digest = text_hash(full_text)
+    if existing is None:
+        cur = con.execute(
+            "INSERT OR IGNORE INTO submissions(native_id, source_id,"
+            " session_key, turn_id, ordinal_num, ts, kind, text_hash,"
+            " text_excerpt, is_genuine) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (native_id, src.source_id if src is not None else None,
+             r.session_key, turn_id, entry["first"], entry["ts"], kind,
+             digest, excerpt, is_genuine))
+        if cur.rowcount:
+            r.stats["submissions_inserted"] += 1
+        return
+    # Existing row: follow appended text, allow reclassification, fill turn.
+    if digest != existing["text_hash"]:
+        new_sanitized = excerpt
+        old_excerpt = existing["text_excerpt"] or ""
+        # Growth means the sanitized form extends the stored one (empty
+        # provisional excerpts are a prefix of any reclassified excerpt).
+        if new_sanitized.startswith(old_excerpt) or old_excerpt == "":
+            # For synthetic/provisional both excerpts are empty; still
+            # follow the hash so later comparisons see the latest text.
+            con.execute(
+                "UPDATE submissions SET text_hash=?, text_excerpt=?"
+                " WHERE native_id=?", (digest, new_sanitized, native_id))
+        else:
+            r.stats["malformed"] += 1
+            if record_error is not None:
+                record_error(
+                    entry["first"], "conflicting prompt",
+                    entry.get("first_obj"))
+            # Do not apply divergent text; keep original hash/excerpt.
+    # Reclassification: reliable chat evidence updates kind/excerpt even
+    # when the full text hash is unchanged. Never downgrade a definitive
+    # genuine/synthetic row merely because later chat is unreliable or
+    # silent for that index.
+    if chat.get("reliable"):
+        if kind in ("genuine", "synthetic") and \
+                (existing["kind"] != kind or
+                 (existing["is_genuine"] or 0) != is_genuine or
+                 (existing["text_excerpt"] or "") != excerpt):
+            # Allow provisional->definitive and definitive->definitive
+            # flips; keep provisional when desired is unknown.
+            con.execute(
+                "UPDATE submissions SET kind=?, is_genuine=?, text_excerpt=?"
+                " WHERE native_id=?", (kind, is_genuine, excerpt, native_id))
+    else:
+        # Unreliable chat: only ensure provisional rows stay empty-excerpt.
+        if existing["kind"] in (None, "", "unknown") and \
+                (existing["text_excerpt"] or "") != "":
+            con.execute(
+                "UPDATE submissions SET text_excerpt=? WHERE native_id=?",
+                ("", native_id))
+    if turn_id and not existing["turn_id"]:
+        con.execute("UPDATE submissions SET turn_id=? WHERE native_id=?",
+                    (turn_id, native_id))
+
+
+def _reclassify_existing(con, r: _Reader, session_dir: str,
+                         chat: dict) -> int:
+    """Update stored submissions when chat metadata arrives later.
+
+    Runs even when updates.jsonl/events.jsonl are unchanged. Re-reads the
+    updates file silently (no duplicate import_errors) and applies
+    evidence-aware kind/excerpt/turn updates in place without duplicates.
+    Returns the number of rows changed.
+    """
+    updates_path = os.path.join(session_dir, "updates.jsonl")
+    if not os.path.isfile(updates_path):
+        return 0
+    # Source id for any late insert (normally rows already exist).
+    src_holder = None
+    try:
+        src_holder = JsonlSource(con, HARNESS, updates_path)
+    except (OSError, sqlite3.DatabaseError):
+        src_holder = None
+    prompts, order, completions_ordered = _collect_prompts(
+        updates_path, record_error=None)
+    completions_by_id = {}
+    for ordinal, update, ts, obj, method in completions_ordered:
+        pid = str(update.get("prompt_id") or update.get("promptId"))
+        if pid not in completions_by_id:
+            completions_by_id[pid] = (ordinal, update, ts, obj, method)
+    before = con.total_changes
+    for key in order:
+        _upsert_submission(con, r, src_holder, chat, key, prompts[key],
+                           completions_by_id, record_error=None)
+    # Finish without advancing offsets when we only reclassified: do not
+    # call finish() here because sources offsets belong to the incremental
+    # loops. Just report whether anything changed.
+    return con.total_changes - before
+
+
+def _replay_updates(con, r: _Reader, src: JsonlSource, chat: dict,
+                    model_fallback, effort) -> None:
+    """Rebuild prompts and per-prompt usage from the whole updates.jsonl.
+
+    A growing file can extend an open prompt or finalize it on a later sync,
+    but the schema keeps only the text hash and a bounded excerpt, so the
+    full text is reconstructed here on every sync that saw new bytes. Every
+    insert is under a natural key, so the replay never duplicates rows.
+    Completions bind to prompts by native prompt id (deduplicated); position
+    never shifts bindings. Unmatched prompts stay unbound; unmatched
+    completions still store one response row by their own key.
+    """
+
+    def record_error(ordinal: int, category: str, obj) -> None:
+        r.stats["malformed"] += 1
+        if category == "user chunk without promptIndex":
+            src.error(ordinal, category,
+                      _safe_error_excerpt("missing_prompt_index", obj))
+        elif category == "turn_completed without prompt_id":
+            src.error(ordinal, category,
+                      _safe_error_excerpt("missing_prompt_id", obj))
+        elif category == "conflicting prompt id":
+            src.error(ordinal, "conflicting prompt id",
+                      _safe_error_excerpt("conflicting_prompt", obj))
+        elif category == "conflicting prompt":
+            src.error(ordinal, category,
+                      _safe_conflict_excerpt(
+                          "conflicting_prompt", "session/update",
+                          "user_message_chunk"))
+        else:
+            src.error(ordinal, category,
+                      _safe_error_excerpt("schema_error", obj))
+
+    prompts, order, completions_ordered = _collect_prompts(
+        src.path, record_error=record_error)
+    completions_by_id: dict = {}
+    for ordinal, update, ts, obj, method in completions_ordered:
+        pid = str(update.get("prompt_id") or update.get("promptId"))
+        if pid not in completions_by_id:
+            completions_by_id[pid] = (ordinal, update, ts, obj, method)
+        else:
+            # Duplicate turn_completed: keep first binding but merge late
+            # usage when the first lacked it, so a repeated completion can
+            # fill NULL counters without shifting any prompt binding.
+            _, first_update, _, _, _ = completions_by_id[pid]
+            first_usage = first_update.get("usage")
+            new_usage = update.get("usage")
+            if (not isinstance(first_usage, dict) or not first_usage) \
+                    and isinstance(new_usage, dict) and new_usage:
+                merged = dict(first_update)
+                merged["usage"] = new_usage
+                completions_by_id[pid] = (
+                    completions_by_id[pid][0], merged,
+                    completions_by_id[pid][2], completions_by_id[pid][3],
+                    completions_by_id[pid][4])
+    # Prompt-ID to chunk model for response model fallback.
+    pid_to_model: dict = {}
+    for key in order:
+        pid = prompts[key].get("prompt_id")
+        if pid and pid not in pid_to_model and prompts[key].get("model"):
+            pid_to_model[pid] = prompts[key]["model"]
     turn_models = _turn_models(
         os.path.join(os.path.dirname(src.path), "events.jsonl"))
-    for position, key in enumerate(order):
-        entry = prompts[key]
-        text = "".join(entry["texts"])
-        prompt_id = (completions[position][1].get("prompt_id")
-                     if position < len(completions) else None)
-        turn_id = (f"{HARNESS}:{r.native_sid}:{prompt_id}"
-                   if prompt_id else None)
-        kind = "synthetic" if key in chat["synthetic"] else "genuine"
-        native_id = f"{HARNESS}:{r.native_sid}:prompt:{key}"
-        existing = con.execute(
-            "SELECT text_hash, text_excerpt, turn_id FROM submissions"
-            " WHERE native_id=?", (native_id,)).fetchone()
-        if existing is None:
-            cur = con.execute(
-                "INSERT OR IGNORE INTO submissions(native_id, source_id,"
-                " session_key, turn_id, ordinal_num, ts, kind, text_hash,"
-                " text_excerpt, is_genuine) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (native_id, src.source_id, r.session_key, turn_id,
-                 entry["first"], entry["ts"], kind, text_hash(text),
-                 text[:EXCERPT_LEN], 1 if kind == "genuine" else 0))
-            if cur.rowcount:
-                r.stats["submissions_inserted"] += 1
-        else:
-            # A growing file extends the text or finalizes the prompt: the
-            # stored hash follows appended text, never a divergent rewrite.
-            if text_hash(text) != existing["text_hash"]:
-                if text.startswith(existing["text_excerpt"] or ""):
-                    con.execute(
-                        "UPDATE submissions SET text_hash=?, text_excerpt=?"
-                        " WHERE native_id=?",
-                        (text_hash(text), text[:EXCERPT_LEN], native_id))
-                else:
-                    r.stats["malformed"] += 1
-                    src.error(entry["first"],
-                              f"conflicting prompt text for {native_id}",
-                              text[:200])
-            if turn_id and not existing["turn_id"]:
-                con.execute("UPDATE submissions SET turn_id=? WHERE native_id=?",
-                            (turn_id, native_id))
-    for position, (ordinal, update, ts) in enumerate(completions):
-        chunk_model = (prompts[order[position]]["model"]
-                       if position < len(order) else None)
+    for key in order:
+        _upsert_submission(con, r, src, chat, key, prompts[key],
+                           completions_by_id, record_error)
+    for ordinal, update, ts, obj, method in completions_ordered:
+        pid = str(update.get("prompt_id") or update.get("promptId"))
+        chunk_model = pid_to_model.get(pid)
         _store_response(con, r, src, ordinal, update, ts,
                         _usage_model(update), model_fallback, chunk_model,
-                        effort or chat["effort"], turn_models)
+                        effort or chat.get("effort"), turn_models,
+                        outer_obj=obj)
 
 
 def _usage_model(update: dict):
@@ -497,8 +798,11 @@ def _usage_model(update: dict):
 
 def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
                     update: dict, ts, usage_model, summary_model, chunk_model,
-                    effort, turn_models) -> None:
-    prompt_id = update.get("prompt_id")
+                    effort, turn_models, outer_obj=None) -> None:
+    prompt_id = update.get("prompt_id") or update.get("promptId")
+    if not prompt_id:
+        return
+    prompt_id = str(prompt_id)
     response_id = f"{HARNESS}:{r.native_sid}:{prompt_id}"
     usage = update.get("usage") if isinstance(update.get("usage"), dict) \
         else {}
@@ -538,9 +842,29 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
         old, new = existing[key], counters[key]
         if old is not None and new is not None and old != new:
             r.stats["malformed"] += 1
-            src.error(ordinal, f"conflicting usage for {prompt_id}",
-                      json.dumps(usage, sort_keys=True, default=str)[:200])
+            shape = _safe_error_excerpt("conflicting_usage", outer_obj) \
+                if isinstance(outer_obj, dict) else _safe_conflict_excerpt(
+                    "conflicting_usage", "session/update", "turn_completed",
+                    f"prompt_id={prompt_id}")
+            # Ensure prompt_id travels without any counter values.
+            if "prompt_id=" not in shape:
+                shape = (shape + f" prompt_id={prompt_id}")[:ERROR_EXCERPT_LEN]
+            src.error(ordinal, f"conflicting usage for {prompt_id}", shape)
             return
+    fill = {key: counters[key] for key in counters
+            if existing[key] is None and counters[key] is not None}
+    if fill:
+        con.execute(
+            "UPDATE responses SET input_tokens=COALESCE(input_tokens, ?),"
+            " cached_input_tokens=COALESCE(cached_input_tokens, ?),"
+            " cache_write_input_tokens=COALESCE(cache_write_input_tokens, ?),"
+            " output_tokens=COALESCE(output_tokens, ?),"
+            " reasoning_output_tokens=COALESCE(reasoning_output_tokens, ?),"
+            " total_tokens=COALESCE(total_tokens, ?) WHERE response_id=?",
+            (fill.get("input_tokens"), fill.get("cached_input_tokens"),
+             fill.get("cache_write_input_tokens"), fill.get("output_tokens"),
+             fill.get("reasoning_output_tokens"), fill.get("total_tokens"),
+             response_id))
     r.stats["responses_duplicate"] += 1
 
 
