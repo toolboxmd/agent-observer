@@ -16,7 +16,12 @@ def comment(cid, body, author, created="2026-09-20T10:00:00Z"):
 
 
 class PublishGh:
-    """Fake gh api: answers the login lookup, records PATCH/POST calls."""
+    """Fake gh api: answers the login lookup, records PATCH/POST calls.
+
+    Comment listings paginate at 100 per page like the real API: the
+    page query selects the slice, so a marker beyond the first page is
+    only found when the caller paginates.
+    """
 
     def __init__(self, comments, login=ME):
         self.comments = comments
@@ -24,12 +29,23 @@ class PublishGh:
         self.patched = []
         self.posted = []
         self.next_id = max([c["id"] for c in comments] + [100]) + 1
+        self.list_calls = []
 
     def __call__(self, args, payload=None):
         if args == ["user"]:
             return {"login": self.login}
-        if args[0].endswith("per_page=100"):
-            return list(self.comments)
+        if "per_page=100" in args[0]:
+            self.list_calls.append(args[0])
+            url = args[0]
+            page = 1
+            for chunk in url.replace("?", "&").split("&"):
+                if chunk.startswith("page="):
+                    try:
+                        page = int(chunk.split("=", 1)[1])
+                    except ValueError:
+                        page = 1
+            start = (page - 1) * 100
+            return list(self.comments[start:start + 100])
         if args[:2] == ["-X", "POST"]:
             new = comment(self.next_id, payload["body"], self.login)
             self.next_id += 1
@@ -115,6 +131,34 @@ class PublishTest(LedgerCase):
             result = publish.post("o/r", publish.MARKER + " mine", commit="abc123")
         self.assertEqual(result["action"], "created")
         self.assertEqual(gh.patched, [])
+
+    def test_marker_beyond_first_page_is_updated_not_duplicated(self):
+        fillers = [comment(i, f"filler {i}", "someone-else",
+                           f"2026-09-19T10:{i % 60:02d}:00Z")
+                   for i in range(1, 101)]
+        owned = comment(1001, publish.MARKER + " old", ME,
+                        "2026-09-20T12:00:00Z")
+        foreign = comment(1002, publish.MARKER + " spoofed", FOREIGN,
+                          "2026-09-20T12:30:00Z")
+        gh = PublishGh(fillers + [owned, foreign])
+        with mock.patch.object(publish, "_gh", gh):
+            result = publish.post("o/r", publish.MARKER + " fresh", pr=5)
+        self.assertEqual(result["action"], "updated")
+        self.assertEqual(result["id"], 1001)
+        self.assertEqual(gh.patched, [1001])
+        self.assertEqual(len(gh.posted), 0)
+        self.assertTrue(any("page=2" in call for call in gh.list_calls),
+                        "expected pagination past the first page")
+        spoofed = next(c for c in gh.comments if c["id"] == 1002)
+        self.assertIn("spoofed", spoofed["body"])
+
+    def test_shared_unknown_total_with_unknown_count_renders(self):
+        summary = publish.summarize(self.con, {"claude:s1"}, "task T")
+        summary["shared_tokens"] = None
+        summary["shared_tokens_unknown"] = 2
+        body = publish.render(summary)
+        self.assertIn("Shared with other tasks and not divided", body)
+        self.assertIn("unknown", body)
 
     def test_target_must_be_exactly_one(self):
         with self.assertRaises(ValueError):

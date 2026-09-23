@@ -222,6 +222,89 @@ class CompareByModelTest(AnalysisCase):
         self.assertEqual(groups["mixed"]["sessions"], 1)
 
 
+class MixedTurnModelTest(AnalysisCase):
+    """A turn with live responses from two models is mixed, not majority."""
+
+    def setUp(self):
+        super().setUp()
+        self.session("codex:mix1", project="/p/app")
+        self.con.execute(
+            "INSERT INTO sources(harness, path, sha256, imported_at)"
+            " VALUES('codex','p','x',0)")
+        # Turn t-mix has two model-a responses and one model-b response:
+        # the majority would be model-a, but the turn is mixed.
+        self.con.execute(
+            "INSERT INTO responses(response_id, source_id, harness, session_key,"
+            " turn_id, model, total_tokens) VALUES"
+            " ('codex:ma1', 1, 'codex', 'codex:mix1', 't-mix', 'model-a', 100),"
+            " ('codex:ma2', 1, 'codex', 'codex:mix1', 't-mix', 'model-a', 100),"
+            " ('codex:mb1', 1, 'codex', 'codex:mix1', 't-mix', 'model-b', 100)")
+        self.con.execute(
+            "INSERT INTO events(session_key, ts, family, native_id, name, target,"
+            " turn_id, detail_json) VALUES"
+            " ('codex:mix1', 1, 'read', 'r1', 'a.py', '/p/a.py', 't-mix', NULL),"
+            " ('codex:mix1', 2, 'read', 'r2', 'a.py', '/p/a.py', 't-mix', NULL)")
+        self.con.commit()
+
+    def test_same_turn_mixed_model_incident_is_not_majority(self):
+        turn_models = analysis._turn_models(self.con, "codex:mix1")
+        self.assertEqual(turn_models.get("t-mix"), "mixed")
+        groups = {g["group"]: g
+                  for g in analysis.compare(self.con, by="model")["groups"]}
+        self.assertEqual(groups["model-a"]["repeated_read"]["incidents"], 0)
+        self.assertEqual(groups["model-b"]["repeated_read"]["incidents"], 0)
+        self.assertEqual(groups["mixed"]["repeated_read"]["incidents"], 1)
+
+    def test_overlap_responses_do_not_decide_the_turn(self):
+        # An overlap model-b row on the same turn changes nothing: the
+        # turn stays mixed from its live responses, and an overlap-only
+        # turn stays unmapped.
+        self.con.execute(
+            "INSERT INTO responses(response_id, source_id, harness, session_key,"
+            " turn_id, model, total_tokens, is_overlap) VALUES"
+            " ('codex:ov1', 1, 'codex', 'codex:mix1', 't-mix', 'model-b', 500, 1),"
+            " ('codex:ov2', 1, 'codex', 'codex:mix1', 't-only', 'model-c', 500, 1)")
+        self.con.commit()
+        turn_models = analysis._turn_models(self.con, "codex:mix1")
+        self.assertEqual(turn_models.get("t-mix"), "mixed")
+        self.assertNotIn("t-only", turn_models)
+
+
+class UnknownModelMembershipTest(AnalysisCase):
+    """Live unknown-model responses group under unknown; overlap and
+    fallback-only models never create groups."""
+
+    def setUp(self):
+        super().setUp()
+        self.session("codex:u1", project="/p/app")
+        self.con.execute(
+            "INSERT INTO sources(harness, path, sha256, imported_at)"
+            " VALUES('codex','p','x',0)")
+        self.con.execute(
+            "INSERT INTO responses(response_id, source_id, harness, session_key,"
+            " turn_id, model, total_tokens, is_overlap) VALUES"
+            " ('codex:ua1', 1, 'codex', 'codex:u1', 't1', 'model-a', 100, 0),"
+            " ('codex:uu1', 1, 'codex', 'codex:u1', 't2', NULL, 200, 0),"
+            " ('codex:uu2', 1, 'codex', 'codex:u1', 't2', NULL, NULL, 0),"
+            " ('codex:ov1', 1, 'codex', 'codex:u1', 't3', 'overlap-only', 999, 1)")
+        self.con.execute(
+            "INSERT INTO turns(turn_id, source_id, session_key, model_observed)"
+            " VALUES('t-fallback', 1, 'codex:u1', 'fallback-only')")
+        self.con.commit()
+
+    def test_unknown_group_exists_and_overlap_fallback_do_not(self):
+        groups = {g["group"]: g
+                  for g in analysis.compare(self.con, by="model")["groups"]}
+        self.assertIn("model-a", groups)
+        self.assertIn("unknown", groups)
+        self.assertNotIn("overlap-only", groups)
+        self.assertNotIn("fallback-only", groups)
+        self.assertEqual(groups["unknown"]["sessions"], 1)
+        self.assertEqual(groups["unknown"]["tokens_per_session"]["total"], 200)
+        self.assertEqual(groups["unknown"]["unknown_token_responses"], 1)
+        self.assertEqual(groups["model-a"]["tokens_per_session"]["total"], 100)
+
+
 class HumanSignalsTest(AnalysisCase):
     def test_permission_questions_and_corrections(self):
         self.session("claude:f")

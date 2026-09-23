@@ -413,22 +413,25 @@ def _session_metrics(con, s) -> dict:
 def _turn_models(con, session_key: str) -> dict:
     """Map turn_id to the model that produced it.
 
-    A turn's model comes from its responses; the turns table's observed
-    model is the fallback. A turn with responses from several models
-    keeps the majority one so incidents still attribute deterministically.
+    A turn's model comes from its live responses only; overlap rows
+    never participate. A turn with live responses from more than one
+    model maps to "mixed", never to a majority model, so incidents on
+    that turn attribute to mixed. Turns without a live modeled
+    response stay unmapped and their incidents also land in mixed.
     """
-    votes: dict = defaultdict(lambda: defaultdict(int))
+    per_turn: dict = defaultdict(set)
     for r in con.execute(
             "SELECT turn_id, model FROM responses WHERE session_key=?"
-            " AND turn_id IS NOT NULL AND model IS NOT NULL AND is_overlap=0",
+            " AND turn_id IS NOT NULL AND is_overlap=0",
             (session_key,)):
-        votes[r["turn_id"]][r["model"]] += 1
-    mapping = {turn: max(counts, key=counts.get) for turn, counts in votes.items()}
-    for t in con.execute(
-            "SELECT turn_id, model_observed FROM turns WHERE session_key=?"
-            " AND turn_id IS NOT NULL AND model_observed IS NOT NULL",
-            (session_key,)):
-        mapping.setdefault(t["turn_id"], t["model_observed"])
+        if r["model"] is not None:
+            per_turn[r["turn_id"]].add(r["model"])
+    mapping: dict = {}
+    for turn, models in per_turn.items():
+        if len(models) == 1:
+            mapping[turn] = next(iter(models))
+        elif len(models) > 1:
+            mapping[turn] = "mixed"
     return mapping
 
 
@@ -475,12 +478,23 @@ def _incident_model(con, turn_models: dict, session_key: str, incident: dict) ->
 
 
 def _model_session_tokens(con, session_key: str, model: str) -> tuple:
-    """Known total_tokens sum and unknown count for one model's responses."""
-    row = con.execute(
-        "SELECT SUM(total_tokens) t,"
-        " SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END) u"
-        " FROM responses WHERE session_key=? AND model=? AND is_overlap=0",
-        (session_key, model)).fetchone()
+    """Known total_tokens sum and unknown count for one model's responses.
+
+    Live responses only. The "unknown" group holds responses with no
+    model; every other group holds live responses for that exact model.
+    """
+    if model == "unknown":
+        row = con.execute(
+            "SELECT SUM(total_tokens) t,"
+            " SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END) u"
+            " FROM responses WHERE session_key=? AND model IS NULL AND is_overlap=0",
+            (session_key,)).fetchone()
+    else:
+        row = con.execute(
+            "SELECT SUM(total_tokens) t,"
+            " SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END) u"
+            " FROM responses WHERE session_key=? AND model=? AND is_overlap=0",
+            (session_key, model)).fetchone()
     return row["t"], row["u"] or 0
 
 
@@ -533,18 +547,24 @@ def _compare_by_model(con, **filters) -> dict:
 
     Tokens attribute per response to that response's model, and a session
     counts under every model it used, so group session counts overlap.
-    Incidents attribute to the model of the turn where they occurred; an
-    incident whose turn or model is unknown lands in 'mixed', never
-    guessed into a model. Prompts stay session-level: they describe the
-    sessions in the group, not the model.
+    Membership comes from live responses only: overlap rows, the turns
+    table's observed model and other fallback sources never create
+    groups. Responses without a model count under an explicit "unknown"
+    group. Incidents attribute to the model of the turn where they
+    occurred; an incident whose turn is mixed, unmodeled or spanning
+    models lands in 'mixed', never guessed into a model. Prompts stay
+    session-level: they describe the sessions in the group, not the model.
     """
     sessions = sessions_in_scope(con, **filters)
     members: dict = defaultdict(list)  # model -> sessions using it
     session_models: dict = {}
     for s in sessions:
-        models = sorted(r["model"] for r in con.execute(
+        live_models = [r["model"] for r in con.execute(
             "SELECT DISTINCT model FROM responses WHERE session_key=?"
-            " AND model IS NOT NULL", (s["session_key"],)))
+            " AND is_overlap=0", (s["session_key"],))]
+        models = sorted(m for m in live_models if m is not None)
+        if any(m is None for m in live_models):
+            models.append("unknown")
         session_models[s["session_key"]] = models
         for model in models:
             members[model].append(s)

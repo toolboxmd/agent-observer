@@ -87,7 +87,7 @@ def render(summary: dict) -> str:
     lines += ["", f"Total tokens {_fmt_tokens(u['total_tokens'], (u.get('unknown_counts') or {}).get('total_tokens', 0))} over {u['responses']} responses "
               f"(each harness's own total; cache and reasoning buckets are not added across "
               f"harnesses)."]
-    if summary["shared_tokens"]:
+    if summary["shared_tokens"] or summary.get("shared_tokens_unknown"):
         lines.append(f"Shared with other tasks and not divided: {_fmt_tokens(summary['shared_tokens'], summary.get('shared_tokens_unknown') or 0)} tokens.")
     if summary["incidents"]:
         lines += ["", "Diagnostics (candidates, not verdicts): " + ", ".join(
@@ -129,12 +129,36 @@ def _comment_time(comment: dict) -> tuple:
             comment.get("id") or 0)
 
 
+def _list_all_comments(listing: str) -> list:
+    """Every comment on the listing, across all pages.
+
+    The first page is fetched at the given listing URL; later pages
+    append page numbers. Collection stops at the first short or empty
+    page so a marker beyond the first 100 comments is still found.
+    """
+    comments: list = []
+    page = 1
+    while True:
+        url = listing if page == 1 else f"{listing}&page={page}"
+        batch = _gh([url])
+        if not isinstance(batch, list):
+            break
+        comments.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+        if page > 100:
+            break
+    return comments
+
+
 def post(repo: str, body: str, pr: int | None = None, commit: str | None = None) -> dict:
     """Create or update the Observer-owned comment on a PR or a commit.
 
     Only a marker comment authored by the authenticated gh user is ever
     patched: a foreign or spoofed marker is left alone and a new comment
-    is created beside it. When several owned markers exist, the newest
+    is created beside it. The full comment list is paginated before
+    markers are selected; when several owned markers exist, the newest
     is updated and the duplicates are reported.
     """
     if (pr is None) == (commit is None):
@@ -148,9 +172,7 @@ def post(repo: str, body: str, pr: int | None = None, commit: str | None = None)
         create = f"repos/{repo}/commits/{commit}/comments"
         edit = f"repos/{repo}/comments/{{id}}"
     me = _authenticated_login()
-    comments = _gh([listing])
-    if not isinstance(comments, list):
-        comments = []
+    comments = _list_all_comments(listing)
     markers = [c for c in comments if MARKER in (c.get("body") or "")]
     owned = sorted((c for c in markers if _comment_author(c) == me),
                    key=_comment_time)
