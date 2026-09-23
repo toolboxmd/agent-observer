@@ -135,7 +135,6 @@ class _Reader:
         self.first_ts = None
         self.last_ts = None
         self.meta: dict = {}
-        self.saw_usage_records = False
         self.token_counts: list = []
 
     @property
@@ -168,13 +167,13 @@ def import_codex_file(con: sqlite3.Connection, path: str,
     reader = _Reader(con, src, stats)
     for ordinal, obj, line in src.records():
         stats["lines"] += 1
-        if obj is None:
+        if obj is None or not isinstance(obj, dict):
             stats["malformed"] += 1
-            src.error(ordinal, "json_error", line)
+            src.error(ordinal, "json_error" if obj is None else "shape_error", line)
             continue
         try:
             _ingest_record(reader, obj)
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
             stats["malformed"] += 1
             src.error(obj.get("ordinal", ordinal), f"schema_error: {exc}", line)
             continue
@@ -202,7 +201,10 @@ def _ingest_record(r: _Reader, obj: dict) -> None:
                      "token_usage_record", "turn_context", "compacted",
                      "world_state", "inter_agent_communication_metadata"):
         raise ValueError(f"unsupported record type: {rtype!r}")
-    payload = obj.get("payload", {}) if isinstance(obj, dict) else {}
+    payload = obj.get("payload", {})
+    if not isinstance(payload, dict):
+        raise ValueError(f"unsupported payload shape for {rtype}: "
+                         f"{type(payload).__name__}")
     if rtype == "session_meta":
         r.session_id = payload.get("session_id") or payload.get("id") or r.session_id
         r.thread_id = payload.get("id") or r.thread_id
@@ -234,44 +236,73 @@ def _ingest_record(r: _Reader, obj: dict) -> None:
     # beyond source metadata; they stay private in the raw file.
 
 
-def _flush_token_counts(r: _Reader) -> None:
-    """Count token_count checkpoints only for rollouts without usage records.
+def _reconcile_fallback(r: _Reader) -> None:
+    """Mark only genuinely reconciled fallback checkpoints as overlap.
 
-    A checkpoint is a new response when the cumulative total grows; repeats
-    of the same total add nothing."""
-    if r.saw_usage_records or not r.token_counts:
-        return
-    if r.con.execute("SELECT 1 FROM responses WHERE session_key=? AND semantics=?",
-                     (r.session_key, SEMANTICS)).fetchone():
-        return
-    row = r.con.execute("SELECT MAX(thread_total_tokens) t FROM responses"
-                        " WHERE session_key=?", (r.session_key,)).fetchone()
-    previous = row["t"] or 0
-    for obj, info in r.token_counts:
-        total = (info.get("total_token_usage") or {}).get("total_tokens")
-        last = info.get("last_token_usage") or {}
-        if not isinstance(total, int) or total <= previous:
-            continue
-        previous = total
-        cur = r.con.execute(
-            "INSERT OR IGNORE INTO responses(response_id, source_id, harness,"
-            " session_key, thread_id, ordinal_num, ts, model, effort, input_tokens,"
-            " cached_input_tokens, cache_write_input_tokens, output_tokens,"
-            " reasoning_output_tokens, total_tokens, thread_total_tokens, semantics)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (f"{r.session_key}:tc:{obj.get('ordinal')}", r.src.source_id, HARNESS,
-             r.session_key, r.thread_id, obj.get("ordinal"), iso_ts(obj.get("timestamp")),
-             r.model, r.effort, last.get("input_tokens"), last.get("cached_input_tokens"),
-             last.get("cache_write_input_tokens"), last.get("output_tokens"),
-             last.get("reasoning_output_tokens"), last.get("total_tokens"), total,
-             TOKEN_COUNT_SEMANTICS))
-        r.stats["responses_inserted" if cur.rowcount else "responses_duplicate"] += 1
-    r.token_counts = []
+    A legacy cumulative checkpoint is covered when an authoritative
+    response's own thread span (thread_total minus its own total up to
+    thread_total) contains that cumulative point: the authoritative record
+    then accounts for the same native work. Checkpoints outside every
+    authoritative span stay counted, so partial transitions never undercount
+    and no representation is ever counted twice. The rows stay as evidence.
+    """
+    r.con.execute(
+        "UPDATE responses SET is_overlap=1 WHERE session_key=?"
+        " AND semantics=? AND is_overlap=0"
+        " AND thread_total_tokens IS NOT NULL"
+        " AND EXISTS (SELECT 1 FROM responses auth"
+        " WHERE auth.session_key=responses.session_key"
+        " AND auth.semantics=? AND auth.is_overlap=0"
+        " AND auth.thread_total_tokens IS NOT NULL"
+        " AND auth.total_tokens IS NOT NULL"
+        " AND auth.thread_total_tokens - auth.total_tokens"
+        " < responses.thread_total_tokens"
+        " AND responses.thread_total_tokens <= auth.thread_total_tokens)",
+        (r.session_key, TOKEN_COUNT_SEMANTICS, SEMANTICS))
+
+
+def _flush_token_counts(r: _Reader) -> None:
+    """Count token_count checkpoints for rollouts without full usage cover.
+
+    Each rising cumulative total is one new response keyed by that total, so
+    appended logs, copied snapshots and full reimports all converge: repeats
+    of the same total add nothing. Rising checkpoints are always preserved
+    as evidence, wherever they appear; reconciliation then marks only the
+    checkpoints an authoritative span genuinely covers as overlap."""
+
+    if r.token_counts:
+        row = r.con.execute(
+            "SELECT MAX(thread_total_tokens) t FROM responses"
+            " WHERE session_key=? AND semantics=?",
+            (r.session_key, TOKEN_COUNT_SEMANTICS)).fetchone()
+        previous = row["t"] or 0
+        for obj, info in r.token_counts:
+            total = (info.get("total_token_usage") or {}).get("total_tokens") \
+                if isinstance(info.get("total_token_usage"), dict) else None
+            last = info.get("last_token_usage")
+            if not isinstance(total, int) or total <= previous \
+                    or not isinstance(last, dict):
+                continue
+            previous = total
+            cur = r.con.execute(
+                "INSERT OR IGNORE INTO responses(response_id, source_id, harness,"
+                " session_key, thread_id, ordinal_num, ts, model, effort, input_tokens,"
+                " cached_input_tokens, cache_write_input_tokens, output_tokens,"
+                " reasoning_output_tokens, total_tokens, thread_total_tokens, semantics)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (f"{r.session_key}:tc:{total}", r.src.source_id, HARNESS,
+                 r.session_key, r.thread_id, obj.get("ordinal"), iso_ts(obj.get("timestamp")),
+                 r.model, r.effort, last.get("input_tokens"), last.get("cached_input_tokens"),
+                 last.get("cache_write_input_tokens"), last.get("output_tokens"),
+                 last.get("reasoning_output_tokens"), last.get("total_tokens"), total,
+                 TOKEN_COUNT_SEMANTICS))
+            r.stats["responses_inserted" if cur.rowcount else "responses_duplicate"] += 1
+        r.token_counts = []
+    _reconcile_fallback(r)
 
 
 def _ingest_usage(r: _Reader, obj: dict) -> None:
     p = obj["payload"]
-    r.saw_usage_records = True
     for k in ("response_id", "usage"):
         if k not in p:
             raise ValueError(f"token_usage_record missing {k}")
@@ -295,12 +326,26 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
          u.get("reasoning_output_tokens"), u.get("total_tokens"),
          tt.get("total_tokens"), th.get("total_tokens"), SEMANTICS))
     if cur.rowcount == 0:
-        # Same response_id seen again: verify counters agree, never re-sum.
+        # Same response_id seen again: every immutable counter must agree.
+        # An exact repeat is a no-op; any mismatch is quarantined and later
+        # valid records still import.
         existing = r.con.execute(
-            "SELECT total_tokens FROM responses WHERE response_id=?",
-            (rid,)).fetchone()
-        if existing is None or existing["total_tokens"] != u.get("total_tokens"):
-            raise ValueError(f"conflicting usage for {p['response_id']}")
+            "SELECT input_tokens, cached_input_tokens,"
+            " cache_write_input_tokens, output_tokens, reasoning_output_tokens,"
+            " total_tokens, turn_total_tokens, thread_total_tokens"
+            " FROM responses WHERE response_id=?", (rid,)).fetchone()
+        seen = dict(existing) if existing is not None else {}
+        want = {"input_tokens": u.get("input_tokens"),
+                "cached_input_tokens": u.get("cached_input_tokens"),
+                "cache_write_input_tokens": u.get("cache_write_input_tokens"),
+                "output_tokens": u.get("output_tokens"),
+                "reasoning_output_tokens": u.get("reasoning_output_tokens"),
+                "total_tokens": u.get("total_tokens"),
+                "turn_total_tokens": tt.get("total_tokens"),
+                "thread_total_tokens": th.get("total_tokens")}
+        if seen != want:
+            raise ValueError(f"conflicting usage for {p['response_id']}:"
+                             f" {seen!r} != {want!r}")
         r.stats["responses_duplicate"] += 1
     else:
         r.stats["responses_inserted"] += 1
@@ -351,13 +396,18 @@ def _ingest_response_item(r: _Reader, obj: dict) -> None:
             return
         kind = _submission_kind(p)
         native = p.get("id") or f"ordinal:{obj.get('ordinal')}"
+        # Excerpts persist only genuine human input (or an interrupt); every
+        # other kind keeps an empty excerpt so skill bodies, question replies
+        # and scaffolding can never persist file or preference contents.
+        # Identity extraction above already saw the complete text.
+        excerpt = text[:300] if kind in ("genuine", "interrupt") else ""
         cur = r.con.execute(
             "INSERT OR IGNORE INTO submissions(native_id, source_id,"
             " session_key, turn_id, ordinal_num, ts, kind, text_hash,"
             " text_excerpt, is_genuine) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (f"{HARNESS}:{native}", r.src.source_id, r.session_key, turn_id,
              obj.get("ordinal"), iso_ts(obj.get("timestamp")), kind,
-             text_hash(text), text[:300], 1 if kind == "genuine" else 0))
+             text_hash(text), excerpt, 1 if kind == "genuine" else 0))
         if cur.rowcount:
             r.stats["submissions_inserted"] += 1
         return

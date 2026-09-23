@@ -126,6 +126,11 @@ class _Reader:
         self.last_ts = None
         self.turn = None
         self.pending: dict = {}
+        # Message ids whose native final block (stop_reason) has been seen,
+        # either earlier in this import or in the already-imported file
+        # prefix. A row is updated while its message streams; once final,
+        # every later same-ID repeat is validation only.
+        self.finalized: set = set()
 
     @property
     def session_key(self) -> str:
@@ -145,10 +150,16 @@ class _Reader:
 def import_claude_file(con: sqlite3.Connection, path: str,
                        full: bool = False) -> dict:
     stats = {"lines": 0, "responses_inserted": 0, "responses_duplicate": 0,
+             "responses_updated": 0,
              "submissions_inserted": 0, "events_inserted": 0,
              "events_duplicate": 0, "compactions": 0, "malformed": 0}
     src = JsonlSource(con, HARNESS, path, full=full)
     r = _Reader(con, src, stats)
+    if src.incremental:
+        # Recover finality decided by earlier imports from the already-read
+        # file prefix, so later imports validate post-final repeats instead
+        # of updating them.
+        r.finalized |= _prefix_finalized(src.path, src.start_offset)
     if src.incremental and src.row["session_id"]:
         # Resume the turn the previous import ended in.
         row = con.execute(
@@ -202,34 +213,147 @@ def _ingest(r: _Reader, obj: dict, ordinal: int) -> None:
         _attachment(r, obj, ordinal, ts)
     elif kind == "system":
         _system(r, obj, ordinal, ts)
-    elif kind == "ai-title" and obj.get("aiTitle"):
-        r.meta.setdefault("title", str(obj["aiTitle"])[:200])
+    elif kind == "ai-title":
+        if obj.get("aiTitle"):
+            r.meta.setdefault("title", str(obj["aiTitle"])[:200])
+    else:
+        raise ValueError(f"unsupported record type: {kind!r}")
+
+
+def _usage_values(usage) -> dict:
+    """Native usage buckets with unknown preserved as NULL.
+
+    total_tokens is the harness's own total and is only known when every
+    bucket is known; a partial sum from some buckets is never constructed."""
+    if not isinstance(usage, dict):
+        raise ValueError(f"unsupported usage shape: {type(usage).__name__}")
+    details = usage.get("output_tokens_details") or {}
+    if not isinstance(details, dict):
+        raise ValueError("unsupported usage details shape")
+    values = [usage.get(k) for k in ("input_tokens",
+                                     "cache_creation_input_tokens",
+                                     "cache_read_input_tokens",
+                                     "output_tokens")]
+    return {
+        "input_tokens": usage.get("input_tokens"),
+        "cached_input_tokens": usage.get("cache_read_input_tokens"),
+        "cache_write_input_tokens": usage.get("cache_creation_input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "reasoning_output_tokens": details.get("thinking_tokens"),
+        "total_tokens": sum(values)
+        if all(isinstance(v, int) for v in values) else None,
+    }
+
+
+def _prefix_finalized(path: str, end_offset: int) -> set:
+    """Message ids already finalized in the imported file prefix.
+
+    An incremental import only reads appended lines, so finality decided by
+    an earlier import is recovered from the source evidence itself: any
+    assistant block before the resume offset that carries a native final
+    stop_reason. Read-only; never touches harness state beyond reading.
+    """
+    finals = set()
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(end_offset)
+    except OSError:
+        return finals
+    for raw in data.split(b"\n"):
+        if not raw.strip():
+            continue
+        try:
+            obj = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "assistant":
+            continue
+        message = obj.get("message") or {}
+        if not isinstance(message, dict):
+            continue
+        usage = message.get("usage") or {}
+        if (message.get("id") and message.get("stop_reason") is not None
+                and isinstance(usage, dict) and usage
+                and message.get("model") != "<synthetic>"):
+            finals.add(message["id"])
+    return finals
+
+
+def _stored_counters(r: _Reader, rid: str) -> dict:
+    row = r.con.execute(
+        "SELECT input_tokens, cached_input_tokens, cache_write_input_tokens,"
+        " output_tokens, reasoning_output_tokens, total_tokens"
+        " FROM responses WHERE response_id=?", (rid,)).fetchone()
+    return dict(row) if row is not None else {}
+
+
+def _ingest_usage_row(r: _Reader, obj: dict, ordinal: int, ts, mid: str,
+                      model, values: dict, final: bool) -> None:
+    """One streamed usage block for a message id.
+
+    The first block inserts the row; later blocks update it while the message
+    is still streaming. The final block finalizes it; every later repeat is
+    validated instead of applied, and a mismatch is quarantined."""
+    rid = f"{HARNESS}:{mid}"
+    if mid in r.finalized:
+        seen = _stored_counters(r, rid)
+        if seen != values:
+            raise ValueError(f"conflicting usage for {mid}:"
+                             f" {seen!r} != {values!r}")
+        r.stats["responses_duplicate"] += 1
+        return
+    cur = r.con.execute(
+        "INSERT OR IGNORE INTO responses(response_id, source_id, harness,"
+        " session_key, turn_id, session_id, ordinal_num, ts, model, effort,"
+        " input_tokens, cached_input_tokens, cache_write_input_tokens,"
+        " output_tokens, reasoning_output_tokens, total_tokens, semantics)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (rid, r.src.source_id, HARNESS, r.session_key, r.turn,
+         r.native_session, ordinal, ts, model, obj.get("effort"),
+         values["input_tokens"], values["cached_input_tokens"],
+         values["cache_write_input_tokens"], values["output_tokens"],
+         values["reasoning_output_tokens"], values["total_tokens"],
+         SEMANTICS))
+    if cur.rowcount:
+        r.stats["responses_inserted"] += 1
+        if final:
+            r.finalized.add(mid)
+        return
+    if _stored_counters(r, rid) == values:
+        r.stats["responses_duplicate"] += 1
+        if final:
+            r.finalized.add(mid)
+        return
+    # The message is still streaming (or its final block just arrived): the
+    # latest native block is the authority, across imports as well.
+    r.con.execute(
+        "UPDATE responses SET ordinal_num=?, ts=?,"
+        " model=COALESCE(?, model), effort=COALESCE(?, effort),"
+        " input_tokens=?, cached_input_tokens=?,"
+        " cache_write_input_tokens=?, output_tokens=?,"
+        " reasoning_output_tokens=?, total_tokens=?"
+        " WHERE response_id=?",
+        (ordinal, ts, model, obj.get("effort"),
+         values["input_tokens"], values["cached_input_tokens"],
+         values["cache_write_input_tokens"], values["output_tokens"],
+         values["reasoning_output_tokens"], values["total_tokens"], rid))
+    r.stats["responses_updated"] += 1
+    if final:
+        r.finalized.add(mid)
 
 
 def _assistant(r: _Reader, obj: dict, ordinal: int, ts) -> None:
     message = obj.get("message") or {}
+    if message and not isinstance(message, dict):
+        raise ValueError(
+            f"unsupported message shape: {type(message).__name__}")
     mid = message.get("id")
     model = message.get("model")
     usage = message.get("usage") or {}
     if mid and usage and model != "<synthetic>":
-        details = usage.get("output_tokens_details") or {}
-        values = [usage.get(k) for k in ("input_tokens", "cache_creation_input_tokens",
-                                          "cache_read_input_tokens", "output_tokens")]
-        total = sum(v for v in values if isinstance(v, int)) if any(
-            isinstance(v, int) for v in values) else None
-        cur = r.con.execute(
-            "INSERT OR IGNORE INTO responses(response_id, source_id, harness,"
-            " session_key, turn_id, session_id, ordinal_num, ts, model, effort,"
-            " input_tokens, cached_input_tokens, cache_write_input_tokens,"
-            " output_tokens, reasoning_output_tokens, total_tokens, semantics)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (f"{HARNESS}:{mid}", r.src.source_id, HARNESS, r.session_key, r.turn,
-             r.native_session, ordinal, ts, model, obj.get("effort"),
-             usage.get("input_tokens"), usage.get("cache_read_input_tokens"),
-             usage.get("cache_creation_input_tokens"), usage.get("output_tokens"),
-             details.get("thinking_tokens"), total, SEMANTICS))
-        key = "responses_inserted" if cur.rowcount else "responses_duplicate"
-        r.stats[key] += 1
+        values = _usage_values(usage)
+        _ingest_usage_row(r, obj, ordinal, ts, mid, model, values,
+                          message.get("stop_reason") is not None)
     for index, block in enumerate(message.get("content") or []):
         if not isinstance(block, dict):
             continue
@@ -258,12 +382,17 @@ def _assistant(r: _Reader, obj: dict, ordinal: int, ts) -> None:
 
 
 def _submission(r: _Reader, native_id, ordinal, ts, kind: str, text: str) -> None:
+    # Excerpts persist only genuine human input (or an interrupt); every
+    # other kind keeps an empty excerpt so skill bodies, sidechain prompts,
+    # hook output and scaffolding can never persist file or preference
+    # contents. Identity extraction already saw the complete text.
+    excerpt = text[:300] if kind in ("genuine", "interrupt") else ""
     cur = r.con.execute(
         "INSERT OR IGNORE INTO submissions(native_id, source_id, session_key,"
         " turn_id, ordinal_num, ts, kind, text_hash, text_excerpt, is_genuine)"
         " VALUES(?,?,?,?,?,?,?,?,?,?)",
         (f"{HARNESS}:{native_id}", r.src.source_id, r.session_key, r.turn, ordinal,
-         ts, kind, text_hash(text), text[:300], 1 if kind == "genuine" else 0))
+         ts, kind, text_hash(text), excerpt, 1 if kind == "genuine" else 0))
     if cur.rowcount:
         r.stats["submissions_inserted"] += 1
 
@@ -274,6 +403,10 @@ def _user_kind(r: _Reader, obj: dict, text: str) -> str:
     stripped = text.lstrip()
     if stripped.startswith(INTERRUPT_PREFIX):
         return "interrupt"
+    if stripped.startswith(SKILL_BASE_PREFIX):
+        # A loaded skill body arrives as message text: skill-load evidence,
+        # never a genuine human submission.
+        return "scaffolding"
     origin = obj.get("origin") if isinstance(obj.get("origin"), dict) else {}
     if origin.get("kind") == "human" or obj.get("promptSource") == "typed":
         return "genuine"

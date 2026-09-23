@@ -1,0 +1,8 @@
+{"ordinal":0,"payload":{"cli_version":"0.155.0","cwd":"/redacted/workspace","model_provider":"openai","session_id":"sess-fixture-shape-01","thread_source":"user"},"timestamp":"2026-09-14T13:00:00.000Z","type":"session_meta"}
+{"ordinal":1,"payload":{"content":[{"text":"A valid request that must survive the bad lines around it.","type":"input_text"}],"id":"msg-shape-sub-01","internal_chat_message_metadata_passthrough":{"content_item_kinds":["user.text"],"create_time":1789003001.0,"turn_id":"turn-shape-aaa"},"role":"user","type":"message"},"timestamp":"2026-09-14T13:00:01.000Z","type":"response_item"}
+[1, 2, 3]
+"just a scalar string"
+42
+{"ordinal":5,"payload":{},"timestamp":"2026-09-14T13:00:02.000Z","type":"future_unknown_type"}
+{"ordinal":6,"timestamp":"2026-09-14T13:00:03.000Z","type":"token_usage_record"}
+{"ordinal":7,"payload":{"response_id":"resp-shape-001","root_turn_id":"turn-shape-aaa","session_id":"sess-fixture-shape-01","thread_id":"sess-fixture-shape-01","thread_token_usage":{"cache_write_input_tokens":0,"cached_input_tokens":100,"input_tokens":500,"output_tokens":50,"reasoning_output_tokens":5,"total_tokens":550},"turn_id":"turn-shape-aaa","turn_token_usage":{"cache_write_input_tokens":0,"cached_input_tokens":100,"input_tokens":500,"output_tokens":50,"reasoning_output_tokens":5,"total_tokens":550},"usage":{"cache_write_input_tokens":0,"cached_input_tokens":100,"input_tokens":500,"output_tokens":50,"reasoning_output_tokens":5,"total_tokens":550}},"timestamp":"2026-09-14T13:00:04.000Z","type":"token_usage_record"}
