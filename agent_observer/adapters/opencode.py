@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 
@@ -31,7 +32,7 @@ DB_FILENAME = "opencode.db"
 CAPABILITIES = [
     ("model_usage", True, "assistant message usage once completed; input excludes cache, reasoning separate; all-zero counters mean unknown"),
     ("tool_calls", True, "tool parts with callID join, name, argument fingerprint and target"),
-    ("tool_results", True, "tool results joined on callID; completed maps to ok, error to error; running has no result yet"),
+    ("tool_results", True, "tool results joined on callID; completed maps to ok, error to error; pending and running have no result yet"),
     ("read_evidence", True, "read tool results with resolved path"),
     ("skill_file_reads", True, "reads under an installed Skill directory"),
     ("skill_invocation", True, "skill tool calls name the skill; skill dir observed as SKILL.md path"),
@@ -42,6 +43,21 @@ CAPABILITIES = [
     ("instruction_identity", True, "AgentsMD direction block from user text; versioned plugin paths read"),
     ("subagents", True, "child sessions as subagent sessions of their parent"),
 ]
+
+# Privacy: the full AgentsMD direction block (which carries preference
+# contents) is stripped from submission excerpts. Identity observation still
+# sees the full text so instructions_sha256 / preferences_sha256 keep working.
+_DIRECTION_SPAN_RE = re.compile(
+    r"<<<AGENTSMD_PROJECT_DIRECTION_V1>>>.*?<<<END_AGENTSMD_PROJECT_DIRECTION_V1>>>",
+    re.S)
+_INSTRUCTIONS_RE = re.compile(
+    r"<INSTRUCTIONS>\n?(.*?)(?:</INSTRUCTIONS>|\Z)", re.S)
+
+# Part types that are known to carry no ledger event. Anything else is
+# quarantined as unknown_part_type instead of being silently dropped.
+_KNOWN_QUIET_PART_TYPES = frozenset(
+    {"text", "reasoning", "file", "step-start", "step-finish"})
+_INCOMPLETE_TOOL_STATUSES = frozenset({"running", "pending"})
 
 
 def _resolve_db(path: str | None) -> str:
@@ -56,6 +72,73 @@ def _resolve_db(path: str | None) -> str:
 def discover(root: str | None = None) -> list[str]:
     path = _resolve_db(root)
     return [path] if os.path.exists(path) else []
+
+
+def _native_columns(native: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        rows = native.execute(f"PRAGMA table_info({table})").fetchall()
+    except sqlite3.Error:
+        return set()
+    cols: set[str] = set()
+    for row in rows:
+        try:
+            cols.add(row["name"])
+        except (KeyError, TypeError, IndexError):
+            try:
+                cols.add(row[1])
+            except (IndexError, TypeError):
+                continue
+    return cols
+
+
+def _fetch_dicts(native: sqlite3.Connection, table: str, want: list[str],
+                 where: str | None = None, args: tuple = (),
+                 order: list[str] | None = None) -> list[dict]:
+    cols = _native_columns(native, table)
+    if not cols or "id" not in cols and table in ("session", "message", "part"):
+        # Without columns (or without an id on a core table) there is
+        # nothing projectable; let the caller quarantine the read.
+        if not cols:
+            raise sqlite3.Error(f"no such table: {table}")
+    present = [c for c in want if c in cols]
+    if not present:
+        return []
+    sql = f"SELECT {', '.join(present)} FROM {table}"
+    if where:
+        # Only filter when the filter column exists; otherwise return all.
+        sql += f" WHERE {where}"
+    order_cols = [c for c in (order or []) if c in cols]
+    if order_cols:
+        sql += " ORDER BY " + ", ".join(order_cols)
+    rows = native.execute(sql, args).fetchall()
+    out: list[dict] = []
+    for row in rows:
+        item = {c: row[c] for c in present}
+        for col in want:
+            if col not in item:
+                item[col] = None
+        out.append(item)
+    return out
+
+
+def _count_max(native: sqlite3.Connection, table: str,
+               sess_id: str | None) -> tuple[int, object]:
+    cols = _native_columns(native, table)
+    if not cols or "session_id" not in cols:
+        return 0, None
+    try:
+        if "time_updated" in cols:
+            row = native.execute(
+                f"SELECT COUNT(*) n, MAX(time_updated) m FROM {table}"
+                " WHERE session_id=?", (sess_id,)).fetchone()
+            return (row["n"] if row else 0,
+                    row["m"] if row and "m" in row.keys() else None)
+        row = native.execute(
+            f"SELECT COUNT(*) n FROM {table} WHERE session_id=?",
+            (sess_id,)).fetchone()
+        return (row["n"] if row else 0), None
+    except sqlite3.Error:
+        return 0, None
 
 
 def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
@@ -76,10 +159,11 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
     native.row_factory = sqlite3.Row
     try:
         try:
-            rows = native.execute(
-                "SELECT id, parent_id, directory, title, version,"
-                " time_created, time_updated, time_compacting"
-                " FROM session ORDER BY id").fetchall()
+            rows = _fetch_dicts(
+                native, "session",
+                ["id", "parent_id", "directory", "title", "version",
+                 "time_created", "time_updated", "time_compacting"],
+                order=["id"])
         except sqlite3.Error as exc:
             totals["failed"].append({"path": abs_path, "error": str(exc)})
             return totals
@@ -89,7 +173,7 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
                                        full=full)
             except (OSError, sqlite3.DatabaseError) as exc:
                 totals["failed"].append(
-                    {"path": f"{abs_path}#{row['id']}", "error": str(exc)})
+                    {"path": f"{abs_path}#{row.get('id')}", "error": str(exc)})
                 continue
             totals["sources"] += 1
             totals["unchanged"] += 1 if stats.get("unchanged") else 0
@@ -101,6 +185,37 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
     return totals
 
 
+def _shape_keys(data) -> list[str] | None:
+    if not isinstance(data, dict):
+        return None
+    try:
+        return sorted(str(k) for k in data.keys())
+    except (TypeError, ValueError):
+        return []
+
+
+def _sanitized_excerpt(native_id=None, data=None, role=None,
+                       ptype=None) -> str:
+    """Sanitized import_errors excerpt: native id plus record shape only.
+
+    Carries the sorted top-level keys, part type and role. Never includes
+    raw JSON, tool input/output, message text or exception payloads.
+    """
+    keys = _shape_keys(data)
+    nid = "" if native_id is None else str(native_id)[:60]
+    if keys is not None:
+        keys_part = ",".join(keys)[:110]
+        base = f"id={nid} keys=[{keys_part}]"
+    else:
+        dtype = type(data).__name__ if data is not None else "missing"
+        base = f"id={nid} shape={dtype}"
+    if ptype:
+        base += f" type={str(ptype)[:30]}"
+    if role is not None:
+        base += f" role={str(role)[:30]}"
+    return base[:200]
+
+
 def _oops(con: sqlite3.Connection, stats: dict, src_path: str,
           ordinal, message: str, excerpt: str = "") -> None:
     stats["malformed"] += 1
@@ -109,6 +224,15 @@ def _oops(con: sqlite3.Connection, stats: dict, src_path: str,
         " line_excerpt, created_at) VALUES(?,?,?,?,?,?)",
         (HARNESS, src_path, ordinal, message, (excerpt or "")[:200],
          db.now()))
+
+
+def _sanitize_user_text(text: str) -> str:
+    """Human-only excerpt text with direction/instruction blocks removed."""
+    if not isinstance(text, str):
+        return ""
+    cleaned = _DIRECTION_SPAN_RE.sub("", text)
+    cleaned = _INSTRUCTIONS_RE.sub("", cleaned)
+    return cleaned.strip()
 
 
 def _target(tool_input: dict) -> str | None:
@@ -153,6 +277,111 @@ def _int_or_none(value):
         else None
 
 
+def _upsert_response(con: sqlite3.Connection, stats: dict, src_path: str,
+                     *, response_id: str, source_id, session_key, session_id,
+                     ordinal, ts, model, provider, effort, values: dict,
+                     total, semantics, cost_usd) -> None:
+    existing = con.execute(
+        "SELECT * FROM responses WHERE response_id=?",
+        (response_id,)).fetchone()
+    if existing is None:
+        con.execute(
+            "INSERT INTO responses(response_id, source_id, harness,"
+            " session_key, session_id, ordinal_num, ts, model, provider, effort,"
+            " input_tokens, cached_input_tokens, cache_write_input_tokens,"
+            " output_tokens, reasoning_output_tokens, total_tokens, semantics,"
+            " cost_usd) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (response_id, source_id, HARNESS, session_key,
+             session_id, ordinal, ts, model,
+             provider, effort,
+             values["input_tokens"], values["cached_input_tokens"],
+             values["cache_write_input_tokens"], values["output_tokens"],
+             values["reasoning_output_tokens"], total, semantics, cost_usd))
+        stats["responses_inserted"] = stats.get("responses_inserted", 0) + 1
+        return
+    # Immutable identity: the same response id must stay in its session.
+    if (existing["session_key"] != session_key
+            or existing["session_id"] != session_id):
+        _oops(con, stats, src_path, ordinal, "conflict_response",
+              _sanitized_excerpt(response_id,
+                                 {"keys": "response", "session": session_key},
+                                 role="assistant"))
+        stats["responses_duplicate"] = stats.get("responses_duplicate", 0) + 1
+        return
+    new_fields = {
+        "ordinal_num": ordinal, "ts": ts, "model": model, "provider": provider,
+        "effort": effort, "input_tokens": values["input_tokens"],
+        "cached_input_tokens": values["cached_input_tokens"],
+        "cache_write_input_tokens": values["cache_write_input_tokens"],
+        "output_tokens": values["output_tokens"],
+        "reasoning_output_tokens": values["reasoning_output_tokens"],
+        "total_tokens": total, "semantics": semantics, "cost_usd": cost_usd,
+        "source_id": source_id,
+    }
+    changed = any(existing[col] != val for col, val in new_fields.items())
+    if not changed:
+        stats["responses_duplicate"] = stats.get("responses_duplicate", 0) + 1
+        return
+    con.execute(
+        "UPDATE responses SET source_id=?, ordinal_num=?, ts=?, model=?,"
+        " provider=?, effort=?, input_tokens=?, cached_input_tokens=?,"
+        " cache_write_input_tokens=?, output_tokens=?,"
+        " reasoning_output_tokens=?, total_tokens=?, semantics=?, cost_usd=?"
+        " WHERE response_id=?",
+        (source_id, ordinal, ts, model, provider, effort,
+         values["input_tokens"], values["cached_input_tokens"],
+         values["cache_write_input_tokens"], values["output_tokens"],
+         values["reasoning_output_tokens"], total, semantics, cost_usd,
+         response_id))
+    stats["responses_inserted"] = stats.get("responses_inserted", 0) + 1
+
+
+def _upsert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
+                  session_key: str, family: str, native_id, ordinal=None,
+                  ts=None, turn_id=None, name=None, target=None, status=None,
+                  duration_ms=None, size_bytes=None, truncated=None,
+                  fingerprint=None, detail=None) -> None:
+    if not native_id:
+        raise ValueError(f"{family} event missing native identity")
+    native_id = str(native_id)
+    detail_json = json.dumps(detail, sort_keys=True, default=str)[:4000] \
+        if detail else None
+    existing = con.execute(
+        "SELECT * FROM events WHERE session_key=? AND family=? AND native_id=?",
+        (session_key, family, native_id)).fetchone()
+    if existing is None:
+        con.execute(
+            "INSERT INTO events(source_id, session_key, ordinal_num, ts,"
+            " family, native_id, turn_id, name, target, status, duration_ms,"
+            " size_bytes, truncated, fingerprint, detail_json)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (source_id, session_key, ordinal, ts, family, native_id, turn_id,
+             name, target, status, duration_ms, size_bytes, truncated,
+             fingerprint, detail_json))
+        stats["events_inserted"] = stats.get("events_inserted", 0) + 1
+        return
+    new_fields = {
+        "source_id": source_id, "ordinal_num": ordinal, "ts": ts,
+        "turn_id": turn_id, "name": name, "target": target, "status": status,
+        "duration_ms": duration_ms, "size_bytes": size_bytes,
+        "truncated": truncated, "fingerprint": fingerprint,
+        "detail_json": detail_json,
+    }
+    changed = any(existing[col] != val for col, val in new_fields.items())
+    if not changed:
+        stats["events_duplicate"] = stats.get("events_duplicate", 0) + 1
+        return
+    con.execute(
+        "UPDATE events SET source_id=?, ordinal_num=?, ts=?, turn_id=?,"
+        " name=?, target=?, status=?, duration_ms=?, size_bytes=?,"
+        " truncated=?, fingerprint=?, detail_json=? WHERE session_key=?"
+        " AND family=? AND native_id=?",
+        (source_id, ordinal, ts, turn_id, name, target, status, duration_ms,
+         size_bytes, truncated, fingerprint, detail_json, session_key,
+         family, native_id))
+    stats["events_inserted"] = stats.get("events_inserted", 0) + 1
+
+
 def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
                    abs_db_path: str, sess: dict,
                    full: bool = False) -> dict:
@@ -163,17 +392,9 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     sess_id = sess.get("id")
     src_path = f"{abs_db_path}#{sess_id}"
     session_key = f"{HARNESS}:{sess_id}"
-    msg_row = native.execute(
-        "SELECT COUNT(*) n, MAX(time_updated) m FROM message"
-        " WHERE session_id=?", (sess_id,)).fetchone()
-    part_row = native.execute(
-        "SELECT COUNT(*) n, MAX(time_updated) m FROM part"
-        " WHERE session_id=?", (sess_id,)).fetchone()
-    fp = fingerprint(sess.get("time_updated"),
-                     msg_row["m"] if msg_row else None,
-                     part_row["m"] if part_row else None,
-                     msg_row["n"] if msg_row else 0,
-                     part_row["n"] if part_row else 0)
+    msg_n, msg_m = _count_max(native, "message", sess_id)
+    part_n, part_m = _count_max(native, "part", sess_id)
+    fp = fingerprint(sess.get("time_updated"), msg_m, part_m, msg_n, part_n)
     row = con.execute(
         "SELECT * FROM sources WHERE harness=? AND path=?",
         (HARNESS, src_path)).fetchone()
@@ -191,45 +412,59 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     source_id = row["id"]
     identity = SessionIdentity()
     try:
-        messages = native.execute(
-            "SELECT id, time_created, time_updated, data FROM message"
-            " WHERE session_id=? ORDER BY time_created, id",
-            (sess_id,)).fetchall()
+        messages = _fetch_dicts(
+            native, "message",
+            ["id", "session_id", "time_created", "time_updated", "data"],
+            where="session_id=?", args=(sess_id,),
+            order=["time_created", "id"])
     except sqlite3.Error as exc:
-        _oops(con, stats, abs_db_path, None, f"message_read: {exc}", sess_id or "")
+        _oops(con, stats, abs_db_path, None,
+              f"message_read:{type(exc).__name__}",
+              _sanitized_excerpt(sess_id, None, role="read"))
         messages = []
     try:
-        parts = native.execute(
-            "SELECT id, message_id, time_created, time_updated, data FROM part"
-            " WHERE session_id=? ORDER BY time_created, id",
-            (sess_id,)).fetchall()
+        parts = _fetch_dicts(
+            native, "part",
+            ["id", "message_id", "session_id", "time_created", "time_updated",
+             "data"],
+            where="session_id=?", args=(sess_id,),
+            order=["time_created", "id"])
     except sqlite3.Error as exc:
-        _oops(con, stats, abs_db_path, None, f"part_read: {exc}", sess_id or "")
+        _oops(con, stats, abs_db_path, None,
+              f"part_read:{type(exc).__name__}",
+              _sanitized_excerpt(sess_id, None, role="read"))
         parts = []
     by_message: dict[str, list] = {}
     for part in parts:
-        by_message.setdefault(part["message_id"], []).append(part)
+        by_message.setdefault(part.get("message_id"), []).append(part)
     roles: dict[str, str | None] = {}
     parsed_messages: list[tuple] = []
     for index, msg in enumerate(messages):
+        raw = msg.get("data")
+        msg_id = msg.get("id")
+        if not msg_id or raw is None:
+            _oops(con, stats, abs_db_path, index, "message_shape",
+                  _sanitized_excerpt(msg_id, None, role=None))
+            continue
         try:
-            data = json.loads(msg["data"])
+            data = json.loads(raw)
         except (json.JSONDecodeError, TypeError, UnicodeDecodeError) as exc:
-            _oops(con, stats, abs_db_path, index, f"message_json: {exc}",
-                  str(msg["data"])[:200])
+            _oops(con, stats, abs_db_path, index,
+                  f"message_json:{type(exc).__name__}",
+                  _sanitized_excerpt(msg_id, None, role=None))
             continue
         if not isinstance(data, dict):
             _oops(con, stats, abs_db_path, index, "message_shape",
-                  str(msg["data"])[:200])
+                  _sanitized_excerpt(msg_id, data, role=None))
             continue
         parsed_messages.append((index, msg, data))
-        roles[msg["id"]] = data.get("role")
+        roles[msg_id] = data.get("role")
     ordinal = 0
     for index, msg, data in parsed_messages:
         ordinal += 1
         _ingest_message(con, native, stats, identity, abs_db_path, source_id,
                         session_key, sess, msg, data, index, ordinal,
-                        by_message.get(msg["id"], []))
+                        by_message.get(msg.get("id"), []))
     for part in parts:
         ordinal += 1
         _ingest_part(con, stats, identity, abs_db_path, source_id,
@@ -268,12 +503,12 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
 def _ingest_message(con, native, stats, identity, abs_db_path, source_id,
                     session_key, sess, msg, data, index, ordinal,
                     msg_parts) -> None:
-    msg_id = msg["id"]
+    msg_id = msg.get("id")
     timing = data.get("time") if isinstance(data.get("time"), dict) else {}
     completed = timing.get("completed")
     created = timing.get("created")
     ts = iso_ts(completed if completed is not None else
-                (created if created is not None else msg["time_created"]))
+                (created if created is not None else msg.get("time_created")))
     error = data.get("error")
     if isinstance(error, dict):
         native_name = error.get("name") or "error"
@@ -290,15 +525,18 @@ def _ingest_message(con, native, stats, identity, abs_db_path, source_id,
     role = data.get("role")
     if role == "assistant":
         _ingest_response(con, stats, abs_db_path, source_id, session_key,
-                         sess, msg, data, index, ts)
+                         sess, msg, data, index, ts, ordinal)
     elif role == "user":
         _ingest_submission(con, stats, identity, abs_db_path, source_id,
                            session_key, sess, msg, data, index, ts,
-                           msg_parts)
+                           msg_parts, ordinal)
+    else:
+        _oops(con, stats, abs_db_path, ordinal, "unknown_role",
+              _sanitized_excerpt(msg_id, data, role=role))
 
 
 def _ingest_response(con, stats, abs_db_path, source_id, session_key, sess,
-                     msg, data, index, ts) -> None:
+                     msg, data, index, ts, ordinal) -> None:
     timing = data.get("time") if isinstance(data.get("time"), dict) else {}
     if timing.get("completed") is None:
         return
@@ -320,38 +558,51 @@ def _ingest_response(con, stats, abs_db_path, source_id, session_key, sess,
     cost = data.get("cost")
     cost_usd = cost if isinstance(cost, (int, float)) \
         and not isinstance(cost, bool) else None
-    cur = con.execute(
-        "INSERT OR IGNORE INTO responses(response_id, source_id, harness,"
-        " session_key, session_id, ordinal_num, ts, model, provider, effort,"
-        " input_tokens, cached_input_tokens, cache_write_input_tokens,"
-        " output_tokens, reasoning_output_tokens, total_tokens, semantics,"
-        " cost_usd) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (f"{HARNESS}:{msg['id']}", source_id, HARNESS, session_key,
-         sess.get("id"), index, ts, data.get("modelID"),
-         data.get("providerID"), data.get("variant"),
-         values["input_tokens"], values["cached_input_tokens"],
-         values["cache_write_input_tokens"], values["output_tokens"],
-         values["reasoning_output_tokens"], total, SEMANTICS, cost_usd))
-    stats["responses_inserted" if cur.rowcount else "responses_duplicate"] += 1
+    _upsert_response(
+        con, stats, abs_db_path, response_id=f"{HARNESS}:{msg.get('id')}",
+        source_id=source_id, session_key=session_key,
+        session_id=sess.get("id"), ordinal=index, ts=ts,
+        model=data.get("modelID"), provider=data.get("providerID"),
+        effort=data.get("variant"), values=values, total=total,
+        semantics=SEMANTICS, cost_usd=cost_usd)
 
 
 def _ingest_submission(con, stats, identity, abs_db_path, source_id,
                        session_key, sess, msg, data, index, ts,
-                       msg_parts) -> None:
+                       msg_parts, ordinal) -> None:
     texts: list[str] = []
     flags: list[bool] = []
     for part in msg_parts:
-        try:
-            pdata = json.loads(part["data"])
-        except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        raw = part.get("data") if isinstance(part, dict) else None
+        part_id = part.get("id") if isinstance(part, dict) else None
+        if raw is None:
+            _oops(con, stats, abs_db_path, ordinal, "malformed_user_part",
+                  _sanitized_excerpt(part_id, None, role="user",
+                                     ptype="text"))
             continue
-        if not isinstance(pdata, dict) or pdata.get("type") != "text":
+        try:
+            pdata = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, UnicodeDecodeError) as exc:
+            _oops(con, stats, abs_db_path, ordinal,
+                  f"malformed_user_part:{type(exc).__name__}",
+                  _sanitized_excerpt(part_id, None, role="user",
+                                     ptype="text"))
+            continue
+        if not isinstance(pdata, dict):
+            _oops(con, stats, abs_db_path, ordinal, "malformed_user_part",
+                  _sanitized_excerpt(part_id, pdata, role="user"))
+            continue
+        if pdata.get("type") != "text":
             continue
         text = pdata.get("text")
         if not isinstance(text, str) or not text:
+            _oops(con, stats, abs_db_path, ordinal, "malformed_user_part",
+                  _sanitized_excerpt(part_id, pdata, role="user",
+                                     ptype="text"))
             continue
         texts.append(text)
         flags.append(pdata.get("synthetic") is True)
+        # Identity sees the full valid text, including the direction block.
         identity.observe_text(text)
     if not texts:
         return
@@ -362,53 +613,76 @@ def _ingest_submission(con, stats, identity, abs_db_path, source_id,
         kind = "synthetic"
     else:
         kind = "genuine"
+    # Excerpt uses only the human's own (non-synthetic) parts with the
+    # AgentsMD direction block and instruction bodies removed.
+    human_texts = [t for t, flag in zip(texts, flags) if not flag]
+    excerpt_src = _sanitize_user_text("".join(human_texts))
+    excerpt = excerpt_src[:300]
+    digest = text_hash(excerpt_src)
     cur = con.execute(
         "INSERT OR IGNORE INTO submissions(native_id, source_id, session_key,"
         " ordinal_num, ts, kind, text_hash, text_excerpt, is_genuine)"
         " VALUES(?,?,?,?,?,?,?,?,?)",
-        (f"{HARNESS}:{msg['id']}", source_id, session_key, index, ts,
-         kind, text_hash(body), body[:300], 1 if kind == "genuine" else 0))
+        (f"{HARNESS}:{msg.get('id')}", source_id, session_key, index, ts,
+         kind, digest, excerpt, 1 if kind == "genuine" else 0))
     if cur.rowcount:
         stats["submissions_inserted"] += 1
 
 
 def _ingest_part(con, stats, identity, abs_db_path, source_id, session_key,
                  sess, roles, part, ordinal) -> None:
+    raw = part.get("data") if isinstance(part, dict) else None
+    part_id = part.get("id") if isinstance(part, dict) else None
+    message_id = part.get("message_id") if isinstance(part, dict) else None
+    role = roles.get(message_id) if isinstance(roles, dict) else None
+    if raw is None:
+        _oops(con, stats, abs_db_path, ordinal, "part_shape",
+              _sanitized_excerpt(part_id, None, role=role))
+        return
     try:
-        data = json.loads(part["data"])
+        data = json.loads(raw)
     except (json.JSONDecodeError, TypeError, UnicodeDecodeError) as exc:
-        _oops(con, stats, abs_db_path, ordinal, f"part_json: {exc}",
-              str(part["data"])[:200])
+        _oops(con, stats, abs_db_path, ordinal,
+              f"part_json:{type(exc).__name__}",
+              _sanitized_excerpt(part_id, None, role=role))
         return
     if not isinstance(data, dict):
         _oops(con, stats, abs_db_path, ordinal, "part_shape",
-              str(part["data"])[:200])
+              _sanitized_excerpt(part_id, data, role=role))
         return
     ptype = data.get("type")
-    ts = iso_ts(part["time_created"])
+    ts = iso_ts(part.get("time_created"))
     if ptype == "tool":
-        _ingest_tool(con, stats, identity, source_id, session_key, part,
-                     data, ordinal, ts)
+        _ingest_tool(con, stats, identity, abs_db_path, source_id,
+                      session_key, sess, roles, part, data, ordinal, ts)
     elif ptype == "patch":
         _ingest_patch(con, stats, source_id, session_key, part, data,
                       ordinal, ts)
     elif ptype == "compaction":
         insert_event(con, stats, source_id=source_id,
                      session_key=session_key, family="compaction",
-                     native_id=part["id"], ordinal=ordinal, ts=ts,
+                     native_id=part_id, ordinal=ordinal, ts=ts,
                      name="compaction")
-    # text, reasoning, step-start, step-finish and file parts carry no
-    # ledger event: user text is handled per message, and file data URLs,
-    # reasoning bodies and step checkpoints stay out of the ledger.
+    elif ptype in _KNOWN_QUIET_PART_TYPES:
+        # text, reasoning, step checkpoints and file data URLs carry no
+        # ledger event: user text is handled per message, and file data,
+        # reasoning bodies and step checkpoints stay out of the ledger.
+        return
+    else:
+        _oops(con, stats, abs_db_path, ordinal, "unknown_part_type",
+              _sanitized_excerpt(part_id, data, role=role, ptype=ptype))
 
 
-def _ingest_tool(con, stats, identity, source_id, session_key, part, data,
-                 ordinal, ts) -> None:
+def _ingest_tool(con, stats, identity, abs_db_path, source_id, session_key,
+                 sess, roles, part, data, ordinal, ts) -> None:
     tool = data.get("tool") or "unknown"
     call_id = data.get("callID")
+    part_id = part.get("id") if isinstance(part, dict) else None
+    message_id = part.get("message_id") if isinstance(part, dict) else None
+    role = roles.get(message_id) if isinstance(roles, dict) else None
     if not call_id:
-        _oops(con, stats, "", ordinal, "tool_missing_callID",
-              json.dumps(data, default=str)[:200])
+        _oops(con, stats, abs_db_path, ordinal, "tool_missing_callID",
+              _sanitized_excerpt(part_id, data, role=role, ptype="tool"))
         return
     state = data.get("state") if isinstance(data.get("state"), dict) else {}
     status = state.get("status")
@@ -422,40 +696,39 @@ def _ingest_tool(con, stats, identity, source_id, session_key, part, data,
                                               default=str)[:4000])
     except (TypeError, ValueError):
         arg_fp = fingerprint(tool)
-    detail = {"message_id": part["message_id"]}
+    detail = {"message_id": message_id}
     if isinstance(title, str) and title:
         detail["title"] = title[:200]
-    insert_event(con, stats, source_id=source_id, session_key=session_key,
-                 family="tool_call", native_id=call_id, ordinal=ordinal,
-                 ts=ts, name=str(tool)[:200], target=target,
-                 fingerprint=arg_fp, detail=detail)
-    if status == "running" or status is None:
+    _upsert_event(con, stats, source_id=source_id, session_key=session_key,
+                  family="tool_call", native_id=call_id, ordinal=ordinal,
+                  ts=ts, name=str(tool)[:200], target=target,
+                  fingerprint=arg_fp, detail=detail)
+    if status in _INCOMPLETE_TOOL_STATUSES or status is None:
         # No terminal result yet; a later snapshot must add it.
         pass
+    elif status in ("completed", "error"):
+        result_status = "ok" if status == "completed" else "error"
+        _upsert_event(con, stats, source_id=source_id,
+                      session_key=session_key, family="tool_result",
+                      native_id=call_id, ordinal=ordinal, ts=ts,
+                      name=str(tool)[:200], target=target,
+                      status=result_status, duration_ms=_duration_ms(state),
+                      size_bytes=_output_size(output),
+                      detail={"tool": str(tool)[:200]})
     else:
-        if status == "completed":
-            result_status = "ok"
-        elif status == "error":
-            result_status = "error"
-        else:
-            result_status = None
-        insert_event(con, stats, source_id=source_id, session_key=session_key,
-                     family="tool_result", native_id=call_id, ordinal=ordinal,
-                     ts=ts, name=str(tool)[:200], target=target,
-                     status=result_status, duration_ms=_duration_ms(state),
-                     size_bytes=_output_size(output),
-                     detail={"tool": str(tool)[:200]})
+        _oops(con, stats, abs_db_path, ordinal, "unknown_tool_status",
+              _sanitized_excerpt(part_id, data, role=role, ptype="tool"))
     if tool == "read" and status == "completed" and target:
         identity.observe_path(target)
         skill = skill_from_path(target)
         family = "skill_read" if skill else "read"
-        insert_event(con, stats, source_id=source_id,
-                     session_key=session_key, family=family,
-                     native_id=call_id, ordinal=ordinal, ts=ts,
-                     name=os.path.basename(target)[:200], target=target,
-                     status="ok", size_bytes=_output_size(output),
-                     fingerprint=fingerprint(target),
-                     detail={"skill": skill} if skill else None)
+        _upsert_event(con, stats, source_id=source_id,
+                      session_key=session_key, family=family,
+                      native_id=call_id, ordinal=ordinal, ts=ts,
+                      name=os.path.basename(target)[:200], target=target,
+                      status="ok", size_bytes=_output_size(output),
+                      fingerprint=fingerprint(target),
+                      detail={"skill": skill} if skill else None)
     if tool == "skill":
         name = tool_input.get("name") if isinstance(tool_input, dict) \
             else None
@@ -466,18 +739,18 @@ def _ingest_tool(con, stats, identity, source_id, session_key, part, data,
         if isinstance(skill_dir, str) and skill_dir:
             identity.observe_path(
                 os.path.join(skill_dir, "SKILL.md"))
-        insert_event(con, stats, source_id=source_id,
-                     session_key=session_key, family="skill_invoke",
-                     native_id=call_id, ordinal=ordinal, ts=ts,
-                     name=skill_name[:200], target=skill_name[:500],
-                     detail={"skill": skill_name[:200]})
+        _upsert_event(con, stats, source_id=source_id,
+                      session_key=session_key, family="skill_invoke",
+                      native_id=call_id, ordinal=ordinal, ts=ts,
+                      name=skill_name[:200], target=skill_name[:500],
+                      detail={"skill": skill_name[:200]})
     if tool in ("edit", "write", "patch") and target:
-        insert_event(con, stats, source_id=source_id,
-                     session_key=session_key, family="file_change",
-                     native_id=call_id, ordinal=ordinal, ts=ts,
-                     name=str(tool)[:200], target=target,
-                     fingerprint=fingerprint(tool, target),
-                     detail={"tool": str(tool)[:200]})
+        _upsert_event(con, stats, source_id=source_id,
+                      session_key=session_key, family="file_change",
+                      native_id=call_id, ordinal=ordinal, ts=ts,
+                      name=str(tool)[:200], target=target,
+                      fingerprint=fingerprint(tool, target),
+                      detail={"tool": str(tool)[:200]})
 
 
 def _ingest_patch(con, stats, source_id, session_key, part, data, ordinal,
@@ -486,8 +759,8 @@ def _ingest_patch(con, stats, source_id, session_key, part, data, ordinal,
     files = data.get("files")
     file_list = files if isinstance(files, list) else []
     target = str(file_list[0])[:500] if file_list and file_list[0] else None
-    insert_event(con, stats, source_id=source_id, session_key=session_key,
-                 family="file_change", native_id=part["id"], ordinal=ordinal,
-                 ts=ts, name="patch", target=target,
-                 fingerprint=fingerprint("patch", digest, file_list),
-                 detail={"hash": digest} if isinstance(digest, str) else None)
+    _upsert_event(con, stats, source_id=source_id, session_key=session_key,
+                  family="file_change", native_id=part.get("id"),
+                  ordinal=ordinal, ts=ts, name="patch", target=target,
+                  fingerprint=fingerprint("patch", digest, file_list),
+                  detail={"hash": digest} if isinstance(digest, str) else None)
