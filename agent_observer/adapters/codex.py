@@ -47,6 +47,44 @@ CAPABILITIES = [
 ]
 
 
+class _MalformedUsage(ValueError):
+    """A usage bucket that is not NULL or a real integer counter."""
+
+
+class _UsageConflict(ValueError):
+    """An exact-ID repeat whose counters differ from the stored row."""
+
+
+_CODEX_BUCKET_KEYS = ("input_tokens", "cached_input_tokens",
+                      "cache_write_input_tokens", "output_tokens",
+                      "reasoning_output_tokens", "total_tokens")
+
+
+def _valid_counter(value) -> bool:
+    """Only NULL or a real integer counter; booleans are malformed."""
+    if value is None:
+        return True
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _validate_bucket(bucket, *, allow_none: bool = True):
+    """Validate one usage bucket before any SQL.
+
+    None/missing stays unknown (NULL). A dict is validated counter by
+    counter; any other shape, including falsey lists, strings or numbers,
+    is malformed and quarantined.
+    """
+    if bucket is None:
+        if allow_none:
+            return
+        raise _MalformedUsage("malformed usage")
+    if not isinstance(bucket, dict):
+        raise _MalformedUsage("malformed usage")
+    for key in _CODEX_BUCKET_KEYS:
+        if key in bucket and not _valid_counter(bucket[key]):
+            raise _MalformedUsage("malformed usage counter")
+
+
 def discover(root: str | None = None) -> list[str]:
     root = root or DEFAULT_ROOT
     return sorted(glob.glob(os.path.join(root, "**", "rollout-*.jsonl"),
@@ -173,9 +211,17 @@ def import_codex_file(con: sqlite3.Connection, path: str,
             continue
         try:
             _ingest_record(reader, obj)
-        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        except _UsageConflict:
             stats["malformed"] += 1
-            src.error(obj.get("ordinal", ordinal), f"schema_error: {exc}", line)
+            src.error(obj.get("ordinal", ordinal), "usage_conflict", line)
+            continue
+        except _MalformedUsage:
+            stats["malformed"] += 1
+            src.error(obj.get("ordinal", ordinal), "malformed_usage", line)
+            continue
+        except (KeyError, TypeError, ValueError, AttributeError):
+            stats["malformed"] += 1
+            src.error(obj.get("ordinal", ordinal), "schema_error", line)
             continue
         ts = iso_ts(obj.get("timestamp"))
         if ts is not None:
@@ -261,14 +307,29 @@ def _reconcile_fallback(r: _Reader) -> None:
         (r.session_key, TOKEN_COUNT_SEMANTICS, SEMANTICS))
 
 
+def _fallback_want(last: dict, total: int) -> dict:
+    return {
+        "input_tokens": last.get("input_tokens"),
+        "cached_input_tokens": last.get("cached_input_tokens"),
+        "cache_write_input_tokens": last.get("cache_write_input_tokens"),
+        "output_tokens": last.get("output_tokens"),
+        "reasoning_output_tokens": last.get("reasoning_output_tokens"),
+        "total_tokens": last.get("total_tokens"),
+        "thread_total_tokens": total,
+    }
+
+
 def _flush_token_counts(r: _Reader) -> None:
     """Count token_count checkpoints for rollouts without full usage cover.
 
     Each rising cumulative total is one new response keyed by that total, so
-    appended logs, copied snapshots and full reimports all converge: repeats
-    of the same total add nothing. Rising checkpoints are always preserved
-    as evidence, wherever they appear; reconciliation then marks only the
-    checkpoints an authoritative span genuinely covers as overlap."""
+    appended logs, copied snapshots and full reimports all converge. Every
+    duplicate fallback key is compared across all fallback counters: an exact
+    repeat is a no-op and any difference is quarantined without overwriting.
+    Malformed buckets are quarantined before any SQL and later valid records
+    still import. Rising checkpoints are always preserved as evidence,
+    wherever they appear; reconciliation then marks only the checkpoints an
+    authoritative span genuinely covers as overlap."""
 
     if r.token_counts:
         row = r.con.execute(
@@ -277,26 +338,87 @@ def _flush_token_counts(r: _Reader) -> None:
             (r.session_key, TOKEN_COUNT_SEMANTICS)).fetchone()
         previous = row["t"] or 0
         for obj, info in r.token_counts:
-            total = (info.get("total_token_usage") or {}).get("total_tokens") \
-                if isinstance(info.get("total_token_usage"), dict) else None
-            last = info.get("last_token_usage")
-            if not isinstance(total, int) or total <= previous \
-                    or not isinstance(last, dict):
+            ordinal = obj.get("ordinal", 0)
+            try:
+                if not isinstance(info, dict):
+                    raise _MalformedUsage("malformed usage")
+                last_raw = info.get("last_token_usage")
+                total_raw = info.get("total_token_usage")
+                if last_raw is None or total_raw is None:
+                    # A checkpoint without both usages is malformed: quarantine
+                    # before any SQL and continue with later checkpoints.
+                    raise _MalformedUsage("malformed usage")
+                _validate_bucket(last_raw)
+                _validate_bucket(total_raw)
+                if not isinstance(last_raw, dict) or not isinstance(
+                        total_raw, dict):
+                    raise _MalformedUsage("malformed usage")
+                total = total_raw.get("total_tokens")
+                if not _valid_counter(total) or total is None:
+                    raise _MalformedUsage("malformed usage counter")
+                if not isinstance(total, int) or isinstance(total, bool):
+                    raise _MalformedUsage("malformed usage counter")
+                rid = f"{r.session_key}:tc:{total}"
+                existing = r.con.execute(
+                    "SELECT input_tokens, cached_input_tokens,"
+                    " cache_write_input_tokens, output_tokens,"
+                    " reasoning_output_tokens, total_tokens,"
+                    " thread_total_tokens FROM responses"
+                    " WHERE response_id=?", (rid,)).fetchone()
+                if existing is not None:
+                    # The rising-total shortcut never bypasses comparison:
+                    # every duplicate key is validated across all fallback
+                    # counters.
+                    seen = dict(existing)
+                    want = _fallback_want(last_raw, total)
+                    if seen != want:
+                        raise _UsageConflict("usage conflict")
+                    r.stats["responses_duplicate"] += 1
+                    if total > previous:
+                        previous = total
+                    continue
+                if total <= previous:
+                    continue
+                previous = total
+                cur = r.con.execute(
+                    "INSERT OR IGNORE INTO responses(response_id, source_id, harness,"
+                    " session_key, thread_id, ordinal_num, ts, model, effort, input_tokens,"
+                    " cached_input_tokens, cache_write_input_tokens, output_tokens,"
+                    " reasoning_output_tokens, total_tokens, thread_total_tokens, semantics)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (rid, r.src.source_id, HARNESS,
+                     r.session_key, r.thread_id, obj.get("ordinal"), iso_ts(obj.get("timestamp")),
+                     r.model, r.effort, last_raw.get("input_tokens"), last_raw.get("cached_input_tokens"),
+                     last_raw.get("cache_write_input_tokens"), last_raw.get("output_tokens"),
+                     last_raw.get("reasoning_output_tokens"), last_raw.get("total_tokens"), total,
+                     TOKEN_COUNT_SEMANTICS))
+                if cur.rowcount:
+                    r.stats["responses_inserted"] += 1
+                else:
+                    # Lost a race with an existing row: compare before counting.
+                    existing = r.con.execute(
+                        "SELECT input_tokens, cached_input_tokens,"
+                        " cache_write_input_tokens, output_tokens,"
+                        " reasoning_output_tokens, total_tokens,"
+                        " thread_total_tokens FROM responses"
+                        " WHERE response_id=?", (rid,)).fetchone()
+                    seen = dict(existing) if existing is not None else {}
+                    want = _fallback_want(last_raw, total)
+                    if seen != want:
+                        raise _UsageConflict("usage conflict")
+                    r.stats["responses_duplicate"] += 1
+            except _UsageConflict:
+                r.stats["malformed"] += 1
+                r.src.error(ordinal, "usage_conflict", "")
                 continue
-            previous = total
-            cur = r.con.execute(
-                "INSERT OR IGNORE INTO responses(response_id, source_id, harness,"
-                " session_key, thread_id, ordinal_num, ts, model, effort, input_tokens,"
-                " cached_input_tokens, cache_write_input_tokens, output_tokens,"
-                " reasoning_output_tokens, total_tokens, thread_total_tokens, semantics)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (f"{r.session_key}:tc:{total}", r.src.source_id, HARNESS,
-                 r.session_key, r.thread_id, obj.get("ordinal"), iso_ts(obj.get("timestamp")),
-                 r.model, r.effort, last.get("input_tokens"), last.get("cached_input_tokens"),
-                 last.get("cache_write_input_tokens"), last.get("output_tokens"),
-                 last.get("reasoning_output_tokens"), last.get("total_tokens"), total,
-                 TOKEN_COUNT_SEMANTICS))
-            r.stats["responses_inserted" if cur.rowcount else "responses_duplicate"] += 1
+            except _MalformedUsage:
+                r.stats["malformed"] += 1
+                r.src.error(ordinal, "malformed_usage", "")
+                continue
+            except (KeyError, TypeError, ValueError, AttributeError):
+                r.stats["malformed"] += 1
+                r.src.error(ordinal, "schema_error", "")
+                continue
         r.token_counts = []
     _reconcile_fallback(r)
 
@@ -306,9 +428,18 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
     for k in ("response_id", "usage"):
         if k not in p:
             raise ValueError(f"token_usage_record missing {k}")
-    u = p["usage"] or {}
-    tt = p.get("turn_token_usage") or {}
-    th = p.get("thread_token_usage") or {}
+    # No falsey fallbacks: None/missing stays unknown, any other non-dict
+    # shape (including falsey lists, strings or numbers) is malformed and
+    # quarantined before any SQL.
+    u_raw = p.get("usage")
+    tt_raw = p.get("turn_token_usage")
+    th_raw = p.get("thread_token_usage")
+    _validate_bucket(u_raw)
+    _validate_bucket(tt_raw)
+    _validate_bucket(th_raw)
+    u = u_raw if isinstance(u_raw, dict) else {}
+    tt = tt_raw if isinstance(tt_raw, dict) else {}
+    th = th_raw if isinstance(th_raw, dict) else {}
     rid = f"{HARNESS}:{p['response_id']}"
     turn_id = f"{HARNESS}:{p['turn_id']}" if p.get("turn_id") else None
     cur = r.con.execute(
@@ -344,8 +475,7 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
                 "turn_total_tokens": tt.get("total_tokens"),
                 "thread_total_tokens": th.get("total_tokens")}
         if seen != want:
-            raise ValueError(f"conflicting usage for {p['response_id']}:"
-                             f" {seen!r} != {want!r}")
+            raise _UsageConflict("usage conflict")
         r.stats["responses_duplicate"] += 1
     else:
         r.stats["responses_inserted"] += 1
@@ -552,9 +682,20 @@ def _ingest_event_msg(r: _Reader, obj: dict) -> None:
     elif etype == "token_count":
         # A checkpoint of counters also carried by token_usage_record in
         # current rollouts; kept only as the fallback for older ones.
-        info = p.get("info") or {}
-        if info.get("last_token_usage") and info.get("total_token_usage"):
-            r.token_counts.append((obj, info))
+        # No falsey shortcuts: malformed buckets are collected for flush to
+        # quarantine before any SQL, so later valid records still import.
+        info_raw = p.get("info")
+        if info_raw is None:
+            return
+        if not isinstance(info_raw, dict):
+            raise _MalformedUsage("malformed usage")
+        last_raw = info_raw.get("last_token_usage")
+        total_raw = info_raw.get("total_token_usage")
+        if last_raw is None and total_raw is None:
+            return
+        # Collect for validated flush; missing halves, malformed shapes and
+        # counters quarantine there without losing later valid checkpoints.
+        r.token_counts.append((obj, info_raw))
     elif etype == "thread_settings_applied":
         return
     elif etype == "turn_aborted":

@@ -26,7 +26,8 @@ HARNESS = "claude"
 SEMANTICS = "claude:input_excludes_cache,output_includes_thinking"
 DEFAULT_ROOT = os.path.expanduser("~/.claude/projects")
 SCAFFOLD_PREFIXES = ("<command-name>", "<local-command", "<system-reminder>",
-                     "Caveat:", "<task-notification>", "<bash-")
+                     "Caveat:", "<task-notification>", "<bash-",
+                     "<hook", "<stop-hook")
 INTERRUPT_PREFIX = "[Request interrupted"
 SKILL_BASE_PREFIX = "Base directory for this skill:"
 READ_TOOLS = {"Read": "file_path", "NotebookRead": "notebook_path"}
@@ -46,6 +47,52 @@ CAPABILITIES = [
     ("instruction_identity", True, "AgentsMD direction block from the SessionStart hook; versioned plugin paths read"),
     ("subagents", True, "subagent transcripts as child sessions of their parent"),
 ]
+
+
+class _MalformedUsage(ValueError):
+    """A usage bucket that is not NULL or a real integer counter."""
+
+
+class _UsageConflict(ValueError):
+    """An exact-ID repeat whose counters differ from the stored final row."""
+
+
+_CLAUDE_COUNTER_KEYS = ("input_tokens", "cache_creation_input_tokens",
+                        "cache_read_input_tokens", "output_tokens")
+
+
+def _valid_counter(value) -> bool:
+    """Only NULL or a real integer counter; booleans are malformed."""
+    if value is None:
+        return True
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+_FINALITY_TABLE = "claude_response_finality"
+
+
+def _ensure_finality_table(con) -> None:
+    con.execute(
+        f"CREATE TABLE IF NOT EXISTS {_FINALITY_TABLE}"
+        "(response_id TEXT PRIMARY KEY, finalized_at REAL)")
+
+
+def _is_finalized(con, rid: str) -> bool:
+    try:
+        row = con.execute(
+            f"SELECT 1 FROM {_FINALITY_TABLE} WHERE response_id=?",
+            (rid,)).fetchone()
+    except sqlite3.DatabaseError:
+        return False
+    return row is not None
+
+
+def _mark_finalized(con, rid: str) -> None:
+    import time as _time
+    con.execute(
+        f"INSERT OR IGNORE INTO {_FINALITY_TABLE}"
+        "(response_id, finalized_at)"
+        " VALUES(?, ?)", (rid, _time.time()))
 
 
 def discover(root: str | None = None) -> list[str]:
@@ -155,11 +202,19 @@ def import_claude_file(con: sqlite3.Connection, path: str,
              "events_duplicate": 0, "compactions": 0, "malformed": 0}
     src = JsonlSource(con, HARNESS, path, full=full)
     r = _Reader(con, src, stats)
-    if src.incremental:
-        # Recover finality decided by earlier imports from the already-read
-        # file prefix, so later imports validate post-final repeats instead
-        # of updating them.
-        r.finalized |= _prefix_finalized(src.path, src.start_offset)
+    _ensure_finality_table(con)
+    # Durable per-response finality is authoritative for accepted final
+    # rows. It covers copied sources, full reimports and incremental
+    # appends. The file prefix is never authority on its own, so a malformed
+    # final prefix can never finalize a response before any row exists.
+    try:
+        for row in con.execute(
+                f"SELECT response_id FROM {_FINALITY_TABLE}"):
+            rid = row["response_id"] if "response_id" in row.keys() else row[0]
+            if isinstance(rid, str) and rid.startswith(f"{HARNESS}:"):
+                r.finalized.add(rid[len(HARNESS) + 1:])
+    except sqlite3.DatabaseError:
+        pass
     if src.incremental and src.row["session_id"]:
         # Resume the turn the previous import ended in.
         row = con.execute(
@@ -174,9 +229,15 @@ def import_claude_file(con: sqlite3.Connection, path: str,
             continue
         try:
             _ingest(r, obj, ordinal)
-        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        except _UsageConflict:
             stats["malformed"] += 1
-            src.error(ordinal, f"schema_error: {exc}", line)
+            src.error(ordinal, "usage_conflict", line)
+        except _MalformedUsage:
+            stats["malformed"] += 1
+            src.error(ordinal, "malformed_usage", line)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            stats["malformed"] += 1
+            src.error(ordinal, "schema_error", line)
     if r.native_session:
         fields = {"started_at": r.first_ts, "ended_at": r.last_ts, **r.meta,
                   **r.identity.fields(con)}
@@ -223,17 +284,34 @@ def _ingest(r: _Reader, obj: dict, ordinal: int) -> None:
 def _usage_values(usage) -> dict:
     """Native usage buckets with unknown preserved as NULL.
 
+    Only NULL or real integer counters are accepted; booleans, strings,
+    lists and other shapes are malformed and quarantined before any SQL.
+    Only recognized numeric counters are validated; string metadata such as
+    service_tier is ignored. A usage object with no recognized numeric
+    counter is malformed and never creates a response row or finality.
     total_tokens is the harness's own total and is only known when every
     bucket is known; a partial sum from some buckets is never constructed."""
     if not isinstance(usage, dict):
-        raise ValueError(f"unsupported usage shape: {type(usage).__name__}")
-    details = usage.get("output_tokens_details") or {}
-    if not isinstance(details, dict):
-        raise ValueError("unsupported usage details shape")
-    values = [usage.get(k) for k in ("input_tokens",
-                                     "cache_creation_input_tokens",
-                                     "cache_read_input_tokens",
-                                     "output_tokens")]
+        raise _MalformedUsage("malformed usage")
+    details_raw = usage.get("output_tokens_details")
+    if details_raw is None:
+        details: dict = {}
+    elif not isinstance(details_raw, dict):
+        raise _MalformedUsage("malformed usage details")
+    else:
+        details = details_raw
+    for key in _CLAUDE_COUNTER_KEYS:
+        if not _valid_counter(usage.get(key)):
+            raise _MalformedUsage("malformed usage counter")
+    thinking = details.get("thinking_tokens")
+    if not _valid_counter(thinking):
+        raise _MalformedUsage("malformed usage counter")
+    # service_tier and any other unrecognized metadata are ignored: they
+    # never validate or invalidate a usage block.
+    if not any(k in usage for k in _CLAUDE_COUNTER_KEYS) and \
+            "thinking_tokens" not in details:
+        raise _MalformedUsage("malformed usage")
+    values = [usage.get(k) for k in _CLAUDE_COUNTER_KEYS]
     return {
         "input_tokens": usage.get("input_tokens"),
         "cached_input_tokens": usage.get("cache_read_input_tokens"),
@@ -241,42 +319,8 @@ def _usage_values(usage) -> dict:
         "output_tokens": usage.get("output_tokens"),
         "reasoning_output_tokens": details.get("thinking_tokens"),
         "total_tokens": sum(values)
-        if all(isinstance(v, int) for v in values) else None,
+        if all(type(v) is int for v in values) else None,
     }
-
-
-def _prefix_finalized(path: str, end_offset: int) -> set:
-    """Message ids already finalized in the imported file prefix.
-
-    An incremental import only reads appended lines, so finality decided by
-    an earlier import is recovered from the source evidence itself: any
-    assistant block before the resume offset that carries a native final
-    stop_reason. Read-only; never touches harness state beyond reading.
-    """
-    finals = set()
-    try:
-        with open(path, "rb") as fh:
-            data = fh.read(end_offset)
-    except OSError:
-        return finals
-    for raw in data.split(b"\n"):
-        if not raw.strip():
-            continue
-        try:
-            obj = json.loads(raw.decode("utf-8", "replace"))
-        except ValueError:
-            continue
-        if not isinstance(obj, dict) or obj.get("type") != "assistant":
-            continue
-        message = obj.get("message") or {}
-        if not isinstance(message, dict):
-            continue
-        usage = message.get("usage") or {}
-        if (message.get("id") and message.get("stop_reason") is not None
-                and isinstance(usage, dict) and usage
-                and message.get("model") != "<synthetic>"):
-            finals.add(message["id"])
-    return finals
 
 
 def _stored_counters(r: _Reader, rid: str) -> dict:
@@ -292,14 +336,17 @@ def _ingest_usage_row(r: _Reader, obj: dict, ordinal: int, ts, mid: str,
     """One streamed usage block for a message id.
 
     The first block inserts the row; later blocks update it while the message
-    is still streaming. The final block finalizes it; every later repeat is
-    validated instead of applied, and a mismatch is quarantined."""
+    is still streaming and non-final. Finality persists per response in a
+    durable adapter table keyed by response_id, so a stale copied source or
+    a full reimport can never overwrite a finalized row: an exact later
+    duplicate is a no-op and any differing counters are quarantined. A
+    malformed final block never reaches here, so it never finalizes."""
     rid = f"{HARNESS}:{mid}"
-    if mid in r.finalized:
+    if mid in r.finalized or _is_finalized(r.con, rid):
+        r.finalized.add(mid)
         seen = _stored_counters(r, rid)
         if seen != values:
-            raise ValueError(f"conflicting usage for {mid}:"
-                             f" {seen!r} != {values!r}")
+            raise _UsageConflict("usage conflict")
         r.stats["responses_duplicate"] += 1
         return
     cur = r.con.execute(
@@ -317,15 +364,18 @@ def _ingest_usage_row(r: _Reader, obj: dict, ordinal: int, ts, mid: str,
     if cur.rowcount:
         r.stats["responses_inserted"] += 1
         if final:
+            _mark_finalized(r.con, rid)
             r.finalized.add(mid)
         return
     if _stored_counters(r, rid) == values:
         r.stats["responses_duplicate"] += 1
         if final:
+            _mark_finalized(r.con, rid)
             r.finalized.add(mid)
         return
-    # The message is still streaming (or its final block just arrived): the
-    # latest native block is the authority, across imports as well.
+    # The message is still streaming and non-final (or its final block just
+    # arrived): the latest native block is the authority, across imports as
+    # well. Final rows never reach this update path.
     r.con.execute(
         "UPDATE responses SET ordinal_num=?, ts=?,"
         " model=COALESCE(?, model), effort=COALESCE(?, effort),"
@@ -339,21 +389,30 @@ def _ingest_usage_row(r: _Reader, obj: dict, ordinal: int, ts, mid: str,
          values["reasoning_output_tokens"], values["total_tokens"], rid))
     r.stats["responses_updated"] += 1
     if final:
+        _mark_finalized(r.con, rid)
         r.finalized.add(mid)
 
 
 def _assistant(r: _Reader, obj: dict, ordinal: int, ts) -> None:
-    message = obj.get("message") or {}
+    message = obj.get("message")
+    if message is None:
+        message = {}
     if message and not isinstance(message, dict):
-        raise ValueError(
-            f"unsupported message shape: {type(message).__name__}")
+        raise ValueError("unsupported message shape")
+    if not isinstance(message, dict):
+        raise ValueError("unsupported message shape")
     mid = message.get("id")
     model = message.get("model")
-    usage = message.get("usage") or {}
-    if mid and usage and model != "<synthetic>":
-        values = _usage_values(usage)
-        _ingest_usage_row(r, obj, ordinal, ts, mid, model, values,
-                          message.get("stop_reason") is not None)
+    if mid and "usage" in message and model != "<synthetic>":
+        usage_raw = message.get("usage")
+        if usage_raw is None or (isinstance(usage_raw, dict) and not usage_raw):
+            pass
+        else:
+            # Validated before any SQL; malformed buckets quarantine here and
+            # never finalize, so a later valid block still inserts normally.
+            values = _usage_values(usage_raw)
+            _ingest_usage_row(r, obj, ordinal, ts, mid, model, values,
+                              message.get("stop_reason") is not None)
     for index, block in enumerate(message.get("content") or []):
         if not isinstance(block, dict):
             continue
@@ -403,15 +462,19 @@ def _user_kind(r: _Reader, obj: dict, text: str) -> str:
     stripped = text.lstrip()
     if stripped.startswith(INTERRUPT_PREFIX):
         return "interrupt"
+    # Known synthetic and scaffolding markers are rejected before any
+    # human-origin metadata is accepted. A contradictory record carrying
+    # origin.kind=human or promptSource=typed is never genuine and keeps an
+    # empty excerpt (fail closed on privacy).
     if stripped.startswith(SKILL_BASE_PREFIX):
         # A loaded skill body arrives as message text: skill-load evidence,
         # never a genuine human submission.
         return "scaffolding"
+    if obj.get("isMeta") or stripped.startswith(SCAFFOLD_PREFIXES):
+        return "command" if stripped.startswith("<command-name>") else "scaffolding"
     origin = obj.get("origin") if isinstance(obj.get("origin"), dict) else {}
     if origin.get("kind") == "human" or obj.get("promptSource") == "typed":
         return "genuine"
-    if obj.get("isMeta") or stripped.startswith(SCAFFOLD_PREFIXES):
-        return "command" if stripped.startswith("<command-name>") else "scaffolding"
     if obj.get("origin") is None and obj.get("promptSource") is None and stripped:
         # Older transcripts carry no origin: plain typed text is genuine.
         return "genuine"
@@ -500,10 +563,19 @@ def _attachment(r: _Reader, obj: dict, ordinal: int, ts) -> None:
                 r.identity.observe_loaded_instructions(str(entry.get("content") or ""))
     elif atype == "queued_command":
         prompt = str(attachment.get("prompt") or "")
-        origin = attachment.get("origin") if isinstance(attachment.get("origin"), dict) else {}
-        human = attachment.get("humanTurn") is True or origin.get("kind") == "human"
-        kind = "genuine" if human and attachment.get("commandMode") in (None, "prompt") \
-            else "synthetic"
+        stripped = prompt.lstrip()
+        # Scaffolding markers fail closed before human metadata: a queued
+        # prompt that is a known marker is never genuine even when it
+        # carries humanTurn or origin.kind=human.
+        if stripped.startswith(SCAFFOLD_PREFIXES) or stripped.startswith(
+                (SKILL_BASE_PREFIX, INTERRUPT_PREFIX)):
+            kind = "interrupt" if stripped.startswith(
+                INTERRUPT_PREFIX) else "synthetic"
+        else:
+            origin = attachment.get("origin") if isinstance(attachment.get("origin"), dict) else {}
+            human = attachment.get("humanTurn") is True or origin.get("kind") == "human"
+            kind = "genuine" if human and attachment.get("commandMode") in (None, "prompt") \
+                else "synthetic"
         native = attachment.get("source_uuid") or obj.get("uuid") or f"ordinal:{ordinal}"
         if kind == "genuine":
             r.turn = f"{HARNESS}:{native}"

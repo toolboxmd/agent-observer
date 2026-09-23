@@ -96,9 +96,14 @@ class CodexFallbackTest(LedgerCase):
         # Same total_tokens, different cached_input_tokens: a conflict.
         self.assertEqual(stats["malformed"], 1)
         self.assertEqual(stats["responses_inserted"], 1)
-        errors = self.query("SELECT error FROM import_errors")
+        errors = self.query("SELECT error, line_excerpt FROM import_errors")
         self.assertEqual(len(errors), 1)
-        self.assertIn("resp-conf-001", errors[0]["error"])
+        # Fixed safe category only: no response IDs, counters or record
+        # values persist in the quarantined error.
+        self.assertEqual(errors[0]["error"], "usage_conflict")
+        self.assertNotIn("resp-conf-001", errors[0]["error"])
+        self.assertNotIn("999", errors[0]["error"])
+        self.assertNotIn("999", errors[0]["line_excerpt"] or "")
         row = self.query(
             "SELECT cached_input_tokens, total_tokens FROM responses"
             " WHERE response_id='codex:resp-conf-001'")[0]
@@ -196,9 +201,12 @@ class ClaudeStreamingTest(LedgerCase):
                        " WHERE response_id='claude:msg-after'")[0]["t"], 1135)
         totals = report.scope_totals(self.con, {"claude:sess-stream"})
         self.assertEqual(totals["total_tokens"], 1160 + 1135)
-        errors = self.query("SELECT error FROM import_errors")
+        errors = self.query("SELECT error, line_excerpt FROM import_errors")
         self.assertEqual(len(errors), 1)
-        self.assertIn("msg-stream", errors[0]["error"])
+        # Fixed safe category only: no message IDs or counters persist.
+        self.assertEqual(errors[0]["error"], "usage_conflict")
+        self.assertNotIn("msg-stream", errors[0]["error"])
+        self.assertNotIn("999", errors[0]["error"])
 
     def test_full_reimport_of_streamed_session_adds_nothing(self):
         claude.import_claude_file(self.con, fixture("claude-streaming.jsonl"))
@@ -353,7 +361,9 @@ class ClaudeIncrementalTest(LedgerCase):
         self.assertEqual(_row(self, "claude:msg-next")["total_tokens"], 1135)
         errors = self.query("SELECT error FROM import_errors")
         self.assertEqual(len(errors), 1)
-        self.assertIn("msg-incr", errors[0]["error"])
+        # Fixed safe category only: no message IDs persist.
+        self.assertEqual(errors[0]["error"], "usage_conflict")
+        self.assertNotIn("msg-incr", errors[0]["error"])
         totals = report.scope_totals(self.con, {"claude:sess-incr"})
         self.assertEqual(totals["total_tokens"], 1160 + 1135)
         self.assertEqual(totals["responses"], 2)
@@ -400,3 +410,199 @@ class CodexMixedTransitionTest(LedgerCase):
         self.assertEqual(totals["total_tokens"], 1100 + 2250)
         self.assertEqual(totals["responses"], 2)
         self.assertEqual(totals["overlap_responses"], 2)
+
+
+class ClaudeDurableFinalizationTest(LedgerCase):
+    """Per-response finality persists across imports and source paths."""
+
+    def test_stale_copied_source_never_overwrites_final_row(self):
+        first = claude.import_claude_file(
+            self.con, fixture("claude-streaming.jsonl"))
+        self.assertEqual(first["responses_inserted"], 2)
+        self.assertEqual(_row(self, "claude:msg-stream")["output_tokens"], 50)
+        # A stale copy from another path carries only a partial non-final
+        # block for the already-finalized response, plus one later valid
+        # message that must still import.
+        stale = claude.import_claude_file(
+            self.con, fixture("claude-stale-copy.jsonl"))
+        self.assertEqual(stale["malformed"], 1)
+        self.assertEqual(stale["responses_inserted"], 1)
+        self.assertEqual(_row(self, "claude:msg-stream"), {
+            "input_tokens": 10, "cached_input_tokens": 1000,
+            "cache_write_input_tokens": 100, "output_tokens": 50,
+            "reasoning_output_tokens": 20, "total_tokens": 1160})
+        self.assertEqual(
+            self.query("SELECT total_tokens t FROM responses"
+                       " WHERE response_id='claude:msg-stale-after'")[0]["t"],
+            5 + 0 + 1100 + 30)
+        errors = self.query("SELECT error FROM import_errors ORDER BY id")
+        # One conflict from the original streaming replay plus one from the
+        # stale partial: both fixed categories, never the message ID.
+        self.assertEqual(len(errors), 2)
+        for row in errors:
+            self.assertEqual(row["error"], "usage_conflict")
+            self.assertNotIn("msg-stream", row["error"])
+
+    def test_malformed_final_never_finalizes_and_valid_final_follows(self):
+        stats = claude.import_claude_file(
+            self.con, fixture("claude-malformed-final.jsonl"))
+        # One malformed final quarantined; the later valid final for the
+        # same response plus the trailing message still import.
+        self.assertEqual(stats["malformed"], 1)
+        self.assertEqual(stats["responses_inserted"], 2)
+        self.assertEqual(_row(self, "claude:msg-mf-1"), {
+            "input_tokens": 10, "cached_input_tokens": 1000,
+            "cache_write_input_tokens": 100, "output_tokens": 50,
+            "reasoning_output_tokens": 20, "total_tokens": 1160})
+        self.assertEqual(
+            self.query("SELECT COUNT(*) n FROM responses"
+                       " WHERE response_id='claude:msg-mf-after'")[0]["n"], 1)
+        errors = self.query("SELECT error FROM import_errors")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["error"], "malformed_usage")
+        self.assertNotIn("msg-mf-1", errors[0]["error"])
+
+
+class ClaudeMalformedUsageTest(LedgerCase):
+    def test_falsey_and_typed_buckets_quarantine_before_sql(self):
+        stats = claude.import_claude_file(
+            self.con, fixture("claude-malformed-usage.jsonl"))
+        # Six malformed usage blocks (string, boolean, list, empty string,
+        # bad details, boolean thinking) quarantine before any response SQL;
+        # the later valid message still imports.
+        self.assertEqual(stats["malformed"], 6)
+        self.assertEqual(stats["responses_inserted"], 1)
+        for rid in ("claude:msg-bad-str", "claude:msg-bad-bool",
+                    "claude:msg-bad-list", "claude:msg-bad-empty",
+                    "claude:msg-bad-details", "claude:msg-bad-think"):
+            self.assertEqual(
+                self.query("SELECT COUNT(*) n FROM responses"
+                           " WHERE response_id=?", (rid,))[0]["n"], 0, rid)
+        self.assertEqual(
+            self.query("SELECT total_tokens t FROM responses"
+                       " WHERE response_id='claude:msg-mu-good'")[0]["t"], 10)
+        errors = self.query("SELECT error FROM import_errors")
+        self.assertEqual(len(errors), 6)
+        for row in errors:
+            self.assertEqual(row["error"], "malformed_usage")
+            self.assertNotIn("msg-bad", row["error"])
+
+
+class CodexMalformedUsageTest(LedgerCase):
+    def test_falsey_and_typed_buckets_quarantine_before_sql(self):
+        stats = self.sync("codex-malformed-usage.jsonl")
+        # Five malformed buckets (string counter, boolean counter, list
+        # usage, empty-string usage, string turn bucket) quarantine before
+        # any response SQL; the later valid record still imports.
+        self.assertEqual(stats["malformed"], 5)
+        self.assertEqual(stats["responses_inserted"], 1)
+        for rid in ("codex:resp-mu-bad-str", "codex:resp-mu-bad-bool",
+                    "codex:resp-mu-bad-list", "codex:resp-mu-bad-empty",
+                    "codex:resp-mu-bad-turn"):
+            self.assertEqual(
+                self.query("SELECT COUNT(*) n FROM responses"
+                           " WHERE response_id=?", (rid,))[0]["n"], 0, rid)
+        self.assertEqual(
+            self.query("SELECT COUNT(*) n FROM responses"
+                       " WHERE response_id='codex:resp-mu-good-after'")[0]["n"],
+            1)
+        errors = self.query("SELECT error FROM import_errors")
+        self.assertEqual(len(errors), 5)
+        for row in errors:
+            self.assertEqual(row["error"], "malformed_usage")
+            self.assertNotIn("resp-mu", row["error"])
+
+
+class CodexFallbackConflictTest(LedgerCase):
+    def test_same_total_with_changed_counter_is_quarantined(self):
+        self.sync("codex-legacy-a.jsonl")
+        before = self.query(
+            "SELECT input_tokens, total_tokens, thread_total_tokens"
+            " FROM responses WHERE response_id=?",
+            (f"{LEGACY}:tc:450",))[0]
+        self.assertEqual(before["input_tokens"], 400)
+        stats = self.sync("codex-legacy-conflict.jsonl")
+        # Same cumulative 450 with a changed fallback input counter is a
+        # usage conflict; the later valid 2110 checkpoint still imports.
+        self.assertEqual(stats["malformed"], 1)
+        self.assertEqual(stats["responses_inserted"], 1)
+        after = self.query(
+            "SELECT input_tokens, total_tokens, thread_total_tokens"
+            " FROM responses WHERE response_id=?",
+            (f"{LEGACY}:tc:450",))[0]
+        self.assertEqual(dict(after), dict(before))
+        self.assertEqual(
+            self.query("SELECT COUNT(*) n FROM responses WHERE response_id=?",
+                       (f"{LEGACY}:tc:2110",))[0]["n"], 1)
+        errors = self.query("SELECT error FROM import_errors")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["error"], "usage_conflict")
+        self.assertNotIn("450", errors[0]["error"])
+        totals = report.scope_totals(self.con)
+        self.assertEqual(totals["total_tokens"], 450 + 670 + 990)
+        self.assertEqual(totals["responses"], 3)
+
+
+class ClaudeServiceTierTest(LedgerCase):
+    def test_string_service_tier_does_not_quarantine_valid_response(self):
+        stats = claude.import_claude_file(
+            self.con, fixture("claude-service-tier.jsonl"))
+        self.assertEqual(stats["malformed"], 0)
+        self.assertEqual(stats["responses_inserted"], 1)
+        self.assertEqual(_row(self, "claude:msg-service-tier"), {
+            "input_tokens": 10, "cached_input_tokens": 1000,
+            "cache_write_input_tokens": 100, "output_tokens": 50,
+            "reasoning_output_tokens": 20, "total_tokens": 1160})
+
+
+class ClaudeMalformedPrefixIncrementalTest(LedgerCase):
+    """A malformed final prefix never finalizes an absent response row."""
+
+    def test_malformed_final_then_valid_across_incremental_imports(self):
+        dst = os.path.join(self.tmp.name, "sess-prefix.jsonl")
+        _write_lines(dst, [
+            '{"sessionId": "sess-prefix", "cwd": "/redacted/repo",'
+            ' "version": "2.1.280", "isSidechain": false, "type": "user",'
+            ' "uuid": "u-p1", "promptId": "p-p1", "origin": {"kind": "human"},'
+            ' "promptSource": "typed", "timestamp": "2026-09-14T10:00:01Z",'
+            ' "message": {"role": "user", "content": "Check prefix handling"}}\n',
+            '{"sessionId": "sess-prefix", "cwd": "/redacted/repo",'
+            ' "version": "2.1.280", "isSidechain": false, "type": "assistant",'
+            ' "uuid": "as-p-bad", "requestId": "req-p",'
+            ' "timestamp": "2026-09-14T10:00:02Z",'
+            ' "message": {"id": "msg-prefix", "model": "claude-fable-5-1",'
+            ' "stop_reason": "end_turn",'
+            ' "usage": {"service_tier": "standard"}, "content": []}}\n',
+        ])
+        first = claude.import_claude_file(self.con, dst)
+        self.assertEqual(first["malformed"], 1)
+        self.assertEqual(first["responses_inserted"], 0)
+        self.assertEqual(
+            self.query("SELECT COUNT(*) n FROM responses"
+                       " WHERE response_id='claude:msg-prefix'")[0]["n"], 0)
+        _append_lines(dst, [
+            '{"sessionId": "sess-prefix", "cwd": "/redacted/repo",'
+            ' "version": "2.1.280", "isSidechain": false, "type": "assistant",'
+            ' "uuid": "as-p-good", "requestId": "req-p",'
+            ' "timestamp": "2026-09-14T10:00:03Z",'
+            ' "message": {"id": "msg-prefix", "model": "claude-fable-5-1",'
+            ' "stop_reason": "end_turn",'
+            ' "usage": {"input_tokens": 10,'
+            ' "cache_creation_input_tokens": 100,'
+            ' "cache_read_input_tokens": 1000, "output_tokens": 50,'
+            ' "output_tokens_details": {"thinking_tokens": 20}},'
+            ' "content": []}}\n',
+        ])
+        second = claude.import_claude_file(self.con, dst)
+        self.assertEqual(second["responses_inserted"], 1)
+        self.assertEqual(second["malformed"], 0)
+        self.assertEqual(_row(self, "claude:msg-prefix"), {
+            "input_tokens": 10, "cached_input_tokens": 1000,
+            "cache_write_input_tokens": 100, "output_tokens": 50,
+            "reasoning_output_tokens": 20, "total_tokens": 1160})
+        errors = self.query(
+            "SELECT error, line_excerpt FROM import_errors ORDER BY id")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["error"], "malformed_usage")
+        self.assertNotIn("msg-prefix", errors[0]["error"])
+        self.assertNotIn("standard", errors[0]["line_excerpt"] or "")

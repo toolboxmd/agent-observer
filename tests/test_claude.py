@@ -5,7 +5,7 @@ import os
 
 from agent_observer import report
 from agent_observer.adapters import claude
-from tests.helpers import FIXTURES, LedgerCase
+from tests.helpers import FIXTURES, LedgerCase, fixture
 
 ROOT = os.path.join(FIXTURES, "claude")
 MAIN = "claude:sess-main"
@@ -84,3 +84,58 @@ class ClaudeAdapterTest(LedgerCase):
         again = claude.sync(self.con, root=ROOT, full=True)
         self.assertEqual(again["responses_inserted"], 0)
         self.assertEqual(report.scope_totals(self.con)["responses"], 3)
+
+
+class ClaudeContradictoryMarkersTest(LedgerCase):
+    """Human-origin metadata never makes a known marker genuine."""
+
+    SENTINELS = (
+        "SECRET-CONTRAD-SYS-aaa111",
+        "SECRET-CONTRAD-SKILL-bbb222",
+        "SECRET-CONTRAD-LOCAL-ccc333",
+        "SECRET-CONTRAD-CMD-ddd444",
+        "SECRET-CONTRAD-CAVEAT-eee555",
+        "SECRET-CONTRAD-TASK-fff666",
+        "SECRET-CONTRAD-BASH-ggg777",
+        "SECRET-CONTRAD-META-hhh888",
+        "SECRET-CONTRAD-HOOK-jjj000",
+        "SECRET-CONTRAD-QUEUE-iii999",
+    )
+
+    def test_markers_with_human_metadata_stay_non_genuine(self):
+        claude.import_claude_file(
+            self.con, fixture("claude-contradictory.jsonl"))
+        rows = {r["native_id"]: r for r in self.query(
+            "SELECT native_id, kind, text_excerpt FROM submissions")}
+        # Contradictory scaffolding markers fail closed even with
+        # origin.kind=human or promptSource=typed.
+        self.assertEqual(rows["claude:u-contra-sys"]["kind"], "scaffolding")
+        self.assertEqual(rows["claude:u-contra-skill"]["kind"], "scaffolding")
+        self.assertEqual(rows["claude:u-contra-local"]["kind"], "scaffolding")
+        self.assertEqual(rows["claude:u-contra-cmd"]["kind"], "command")
+        self.assertEqual(rows["claude:u-contra-caveat"]["kind"], "scaffolding")
+        self.assertEqual(rows["claude:u-contra-task"]["kind"], "scaffolding")
+        self.assertEqual(rows["claude:u-contra-bash"]["kind"], "scaffolding")
+        self.assertEqual(rows["claude:u-contra-meta"]["kind"], "scaffolding")
+        self.assertEqual(rows["claude:u-contra-hook"]["kind"], "scaffolding")
+        self.assertEqual(rows["claude:q-contra-1"]["kind"], "synthetic")
+        # Legitimate plain typed input stays genuine.
+        self.assertEqual(rows["claude:u-contra-real"]["kind"], "genuine")
+        self.assertTrue(rows["claude:u-contra-real"]["text_excerpt"])
+        for native in ("claude:u-contra-sys", "claude:u-contra-skill",
+                       "claude:u-contra-local", "claude:u-contra-cmd",
+                       "claude:u-contra-caveat", "claude:u-contra-task",
+                       "claude:u-contra-bash", "claude:u-contra-meta",
+                       "claude:u-contra-hook", "claude:q-contra-1"):
+            self.assertEqual(rows[native]["text_excerpt"], "", native)
+        blob = "".join(r["text_excerpt"] or "" for r in self.query(
+            "SELECT text_excerpt FROM submissions"))
+        blob += "".join(r["detail_json"] or "" for r in self.query(
+            "SELECT detail_json FROM events"))
+        blob += "".join(r["identity_json"] or "" for r in self.query(
+            "SELECT identity_json FROM sessions"))
+        blob += "".join(
+            (r["error"] or "") + (r["line_excerpt"] or "")
+            for r in self.query("SELECT error, line_excerpt FROM import_errors"))
+        for sentinel in self.SENTINELS:
+            self.assertNotIn(sentinel, blob)
