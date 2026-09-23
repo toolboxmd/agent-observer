@@ -9,6 +9,7 @@ import sys
 
 from . import CAPTURE_CONTRACT_VERSION, EVENT_CONTRACT_VERSION, SCHEMA_VERSION
 from . import adapters as _adapters
+from . import analysis as _analysis
 from . import db as _db
 from . import identity as _identity
 from . import report as _report
@@ -171,6 +172,26 @@ def build_parser() -> argparse.ArgumentParser:
     sh.add_argument("--task", required=True)
     sh.add_argument("--json", action="store_true", dest="as_json")
 
+    def _scope(parser):
+        parser.add_argument("--since", default=None, help="ISO date or epoch seconds")
+        parser.add_argument("--until", default=None, help="ISO date or epoch seconds")
+        parser.add_argument("--project", default=None)
+        parser.add_argument("--harness", default=None)
+        parser.add_argument("--agentsmd-version", default=None)
+        parser.add_argument("--json", action="store_true", dest="as_json")
+
+    dg = sub.add_parser("diagnose", help="find repeated work and behavior incidents")
+    dg.add_argument("--detector", action="append", default=None,
+                    choices=list(_analysis.DETECTORS))
+    dg.add_argument("--session", default=None)
+    dg.add_argument("--limit", type=int, default=50)
+    _scope(dg)
+
+    cp = sub.add_parser("compare", help="compare behavior across groups")
+    cp.add_argument("--by", default="agentsmd",
+                    choices=["agentsmd", "model", "harness", "project"])
+    _scope(cp)
+
     tr = sub.add_parser("trace", help="inspect the execution timeline")
     tr.add_argument("--task", default=None)
     tr.add_argument("--turn", default=None)
@@ -196,6 +217,9 @@ def main(argv=None) -> int:
 
         if ns.cmd == "sessions":
             return _sessions(con, ns)
+
+        if ns.cmd in ("diagnose", "compare"):
+            return _analyze(con, ns)
 
         if ns.cmd == "capture":
             return _capture(con, ns)
@@ -374,6 +398,49 @@ def _sync(con, ns) -> int:
                             "capture": CAPTURE_CONTRACT_VERSION}}
     _emit(payload, ns.as_json)
     return 1 if any(r.get("failed") for r in results) else 0
+
+
+def _when(value):
+    if value is None:
+        return None
+    from .ingest import iso_ts
+    return float(value) if str(value).replace(".", "").isdigit() else iso_ts(value)
+
+
+def _analyze(con, ns) -> int:
+    filters = {"since": _when(ns.since), "until": _when(ns.until),
+               "project": ns.project, "harness": ns.harness,
+               "agentsmd_version": ns.agentsmd_version}
+    if ns.cmd == "diagnose":
+        payload = _analysis.diagnose(con, detectors=ns.detector, limit=ns.limit,
+                                     session=ns.session, **filters)
+        if ns.as_json:
+            _emit(payload, True)
+            return 0
+        print(f"{payload['sessions']} sessions; incidents: "
+              + (", ".join(f"{k} {v}" for k, v in sorted(payload["counts"].items())) or "none"))
+        for i in payload["incidents"]:
+            mark = " (heuristic)" if i["heuristic"] else ""
+            print(f"- {i['detector']}{mark} {i['session']} "
+                  f"[{os.path.basename(i['project'] or '?')}] {i['summary']}")
+        print(payload["note"])
+        return 0
+    payload = _analysis.compare(con, by=ns.by, **filters)
+    if ns.as_json:
+        _emit(payload, True)
+        return 0
+    for g in payload["groups"]:
+        tokens = g["tokens_per_session"]
+        prompts = g["genuine_prompts_per_session"]
+        line = (f"{g['group']}: {g['sessions']} sessions, {g['projects']} projects, "
+                f"median tokens {tokens.get('median', '-')}, "
+                f"prompts/session {prompts.get('median', '-')} (n={prompts['n']}), "
+                f"interrupts {g['interrupts']}")
+        extras = ", ".join(f"{d} {g[d]['incidents']}" for d in _analysis.DETECTORS
+                           if g[d]["incidents"])
+        print(line + (f"; {extras}" if extras else ""))
+    print(payload["note"])
+    return 0
 
 
 def _sessions(con, ns) -> int:

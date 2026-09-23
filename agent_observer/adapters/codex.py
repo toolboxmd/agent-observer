@@ -23,6 +23,9 @@ from ..ingest import JsonlSource, fingerprint, insert_event, iso_ts, text_hash
 
 HARNESS = "codex"
 SEMANTICS = "codex:input_includes_cached,output_includes_reasoning"
+# Older rollouts carry usage only in token_count events: last_token_usage per
+# response and a cumulative total that repeats when nothing new happened.
+TOKEN_COUNT_SEMANTICS = SEMANTICS + ";source=token_count"
 SYNTHETIC_PREFIX = "<send_user_message_question_reply>"
 DEFAULT_ROOT = os.path.expanduser("~/.codex/sessions")
 
@@ -132,6 +135,8 @@ class _Reader:
         self.first_ts = None
         self.last_ts = None
         self.meta: dict = {}
+        self.saw_usage_records = False
+        self.token_counts: list = []
 
     @property
     def session_key(self) -> str:
@@ -177,6 +182,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         if ts is not None:
             reader.first_ts = ts if reader.first_ts is None else min(reader.first_ts, ts)
             reader.last_ts = ts if reader.last_ts is None else max(reader.last_ts, ts)
+    _flush_token_counts(reader)
     fields = {"started_at": reader.first_ts, "ended_at": reader.last_ts,
               **reader.meta, **reader.identity.fields(con)}
     db.upsert_session(con, reader.session_key, HARNESS,
@@ -228,8 +234,44 @@ def _ingest_record(r: _Reader, obj: dict) -> None:
     # beyond source metadata; they stay private in the raw file.
 
 
+def _flush_token_counts(r: _Reader) -> None:
+    """Count token_count checkpoints only for rollouts without usage records.
+
+    A checkpoint is a new response when the cumulative total grows; repeats
+    of the same total add nothing."""
+    if r.saw_usage_records or not r.token_counts:
+        return
+    if r.con.execute("SELECT 1 FROM responses WHERE session_key=? AND semantics=?",
+                     (r.session_key, SEMANTICS)).fetchone():
+        return
+    row = r.con.execute("SELECT MAX(thread_total_tokens) t FROM responses"
+                        " WHERE session_key=?", (r.session_key,)).fetchone()
+    previous = row["t"] or 0
+    for obj, info in r.token_counts:
+        total = (info.get("total_token_usage") or {}).get("total_tokens")
+        last = info.get("last_token_usage") or {}
+        if not isinstance(total, int) or total <= previous:
+            continue
+        previous = total
+        cur = r.con.execute(
+            "INSERT OR IGNORE INTO responses(response_id, source_id, harness,"
+            " session_key, thread_id, ordinal_num, ts, model, effort, input_tokens,"
+            " cached_input_tokens, cache_write_input_tokens, output_tokens,"
+            " reasoning_output_tokens, total_tokens, thread_total_tokens, semantics)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"{r.session_key}:tc:{obj.get('ordinal')}", r.src.source_id, HARNESS,
+             r.session_key, r.thread_id, obj.get("ordinal"), iso_ts(obj.get("timestamp")),
+             r.model, r.effort, last.get("input_tokens"), last.get("cached_input_tokens"),
+             last.get("cache_write_input_tokens"), last.get("output_tokens"),
+             last.get("reasoning_output_tokens"), last.get("total_tokens"), total,
+             TOKEN_COUNT_SEMANTICS))
+        r.stats["responses_inserted" if cur.rowcount else "responses_duplicate"] += 1
+    r.token_counts = []
+
+
 def _ingest_usage(r: _Reader, obj: dict) -> None:
     p = obj["payload"]
+    r.saw_usage_records = True
     for k in ("response_id", "usage"):
         if k not in p:
             raise ValueError(f"token_usage_record missing {k}")
@@ -457,8 +499,13 @@ def _ingest_event_msg(r: _Reader, obj: dict) -> None:
     elif etype == "thread_goal_updated":
         r.event(obj, "lifecycle", f"thread_goal_updated:{obj.get('ordinal')}",
                 turn_id=turn_id, name="thread_goal_updated")
-    elif etype in ("token_count", "thread_settings_applied"):
-        # Overlapping checkpoint or configuration echo; never summed.
+    elif etype == "token_count":
+        # A checkpoint of counters also carried by token_usage_record in
+        # current rollouts; kept only as the fallback for older ones.
+        info = p.get("info") or {}
+        if info.get("last_token_usage") and info.get("total_token_usage"):
+            r.token_counts.append((obj, info))
+    elif etype == "thread_settings_applied":
         return
     elif etype == "turn_aborted":
         # Interrupted turn: provisional account, never complete.
