@@ -84,82 +84,130 @@ CAPABILITIES = [
     ("workload_binding", True, "jobs map to tasks and invocations to attempts; worker sessions bind through session_assignments"),
 ]
 
-# Closed router vocabularies. Anything outside these sets is dropped to
-# NULL (fail closed) rather than stored.
+# Closed router vocabularies, derived from Model Router's own contract
+# (installed runner: store.TERMINAL, store.ACTIVE_WORKSPACE_STATUSES,
+# core.terminal_class_for, core.JOB_KINDS, core.PLANNER_HARNESSES,
+# harnesses.INVOCATION_KINDS and harness stage/session_kind values,
+# policy.STAGES, policy.IMPLEMENTATION_LANES, policy.SIGNAL_CLASSES,
+# controller/direction persisted reasons) plus the live ledger's distinct
+# values. Anything outside these sets is dropped to NULL (fail closed)
+# rather than stored.
+#
+# Persisted invocations.reason values: core's "initial" default and
+# "compact_after_submit"; controller dispatch "initial", "resume",
+# "dispatch_stalled", "dispatch_exhausted" and the preflight reasons;
+# "planner_question"; the ladder's "correction" and "escalation"; the
+# capacity moves "pool_move", "lateral", "larger_context" and
+# "stalled_retry". _switch_route appends "_concurrent" to a move reason
+# when the target was concurrency-full, giving the suffixed variants.
+# "dispatch_fallback rc=N" is a dynamic f-string, never a closed value.
 REASONS = frozenset({
     "initial",
     "resume",
-    "retry",
+    "planner_question",
     "compact_after_submit",
+    "correction",
+    "escalation",
+    "pool_move",
+    "lateral",
+    "larger_context",
+    "stalled_retry",
+    "dispatch_stalled",
     "dispatch_exhausted",
     "preflight_exhausted",
     "preflight_degraded",
     "preflight_one_turn",
     "preflight_concurrent",
-    "pool_move",
-    "lateral",
+    "pool_move_concurrent",
+    "lateral_concurrent",
+    "larger_context_concurrent",
+    "correction_concurrent",
+    "escalation_concurrent",
+    "preflight_exhausted_concurrent",
+    "preflight_degraded_concurrent",
+    "preflight_one_turn_concurrent",
 })
 
+# store.TERMINAL plus store.ACTIVE_WORKSPACE_STATUSES: the only job
+# statuses the contract writes (live ledger: cancelled, succeeded,
+# blocked, running). Observer words such as "complete" are never router
+# job statuses.
 JOB_STATUSES = frozenset({
-    "queued",
     "pending",
     "running",
+    "question_pending",
     "blocked",
-    "complete",
+    "cancelling",
+    "succeeded",
     "failed",
     "cancelled",
-    "crashed",
-    "quota_blocked",
 })
 
+# Every core.terminal_class_for output: rc/signal mapping (crashed from
+# the crashed flag; quota/overloaded/stalled/context/hard_error from
+# policy.SIGNAL_CLASSES exhausted/overloaded/stalled/context/hard;
+# completed/timeout/cancelled/failed from rc 0/124/143,-15/other).
+# Live ledger: completed, failed, stalled.
 TERMINAL_CLASSES = frozenset({
     "completed",
     "failed",
+    "timeout",
+    "overloaded",
+    "stalled",
+    "context",
+    "hard_error",
     "cancelled",
     "crashed",
     "quota",
-    "stalled",
 })
 
+# harnesses.INVOCATION_KINDS (live ledger holds all but opencode_serve
+# and grok_control).
 INVOCATION_KINDS = frozenset({
     "codex_dispatch",
     "codex_resume",
+    "claude_callback",
     "claude_compact",
     "opencode_control",
+    "opencode_serve",
+    "grok_control",
 })
 
+# Harness stage_for values (codex dispatch, claude planning, worker
+# implementation); live ledger holds all three.
 STAGES = frozenset({
     "dispatch",
     "planning",
     "implementation",
-    "review",
 })
 
 SESSION_KINDS = frozenset({
     "codex_task_id",
     "opencode_session_id",
-    "claude_session_id",
-    "grok_session_id",
     "planner_session_id",
+    "grok_session_id",
 })
 
+# policy.IMPLEMENTATION_LANES. Submit stores the resolved lane
+# (policy.resolve_lane), so raw aliases such as "default" never persist;
+# live ledger: implementation_small, implementation_default.
 LANES = frozenset({
+    "implementation_default",
     "implementation_small",
-    "implementation",
-    "planning",
-    "review",
+    "implementation_hard",
 })
 
+# core.JOB_KINDS (live ledger: ordinary).
 JOB_KINDS = frozenset({
     "ordinary",
+    "experiment",
+    "replay",
 })
 
+# core.PLANNER_HARNESSES: only claude runs the planner callback
+# (live ledger: claude).
 PLANNER_HARNESSES = frozenset({
     "claude",
-    "codex",
-    "opencode",
-    "grok",
-    "router",
 })
 
 # Closed block classes observed in the router ledger. An arbitrary prefix
@@ -944,16 +992,29 @@ def _upsert_outcome(con: sqlite3.Connection, status, task_id: str) -> bool:
     return True
 
 
-def _attempt_state(terminal_class) -> str:
-    if terminal_class is None:
+def _attempt_state(raw_terminal_class) -> str:
+    """Map the raw ledger terminal class onto the Observer attempt state.
+
+    Takes the raw value (not the validated projection) so an absent
+    class (NULL) stays distinguishable from an unrecognized one: only a
+    genuinely absent terminal class is "active"; every valid finished
+    class maps to its non-active state; any other non-NULL value,
+    including a wrong-typed one, is the explicit "unknown" state, never
+    active.
+    """
+    if raw_terminal_class is None:
         return "active"
-    if terminal_class == "completed":
+    if not isinstance(raw_terminal_class, str):
+        return "unknown"
+    if raw_terminal_class == "completed":
         return "complete"
-    if terminal_class in ("cancelled", "crashed"):
-        return terminal_class
-    if terminal_class == "quota":
+    if raw_terminal_class in ("cancelled", "crashed"):
+        return raw_terminal_class
+    if raw_terminal_class == "quota":
         return "quota_blocked"
-    return "failed"
+    if raw_terminal_class in TERMINAL_CLASSES:
+        return "failed"
+    return "unknown"
 
 
 def _import_invocation(con: sqlite3.Connection, db_path: str, inv: dict,
@@ -1044,7 +1105,10 @@ def _import_invocation(con: sqlite3.Connection, db_path: str, inv: dict,
         "started_at": iso_ts(inv.get("started_at")),
         "ended_at": iso_ts(inv.get("ended_at")),
         "elapsed_s": elapsed_secs,
-        "state": _attempt_state(terminal_class),
+        # The state reads the raw ledger class (absent stays active,
+        # unrecognized stays unknown) while the stored column keeps the
+        # validated closed projection.
+        "state": _attempt_state(inv.get("terminal_class")),
         "terminal_class": terminal_class,
         "usage_json": usage_projected,
     }

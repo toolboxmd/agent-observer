@@ -398,7 +398,7 @@ class RouterAdapterTest(LedgerCase):
         self.assertEqual(self._identities(), before_ids)
         # Router progress updates the same rows, never duplicates.
         src = sqlite3.connect(self.db_path)
-        src.execute("UPDATE jobs SET status='complete',"
+        src.execute("UPDATE jobs SET status='succeeded',"
                     " block_reason='quota_blocked: out of capacity',"
                     " updated_at='2026-09-23T19:00:00+00:00'"
                     " WHERE request_id='wid1'")
@@ -414,7 +414,7 @@ class RouterAdapterTest(LedgerCase):
         self.assertEqual(after_ids, before_ids)
         job = self.con.execute(
             "SELECT * FROM router_jobs WHERE request_id='wid1'").fetchone()
-        self.assertEqual(job["status"], "complete")
+        self.assertEqual(job["status"], "succeeded")
         self.assertEqual(job["block_reason"], "quota_blocked")
         inv = self.con.execute(
             "SELECT * FROM router_invocations"
@@ -427,7 +427,7 @@ class RouterAdapterTest(LedgerCase):
         outcome = self.con.execute(
             "SELECT * FROM outcomes WHERE task_id='router:wid1'").fetchone()
         self.assertEqual(outcome["acceptance_state"], "unknown")
-        self.assertIn("complete", outcome["repairs"])
+        self.assertIn("succeeded", outcome["repairs"])
         # A human-recorded outcome survives re-import untouched.
         self.con.execute(
             "UPDATE outcomes SET acceptance_state='complete',"
@@ -462,7 +462,7 @@ class RouterAdapterTest(LedgerCase):
         before_ids = self._identities()
         # Router progress must not touch the human unknown row.
         src = sqlite3.connect(self.db_path)
-        src.execute("UPDATE jobs SET status='complete'"
+        src.execute("UPDATE jobs SET status='succeeded'"
                     " WHERE request_id='wid1'")
         src.commit()
         src.close()
@@ -830,6 +830,239 @@ class RouterAdapterTest(LedgerCase):
             " WHERE turn_id='router:aaa111'").fetchone()
         self.assertEqual(good_attempt["reason"], "initial")
 
+    def test_closed_projections_match_router_contract(self):
+        # Review finding 2: every closed projection derives from Model
+        # Router's own contract (installed runner plus the live ledger's
+        # distinct values), never guesses. Each valid value persists;
+        # anything else fails closed to NULL.
+        src = sqlite3.connect(self.db_path)
+        statuses = ["pending", "running", "question_pending", "blocked",
+                    "cancelling", "succeeded", "failed", "cancelled"]
+        lanes = ["implementation_default", "implementation_small",
+                 "implementation_hard"]
+        job_kinds = ["ordinary", "experiment", "replay"]
+        for i, status in enumerate(statuses):
+            src.execute(
+                "INSERT INTO jobs(request_id, task_json, workspace, status,"
+                " lane, job_kind, planner_harness,"
+                " created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (f"wid-status-{i}",
+                 json.dumps({"issue": "toolboxmd/agent-observer#1"}),
+                 self.ws_plain, status, lanes[i % len(lanes)],
+                 job_kinds[i % len(job_kinds)], "claude",
+                 "2026-09-23T18:10:00+00:00", "2026-09-23T18:11:00+00:00"))
+        # Observer words and raw lane aliases are never router values.
+        src.execute(
+            "INSERT INTO jobs(request_id, task_json, workspace, status,"
+            " lane, job_kind, planner_harness,"
+            " created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            ("wid-invalid",
+             json.dumps({"issue": "toolboxmd/agent-observer#1"}),
+             self.ws_plain, "complete", "default", "unknown-kind", "codex",
+             "2026-09-23T18:10:00+00:00", "2026-09-23T18:11:00+00:00"))
+        kinds = ["codex_dispatch", "codex_resume", "claude_callback",
+                 "claude_compact", "opencode_control", "opencode_serve",
+                 "grok_control"]
+        stages = ["dispatch", "planning", "implementation"]
+        reasons = ["initial", "resume", "planner_question",
+                   "compact_after_submit", "correction", "escalation",
+                   "pool_move", "lateral", "larger_context", "stalled_retry",
+                   "dispatch_stalled", "dispatch_exhausted",
+                   "preflight_exhausted", "preflight_degraded",
+                   "preflight_one_turn", "preflight_concurrent",
+                   "pool_move_concurrent", "lateral_concurrent",
+                   "larger_context_concurrent", "correction_concurrent",
+                   "escalation_concurrent",
+                   "preflight_exhausted_concurrent",
+                   "preflight_degraded_concurrent",
+                   "preflight_one_turn_concurrent"]
+        session_kinds = ["codex_task_id", "opencode_session_id",
+                         "planner_session_id", "grok_session_id"]
+        terminals = {"completed": "complete", "failed": "failed",
+                     "timeout": "failed", "overloaded": "failed",
+                     "stalled": "failed", "context": "failed",
+                     "hard_error": "failed", "cancelled": "cancelled",
+                     "crashed": "crashed", "quota": "quota_blocked"}
+        for i, reason in enumerate(reasons):
+            terminal = sorted(terminals)[i % len(terminals)]
+            skind = session_kinds[i % len(session_kinds)]
+            src.execute(
+                "INSERT INTO invocations(invocation_id, request_id, kind,"
+                " stage, reason, terminal_class, session_id, session_kind,"
+                " started_at, ended_at, schema_version)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (f"cov-{i:02d}", "wid-status-0", kinds[i % len(kinds)],
+                 stages[i % len(stages)], reason, terminal,
+                 f"thread-cov-{i:02d}", skind,
+                 "2026-09-23T18:00:00+00:00", "2026-09-23T18:01:00+00:00", 2))
+        # An invalid closed value in every projection fails closed; a
+        # non-NULL but unrecognized terminal class is unknown, never
+        # active.
+        src.execute(
+            "INSERT INTO invocations(invocation_id, request_id, kind,"
+            " stage, reason, terminal_class, session_id, session_kind,"
+            " started_at, ended_at, schema_version)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            ("cov-bad", "wid-status-0", "smoke_signals", "review", "retry",
+             "bogus-class", "thread-cov-bad", "claude_session_id",
+             "2026-09-23T18:00:00+00:00", "2026-09-23T18:01:00+00:00", 2))
+        src.commit()
+        src.close()
+        router.sync(self.con, root=self.state)
+        for i, status in enumerate(statuses):
+            with self.subTest(status=status):
+                job = self.con.execute(
+                    "SELECT * FROM router_jobs WHERE request_id=?",
+                    (f"wid-status-{i}",)).fetchone()
+                self.assertIsNotNone(job)
+                self.assertEqual(job["status"], status)
+                self.assertEqual(job["lane"], lanes[i % len(lanes)])
+                self.assertEqual(job["job_kind"],
+                                 job_kinds[i % len(job_kinds)])
+                self.assertEqual(job["planner_harness"], "claude")
+                outcome = self.con.execute(
+                    "SELECT * FROM outcomes WHERE task_id=?",
+                    (f"router:wid-status-{i}",)).fetchone()
+                self.assertEqual(outcome["acceptance_state"], "unknown")
+                self.assertEqual(outcome["repairs"],
+                                 f"router_status:{status}")
+        bad_job = self.con.execute(
+            "SELECT * FROM router_jobs WHERE request_id='wid-invalid'"
+            ).fetchone()
+        self.assertIsNotNone(bad_job)
+        self.assertIsNone(bad_job["status"])
+        self.assertIsNone(bad_job["lane"])
+        self.assertIsNone(bad_job["job_kind"])
+        self.assertIsNone(bad_job["planner_harness"])
+        bad_outcome = self.con.execute(
+            "SELECT * FROM outcomes WHERE task_id='router:wid-invalid'"
+            ).fetchone()
+        self.assertEqual(bad_outcome["acceptance_state"], "unknown")
+        self.assertIsNone(bad_outcome["repairs"])
+        for i, reason in enumerate(reasons):
+            with self.subTest(reason=reason):
+                inv = self.con.execute(
+                    "SELECT * FROM router_invocations WHERE invocation_id=?",
+                    (f"cov-{i:02d}",)).fetchone()
+                self.assertIsNotNone(inv)
+                self.assertEqual(inv["reason"], reason)
+                self.assertEqual(inv["kind"], kinds[i % len(kinds)])
+                self.assertEqual(inv["stage"], stages[i % len(stages)])
+                self.assertEqual(inv["session_kind"],
+                                 session_kinds[i % len(session_kinds)])
+                terminal = sorted(terminals)[i % len(terminals)]
+                self.assertEqual(inv["terminal_class"], terminal)
+                attempt = self.con.execute(
+                    "SELECT * FROM attempts WHERE turn_id=?",
+                    (f"router:cov-{i:02d}",)).fetchone()
+                self.assertIsNotNone(attempt)
+                self.assertEqual(attempt["reason"], reason)
+                self.assertEqual(attempt["terminal_class"], terminal)
+                self.assertEqual(attempt["state"], terminals[terminal])
+        bad = self.con.execute(
+            "SELECT * FROM router_invocations WHERE invocation_id='cov-bad'"
+            ).fetchone()
+        self.assertIsNotNone(bad)
+        self.assertIsNone(bad["kind"])
+        self.assertIsNone(bad["stage"])
+        self.assertIsNone(bad["reason"])
+        self.assertIsNone(bad["terminal_class"])
+        self.assertIsNone(bad["session_kind"])
+        bad_attempt = self.con.execute(
+            "SELECT * FROM attempts WHERE turn_id='router:cov-bad'"
+            ).fetchone()
+        self.assertIsNotNone(bad_attempt)
+        self.assertIsNone(bad_attempt["terminal_class"])
+        # Unknown but present: the explicit unknown state, never active.
+        self.assertEqual(bad_attempt["state"], "unknown")
+        # Genuinely absent: still active (the pre-existing t-null row).
+        missing = self.con.execute(
+            "SELECT * FROM attempts WHERE turn_id='router:t-null'"
+            ).fetchone()
+        self.assertEqual(missing["state"], "active")
+
+    def test_attempt_state_wrong_typed_terminal_is_unknown(self):
+        # Fail-closed edge: the helper reads the raw ledger class, so an
+        # unhashable or otherwise wrong-typed value maps to the explicit
+        # unknown state instead of raising, and never to active. None
+        # stays active and valid mappings are preserved.
+        self.assertEqual(router._attempt_state(None), "active")
+        for bad in ([], {}, ["failed"], 0, 123, b"failed", True, ""):
+            with self.subTest(bad=bad):
+                self.assertEqual(router._attempt_state(bad), "unknown")
+        self.assertEqual(router._attempt_state("completed"), "complete")
+        self.assertEqual(router._attempt_state("cancelled"), "cancelled")
+        self.assertEqual(router._attempt_state("crashed"), "crashed")
+        self.assertEqual(router._attempt_state("quota"), "quota_blocked")
+        self.assertEqual(router._attempt_state("timeout"), "failed")
+        self.assertEqual(router._attempt_state("bogus-class"), "unknown")
+
+    def test_router_child_rollout_stores_no_excerpt(self):
+        # Review finding 1 confirmation (the core importer fix already
+        # landed underneath this branch): a router-owned child/worker
+        # Codex rollout carrying a genuine-looking user message keeps no
+        # submission excerpt.
+        kit_dir = os.path.join(
+            self.state, "kits", "wid-child.child", "sessions",
+            "2026", "09", "23")
+        os.makedirs(kit_dir)
+        thread = "thread-router-child-worker"
+        session = "sess-router-child-01"
+        usage = {"cache_write_input_tokens": 0, "cached_input_tokens": 500,
+                 "input_tokens": 700, "output_tokens": 70,
+                 "reasoning_output_tokens": 7, "total_tokens": 770}
+        records = [
+            {"ordinal": 0,
+             "payload": {"cli_version": "0.155.0",
+                         "cwd": "/redacted/workspace",
+                         "session_id": session, "thread_source": "user"},
+             "timestamp": "2026-09-23T18:00:00.000Z",
+             "type": "session_meta"},
+            {"ordinal": 1,
+             "payload": {"cwd": "/redacted/workspace", "effort": "medium",
+                         "model": "gpt-6-fixture",
+                         "root_turn_id": "turn-router-child",
+                         "turn_id": "turn-router-child"},
+             "timestamp": "2026-09-23T18:00:01.000Z",
+             "type": "turn_context"},
+            {"ordinal": 2,
+             "payload": {
+                 "content": [{"text": "Please summarize the worker findings"
+                                      " for the status report.",
+                              "type": "input_text"}],
+                 "id": "msg-router-child-01",
+                 "internal_chat_message_metadata_passthrough": {
+                     "content_item_kinds": ["user.text"],
+                     "turn_id": "turn-router-child"},
+                 "role": "user", "type": "message"},
+             "timestamp": "2026-09-23T18:00:02.000Z",
+             "type": "response_item"},
+            {"ordinal": 3,
+             "payload": {"response_id": "resp-router-child-1",
+                         "root_turn_id": "turn-router-child",
+                         "session_id": session, "thread_id": thread,
+                         "thread_token_usage": usage,
+                         "turn_id": "turn-router-child",
+                         "turn_token_usage": usage, "usage": usage},
+             "timestamp": "2026-09-23T18:00:03.000Z",
+             "type": "token_usage_record"},
+        ]
+        with open(os.path.join(
+                kit_dir,
+                "rollout-2026-09-23T18-00-00-thread-router-child.jsonl"),
+                "w") as fh:
+            for record in records:
+                fh.write(json.dumps(record) + "\n")
+        router.sync(self.con, root=self.state)
+        rows = self.con.execute(
+            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            " WHERE session_key=?", (f"codex:{thread}",)).fetchall()
+        # The genuine-looking child message imported, but stores nothing.
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(row["kind"], "genuine")
+            self.assertEqual(row["text_excerpt"], "")
+
     def test_missing_and_dangling_ids_quarantined_later_rows_import(self):
         src = sqlite3.connect(self.db_path)
         # Empty request id: passes SQLite, fails closed validation.
@@ -963,7 +1196,7 @@ class RouterAdapterTest(LedgerCase):
             "SELECT rowid FROM outcomes"
             " WHERE task_id='router:wid1'").fetchone()["rowid"]
         src = sqlite3.connect(self.db_path)
-        src.execute("UPDATE jobs SET status='complete'"
+        src.execute("UPDATE jobs SET status='succeeded'"
                     " WHERE request_id='wid1'")
         src.commit()
         src.close()
@@ -987,7 +1220,7 @@ class RouterAdapterTest(LedgerCase):
         before = dict(self.con.execute(
             "SELECT * FROM outcomes WHERE task_id='router:wid1'").fetchone())
         src = sqlite3.connect(self.db_path)
-        src.execute("UPDATE jobs SET status='complete'"
+        src.execute("UPDATE jobs SET status='succeeded'"
                     " WHERE request_id='wid1'")
         src.commit()
         src.close()
@@ -1239,7 +1472,7 @@ class RouterAdapterTest(LedgerCase):
             " WHERE harness='router' AND path=?", (canonical,))
         self.con.commit()
         src = sqlite3.connect(self.db_path)
-        src.execute("UPDATE jobs SET status='complete'"
+        src.execute("UPDATE jobs SET status='succeeded'"
                     " WHERE request_id='wid1'")
         src.commit()
         src.close()
@@ -1261,7 +1494,7 @@ class RouterAdapterTest(LedgerCase):
                 " WHERE request_id='wid1'").fetchone()["rowid"], job_rowid)
         job = self.con.execute(
             "SELECT * FROM router_jobs WHERE request_id='wid1'").fetchone()
-        self.assertEqual(job["status"], "complete")
+        self.assertEqual(job["status"], "succeeded")
 
     def test_stale_version_replaces_errors_before_guard_failure(self):
         router.sync(self.con, root=self.state)
