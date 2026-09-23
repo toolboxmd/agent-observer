@@ -9,6 +9,7 @@ import unittest
 
 from agent_observer import db, privacy
 from agent_observer.adapters import opencode
+from agent_observer.ingest import text_hash
 
 T0 = 1788000000000
 
@@ -1312,6 +1313,154 @@ class OpencodeAdapterTest(unittest.TestCase):
         self.assertEqual(snapshot(), before)
         opencode.sync(self.con, source=self.db_file, full=True)
         self.assertEqual(snapshot(), before)
+
+    def test_stale_reimport_malformed_clears_submission_and_event(self):
+        # A privacy-stale re-import must reconcile every owned row: when a
+        # previously valid native record turns malformed without changing
+        # the snapshot fingerprint, old excerpts, hashes, targets and
+        # detail must not survive.
+        sentinel = "SECRET_RECON_CLEAR_zzz_qqq"
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_recon", None, "/repo", "Recon", "1.2.3", None,
+                        "build", T0 + 1000, T0 + 1000, None))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_recon_u", "ses_recon", T0 + 1000, T0 + 1000,
+                        json.dumps({"role": "user",
+                                    "time": {"created": T0 + 1000}})))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_recon_t", "msg_recon_u", "ses_recon",
+                        T0 + 1000, T0 + 1000,
+                        json.dumps({"type": "text",
+                                    "text": "Valid recon prompt "
+                                            + sentinel})))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_recon_a", "ses_recon", T0 + 1001, T0 + 1001,
+                        _msg("assistant", T0 + 1001, T0 + 1011,
+                             _tokens(2, 2, 0, 0, 0))))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_recon_tool", "msg_recon_a", "ses_recon",
+                        T0 + 1001, T0 + 1001,
+                        _tool("read", "call_recon1", "completed",
+                              {"filePath": "/repo/notes.md"}, "output ok",
+                              T0 + 1001, T0 + 1011)))
+        native.commit()
+        native.close()
+        opencode.sync(self.con, source=self.db_file)
+        first = self.q("SELECT * FROM submissions WHERE native_id=?",
+                       ("opencode:msg_recon_u",))[0]
+        self.assertEqual(first["kind"], "genuine")
+        self.assertIn(sentinel, first["text_excerpt"] or "")
+        call_before = self.q("SELECT * FROM events WHERE family='tool_call'"
+                             " AND native_id=?", ("call_recon1",))[0]
+        self.assertEqual(call_before["target"], "/repo/notes.md")
+        # Give the source-owned event a non-NULL old detail holding a
+        # test-only sentinel, the way a pre-fix import could have kept
+        # unsafe detail. The stale re-import must clear it.
+        event_sentinel = "SECRET_RECON_DETAIL_zzz_qqq"
+        self.con.execute(
+            "UPDATE events SET detail_json=? WHERE family='tool_call'"
+            " AND native_id=?",
+            (json.dumps({"note": event_sentinel}), "call_recon1"))
+        self.con.commit()
+        poisoned = self.q("SELECT * FROM events WHERE family='tool_call'"
+                          " AND native_id=?", ("call_recon1",))[0]
+        self.assertIsNotNone(poisoned["detail_json"])
+        self.assertIn(event_sentinel, poisoned["detail_json"] or "")
+        # Malform both native records without touching any timestamp or
+        # count, so the snapshot fingerprint is unchanged and only the
+        # privacy version mismatch can trigger the re-import.
+        native = sqlite3.connect(self.db_file)
+        native.execute("UPDATE message SET data=? WHERE id=?",
+                       ("not json at all", "msg_recon_u"))
+        native.execute("UPDATE part SET data=? WHERE id=?",
+                       ("not json at all", "p_recon_tool"))
+        native.commit()
+        native.close()
+        self.con.execute(
+            "UPDATE sources SET privacy_version=0 WHERE harness='opencode'")
+        self.con.commit()
+        opencode.sync(self.con, source=self.db_file)
+        cleared = self.q("SELECT * FROM submissions WHERE native_id=?",
+                         ("opencode:msg_recon_u",))[0]
+        self.assertEqual(
+            self.q("SELECT COUNT(*) n FROM submissions WHERE native_id=?",
+                   ("opencode:msg_recon_u",))[0]["n"], 1)
+        self.assertEqual(cleared["text_excerpt"], "")
+        self.assertEqual(cleared["kind"], "synthetic")
+        self.assertEqual(cleared["is_genuine"], 0)
+        self.assertEqual(cleared["text_hash"], text_hash(""))
+        self.assertNotIn(sentinel, cleared["text_excerpt"] or "")
+        for family in ("tool_call", "tool_result"):
+            rows = self.q("SELECT * FROM events WHERE family=?"
+                          " AND native_id=?", (family, "call_recon1"))
+            self.assertEqual(len(rows), 1, family)
+            self.assertIsNone(rows[0]["target"], family)
+            self.assertIsNone(rows[0]["detail_json"], family)
+        self._assert_no_secret_anywhere((sentinel, event_sentinel))
+
+    def test_stale_unreadable_source_keeps_old_privacy_version(self):
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_unread", None, "/repo", "Unread", "1.2.3", None,
+                        "build", T0 + 1010, T0 + 1010, None))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_unread_u", "ses_unread", T0 + 1010, T0 + 1010,
+                        json.dumps({"role": "user",
+                                    "time": {"created": T0 + 1010}})))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_unread_t", "msg_unread_u", "ses_unread",
+                        T0 + 1010, T0 + 1010,
+                        json.dumps({"type": "text",
+                                    "text": "unreadable probe"})))
+        native.commit()
+        native.close()
+        opencode.sync(self.con, source=self.db_file)
+        abs_path = os.path.abspath(self.db_file)
+        src_path = f"{abs_path}#ses_unread"
+        self.con.execute(
+            "UPDATE sources SET privacy_version=0 WHERE harness='opencode'")
+        self.con.commit()
+        # Make the source partially readable: messages no longer fetch.
+        native = sqlite3.connect(self.db_file)
+        native.execute("DROP TABLE message")
+        native.commit()
+        native.close()
+        opencode.sync(self.con, source=self.db_file)
+        row = self.q("SELECT * FROM sources WHERE harness=? AND path=?",
+                     ("opencode", src_path))[0]
+        self.assertEqual(row["privacy_version"], 0)
+        errs = self.q("SELECT * FROM import_errors WHERE source_path=?",
+                      (src_path,))
+        self.assertTrue(any(r["error"] == "source_unreadable" for r in errs))
+
+    def test_string_synthetic_flag_is_treated_as_synthetic(self):
+        # Only a native JSON boolean counts for provenance: the string
+        # "false" must fail closed as synthetic with no excerpt.
+        secret = "SECRET_STRING_SYNTH_zzz_qqq"
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_strsyn", None, "/repo", "StrSyn", "1.2.3", None,
+                        "build", T0 + 1020, T0 + 1020, None))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_strsyn_u", "ses_strsyn", T0 + 1020, T0 + 1020,
+                        json.dumps({"role": "user",
+                                    "time": {"created": T0 + 1020}})))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_strsyn_t", "msg_strsyn_u", "ses_strsyn",
+                        T0 + 1020, T0 + 1020,
+                        json.dumps({"type": "text", "text": secret,
+                                    "synthetic": "false"})))
+        native.commit()
+        native.close()
+        opencode.sync(self.con, source=self.db_file)
+        sub = self.q("SELECT * FROM submissions WHERE native_id=?",
+                     ("opencode:msg_strsyn_u",))[0]
+        self.assertEqual(sub["kind"], "synthetic")
+        self.assertEqual(sub["is_genuine"], 0)
+        self.assertEqual(sub["text_excerpt"], "")
+        self.assertNotIn(secret, sub["text_excerpt"] or "")
+        self._assert_no_secret_anywhere((secret,))
 
 
 if __name__ == "__main__":

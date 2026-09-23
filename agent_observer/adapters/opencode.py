@@ -436,6 +436,20 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
         return stats
     source_id = row["id"]
     identity = SessionIdentity()
+    if privacy_stale:
+        # Reconcile every row this source owns: clear sensitive fields
+        # before reprocessing so a deleted, malformed or invalid native
+        # record cannot leave an old excerpt, target or detail behind.
+        # Valid records recompute/update these fields in place below.
+        con.execute(
+            "UPDATE submissions SET text_excerpt=?, text_hash=?, kind=?,"
+            " is_genuine=? WHERE source_id=?",
+            ("", text_hash(""), "synthetic", 0, source_id))
+        con.execute(
+            "UPDATE events SET target=NULL, detail_json=NULL"
+            " WHERE source_id=?",
+            (source_id,))
+    complete = True
     try:
         messages = _fetch_dicts(
             native, "message",
@@ -445,6 +459,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     except sqlite3.Error:
         _oops(con, stats, src_path, None, "source_unreadable")
         messages = []
+        complete = False
     try:
         parts = _fetch_dicts(
             native, "part",
@@ -455,6 +470,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     except sqlite3.Error:
         _oops(con, stats, src_path, None, "source_unreadable")
         parts = []
+        complete = False
     by_message: dict[str, list] = {}
     for part in parts:
         by_message.setdefault(part.get("message_id"), []).append(part)
@@ -514,12 +530,15 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
         size_bytes = os.path.getsize(abs_db_path)
     except OSError:
         size_bytes = 0
+    # Only a complete read advances the privacy version. An unreadable or
+    # partially read source keeps its old version so the next sync retries.
+    new_version = privacy.PRIVACY_VERSION if complete else stored_version
     con.execute(
         "UPDATE sources SET sha256=?, size_bytes=?, imported_at=?,"
         " import_ms=?, session_id=?, privacy_version=? WHERE id=?",
         (fp, size_bytes, db.now(),
          int((time.monotonic() - started) * 1000), sess_id,
-         privacy.PRIVACY_VERSION, source_id))
+         new_version, source_id))
     con.commit()
     stats["unchanged"] = False
     return stats
@@ -624,7 +643,19 @@ def _ingest_submission(con, stats, identity, src_path, source_id,
                   _record_line(raw, pdata))
             continue
         texts.append(text)
-        flags.append(pdata.get("synthetic") is True)
+        # Provenance is a native JSON boolean only: missing keeps the
+        # ordinary non-synthetic default, true means synthetic, false
+        # means non-synthetic, and any present non-boolean value (for
+        # example the string "false") fails closed as synthetic so it
+        # never enters human_texts or a genuine excerpt.
+        if "synthetic" not in pdata:
+            flags.append(False)
+        elif pdata["synthetic"] is True:
+            flags.append(True)
+        elif pdata["synthetic"] is False:
+            flags.append(False)
+        else:
+            flags.append(True)
         # Identity sees the full valid text, including the direction block.
         # The full text stays transient: only the rule-1 excerpt persists.
         identity.observe_text(text)
