@@ -78,3 +78,78 @@ class CliTest(unittest.TestCase):
         caps = {c["family"]: c["supported"]
                 for c in json.loads(r.stdout)["capabilities"]}
         self.assertTrue(caps["model_usage"])
+
+
+class UnknownCountersCliTest(unittest.TestCase):
+    """Unknown native counters stay unknown through the CLI, never zero."""
+
+    def setUp(self):
+        from agent_observer import db as _db
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, "unknown.db")
+        con = _db.connect(self.db)
+        _db.init_db(con)
+        _db.upsert_session(con, "codex:u1", "codex", "u1", None,
+                           project_dir="/p/app", started_at=100.0, ended_at=160.0)
+        _db.upsert_session(con, "codex:u2", "codex", "u2", None,
+                           project_dir="/p/app", started_at=100.0, ended_at=160.0)
+        con.execute(
+            "INSERT INTO sources(harness, path, sha256, imported_at)"
+            " VALUES('codex','p','x',0)")
+        # u1: one response with an unknown total beside a known one;
+        # u2: only an unknown total.
+        con.execute(
+            "INSERT INTO responses(response_id, source_id, harness, session_key,"
+            " turn_id, model, total_tokens, semantics) VALUES"
+            " ('codex:ur1', 1, 'codex', 'codex:u1', 't1', 'gpt-6-fixture', NULL, 's'),"
+            " ('codex:ur2', 1, 'codex', 'codex:u1', 't2', 'gpt-6-fixture', 100, 's'),"
+            " ('codex:ur3', 1, 'codex', 'codex:u2', 't3', 'gpt-6-fixture', NULL, 's')")
+        con.execute(
+            "INSERT INTO tasks(task_id, project, family, title, created_at)"
+            " VALUES('T-U','observer','research','unknown totals',0)")
+        con.execute(
+            "INSERT INTO session_assignments(session_key, task_id, evidence,"
+            " created_at) VALUES('codex:u1','T-U','cli-test',0)")
+        con.commit()
+        con.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_sessions_list_shows_unknown_and_lower_bound(self):
+        r = run(self.db, "sessions", "list")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("total=unknown", r.stdout)
+        self.assertIn("lower bound", r.stdout)
+
+    def test_task_json_keeps_null_and_marks_lower_bound(self):
+        r = run(self.db, "task", "show", "--task", "T-U", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        payload = json.loads(r.stdout)
+        attributed = payload["attributed"]
+        self.assertEqual(attributed["total_tokens"], 100)
+        self.assertEqual(attributed["unknown_counts"]["total_tokens"], 1)
+        self.assertNotEqual(attributed["total_tokens"], 0)
+        self.assertTrue(payload["reconciles"])
+
+    def test_task_text_marks_lower_bound(self):
+        r = run(self.db, "task", "show", "--task", "T-U")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("lower bound", r.stdout)
+
+    def test_session_show_json_keeps_null(self):
+        r = run(self.db, "sessions", "show", "--session", "codex:u2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        payload = json.loads(r.stdout)
+        self.assertIsNone(payload["usage"]["total_tokens"])
+        self.assertEqual(payload["usage"]["unknown_counts"]["total_tokens"], 1)
+
+    def test_compare_by_model_json_attributes_per_response(self):
+        r = run(self.db, "compare", "--by", "model", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        groups = {g["group"]: g for g in json.loads(r.stdout)["groups"]}
+        self.assertIn("gpt-6-fixture", groups)
+        self.assertEqual(groups["gpt-6-fixture"]["sessions"], 2)
+        self.assertEqual(
+            groups["gpt-6-fixture"]["tokens_per_session"]["total"], 100)
+        self.assertEqual(groups["gpt-6-fixture"]["unknown_token_responses"], 2)

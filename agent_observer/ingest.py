@@ -93,7 +93,8 @@ class JsonlSource:
         self.con.execute(
             "INSERT INTO import_errors(harness, source_path, ordinal_num, error,"
             " line_excerpt, created_at) VALUES(?,?,?,?,?,?)",
-            (self.harness, self.path, ordinal, message, line[:200], now()))
+            (self.harness, self.path, ordinal, message,
+             _redacted_excerpt(line, message), now()))
 
     def finish(self, session_id: str | None = None,
                thread_id: str | None = None,
@@ -116,6 +117,42 @@ class JsonlSource:
         return {"source_id": self.source_id, "sha256": fingerprint,
                 "ordinal_max": ordinal_max, "incremental": self.incremental,
                 "unchanged": self.unchanged}
+
+
+def _redacted_excerpt(line: str, message: str) -> str:
+    """Structural metadata only, never raw line text.
+
+    Contract rule 7: malformed lines may carry tool output, file contents
+    or preference contents, so nothing from the line body is stored. The
+    excerpt holds the error category plus, when the line parses as JSON,
+    its sorted top-level keys and type/subtype values, capped at 200 chars.
+    """
+    category = (message or "import_error").split(":")[0].strip() or "import_error"
+    # Keep the category to a safe token; anything else in the message stays
+    # in the error column, never in the excerpt.
+    category = "".join(c if (c.isalnum() or c in ("_", "-")) else "_" for c in category)[:60]
+    if not line or not line.strip():
+        return category[:200]
+    try:
+        obj = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return category[:200]
+    if isinstance(obj, dict):
+        try:
+            keys = sorted(str(k) for k in obj.keys())
+        except Exception:
+            return category[:200]
+        parts = [category, f"keys={','.join(keys)[:120]}"]
+        for field in ("type", "subtype"):
+            value = obj.get(field)
+            if isinstance(value, str) and value:
+                safe = "".join(c if (c.isalnum() or c in ("_", "-", ".", "/")) else "_"
+                               for c in value)[:60]
+                parts.append(f"{field}={safe}")
+        return " ".join(parts)[:200]
+    if isinstance(obj, list):
+        return f"{category} json_type=list"[:200]
+    return f"{category} json_type={type(obj).__name__}"[:200]
 
 
 def insert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,

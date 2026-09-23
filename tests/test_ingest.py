@@ -64,3 +64,55 @@ class IncrementalTest(LedgerCase):
         self.assertTrue(later["incremental"])
         self.assertEqual(later["responses_inserted"], 1)
         self.assertEqual(report.scope_totals(self.con)["total_tokens"], 3350)
+
+
+SECRET = "SECRET-QUARANTINE-9f8e7d6c"
+
+
+class QuarantineRedactionTest(LedgerCase):
+    """Quarantined lines keep structural metadata only, never raw text.
+
+    The fixture holds a malformed non-JSON line and an unknown-type JSON
+    line, both carrying a canary secret in tool-output, file-content and
+    preference shape, followed by a valid usage record.
+    """
+
+    def test_secrets_never_persist_and_valid_records_continue(self):
+        stats = self.sync("codex-secrets-quarantine.jsonl")
+        self.assertEqual(stats["malformed"], 2)
+        # Both valid usage records import: the bad lines destroy nothing
+        # and the later record is not skipped.
+        self.assertEqual(stats["responses_inserted"], 2)
+        self.assertEqual(report.scope_totals(self.con)["total_tokens"], 1540)
+        subs = self.query("SELECT native_id FROM submissions")
+        self.assertEqual([r["native_id"] for r in subs], ["codex:msg-q-sub-01"])
+
+    def test_excerpts_hold_no_raw_text(self):
+        self.sync("codex-secrets-quarantine.jsonl")
+        errors = self.query(
+            "SELECT error, line_excerpt FROM import_errors ORDER BY ordinal_num")
+        self.assertEqual(len(errors), 2)
+        for row in errors:
+            self.assertNotIn(SECRET, row["line_excerpt"] or "")
+            self.assertNotIn(SECRET, row["error"] or "")
+            self.assertLessEqual(len(row["line_excerpt"] or ""), 200)
+        by_error = {r["error"]: r["line_excerpt"] for r in errors}
+        # Invalid JSON keeps only a safe category, no raw excerpt.
+        self.assertEqual(by_error["json_error"], "json_error")
+        # A JSON line keeps the category plus sorted top-level keys and
+        # the type value, but no payload contents.
+        excerpt = next(v for k, v in by_error.items()
+                       if k.startswith("schema_error"))
+        self.assertIn("schema_error", excerpt)
+        self.assertIn("keys=ordinal,payload,timestamp,type", excerpt)
+        self.assertIn("type=future_unknown_type", excerpt)
+
+    def test_secret_in_no_ledger_text(self):
+        self.sync("codex-secrets-quarantine.jsonl")
+        for table, column in (("import_errors", "line_excerpt"),
+                              ("import_errors", "error"),
+                              ("submissions", "text_excerpt"),
+                              ("events", "detail_json")):
+            rows = self.query(f"SELECT {column} FROM {table}")
+            for row in rows:
+                self.assertNotIn(SECRET, row[column] or "")

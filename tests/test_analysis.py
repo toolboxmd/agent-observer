@@ -87,6 +87,141 @@ class TestEditAfterFailureTest(AnalysisCase):
         self.assertEqual(self.found("claude:e", "test_edit_after_failure"), [])
 
 
+class RepeatedSkillTest(AnalysisCase):
+    def load(self, key, skill="wayfinder", target="skills/wayfinder/SKILL.md",
+             family="skill_read"):
+        detail = {"skill": skill} if family == "skill_read" else None
+        self.event(key, family, name=skill, target=target if family == "skill_read" else skill,
+                   detail=detail)
+
+    def test_second_load_without_change_is_a_candidate(self):
+        self.session("claude:sk1")
+        self.load("claude:sk1")
+        self.load("claude:sk1")
+        self.assertEqual(len(self.found("claude:sk1", "repeated_skill_load")), 1)
+
+    def test_edit_of_the_skill_file_resets_seen_state(self):
+        self.session("claude:sk2")
+        self.load("claude:sk2")
+        self.event("claude:sk2", "file_change", target="skills/wayfinder/SKILL.md")
+        self.load("claude:sk2")
+        self.assertEqual(self.found("claude:sk2", "repeated_skill_load"), [])
+
+    def test_edit_in_multi_path_detail_resets_seen_state(self):
+        self.session("codex:sk3")
+        self.load("codex:sk3")
+        self.event("codex:sk3", "file_change", target="/p/other.py",
+                   detail={"paths": {"/p/other.py": {"type": "edit"},
+                                      "skills/wayfinder/SKILL.md": {"type": "edit"}}})
+        self.load("codex:sk3")
+        self.assertEqual(self.found("codex:sk3", "repeated_skill_load"), [])
+
+    def test_unrelated_edit_does_not_reset(self):
+        self.session("claude:sk4")
+        self.load("claude:sk4")
+        self.event("claude:sk4", "file_change", target="/p/unrelated.py")
+        self.load("claude:sk4")
+        self.assertEqual(len(self.found("claude:sk4", "repeated_skill_load")), 1)
+
+    def test_compaction_still_breaks_the_run(self):
+        self.session("claude:sk5")
+        self.load("claude:sk5")
+        self.event("claude:sk5", "compaction", name="compact_boundary")
+        self.load("claude:sk5")
+        self.assertEqual(self.found("claude:sk5", "repeated_skill_load"), [])
+
+    def test_invoke_after_skill_dir_edit_is_not_flagged(self):
+        self.session("claude:sk6")
+        self.event("claude:sk6", "skill_invoke", name="wayfinder", target="wayfinder")
+        self.event("claude:sk6", "file_change",
+                   target="/opt/skills/wayfinder/SKILL.md")
+        self.event("claude:sk6", "skill_invoke", name="wayfinder", target="wayfinder")
+        self.assertEqual(self.found("claude:sk6", "repeated_skill_load"), [])
+
+
+class MultiPathChangeTest(AnalysisCase):
+    def test_reread_after_multi_path_edit_is_explained(self):
+        self.session("codex:mp1")
+        self.event("codex:mp1", "read", target="/p/a.py")
+        self.event("codex:mp1", "file_change", target="/p/b.py",
+                   detail={"paths": {"/p/b.py": {"type": "edit"},
+                                      "/p/a.py": {"type": "edit"}}})
+        self.event("codex:mp1", "read", target="/p/a.py")
+        self.assertEqual(self.found("codex:mp1", "repeated_read"), [])
+
+    def test_reread_after_edit_elsewhere_is_still_a_candidate(self):
+        self.session("codex:mp2")
+        self.event("codex:mp2", "read", target="/p/a.py")
+        self.event("codex:mp2", "file_change", target="/p/b.py",
+                   detail={"paths": {"/p/b.py": {"type": "edit"},
+                                      "/p/c.py": {"type": "edit"}}})
+        self.event("codex:mp2", "read", target="/p/a.py")
+        self.assertEqual(len(self.found("codex:mp2", "repeated_read")), 1)
+
+    def test_test_edit_after_failure_sees_every_changed_path(self):
+        self.session("codex:mp3")
+        self.event("codex:mp3", "tool_result", name="exec",
+                   target="python3 -m unittest discover -s tests", status="error")
+        self.event("codex:mp3", "file_change", target="/p/src/policy.py",
+                   detail={"paths": {"/p/src/policy.py": {"type": "edit"},
+                                      "/p/tests/test_policy.py": {"type": "edit"}}})
+        self.event("codex:mp3", "tool_result", name="exec",
+                   target="python3 -m unittest discover -s tests", status="ok")
+        found = self.found("codex:mp3", "test_edit_after_failure")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["test_files"], ["/p/tests/test_policy.py"])
+        self.assertEqual(found[0]["code_files"], ["/p/src/policy.py"])
+        self.assertFalse(found[0]["only_tests_changed"])
+
+
+class CompareByModelTest(AnalysisCase):
+    def setUp(self):
+        super().setUp()
+        self.session("codex:m1", project="/p/app")
+        self.con.execute(
+            "INSERT INTO sources(harness, path, sha256, imported_at)"
+            " VALUES('codex','p','x',0)")
+        # One session, two models: model-a owns turn t1, model-b owns t2.
+        self.con.execute(
+            "INSERT INTO responses(response_id, source_id, harness, session_key,"
+            " turn_id, model, total_tokens) VALUES"
+            " ('codex:ra1', 1, 'codex', 'codex:m1', 't1', 'model-a', 100),"
+            " ('codex:ra2', 1, 'codex', 'codex:m1', 't1', 'model-a', 200),"
+            " ('codex:ra3', 1, 'codex', 'codex:m1', 't1', 'model-a', NULL),"
+            " ('codex:rb1', 1, 'codex', 'codex:m1', 't2', 'model-b', 300)")
+        # A reread on turn t1 and a turn-less reread elsewhere.
+        self.con.execute(
+            "INSERT INTO events(session_key, ts, family, native_id, name, target,"
+            " turn_id, detail_json) VALUES"
+            " ('codex:m1', 1, 'read', 'r1', 'a.py', '/p/a.py', 't1', NULL),"
+            " ('codex:m1', 2, 'read', 'r2', 'a.py', '/p/a.py', 't1', NULL),"
+            " ('codex:m1', 3, 'read', 'r3', 'b.py', '/p/b.py', NULL, NULL),"
+            " ('codex:m1', 4, 'read', 'r4', 'b.py', '/p/b.py', NULL, NULL)")
+        self.con.commit()
+
+    def test_tokens_attribute_per_response_and_session_counts_twice(self):
+        groups = {g["group"]: g
+                  for g in analysis.compare(self.con, by="model")["groups"]}
+        self.assertEqual(sorted(groups), ["mixed", "model-a", "model-b"])
+        # The session used both models, so it counts under each.
+        self.assertEqual(groups["model-a"]["sessions"], 1)
+        self.assertEqual(groups["model-b"]["sessions"], 1)
+        # Tokens follow the response's own model, with the NULL total kept
+        # visible instead of zeroed.
+        self.assertEqual(groups["model-a"]["tokens_per_session"]["total"], 300)
+        self.assertEqual(groups["model-a"]["unknown_token_responses"], 1)
+        self.assertEqual(groups["model-b"]["tokens_per_session"]["total"], 300)
+        self.assertEqual(groups["model-b"]["unknown_token_responses"], 0)
+
+    def test_incidents_follow_the_turn_model_or_mixed(self):
+        groups = {g["group"]: g
+                  for g in analysis.compare(self.con, by="model")["groups"]}
+        self.assertEqual(groups["model-a"]["repeated_read"]["incidents"], 1)
+        self.assertEqual(groups["model-b"]["repeated_read"]["incidents"], 0)
+        self.assertEqual(groups["mixed"]["repeated_read"]["incidents"], 1)
+        self.assertEqual(groups["mixed"]["sessions"], 1)
+
+
 class HumanSignalsTest(AnalysisCase):
     def test_permission_questions_and_corrections(self):
         self.session("claude:f")
