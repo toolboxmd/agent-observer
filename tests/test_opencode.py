@@ -336,12 +336,20 @@ class OpencodeAdapterTest(unittest.TestCase):
         stats = opencode.sync(self.con, source=self.db_file)
         self.assertGreaterEqual(stats["malformed"], 1)
         errs = self.q("SELECT * FROM import_errors WHERE error=?",
-                      ("part_missing_id",))
+                      ("missing_id",))
         self.assertTrue(errs)
         for row in errs:
+            # Closed category, structure-only excerpt: sorted top-level
+            # keys, no values.
+            self.assertIn(row["error"], opencode.IMPORT_ERROR_CATEGORIES)
             self.assertLessEqual(len(row["line_excerpt"] or ""), 200)
             self.assertNotIn(sentinel, row["line_excerpt"] or "")
-            self.assertIn("type=patch", row["line_excerpt"] or "")
+            self.assertNotIn("type=patch", row["line_excerpt"] or "")
+            self.assertNotIn("patch", row["line_excerpt"] or "")
+            self.assertNotIn("/repo/a.txt", row["line_excerpt"] or "")
+        # The patch record contributes exactly its sorted key names.
+        self.assertTrue(any(
+            (r["line_excerpt"] or "") == "files,hash,type" for r in errs))
         self._assert_no_secret_anywhere((sentinel,))
         # The later valid part in the same session imported.
         late_part = self.q("SELECT * FROM events WHERE family='compaction'"
@@ -405,9 +413,12 @@ class OpencodeAdapterTest(unittest.TestCase):
         self.assertEqual(rows[0]["name"], "error")
         self.assertIn("403", rows[0]["status"] or "")
         detail = json.loads(rows[0]["detail_json"] or "{}")
-        self.assertEqual(detail.get("error"), "APIError")
-        self.assertEqual(detail.get("status_code"), 403)
+        # Whitelisted safe metadata only: numeric status code, no error
+        # name, message or other free text.
+        self.assertEqual(detail, {"status_code": 403})
+        self.assertNotIn("APIError", rows[0]["detail_json"] or "")
         self.assertNotIn(SECRET_ERRMSG, rows[0]["detail_json"] or "")
+        self._assert_no_secret_anywhere(("APIError", SECRET_ERRMSG))
 
     def test_compaction_from_part_and_session_time(self):
         fams = [(r["family"], r["native_id"]) for r in self.q(
@@ -529,11 +540,15 @@ class OpencodeAdapterTest(unittest.TestCase):
         native.close()
         stats = opencode.sync(self.con, source=self.db_file)
         self.assertGreaterEqual(stats["malformed"], 1)
-        errs = self.q("SELECT * FROM import_errors WHERE error LIKE ?",
-                      ("tool_missing_callID%",))
+        errs = self.q("SELECT * FROM import_errors WHERE error=?",
+                      ("missing_id",))
         self.assertTrue(errs)
         for row in errs:
+            self.assertIn(row["error"], opencode.IMPORT_ERROR_CATEGORIES)
             self.assertLessEqual(len(row["line_excerpt"] or ""), 200)
+            # Structure only: sorted keys, no secret values.
+            self.assertNotIn(SECRET_MAL_INPUT, row["line_excerpt"] or "")
+            self.assertNotIn(SECRET_MAL_OUTPUT, row["line_excerpt"] or "")
         self._assert_no_secret_anywhere(
             (SECRET_MAL_INPUT, SECRET_MAL_OUTPUT, SECRET_READ, SECRET_PREF))
 
@@ -618,8 +633,8 @@ class OpencodeAdapterTest(unittest.TestCase):
                                 " WHERE response_id=?",
                                 ("opencode:msg_a1",))[0]["n"], 1)
         # No immutable conflict for a mutable change.
-        conflicts = self.q("SELECT * FROM import_errors WHERE error LIKE ?",
-                           ("conflict_%",))
+        conflicts = self.q("SELECT * FROM import_errors WHERE error=?",
+                           ("usage_conflict",))
         self.assertEqual(conflicts, [])
 
     def test_tool_payload_status_updates_in_place(self):
@@ -649,8 +664,12 @@ class OpencodeAdapterTest(unittest.TestCase):
         self.assertEqual(res_after["duration_ms"], 20)
         call_after = self.q("SELECT * FROM events WHERE family='tool_call'"
                             " AND native_id=?", ("call_read1",))[0]
-        self.assertIn("read notes v2",
-                      (call_after["detail_json"] or ""))
+        # Tool titles never enter the ledger, but the payload update still
+        # lands in place on the same joined rows.
+        self.assertNotIn("read notes v2",
+                         (call_after["detail_json"] or ""))
+        detail = json.loads(call_after["detail_json"] or "{}")
+        self.assertNotIn("title", detail)
         for family in ("tool_call", "tool_result"):
             n = self.q("SELECT COUNT(*) n FROM events WHERE family=?"
                        " AND native_id=? AND session_key=?",
@@ -667,8 +686,8 @@ class OpencodeAdapterTest(unittest.TestCase):
         native.close()
         stats = opencode.sync(self.con, source=self.db_file)
         self.assertGreaterEqual(stats["malformed"], 1)
-        conflicts = self.q("SELECT * FROM import_errors WHERE error LIKE ?",
-                           ("conflict_%",))
+        conflicts = self.q("SELECT * FROM import_errors WHERE error=?",
+                           ("usage_conflict",))
         self.assertTrue(conflicts)
         for row in conflicts:
             self.assertLessEqual(len(row["line_excerpt"] or ""), 200)
@@ -741,9 +760,12 @@ class OpencodeAdapterTest(unittest.TestCase):
         stats = opencode.sync(self.con, source=self.db_file)
         self.assertGreaterEqual(stats["malformed"], 3)
         errors = [r["error"] for r in self.q("SELECT error FROM import_errors")]
-        self.assertTrue(any(e.startswith("unknown_role") for e in errors))
-        self.assertTrue(any(e.startswith("unknown_part_type") for e in errors))
-        self.assertTrue(any(e.startswith("message_json") for e in errors))
+        # Exact closed categories, no appended exception names or values.
+        for err in errors:
+            self.assertIn(err, opencode.IMPORT_ERROR_CATEGORIES)
+        self.assertIn("unknown_record", errors)
+        self.assertIn("unsupported_schema", errors)
+        self.assertIn("malformed_json", errors)
         for row in self.q("SELECT * FROM import_errors"):
             self.assertLessEqual(len(row["line_excerpt"] or ""), 200)
             self.assertNotIn("not json at all", row["line_excerpt"] or "")
@@ -752,6 +774,242 @@ class OpencodeAdapterTest(unittest.TestCase):
                                 ("opencode:msg_alien",)), [])
         self.assertEqual(self.q("SELECT * FROM submissions WHERE native_id=?",
                                 ("opencode:msg_alien",)), [])
+
+
+    def test_privacy_spec_tagged_blocks_titles_errors_and_shape_only(self):
+        s_user_rule = "SECRET_USER_RULE_zzz_qqq"
+        s_sys_rem = "SECRET_SYS_REM_zzz_qqq"
+        s_unterm_tag = "SECRET_UNTERM_TAG_zzz_qqq"
+        s_unterm_triple = "SECRET_UNTERM_TRIPLE_zzz_qqq"
+        s_tool_title = "SECRET_TOOL_TITLE_zzz_qqq"
+        s_lifecycle = "SECRET_LIFECYCLE_ERR_zzz_qqq"
+        s_mal = "SECRET_MAL_VAL_zzz_qqq"
+        s_session_title = "SECRET_SESSION_TITLE_zzz_qqq"
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_priv", None, "/repo", s_session_title, "1.2.3",
+                        None, "build", T0 + 900, T0 + 900, None))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_priv_u", "ses_priv", T0 + 900, T0 + 900,
+                        json.dumps({"role": "user",
+                                    "time": {"created": T0 + 900}})))
+        human = ("Safe human request   with \n  whitespace noise\t here "
+                 f"<user_rule>do not keep {s_user_rule}</user_rule>"
+                 " middle keep "
+                 f"<system-reminder foo=\"bar\">hide {s_sys_rem}</system-reminder>"
+                 " tail keep "
+                 f"<mytag attr=\"x\">leak {s_unterm_tag}"
+                 f"<<<MYSTUFF>>>leak {s_unterm_triple}")
+        # Note: the unterminated generic tag swallows the unterminated
+        # triple block too (fail-closed through end of text), so the
+        # excerpt must end at "tail keep".
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_priv_t", "msg_priv_u", "ses_priv",
+                        T0 + 900, T0 + 900,
+                        json.dumps({"type": "text", "text": human})))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_priv_a", "ses_priv", T0 + 910, T0 + 910,
+                        _msg("assistant", T0 + 910, T0 + 920,
+                             _tokens(2, 2, 0, 0, 0),
+                             error={"name": s_lifecycle,
+                                    "data": {"statusCode": 500,
+                                             "message": "boom " + s_lifecycle}})))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_priv_tool", "msg_priv_a", "ses_priv",
+                        T0 + 911, T0 + 911,
+                        _tool("bash", "call_priv1", "completed",
+                              {"command": "echo hi"}, "output ok",
+                              T0 + 911, T0 + 921,
+                              title="title " + s_tool_title)))
+        # Malformed tool part without callID carrying secret values.
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_priv_mal", "msg_priv_a", "ses_priv",
+                        T0 + 912, T0 + 912,
+                        json.dumps({"type": "tool", "tool": "bash",
+                                    "state": {"status": "completed",
+                                              "input": {"command": s_mal},
+                                              "output": s_mal,
+                                              "time": {"start": T0 + 912,
+                                                       "end": T0 + 922}}})))
+        native.commit()
+        native.close()
+        stats = opencode.sync(self.con, source=self.db_file)
+        self.assertGreaterEqual(stats["malformed"], 1)
+        secrets = (s_user_rule, s_sys_rem, s_unterm_tag, s_unterm_triple,
+                   s_tool_title, s_lifecycle, s_mal, s_session_title)
+        self._assert_no_secret_anywhere(secrets)
+        # Sanitized genuine excerpt: collapsed, bounded, safe prefix kept.
+        sub = self.q("SELECT * FROM submissions WHERE native_id=?",
+                     ("opencode:msg_priv_u",))[0]
+        self.assertEqual(sub["kind"], "genuine")
+        self.assertEqual(sub["is_genuine"], 1)
+        excerpt = sub["text_excerpt"] or ""
+        self.assertLessEqual(len(excerpt), 300)
+        self.assertIn("Safe human request", excerpt)
+        self.assertIn("whitespace noise here", excerpt)
+        self.assertIn("middle keep", excerpt)
+        self.assertIn("tail keep", excerpt)
+        self.assertNotIn("  ", excerpt)
+        self.assertNotIn("\n", excerpt)
+        for marker in ("<user_rule>", "</user_rule>", "<system-reminder>",
+                       "</system-reminder>", "<mytag", "<<<MYSTUFF>>>",
+                       s_user_rule, s_sys_rem, s_unterm_tag, s_unterm_triple):
+            self.assertNotIn(marker, excerpt)
+        # import_errors: exact closed categories, keys-only excerpts.
+        for row in self.q("SELECT * FROM import_errors"):
+            self.assertIn(row["error"], opencode.IMPORT_ERROR_CATEGORIES)
+            self.assertNotIn(":", row["error"])
+            lx = row["line_excerpt"] or ""
+            self.assertLessEqual(len(lx), 200)
+            for secret in secrets:
+                self.assertNotIn(secret, lx)
+            # No values: ids, roles, types, paths must not appear as values.
+            self.assertNotIn("id=", lx)
+            self.assertNotIn("role=", lx)
+            self.assertNotIn("type=", lx)
+            self.assertNotIn("shape=", lx)
+            self.assertNotIn("keys=", lx)
+            if lx != "[]":
+                # Only comma-delimited key names.
+                self.assertNotIn(" ", lx)
+                self.assertNotIn("=", lx)
+        mal_rows = self.q("SELECT * FROM import_errors WHERE error=?",
+                          ("missing_id",))
+        self.assertTrue(mal_rows)
+        self.assertTrue(any(
+            (r["line_excerpt"] or "") == "state,tool,type" for r in mal_rows))
+        # events.detail_json: whitelisted safe metadata only.
+        allowed_keys = {"message_id", "status_code", "skill", "hash"}
+        for row in self.q("SELECT * FROM events"):
+            detail_json = row["detail_json"] or ""
+            for secret in secrets:
+                self.assertNotIn(secret, detail_json)
+            if detail_json:
+                detail = json.loads(detail_json)
+                self.assertTrue(set(detail.keys()) <= allowed_keys,
+                                f"unsafe detail keys: {detail}")
+                for key in ("title", "error", "message", "output",
+                            "content", "arguments", "args", "input"):
+                    self.assertNotIn(key, detail)
+        call = self.q("SELECT * FROM events WHERE family='tool_call'"
+                      " AND native_id=?", ("call_priv1",))[0]
+        self.assertNotIn(s_tool_title, call["detail_json"] or "")
+        call_detail = json.loads(call["detail_json"] or "{}")
+        self.assertEqual(set(call_detail.keys()), {"message_id"})
+        self.assertEqual(call_detail["message_id"], "msg_priv_a")
+        life = self.q("SELECT * FROM events WHERE family='lifecycle'"
+                      " AND native_id=?", ("msg_priv_a",))[0]
+        self.assertEqual(json.loads(life["detail_json"] or "{}"),
+                         {"status_code": 500})
+        result = self.q("SELECT * FROM events WHERE family='tool_result'"
+                        " AND native_id=?", ("call_priv1",))[0]
+        self.assertIsNone(result["detail_json"])
+        # Rule 7: native session titles never enter the ledger.
+        sess = self.q("SELECT * FROM sessions WHERE session_key=?",
+                      ("opencode:ses_priv",))[0]
+        self.assertNotIn(s_session_title, json.dumps(dict(sess)))
+
+    def test_dotted_and_namespaced_tags_remove_exact_block_and_keep_tail(self):
+        s_dot = "SECRET_DOT_TAG_zzz_qqq"
+        s_ns = "SECRET_NS_TAG_zzz_qqq"
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_dottag", None, "/repo", "DotTag", "1.2.3", None,
+                        "build", T0 + 930, T0 + 930, None))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_dottag_u", "ses_dottag", T0 + 930, T0 + 930,
+                        json.dumps({"role": "user",
+                                    "time": {"created": T0 + 930}})))
+        human = ("Head keep "
+                 f"<custom.tag attr=\"x\">hide {s_dot}</custom.tag>"
+                 " middle keep "
+                 f"<x:y>hide {s_ns}</x:y>"
+                 " tail keep")
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_dottag_t", "msg_dottag_u", "ses_dottag",
+                        T0 + 930, T0 + 930,
+                        json.dumps({"type": "text", "text": human})))
+        native.commit()
+        native.close()
+        opencode.sync(self.con, source=self.db_file)
+        self._assert_no_secret_anywhere((s_dot, s_ns))
+        sub = self.q("SELECT * FROM submissions WHERE native_id=?",
+                     ("opencode:msg_dottag_u",))[0]
+        self.assertEqual(sub["kind"], "genuine")
+        excerpt = sub["text_excerpt"] or ""
+        self.assertIn("Head keep", excerpt)
+        self.assertIn("middle keep", excerpt)
+        self.assertIn("tail keep", excerpt)
+        for marker in ("<custom.tag", "</custom.tag>", "<x:y>", "</x:y>",
+                       s_dot, s_ns):
+            self.assertNotIn(marker, excerpt)
+
+    def test_resync_updates_stale_submission_excerpt_kind_hash_genuine(self):
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_resync", None, "/repo", "Resync", "1.2.3", None,
+                        "build", T0 + 950, T0 + 950, None))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_resync_u", "ses_resync", T0 + 950, T0 + 950,
+                        json.dumps({"role": "user",
+                                    "time": {"created": T0 + 950}})))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_resync_t", "msg_resync_u", "ses_resync",
+                        T0 + 950, T0 + 950,
+                        json.dumps({"type": "text",
+                                    "text": "Original safe prompt Alpha"})))
+        native.commit()
+        native.close()
+        opencode.sync(self.con, source=self.db_file)
+        first = self.q("SELECT * FROM submissions WHERE native_id=?",
+                       ("opencode:msg_resync_u",))[0]
+        self.assertEqual(first["kind"], "genuine")
+        self.assertEqual(first["is_genuine"], 1)
+        self.assertIn("Original safe prompt Alpha", first["text_excerpt"])
+        old_hash = first["text_hash"]
+        old_excerpt = first["text_excerpt"]
+        # Mutate the native prompt; bump timestamps so the fingerprint
+        # path re-syncs the session.
+        native = sqlite3.connect(self.db_file)
+        native.execute("UPDATE part SET data=?, time_updated=? WHERE id=?",
+                       (json.dumps({"type": "text",
+                                    "text": "Updated safe prompt Beta "
+                                            "<user_rule>hide me</user_rule>"}),
+                        T0 + 960, "p_resync_t"))
+        native.execute("UPDATE session SET time_updated=? WHERE id=?",
+                       (T0 + 960, "ses_resync"))
+        native.commit()
+        native.close()
+        stats = opencode.sync(self.con, source=self.db_file)
+        self.assertGreaterEqual(stats["submissions_inserted"], 1)
+        second = self.q("SELECT * FROM submissions WHERE native_id=?",
+                        ("opencode:msg_resync_u",))[0]
+        self.assertEqual(
+            self.q("SELECT COUNT(*) n FROM submissions WHERE native_id=?",
+                   ("opencode:msg_resync_u",))[0]["n"], 1)
+        self.assertEqual(second["kind"], "genuine")
+        self.assertEqual(second["is_genuine"], 1)
+        self.assertIn("Updated safe prompt Beta", second["text_excerpt"])
+        self.assertNotIn("hide me", second["text_excerpt"])
+        self.assertNotEqual(second["text_excerpt"], old_excerpt)
+        self.assertNotEqual(second["text_hash"], old_hash)
+        # Flip to synthetic: the same row must clear its excerpt.
+        native = sqlite3.connect(self.db_file)
+        native.execute("UPDATE part SET data=?, time_updated=? WHERE id=?",
+                       (json.dumps({"type": "text", "text": "now synthetic",
+                                    "synthetic": True}),
+                        T0 + 970, "p_resync_t"))
+        native.execute("UPDATE session SET time_updated=? WHERE id=?",
+                       (T0 + 970, "ses_resync"))
+        native.commit()
+        native.close()
+        opencode.sync(self.con, source=self.db_file)
+        third = self.q("SELECT * FROM submissions WHERE native_id=?",
+                       ("opencode:msg_resync_u",))[0]
+        self.assertEqual(third["kind"], "synthetic")
+        self.assertEqual(third["is_genuine"], 0)
+        self.assertEqual(third["text_excerpt"], "")
+        self.assertNotIn("now synthetic", third["text_excerpt"] or "")
 
 
 if __name__ == "__main__":
