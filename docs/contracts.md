@@ -1,56 +1,103 @@
-# Contracts: ledger, event, capture, and query surface
+# Contracts: ledger, adapters, capture, and query surface
 
-Versions: schema 1, event contract 1, capture contract 1. Stored in
-`schema_meta`. Later adapters and reports extend these tables; they do not
-rewrite core accounting.
+Versions: schema 2, event contract 2, capture contract 1, stored in
+`schema_meta`. A ledger with another schema version is refused; move it
+aside and sync again.
 
 ## Ledger
 
-SQLite, stdlib only. Tables: `sources`, `turns`, `responses`, `submissions`,
-`tasks`, `assignments`, `dispatches`, `attempts`, `outcomes`, `events`,
-`import_errors`, `schema_meta`. Raw session files and the database live
-outside Git. Only sanitized fixtures under `tests/fixtures` are committed.
+SQLite, stdlib only, at `~/.local/state/agent-observer/observer.db`
+(`--db` or `AGENT_OBSERVER_DB` overrides). Raw session files and the
+database stay outside Git. Only sanitized fixtures under `tests/fixtures`
+are committed.
 
-## Codex adapter (`agent_observer/codex.py`)
+| Table | Natural key | Holds |
+| --- | --- | --- |
+| `sources` | harness, path | One native source unit: a session file, or `opencode.db#<session id>`. Snapshot fingerprint, read offset, tail hash, import duration. |
+| `sessions` | `session_key` | `<harness>:<native session id>`: project directory, branch, client version, entrypoint, parent session, start and end, instruction identity. |
+| `turns` | `turn_id` | Harness turn or prompt boundary with observed model and effort, timing, state. |
+| `responses` | `response_id` | One usage-bearing model response: raw counters, `semantics`, harness total. |
+| `submissions` | `native_id` | User-role inputs with `kind` genuine, synthetic, scaffolding or interrupt. |
+| `events` | session_key, family, native_id | Operational events (families below). |
+| `tasks`, `assignments`, `session_assignments`, `dispatches`, `attempts`, `outcomes` | see capture | Workload ownership and outcomes. |
+| `router_jobs`, `router_invocations`, `router_readings` | router ids | Model Router ledger rows, copied read-only. |
+| `agentsmd_versions` | AGENTS.md SHA-256 | Release map from the local AgentsMD tags. |
+| `import_errors` | none | Quarantined records; prior valid data is kept. |
 
-Input: one Codex session JSONL file. Supported record types: `session_meta`,
-`event_msg`, `response_item`, `token_usage_record`, `turn_context`,
-`compacted`, `world_state`, `inter_agent_communication_metadata`. Unknown
-types are quarantined in `import_errors`; prior valid data is kept.
+Every natural key carries its harness prefix (`codex:`, `claude:`,
+`opencode:`, `grok:`, `router:`) except event native ids, which are unique
+within their session and family. Rows are keyed by session, not by source
+file, so re-reading a file, a grown log, or a copied file never adds usage
+twice.
 
-Accounting rules:
+## Adapter contract
 
-- One `token_usage_record` usage block is one atomic response keyed by
-  `response_id`. Reimport verifies identical counters and never re-sums.
-- `turn_token_usage` and `thread_token_usage` are checkpoints stored per row
-  and never summed. Scope totals sum `usage` only.
-- `input_tokens` includes cached input; `output_tokens` includes reasoning.
-  Unknown counters stay null, never zero.
-- The `compacted` embedded `latest_token_usage_record` repeats an existing
-  response and is never inserted. The compaction event records whether its
-  `response_id` resolves to a known response.
-- Parent and worker files share `session_id` but have disjoint `response_id`
-  sets; totals add across scopes without merging rows.
+An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
+`CAPABILITIES` (family, supported, detail) and
+`sync(con, root=None, full=False, source=None) -> dict` returning at least
+`harness`, `sources`, `unchanged`, `responses_inserted`, `events_inserted`,
+`submissions_inserted`, `malformed` and `failed` (list of
+`{path, error}`). It must:
 
-Submission rule: a genuine submission is a `response_item` message with
-`role` user, `content_item_kinds` exactly `["user.text"]`, and text that does
-not start with `<send_user_message_question_reply>`. Skill, plugin, and
-environment scaffolding has other kinds and is excluded. Tool results and
-assistant rows never create submissions.
+1. Read native records only, read-only. Never write a harness's files or
+   database.
+2. Be idempotent: insert under natural keys with `INSERT OR IGNORE`. A
+   repeated immutable record with different counters is a conflict recorded
+   in `import_errors`, never a second row and never a silent overwrite.
+   Mutable native rows (a message still streaming) are imported only once
+   final, or updated in place when the harness finalizes them.
+3. Use `ingest.JsonlSource` for append-only JSONL files (it resumes at the
+   last complete line when the preceding bytes are unchanged).
+4. Write one `sessions` row per native session through `db.upsert_session`,
+   with project directory, branch, client version, start and end where
+   recorded, and instruction identity from `identity.SessionIdentity`
+   (feed it message texts that may carry the AgentsMD direction block and
+   every file path the session read).
+5. Keep native counter meaning. `responses.semantics` names it; the raw
+   columns hold native values; `total_tokens` is the harness's own total.
+   Unknown counters stay NULL, never zero.
+6. Quarantine unknown record shapes in `import_errors` with an excerpt no
+   longer than 200 characters, and continue.
+7. Store no file contents, tool outputs or preference contents. Excerpts
+   are limited to 300 characters of a user submission and the last 400
+   characters of an assistant message, in the private ledger only.
 
-Tool joins: calls (`function_call`, `custom_tool_call`) join results
-(`function_call_output`, `custom_tool_call_output`) only on equal `call_id`.
-Completed `CommandExecution` and `McpToolCall` items keep native ids and stay
-unmatched rather than guessed into a wrapper or inner match. `FileChange`
-items record path, change kind, and content size/hash; contents never enter
-the ledger. `turn_aborted` marks the turn cancelled and keeps its account
-provisional.
+### Counter semantics by harness
 
-Read and skill evidence comes only from observed operations:
-`CommandExecution.parsed_cmd` entries of type `read`. A target ending in
-`SKILL.md` is a `skill_read`; prose that mentions a skill file is not
-evidence. Skill invocation and quota attribution stay unknown for Codex in
-this slice; see `trace --capabilities`.
+| Harness | `semantics` | total_tokens |
+| --- | --- | --- |
+| Codex | `codex:input_includes_cached,output_includes_reasoning` | input + output (native `total_tokens`) |
+| Claude Code | `claude:input_excludes_cache,output_includes_thinking` | input + cache_creation + cache_read + output |
+| OpenCode | `opencode:input_excludes_cache,reasoning_separate` | input + output + reasoning + cache read + cache write |
+| Grok Build | `grok:<per native record>` | as reported per prompt completion |
+
+### Event families
+
+| Family | Meaning | Key detail |
+| --- | --- | --- |
+| `tool_call` | Model requested a tool | name, argument fingerprint, `target` (file path or command when present) |
+| `tool_result` | Tool returned | status (`ok`, `error`, `denied`), size, truncation, duration, exit code in detail |
+| `read` | Observed file read | `target` path; content identity when recorded |
+| `skill_read` | Read under an installed Skill directory | `target` path; skill name and AgentsMD version from the path |
+| `skill_invoke` | Explicit Skill invocation (for example Claude's `Skill` tool) | skill name |
+| `file_change` | Edit or write by the agent | path, change kind, content size and hash |
+| `compaction` | Context compaction boundary | trigger, before and after sizes when recorded |
+| `lifecycle` | Turn start, completion, abort, subagent activity, stop reasons | duration, reason |
+| `assistant_message` | Final assistant text of a turn | last 400 characters |
+| `permission` | Permission request or denial | tool, outcome |
+
+A tool call joins its result only on an equal native call id. Nothing is
+guessed into a join.
+
+## Instruction identity
+
+`identity.SessionIdentity` records, where evidence exists:
+`instructions_sha256`, `preferences_sha256` and `direction_status` from the
+`AGENTSMD_PROJECT_DIRECTION_V1` hook block, and `agentsmd_version` from the
+most-read versioned plugin path (`.../agentsmd/<x.y.z>/...`). `sync`
+rebuilds `agentsmd_versions` from the AgentsMD repository behind the global
+instruction link (or `--agentsmd-repo`) and resolves versions from hashes.
+Unresolved hashes stay unresolved.
 
 ## Capture contract (CLI `capture`)
 
@@ -61,7 +108,7 @@ this slice; see `trace --capabilities`.
   prior task. Binding the same submission to several tasks with `--shared`
   keeps the response joint; tokens are shown under each task as shared and
   never divided. Bindings without `--shared` to several tasks are reported
-  as conflicting.
+  as conflicting. Bare native ids resolve when unique.
 - `dispatch`: links an owning submission to a worker thread with requested
   route, policy version, and reason. Requested route stays separate from the
   observed model and effort on the attempt.
@@ -69,24 +116,26 @@ this slice; see `trace --capabilities`.
   terminal state, and whether output was usable.
 - `outcome`: explicit acceptance state per task. A zero process exit never
   implies acceptance.
+- Runner jobs need no capture: the router import binds each job's sessions
+  to its task through `session_assignments` with the job record as evidence.
 
 Outcome states: `complete`, `active`, `cancelled`, `failed`,
 `quota_blocked`, `crashed`, `unknown`. Crashed attempts with no usable output
-are counted separately and excluded from useful-work comparisons. Repairs and
-corrections are preserved on the outcome.
+are counted separately and excluded from useful-work comparisons.
 
-## Query surface (CLI `task`, `trace`)
+## Query surface
 
-- `task list`, `task show --task ID`: attributed, shared joint, and
-  unassigned token buckets with response counts; missing and conflicting
+- `sync`: import every available harness, or `--harness` / `--source`.
+- `sessions list|show`: sessions with project, AgentsMD version and usage.
+- `task list|show --task ID`: attributed, shared joint, and unassigned token
+  buckets over the sessions the task touches; missing and conflicting
   assignments; crash count; outcome; attempts; dispatches. Exit 3 when
-  missing or conflicting ownership exists. JSON with `--json`.
-- `trace --task ID | --turn ID [--family F]`: ordered events with tool
-  join status (joined, unmatched results, unanswered calls). JSON with
-  `--json`. `trace --capabilities` prints the observed coverage declaration.
+  missing or conflicting ownership exists.
+- `trace --task ID | --session KEY | --turn ID [--family F]`: ordered events
+  with tool join status. `trace --capabilities` prints coverage per harness.
 
-Reconciliation: attributed plus shared plus unassigned equals the selected
-scope total. A report never claims completeness from arithmetic alone; the
+Reconciliation: attributed plus shared plus unassigned equals the scope
+total. A report never claims completeness from arithmetic alone; the
 `complete` flag requires zero missing and zero conflicting bindings.
 
 ## Verifier separation

@@ -14,10 +14,10 @@ class ScopeTest(LedgerCase):
         self.assertEqual(list(rows), [])
         parent = self.query(
             "SELECT SUM(total_tokens) t FROM responses "
-            "WHERE response_id LIKE 'resp-scope-p-%'")[0]["t"]
+            "WHERE response_id LIKE 'codex:resp-scope-p-%'")[0]["t"]
         child = self.query(
             "SELECT SUM(total_tokens) t FROM responses "
-            "WHERE response_id LIKE 'resp-scope-c-%'")[0]["t"]
+            "WHERE response_id LIKE 'codex:resp-scope-c-%'")[0]["t"]
         self.assertEqual(parent, 3300)
         self.assertEqual(child, 1650)
         self.assertEqual(report.scope_totals(self.con)["total_tokens"], 4950)
@@ -40,16 +40,19 @@ class ScopeTest(LedgerCase):
         self.con.execute(
             "INSERT INTO tasks(task_id, project, family, title, created_at)"
             " VALUES(?,?,?,?,?)", ("T-P", "observer", "research", "p", db.now()))
+        child_session = self.query(
+            "SELECT session_key FROM responses WHERE turn_id=?",
+            ("codex:turn-scope-child",))[0]["session_key"]
         self.con.execute(
-            "INSERT INTO submissions(native_id, source_id, turn_id,"
-            " ordinal_num, text_hash, text_excerpt, is_genuine)"
-            " VALUES(?,?,?,?,?,?,?)",
-            ("worker-sub-scope-c1", None, "turn-scope-child", 3,
-             "hash", "worker submission", 1))
+            "INSERT INTO submissions(native_id, source_id, session_key,"
+            " turn_id, ordinal_num, text_hash, text_excerpt, is_genuine)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            ("worker-sub-scope-c1", None, child_session,
+             "codex:turn-scope-child", 3, "hash", "worker submission", 1))
         self.con.execute(
             "INSERT INTO assignments(submission_native_id, task_id,"
             " created_at) VALUES(?,?,?)",
-            ("msg-scope-sub-p1", "T-P", db.now()))
+            ("codex:msg-scope-sub-p1", "T-P", db.now()))
         self.con.execute(
             "INSERT INTO assignments(submission_native_id, task_id,"
             " created_at) VALUES(?,?,?)",
@@ -58,7 +61,7 @@ class ScopeTest(LedgerCase):
             "INSERT INTO dispatches(owning_submission, worker_thread,"
             " worker_turn, requested_model, created_at)"
             " VALUES(?,?,?,?,?)",
-            ("msg-scope-sub-p1", "thread-fixture-scope-child",
+            ("codex:msg-scope-sub-p1", "thread-fixture-scope-child",
              "turn-scope-child", "gpt-6-fixture", db.now()))
         self.con.commit()
         rep = report.task_report(self.con, "T-P")

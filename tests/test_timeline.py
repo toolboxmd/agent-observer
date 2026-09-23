@@ -20,7 +20,7 @@ class TimelineTest(LedgerCase):
         # The compacted latest usage is overlap, not additional tokens.
         row = self.query(
             "SELECT response_id FROM responses "
-            "WHERE response_id='resp-mini-002'")
+            "WHERE response_id='codex:resp-mini-002'")
         self.assertEqual(len(row), 1)
         self.assertEqual(detail["latest_usage_response_id"], "resp-mini-002")
         self.assertTrue(detail["latest_usage_resolves"])
@@ -46,14 +46,15 @@ class TimelineTest(LedgerCase):
         reads = report.timeline(self.con, family="read")["events"]
         self.assertEqual([e["name"] for e in reads], ["AGENTS.md"])
         skills = report.timeline(self.con, family="skill_read")["events"]
-        self.assertEqual([e["name"] for e in skills],
+        self.assertEqual([e["target"] for e in skills],
                          ["skills/wayfinder/SKILL.md"])
         # Prose that mentions SKILL.md creates no skill event.
         self.assertEqual(report.timeline(self.con,
                                          family="skill_invocation")["events"], [])
 
     def test_capability_declaration_states_observed_coverage(self):
-        caps = {c["family"]: c for c in report.capabilities()}
+        caps = {c["family"]: c for c in report.capabilities()
+                if c["harness"] == "codex"}
         self.assertTrue(caps["model_usage"]["supported"])
         self.assertTrue(caps["compaction"]["supported"])
         self.assertTrue(caps["read_evidence"]["supported"])
@@ -73,7 +74,7 @@ class TimelineTest(LedgerCase):
 
     def test_aborted_turn_stays_provisional(self):
         turn = self.query(
-            "SELECT state FROM turns WHERE turn_id='turn-mini-ccc'")[0]
+            "SELECT state FROM turns WHERE turn_id='codex:turn-mini-ccc'")[0]
         self.assertEqual(turn["state"], "cancelled")
-        tl = report.timeline(self.con, turn_id="turn-mini-ccc")
+        tl = report.timeline(self.con, turn_id="codex:turn-mini-ccc")
         self.assertEqual(tl["events"][0]["name"], "turn_aborted")

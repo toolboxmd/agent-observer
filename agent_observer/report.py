@@ -13,12 +13,46 @@ def _sum(rows, field: str) -> int:
     return sum((r[field] or 0) for r in rows if not r["is_overlap"])
 
 
-def scope_totals(con: sqlite3.Connection) -> dict:
-    rows = con.execute("SELECT * FROM responses").fetchall()
-    return {b: _sum(rows, b) for b in BUCKETS} | {
+def _responses(con: sqlite3.Connection, session_keys=None) -> list:
+    if session_keys is None:
+        return con.execute("SELECT * FROM responses").fetchall()
+    keys = sorted(session_keys)
+    if not keys:
+        return []
+    return con.execute(
+        f"SELECT * FROM responses WHERE session_key IN ({','.join('?' * len(keys))})",
+        keys).fetchall()
+
+
+def scope_totals(con: sqlite3.Connection, session_keys=None) -> dict:
+    """Usage over a scope. total_tokens is each harness's own total; the raw
+    buckets are only summed within one counter semantics, listed per
+    semantics when a scope mixes harnesses."""
+    rows = _responses(con, session_keys)
+    totals = {b: _sum(rows, b) for b in BUCKETS} | {
         "responses": sum(1 for r in rows if not r["is_overlap"]),
         "overlap_responses": sum(1 for r in rows if r["is_overlap"]),
     }
+    semantics = sorted({r["semantics"] for r in rows if r["semantics"]})
+    if len(semantics) > 1:
+        totals["by_semantics"] = {
+            sem: {b: _sum([r for r in rows if r["semantics"] == sem], b)
+                  for b in BUCKETS}
+            for sem in semantics}
+    return totals
+
+
+def task_sessions(con: sqlite3.Connection, task_id: str) -> set:
+    """Sessions a task touches: those holding its assigned submissions or
+    wholly assigned to it."""
+    keys = {r["session_key"] for r in con.execute(
+        "SELECT DISTINCT s.session_key FROM assignments a JOIN submissions s"
+        " ON s.native_id=a.submission_native_id WHERE a.task_id=?"
+        " AND s.session_key IS NOT NULL", (task_id,))}
+    keys |= {r["session_key"] for r in con.execute(
+        "SELECT session_key FROM session_assignments WHERE task_id=?",
+        (task_id,))}
+    return keys
 
 
 def _turn_submission(con: sqlite3.Connection) -> dict:
@@ -58,7 +92,14 @@ def task_report(con: sqlite3.Connection, task_id: str) -> dict:
             "all_shared": all(r["shared"] for r in rows),
         }
 
-    responses = con.execute("SELECT * FROM responses").fetchall()
+    scope_keys = task_sessions(con, task_id)
+    whole = {r["session_key"]: r["evidence"] for r in con.execute(
+        "SELECT session_key, evidence FROM session_assignments WHERE task_id=?",
+        (task_id,))}
+    whole_shared = {r["session_key"] for r in con.execute(
+        "SELECT session_key FROM session_assignments GROUP BY session_key"
+        " HAVING COUNT(DISTINCT task_id) > 1")}
+    responses = _responses(con, scope_keys)
     attributed, shared, unassigned = [], [], []
     missing_submissions = []
     assigned_anywhere = {r["submission_native_id"] for r in
@@ -66,6 +107,9 @@ def task_report(con: sqlite3.Connection, task_id: str) -> dict:
                                      "FROM assignments").fetchall()}
     for r in responses:
         if r["is_overlap"]:
+            continue
+        if r["session_key"] in whole:
+            (shared if r["session_key"] in whole_shared else attributed).append(dict(r))
             continue
         sub = turn_sub.get(r["turn_id"])
         if sub is None:
@@ -84,7 +128,7 @@ def task_report(con: sqlite3.Connection, task_id: str) -> dict:
         return {b: sum((x[b] or 0) for x in rows) for b in BUCKETS} | {
             "responses": len(rows)}
 
-    scope = scope_totals(con)
+    scope = scope_totals(con, scope_keys)
     crashes = con.execute(
         "SELECT COUNT(*) n FROM attempts WHERE task_id=? AND state='crashed'",
         (task_id,)).fetchone()["n"]
@@ -94,6 +138,8 @@ def task_report(con: sqlite3.Connection, task_id: str) -> dict:
         "shared_joint": total(shared),
         "unassigned_in_scope": total(unassigned),
         "scope": scope,
+        "scope_sessions": sorted(scope_keys),
+        "whole_session_assignments": whole,
         "missing_assignments": missing_submissions,
         "conflicting_assignments": [
             {"submission": s, **j} for s, j in joint.items()
@@ -127,7 +173,7 @@ def task_report(con: sqlite3.Connection, task_id: str) -> dict:
 
 def timeline(con: sqlite3.Connection, task_id: str | None = None,
              turn_id: str | None = None, family: str | None = None,
-             limit: int = 200) -> dict:
+             limit: int = 200, session_key: str | None = None) -> dict:
     turn_sub = _turn_submission(con)
     task_turns: set[str] | None = None
     if task_id is not None:
@@ -137,18 +183,32 @@ def timeline(con: sqlite3.Connection, task_id: str | None = None,
         task_turns = {t for t, s in turn_sub.items() if s in bound}
     q = "SELECT * FROM events WHERE 1=1"
     args: list = []
+    if session_key:
+        q += " AND session_key=?"
+        args.append(session_key)
     if turn_id:
         q += " AND turn_id=?"
         args.append(turn_id)
     elif task_turns is not None:
-        if not task_turns:
-            return {"events": [], "note": "no bound turns; timeline empty"}
-        q += f" AND turn_id IN ({','.join('?' * len(task_turns))})"
-        args.extend(sorted(task_turns))
+        whole = sorted(r["session_key"] for r in con.execute(
+            "SELECT session_key FROM session_assignments WHERE task_id=?",
+            (task_id,)))
+        if not task_turns and not whole:
+            return {"events": [], "note": "no bound turns; timeline empty",
+                    "join": {"calls": 0, "results": 0, "joined_call_ids": [],
+                             "unmatched_results": [], "unanswered_calls": []}}
+        clauses = []
+        if task_turns:
+            clauses.append(f"turn_id IN ({','.join('?' * len(task_turns))})")
+            args.extend(sorted(task_turns))
+        if whole:
+            clauses.append(f"session_key IN ({','.join('?' * len(whole))})")
+            args.extend(whole)
+        q += " AND (" + " OR ".join(clauses) + ")"
     if family:
         q += " AND family=?"
         args.append(family)
-    q += " ORDER BY ordinal_num LIMIT ?"
+    q += " ORDER BY COALESCE(ts, 0), ordinal_num LIMIT ?"
     args.append(limit)
     rows = con.execute(q, args).fetchall()
     out = []
@@ -178,9 +238,8 @@ def timeline(con: sqlite3.Connection, task_id: str | None = None,
 
 
 def capabilities() -> list[dict]:
-    from .codex import CAPABILITIES
-    return [{"family": f, "supported": s, "detail": d}
-            for f, s, d in CAPABILITIES]
+    from .adapters import capabilities as adapter_capabilities
+    return adapter_capabilities()
 
 
 def _row_or_none(row) -> dict | None:

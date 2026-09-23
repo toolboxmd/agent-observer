@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 from agent_observer import db
-from agent_observer.codex import import_codex_file
+from agent_observer.adapters.codex import import_codex_file
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
 
