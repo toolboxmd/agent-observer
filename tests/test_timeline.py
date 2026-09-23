@@ -40,10 +40,10 @@ class TimelineTest(LedgerCase):
 
     def test_read_evidence_comes_only_from_observed_operations(self):
         reads = report.timeline(self.con, family="read")["events"]
-        # Rule 6 keeps the observed path in target; the file basename is
-        # an instance value, not a canonical kind, so names stay empty.
+        # Rule 6 identifier family: the observed path stays in target and
+        # its native basename stays in name; free text never does.
         self.assertEqual([e["target"] for e in reads], ["AGENTS.md"])
-        self.assertEqual([e["name"] for e in reads], [None])
+        self.assertEqual([e["name"] for e in reads], ["AGENTS.md"])
         skills = report.timeline(self.con, family="skill_read")["events"]
         self.assertEqual([e["target"] for e in skills],
                          ["skills/wayfinder/SKILL.md"])

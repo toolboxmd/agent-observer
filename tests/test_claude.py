@@ -52,10 +52,10 @@ class ClaudeAdapterTest(LedgerCase):
         for e in events:
             by.setdefault(e["family"], []).append(e)
         self.assertEqual([e["target"] for e in by["read"]], ["/redacted/repo/notes.md"])
-        # Rule 6 keeps the skill identity in target; the skill name is an
-        # instance value, not a canonical kind, so names stay empty.
+        # Rule 6 identifier family: the native skill name field survives in
+        # both target and name; titles and free text never do.
         self.assertEqual(by["skill_invoke"][0]["target"], "agentsmd:operations")
-        self.assertIsNone(by["skill_invoke"][0]["name"])
+        self.assertEqual(by["skill_invoke"][0]["name"], "agentsmd:operations")
         self.assertEqual(len(by["compaction"]), 1)
         calls = {e["native_id"] for e in by["tool_call"]}
         results = {e["native_id"] for e in by["tool_result"]}

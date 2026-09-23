@@ -33,12 +33,11 @@ class ScopeTest(LedgerCase):
         calls = self.query(
             "SELECT native_id, name FROM events WHERE family='tool_call'")
         # The spawn edge is joinable on its native call id; the native tool
-        # name is an instance value, not a canonical kind, so rule 6 keeps
-        # no name.
+        # name field is an identifier, so rule 6 keeps it in name.
         spawned = [r for r in calls
                    if r["native_id"] == "call-scope-spawn-01"]
         self.assertEqual(len(spawned), 1)
-        self.assertIsNone(spawned[0]["name"])
+        self.assertEqual(spawned[0]["name"], "collaboration.spawn_agent")
         # Explicit dispatch edge connects ownership; the worker turn holds
         # only the child responses, never a copy of the parent total.
         self.con.execute(

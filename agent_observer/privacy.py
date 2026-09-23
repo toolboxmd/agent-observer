@@ -23,7 +23,7 @@ import re
 
 # Rule 3: bump when any rule in this module changes meaning. A stored source
 # version that differs forces a full re-import with in-place correction.
-PRIVACY_VERSION = 2
+PRIVACY_VERSION = 3
 
 SUBMISSION_EXCERPT_CHARS = 300
 ASSISTANT_EXCERPT_CHARS = 400
@@ -192,6 +192,28 @@ EVENT_DETAIL_ALLOWLIST: dict[str, dict[str, str]] = {
 
 _TARGET_CHARS = 500
 
+# Rule 6, native identifiers for the tool/skill name families: a complete
+# ASCII match of [A-Za-z_][A-Za-z0-9_.:/-]{0,79}. fullmatch (not ^...$)
+# so a trailing newline can never slip through the $ anchor. Covers MCP
+# names such as mcp__server__tool. The complete value is validated before
+# any truncation; an overlong value fails closed instead of being cut.
+_NATIVE_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.:/-]{0,79}")
+_HTTP_CODE_RE = re.compile(r"[0-9]{3}")
+
+_IDENTIFIER_FAMILIES = frozenset({
+    "tool_call", "tool_result", "read", "skill_read", "skill_invoke",
+    "permission",
+})
+
+
+def _valid_native_identifier(value: object) -> str | None:
+    """A validated native tool/skill identifier, or None when rejected."""
+    if not isinstance(value, str) or not value:
+        return None
+    if _NATIVE_IDENTIFIER_RE.fullmatch(value) is None:
+        return None
+    return value
+
 
 def filter_target(target: object) -> str | None:
     """Rule 6 targets: keep strings (paths, commands, identifiers).
@@ -208,9 +230,10 @@ def _valid_int(value: object) -> bool:
 
 
 def _valid_identifier(value: object) -> str | None:
-    if isinstance(value, str) and value:
-        return value[:_TARGET_CHARS]
-    return None
+    # Rule 6 skill identifier detail: the same native-identifier rule as
+    # event names for the identifier families. The complete value must
+    # match before any truncation; overlong or mistyped values fail closed.
+    return _valid_native_identifier(value)
 
 
 def _valid_command(value: object) -> str | None:
@@ -291,32 +314,37 @@ def filter_native_id(family: str, value: object) -> str | None:
     return None
 
 
-# Rule 6, event names: closed per-family enums of canonical name/kind
-# values. The members are exactly what the adapters emit as protocol
-# tokens (message and compaction markers, lifecycle kinds, response-item
-# types, fixed dynamic-tool mappings, unknown-kind fallbacks) plus the
-# command-tool kinds the analysis detectors classify on. Native instance
-# values — tool and skill names, file basenames, server or tool paths such
-# as secret_token, unknown_tool, dynamic.secret or AGENTS.md — are never
-# members, so they fail closed to NULL even when identifier-shaped. Event
-# identity still travels in native_id, and paths/commands in target.
+# Rule 6, event names: the tool/skill name families (tool_call,
+# tool_result, read, skill_read, skill_invoke, permission) accept only a
+# native identifier matching [A-Za-z_][A-Za-z0-9_.:/-]{0,79} (see
+# _valid_native_identifier). Lifecycle, compaction, assistant_message and
+# file_change stay closed sets holding exactly the union of native names
+# every adapter legitimately emits. Unknown families fail closed.
 EVENT_NAME_ENUMS: dict[str, frozenset] = {
     "assistant_message": frozenset({"assistant_message"}),
-    "compaction": frozenset({"context_compaction", "compact_boundary"}),
+    "compaction": frozenset({
+        "context_compaction", "compact_boundary",
+        "time_compacting", "compaction",
+        "auto_compact_started", "auto_compact_completed",
+    }),
     "lifecycle": frozenset({
         "task_complete", "turn_aborted", "turn_duration",
         "subagent_activity", "thread_goal_updated", "api_error",
         "stop_hook_summary", "informational", "Plan", "HookPrompt",
         "EnteredReviewMode", "ExitedReviewMode", "collab.unknown",
+        "error", "turn_started", "turn_ended", "tool_started",
+        "retry_state", "subagent_spawned", "subagent_finished",
+        "task_backgrounded", "task_completed", "compaction_checkpoint",
+        "hook_execution", "session_recap", "plan", "background_tasks",
+        "image_compressed", "current_mode_update", "rewind_marker",
     }),
     "tool_call": frozenset(),
-    "tool_result": frozenset({
-        "bash", "Bash", "exec", "shell", "run_terminal_cmd", "run_command",
-        "function_call_output", "custom_tool_call_output",
-        "image_view", "web_search", "mcp.unknown", "dynamic.unknown",
-        "unknown",
+    "tool_result": frozenset(),
+    "file_change": frozenset({
+        "file_change",
+        "Edit", "Write", "MultiEdit", "NotebookEdit",
+        "edit", "write", "patch",
     }),
-    "file_change": frozenset({"file_change"}),
     "read": frozenset(),
     "skill_read": frozenset(),
     "skill_invoke": frozenset(),
@@ -325,9 +353,25 @@ EVENT_NAME_ENUMS: dict[str, frozenset] = {
 
 
 def filter_event_name(family: str, value: object) -> str | None:
-    """The validated event name, or None for a wrong type/unknown value."""
+    """The validated event name, or None for a wrong type/unknown value.
+
+    Identifier families (tool_call, tool_result, read, skill_read,
+    skill_invoke, permission) accept only the native tool or skill name
+    field matching the complete ASCII pattern
+    [A-Za-z_][A-Za-z0-9_.:/-]{0,79} (this covers MCP names such as
+    mcp__server__tool). Adapters must pass only that native name field,
+    never a title, description, message or other free text, and such free
+    text must never be stored: titles, sentences, tag-like text and
+    secret-looking strings with spaces or punctuation outside the allowed
+    set fail closed. No semantic title detection rejects an
+    identifier-shaped native name. Lifecycle, compaction,
+    assistant_message and file_change accept only their closed sets;
+    unknown families fail closed.
+    """
     if not isinstance(value, str) or not value:
         return None
+    if family in _IDENTIFIER_FAMILIES:
+        return _valid_native_identifier(value)
     allowed = EVENT_NAME_ENUMS.get(family)
     if not allowed:
         return None
@@ -338,18 +382,22 @@ def filter_event_name(family: str, value: object) -> str | None:
 
 # Rule 6, event statuses: closed per-family enums. None stays None (no
 # status); any other value of the wrong type or outside the family set is
-# dropped, never stringified or passed through.
+# dropped, never stringified or passed through. Lifecycle and tool_result
+# additionally accept HTTP status codes 100-599 given as an int or a
+# string of exactly three digits, stored as the three-digit string.
 _COMMON_STATUS = frozenset({
     "ok", "error", "denied", "completed", "success", "failed", "failure",
 })
+_HTTP_STATUS_FAMILIES = frozenset({"lifecycle", "tool_result"})
 EVENT_STATUS_ENUMS: dict[str, frozenset] = {
     "tool_call": _COMMON_STATUS | frozenset({"cancelled"}),
     "tool_result": _COMMON_STATUS | frozenset({"cancelled"}),
     "read": _COMMON_STATUS | frozenset({"cancelled"}),
     "skill_read": _COMMON_STATUS | frozenset({"cancelled"}),
     "lifecycle": frozenset(
-        {"completed", "cancelled", "denied", "ok", "error"}),
-    "permission": frozenset({"denied"}),
+        {"completed", "cancelled", "denied", "ok", "error",
+         "success", "failed"}),
+    "permission": frozenset({"denied", "deny", "allow"}),
     "file_change": frozenset(),
     "compaction": frozenset(),
     "assistant_message": frozenset(),
@@ -357,8 +405,39 @@ EVENT_STATUS_ENUMS: dict[str, frozenset] = {
 }
 
 
+def _valid_http_status(value: object) -> str | None:
+    """An HTTP 100-599 code as an int or exact three-digit string, or None.
+
+    Bools, floats, two- or four-digit values, 000/099/600/999, whitespace
+    variants and arbitrary numeric prose all fail closed.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        if 100 <= value <= 599:
+            return str(value)
+        return None
+    if isinstance(value, str):
+        if _HTTP_CODE_RE.fullmatch(value) is None:
+            return None
+        try:
+            code = int(value)
+        except ValueError:
+            return None
+        if 100 <= code <= 599:
+            return value
+        return None
+    return None
+
+
 def filter_event_status(family: str, value: object) -> str | None:
-    """The validated event status, or None when absent or not allowed."""
+    """The validated event status, or None when absent or not allowed.
+
+    Closed per-family sets, plus HTTP status codes 100-599 (int or exact
+    three-digit string, stored as the three-digit string) for the
+    lifecycle and tool_result families only. Free-text sentences, titles,
+    messages and unknown enum strings return None.
+    """
     if value is None:
         return None
     allowed = EVENT_STATUS_ENUMS.get(family)
@@ -366,4 +445,8 @@ def filter_event_status(family: str, value: object) -> str | None:
         return None
     if isinstance(value, str) and value in allowed:
         return value
+    if family in _HTTP_STATUS_FAMILIES:
+        kept = _valid_http_status(value)
+        if kept is not None:
+            return kept
     return None

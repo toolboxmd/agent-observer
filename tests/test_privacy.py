@@ -479,57 +479,103 @@ class EventPrivacyTest(LedgerCase):
         for row in self.query("SELECT native_id FROM events"):
             self.assertNotIn("123", row["native_id"])
 
-    def test_names_follow_closed_per_family_sets(self):
-        # Canonical protocol and command-kind names survive per family.
+    def test_names_identifier_families_accept_native_identifiers(self):
+        # Planner ruling: tool and skill names are native identifiers
+        # matching ^[A-Za-z_][A-Za-z0-9_.:/-]{0,79}$ (covers MCP names).
+        # Adapters pass only the native name field, never a title.
+        legit = (
+            "read_file", "mcp__server__tool", "AGENTS.md", "SKILL.md",
+            "agentsmd:operations", "Bash", "bash", "exec", "read",
+            "edit", "write", "patch", "skill", "my-skill", "wayfinder",
+            "ops", "search_files", "collaboration.spawn_agent",
+            "function_call_output", "custom_tool_call_output",
+            "mcp.unknown", "dynamic.unknown", "unknown", "Read",
+            "Edit", "notes.md", "a", "_private", "a" * 80,
+            "foo/bar", "foo:baz", "foo-bar", "foo.bar",
+        )
+        for family in ("tool_call", "tool_result", "read", "skill_read",
+                       "skill_invoke", "permission"):
+            for name in legit:
+                self.assertEqual(
+                    privacy.filter_event_name(family, name), name,
+                    (family, name))
+
+    def test_names_identifier_families_reject_free_text(self):
+        # Titles, sentences, spaces, tag-like text, secret-looking strings
+        # with spaces and punctuation outside the allowed set fail closed.
+        bad = (
+            "", "hello world", "Only Title Here",
+            "Read `/redacted/repo/skills/ops/SKILL.md`",
+            "done <b>x</b>", "a < b", "sk-fake-secret 12345",
+            "SECRET TOKEN abc123", "foo bar", "foo\nbar",
+            "foo,bar", "foo;bar", "foo@bar", "foo!bar", '"foo"',
+            "'foo'", "(foo)", "foo=bar", "foo+bar", "foo*bar",
+            "foo?bar", "foo|bar", "foo\\bar", "foo`bar", "foo~bar",
+            "1abc", "123", ".foo", "/foo", "-foo", ":foo",
+            "a" * 81, "x" * 200,
+        )
+        for family in ("tool_call", "tool_result", "read", "skill_read",
+                       "skill_invoke", "permission"):
+            for name in bad:
+                self.assertIsNone(
+                    privacy.filter_event_name(family, name), (family, name))
+        for bad_value in (None, 42, 3.14, True, False, ["a"], {"a": 1}):
+            for family in ("tool_call", "tool_result", "read", "skill_read",
+                           "skill_invoke", "permission"):
+                self.assertIsNone(
+                    privacy.filter_event_name(family, bad_value),
+                    (family, repr(bad_value)))
+        self.assertIsNone(privacy.filter_event_name("nope", "exec"))
+
+    def test_names_closed_sets_accept_adapter_union(self):
         self.assertEqual(
             privacy.filter_event_name("assistant_message",
                                       "assistant_message"),
             "assistant_message")
-        self.assertEqual(
-            privacy.filter_event_name("compaction", "context_compaction"),
-            "context_compaction")
-        self.assertEqual(
-            privacy.filter_event_name("compaction", "compact_boundary"),
-            "compact_boundary")
+        for name in ("context_compaction", "compact_boundary",
+                     "time_compacting", "compaction",
+                     "auto_compact_started", "auto_compact_completed"):
+            self.assertEqual(
+                privacy.filter_event_name("compaction", name), name)
         for name in ("task_complete", "turn_aborted", "turn_duration",
                      "subagent_activity", "thread_goal_updated",
-                     "collab.unknown"):
+                     "api_error", "stop_hook_summary", "informational",
+                     "Plan", "HookPrompt", "EnteredReviewMode",
+                     "ExitedReviewMode", "collab.unknown",
+                     "error", "turn_started", "turn_ended", "tool_started",
+                     "retry_state", "subagent_spawned", "subagent_finished",
+                     "task_backgrounded", "task_completed",
+                     "compaction_checkpoint", "hook_execution",
+                     "session_recap", "plan", "background_tasks",
+                     "image_compressed", "current_mode_update",
+                     "rewind_marker"):
             self.assertEqual(
                 privacy.filter_event_name("lifecycle", name), name)
-        for name in ("exec", "Bash", "function_call_output",
-                     "custom_tool_call_output", "image_view", "web_search",
-                     "mcp.unknown", "dynamic.unknown", "unknown"):
+        for name in ("file_change",
+                     "Edit", "Write", "MultiEdit", "NotebookEdit",
+                     "edit", "write", "patch"):
             self.assertEqual(
-                privacy.filter_event_name("tool_result", name), name)
-        self.assertEqual(
-            privacy.filter_event_name("file_change", "file_change"),
-            "file_change")
-        # Arbitrary identifier-shaped instance values are dropped for every
-        # family, even with no spaces: tool and skill names, file
-        # basenames, server paths and structured prefixes.
+                privacy.filter_event_name("file_change", name), name)
+
+    def test_names_closed_sets_reject_identifiers_and_prose(self):
+        # Closed families never accept arbitrary identifiers: even
+        # identifier-shaped tool names fail there, as does all free text.
         cases = (
-            ("tool_call", "collaboration.spawn_agent"),
-            ("tool_call", "exec"),
-            ("tool_call", "secret_token"),
-            ("tool_result", "secret_token"),
-            ("tool_result", "unknown_tool"),
-            ("tool_result", "Read"),
-            ("tool_result", "mcp.cua_repl.js"),
-            ("tool_result", "dynamic.secret"),
-            ("tool_result", "done <b>x</b>"),
-            ("file_change", "Edit"),
-            ("read", "AGENTS.md"),
-            ("read", "notes.md"),
-            ("skill_read", "SKILL.md"),
-            ("skill_read", "operations"),
-            ("skill_invoke", "agentsmd:operations"),
-            ("skill_invoke", "wayfinder"),
-            ("permission", "Bash"),
-            ("permission", "Read"),
+            ("lifecycle", "read_file"),
             ("lifecycle", "collab.spawn_agent"),
             ("lifecycle", "custom prose status"),
-            ("assistant_message", "chat"),
+            ("lifecycle", "Only Title Here"),
+            ("lifecycle", "done <b>x</b>"),
             ("compaction", "compact"),
+            ("compaction", "read_file"),
+            ("compaction", "custom prose"),
+            ("file_change", "Read"),
+            ("file_change", "AGENTS.md"),
+            ("file_change", "custom prose"),
+            ("file_change", "done <b>x</b>"),
+            ("assistant_message", "chat"),
+            ("assistant_message", "read_file"),
+            ("assistant_message", "custom prose"),
         )
         for family, name in cases:
             self.assertIsNone(
@@ -537,16 +583,30 @@ class EventPrivacyTest(LedgerCase):
         self.assertIsNone(privacy.filter_event_name("tool_call", 42))
         self.assertIsNone(privacy.filter_event_name("tool_call", ""))
         self.assertIsNone(privacy.filter_event_name("tool_call", None))
-        self.assertIsNone(privacy.filter_event_name("nope", "exec"))
 
     def test_statuses_follow_closed_per_family_sets(self):
+        # Preserved closed statuses, including Grok permission allow/deny
+        # and lifecycle success/failed; error remains valid everywhere it
+        # was allowed.
         self.assertEqual(
             privacy.filter_event_status("tool_result", "completed"),
             "completed")
         self.assertEqual(
+            privacy.filter_event_status("tool_result", "error"), "error")
+        self.assertEqual(
             privacy.filter_event_status("lifecycle", "cancelled"), "cancelled")
         self.assertEqual(
+            privacy.filter_event_status("lifecycle", "success"), "success")
+        self.assertEqual(
+            privacy.filter_event_status("lifecycle", "failed"), "failed")
+        self.assertEqual(
+            privacy.filter_event_status("lifecycle", "error"), "error")
+        self.assertEqual(
             privacy.filter_event_status("permission", "denied"), "denied")
+        self.assertEqual(
+            privacy.filter_event_status("permission", "allow"), "allow")
+        self.assertEqual(
+            privacy.filter_event_status("permission", "deny"), "deny")
         self.assertIsNone(
             privacy.filter_event_status("tool_result", "started"))
         self.assertIsNone(
@@ -557,6 +617,38 @@ class EventPrivacyTest(LedgerCase):
             privacy.filter_event_status("compaction", "completed"))
         self.assertIsNone(
             privacy.filter_event_status("tool_result", None))
+
+    def test_statuses_http_codes_for_lifecycle_and_tool_result(self):
+        # HTTP 100-599 as int or exact three-digit string, stored as the
+        # three-digit string, for lifecycle and tool_result only.
+        for code in (100, 200, 403, 429, 500, 599):
+            for family in ("lifecycle", "tool_result"):
+                self.assertEqual(
+                    privacy.filter_event_status(family, code), str(code),
+                    (family, code))
+                self.assertEqual(
+                    privacy.filter_event_status(family, str(code)), str(code),
+                    (family, str(code)))
+        # Out-of-range, wrong width, wrong type and other families fail.
+        for bad in (99, 0, 600, 999, 1000, 42, "99", "00", "000", "099",
+                    "600", "999", "5000", "500 ", " 500", "500\n",
+                    "error 500", True, False, 500.0, "200 OK",
+                    ["500"], {"code": 500}):
+            for family in ("lifecycle", "tool_result"):
+                self.assertIsNone(
+                    privacy.filter_event_status(family, bad), (family, bad))
+        for family in ("tool_call", "read", "skill_read", "permission",
+                       "file_change", "compaction", "assistant_message",
+                       "skill_invoke"):
+            self.assertIsNone(privacy.filter_event_status(family, 500))
+            self.assertIsNone(privacy.filter_event_status(family, "500"))
+        # Free-text status sentences and unknown enums still fail.
+        for bad in ("started", "weird prose", "Only Title Here",
+                    "EVIL-STATUS-abc123", ""):
+            self.assertIsNone(
+                privacy.filter_event_status("lifecycle", bad), bad)
+            self.assertIsNone(
+                privacy.filter_event_status("tool_result", bad), bad)
 
     def test_central_writer_routes_every_protected_field(self):
         source_id = self._source()
@@ -572,6 +664,46 @@ class EventPrivacyTest(LedgerCase):
         self.assertEqual(row["target"], "/p/x.py")
         import json as _json
         self.assertEqual(_json.loads(row["detail_json"]), {"exit_code": 1})
+
+    def test_central_writer_keeps_legitimate_identifiers_and_codes(self):
+        # Legitimate native identifiers and HTTP codes are what reach the
+        # database; free text never does.
+        source_id = self._source()
+        stats: dict = {}
+        insert_event(self.con, stats, source_id=source_id,
+                     session_key="codex:s", family="tool_call",
+                     native_id="call-10", name="mcp__server__tool",
+                     target="/p/y.py")
+        insert_event(self.con, stats, source_id=source_id,
+                     session_key="codex:s", family="tool_result",
+                     native_id="call-11", name="read_file", status=500,
+                     target="/p/z.py")
+        insert_event(self.con, stats, source_id=source_id,
+                     session_key="codex:s", family="lifecycle",
+                     native_id="life-1", name="error", status="429")
+        import json as _json
+        row = self.query(
+            "SELECT * FROM events WHERE native_id='call-10'")[0]
+        self.assertEqual(row["name"], "mcp__server__tool")
+        row = self.query(
+            "SELECT * FROM events WHERE native_id='call-11'")[0]
+        self.assertEqual(row["name"], "read_file")
+        self.assertEqual(row["status"], "500")
+        row = self.query(
+            "SELECT * FROM events WHERE native_id='life-1'")[0]
+        self.assertEqual(row["name"], "error")
+        self.assertEqual(row["status"], "429")
+        # Skill identifier detail follows the same native-identifier rule.
+        self.assertEqual(
+            privacy.filter_detail(
+                "skill_read", {"skill": "agentsmd:operations"}),
+            {"skill": "agentsmd:operations"})
+        self.assertEqual(
+            privacy.filter_detail("skill_read", {"skill": "hello world"}),
+            {})
+        self.assertEqual(
+            privacy.filter_detail("skill_read", {"skill": "done <b>x</b>"}),
+            {})
 
     def test_stale_reimport_corrects_every_protected_event_field(self):
         self.sync("codex-mini.jsonl")
