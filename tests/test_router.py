@@ -6,6 +6,7 @@ workload mapping, session ownership, schema guard, idempotency, rollout
 import, and usage reconciliation. Never invokes a model.
 """
 
+import glob
 import hashlib
 import json
 import os
@@ -16,14 +17,20 @@ import sys
 import tempfile
 import unittest
 
-from agent_observer import db
+from agent_observer import db, privacy
 from agent_observer.adapters import router
+from agent_observer.adapters import codex as _codex
 from tests.helpers import LedgerCase
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "router")
 BLOCK = ("<<<AGENTSMD_PROJECT_DIRECTION_V1>>>\n"
          '{"status":"ready","instructions":{"sha256":"secret-hash"}}\n'
          "<<<END_AGENTSMD_PROJECT_DIRECTION_V1>>>")
+# Fixed-length native identifiers for fixtures: git commit SHAs are 40
+# hex chars, content hashes are 64 hex chars.
+BASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+HEAD_COMMIT = "fedcba9876543210fedcba9876543210fedcba98"
+KIT_HASH = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 
 def _router_db(path):
@@ -88,7 +95,8 @@ class RouterAdapterTest(LedgerCase):
             ("wid1", json.dumps({"issue": "toolboxmd/model-router#17",
                                  "goal": goal1, "branch": "fixture"}),
              self.ws_git, "blocked", "implementation_small", "ordinary", None,
-             "plan-sess-1", "fixture-planner", "claude", "abc", "def",
+             "plan-sess-1", "fixture-planner", "claude", BASE_COMMIT,
+             HEAD_COMMIT,
              "codex_auth_failed: permission denied for /tmp/secret (exit 1)",
              "2026-09-23T18:00:00+00:00", "2026-09-23T18:05:00+00:00"))
         goal2 = BLOCK + "\nReal fixture goal text " + "y" * 200
@@ -169,9 +177,11 @@ class RouterAdapterTest(LedgerCase):
             "SELECT * FROM tasks WHERE task_id='router:wid1'").fetchone()
         self.assertEqual(task["origin"], "router")
         self.assertEqual(task["project"], "fixture-ws")
-        self.assertEqual(task["title"],
-                         "Short fixture goal for workload mapping")
+        # Fail closed: the title is the validated issue reference, never
+        # the native goal.
+        self.assertEqual(task["title"], "toolboxmd/model-router#17")
         self.assertEqual(task["issue_url"], "toolboxmd/model-router#17")
+        self.assertNotIn("Short fixture goal", task["title"] or "")
         job = self.con.execute(
             "SELECT * FROM router_jobs WHERE request_id='wid1'").fetchone()
         self.assertEqual(job["issue"], "toolboxmd/model-router#17")
@@ -182,14 +192,34 @@ class RouterAdapterTest(LedgerCase):
         self.assertEqual(outcome["acceptance_state"], "unknown")
         self.assertIn("blocked", outcome["repairs"])
 
+    def test_title_is_issue_or_request_id_never_goal(self):
+        router.sync(self.con, root=self.state)
+        task1 = self.con.execute(
+            "SELECT * FROM tasks WHERE task_id='router:wid1'").fetchone()
+        self.assertEqual(task1["title"], "toolboxmd/model-router#17")
+        task2 = self.con.execute(
+            "SELECT * FROM tasks WHERE task_id='router:wid2'").fetchone()
+        self.assertEqual(task2["title"], "toolboxmd/agent-observer#1")
+        # No goal text lands in tasks or router_jobs.
+        for row in self.con.execute(
+                "SELECT title, issue_url FROM tasks"):
+            blob = (row["title"] or "") + (row["issue_url"] or "")
+            self.assertNotIn("Short fixture goal", blob)
+            self.assertNotIn("Real fixture goal text", blob)
+            self.assertNotIn("AGENTSMD", blob)
+            self.assertNotIn("secret-hash", blob)
+
     def test_title_strips_direction_block_and_truncates(self):
         router.sync(self.con, root=self.state)
         task = self.con.execute(
             "SELECT * FROM tasks WHERE task_id='router:wid2'").fetchone()
-        self.assertNotIn("AGENTSMD", task["title"])
-        self.assertNotIn("secret-hash", task["title"])
-        self.assertLessEqual(len(task["title"]), 120)
-        self.assertTrue(task["title"].startswith("Real fixture goal text"))
+        # The title is the validated issue reference, never the goal, so
+        # direction blocks and goal text cannot leak through it.
+        self.assertEqual(task["title"], "toolboxmd/agent-observer#1")
+        self.assertNotIn("AGENTSMD", task["title"] or "")
+        self.assertNotIn("secret-hash", task["title"] or "")
+        self.assertNotIn("Real fixture goal text", task["title"] or "")
+        self.assertLessEqual(len(task["title"] or ""), 200)
         # A plain directory without git stays unknown, never zero-filled.
         self.assertIsNone(task["project"])
 
@@ -262,7 +292,7 @@ class RouterAdapterTest(LedgerCase):
                 self.assertEqual(stats["failed"][0]["error"],
                                  "unsupported_schema")
                 self.assertIn(stats["failed"][0]["error"],
-                              router.ERROR_CATEGORIES)
+                              privacy.ERROR_CATEGORIES)
                 con = db.connect(fresh)
                 try:
                     for t in ("router_jobs", "router_invocations",
@@ -590,8 +620,15 @@ class RouterAdapterTest(LedgerCase):
                     "SELECT COUNT(*) c FROM responses"
                     " WHERE session_key='codex:thread-match-aaaa'")
                 .fetchone()["c"], 1)
+            # Realpath dedup: the symlinked rollout imports once under one
+            # codex source row; the router ledger holds its own source row.
             self.assertEqual(
-                con.execute("SELECT COUNT(*) c FROM sources")
+                con.execute("SELECT COUNT(*) c FROM sources"
+                            " WHERE harness='codex'")
+                .fetchone()["c"], 1)
+            self.assertEqual(
+                con.execute("SELECT COUNT(*) c FROM sources"
+                            " WHERE harness='router'")
                 .fetchone()["c"], 1)
             conflicts = con.execute(
                 "SELECT * FROM import_errors WHERE harness='router'"
@@ -623,7 +660,7 @@ class RouterAdapterTest(LedgerCase):
             "SELECT error, line_excerpt FROM import_errors"
             " WHERE harness='router'").fetchall()
         for e in errors:
-            self.assertIn(e["error"], router.ERROR_CATEGORIES)
+            self.assertIn(e["error"], privacy.ERROR_CATEGORIES)
             blob = (e["error"] or "") + (e["line_excerpt"] or "")
             self.assertNotIn("thread-match-aaaa", blob)
             self.assertNotIn("thread-mismatch-bbbb", blob)
@@ -663,7 +700,7 @@ class RouterAdapterTest(LedgerCase):
         for row in self.con.execute("SELECT error, line_excerpt"
                                     " FROM import_errors"):
             # Fixed categories only, shape-only excerpts.
-            self.assertIn(row["error"], router.ERROR_CATEGORIES)
+            self.assertIn(row["error"], privacy.ERROR_CATEGORIES)
             self.assertEqual(row["error"], row["error"][:200])
             blob = (row["error"] or "") + (row["line_excerpt"] or "")
             self.assertNotIn("Short fixture goal", blob)
@@ -697,6 +734,669 @@ class RouterAdapterTest(LedgerCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["used"], 42.0)
         self.assertEqual(rows[0]["rowid"], rowid_before)
+
+
+    def test_arbitrary_goal_and_raw_json_never_stored(self):
+        marker_goal = "MARKER-GOAL free text that must never persist 987654"
+        src = sqlite3.connect(self.db_path)
+        src.execute(
+            "INSERT INTO jobs(request_id, task_json, workspace, status,"
+            " created_at, updated_at) VALUES(?,?,?,?,?,?)",
+            ("wid-raw", json.dumps({"issue": "toolboxmd/agent-observer#9",
+                                    "goal": marker_goal}),
+             self.ws_plain, "running",
+             "2026-09-23T18:10:00+00:00", "2026-09-23T18:11:00+00:00"))
+        src.execute(
+            "INSERT INTO invocations(invocation_id, request_id, kind,"
+            " stage, reason, terminal_class, session_id, session_kind,"
+            " usage_json, native_ids_json, skills_json, tools_json,"
+            " started_at, ended_at, schema_version)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("raw1", "wid-raw", "codex_dispatch", "dispatch",
+             "initial", "completed", "thread-raw-1", "codex_task_id",
+             json.dumps({"input_tokens": 10, "output_tokens": 5,
+                         "source": "codex", "secret": "must-drop"}),
+             '{"thread_id":"thread-raw-1","extra":"drop-me"}',
+             '["skill-a"]', '{"tool":"x"}',
+             "2026-09-23T18:00:00+00:00", "2026-09-23T18:01:00+00:00", 2))
+        src.commit()
+        src.close()
+        router.sync(self.con, root=self.state)
+        task = self.con.execute(
+            "SELECT * FROM tasks WHERE task_id='router:wid-raw'").fetchone()
+        self.assertIsNotNone(task)
+        self.assertEqual(task["title"], "toolboxmd/agent-observer#9")
+        self.assertNotIn("MARKER-GOAL", task["title"] or "")
+        inv = self.con.execute(
+            "SELECT * FROM router_invocations"
+            " WHERE invocation_id='raw1'").fetchone()
+        self.assertIsNotNone(inv)
+        self.assertIsNone(inv["native_ids_json"])
+        self.assertIsNone(inv["skills_json"])
+        self.assertIsNone(inv["tools_json"])
+        stored_usage = json.loads(inv["usage_json"])
+        self.assertEqual(stored_usage["output_tokens"], 5)
+        self.assertNotIn("source", stored_usage)
+        self.assertNotIn("secret", stored_usage)
+        attempt = self.con.execute(
+            "SELECT * FROM attempts WHERE turn_id='router:raw1'").fetchone()
+        self.assertIsNotNone(attempt)
+        attempt_usage = json.loads(attempt["usage_json"])
+        self.assertNotIn("source", attempt_usage)
+        # No table holding the projection keeps the marker or raw blobs.
+        for table, cols in (
+                ("tasks", ["title", "issue_url"]),
+                ("router_jobs", ["status", "issue", "block_reason"]),
+                ("router_invocations",
+                 ["reason", "usage_json", "requested_route"]),
+                ("attempts", ["reason", "usage_json", "route_requested"])):
+            for row in self.con.execute(f"SELECT * FROM {table}"):
+                blob = " ".join(str(row[c] or "") for c in cols)
+                self.assertNotIn("MARKER-GOAL", blob, table)
+                self.assertNotIn("must-drop", blob, table)
+                self.assertNotIn("drop-me", blob, table)
+                self.assertNotIn("skill-a", blob, table)
+
+    def test_invalid_reason_becomes_null_while_valid_reasons_stay(self):
+        src = sqlite3.connect(self.db_path)
+        src.execute(
+            "INSERT INTO invocations(invocation_id, request_id, kind,"
+            " stage, reason, terminal_class, session_id, session_kind,"
+            " started_at, ended_at, schema_version)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            ("badreason1", "wid1", "codex_dispatch", "dispatch",
+             "do it because I said so", "completed", "thread-badreason",
+             "codex_task_id",
+             "2026-09-23T18:00:00+00:00", "2026-09-23T18:01:00+00:00", 2))
+        src.commit()
+        src.close()
+        router.sync(self.con, root=self.state)
+        bad = self.con.execute(
+            "SELECT * FROM router_invocations"
+            " WHERE invocation_id='badreason1'").fetchone()
+        self.assertIsNotNone(bad)
+        self.assertIsNone(bad["reason"])
+        bad_attempt = self.con.execute(
+            "SELECT * FROM attempts"
+            " WHERE turn_id='router:badreason1'").fetchone()
+        self.assertIsNotNone(bad_attempt)
+        self.assertIsNone(bad_attempt["reason"])
+        good = self.con.execute(
+            "SELECT reason FROM router_invocations"
+            " WHERE invocation_id='aaa111'").fetchone()
+        self.assertEqual(good["reason"], "initial")
+        good_attempt = self.con.execute(
+            "SELECT reason FROM attempts"
+            " WHERE turn_id='router:aaa111'").fetchone()
+        self.assertEqual(good_attempt["reason"], "initial")
+
+    def test_missing_and_dangling_ids_quarantined_later_rows_import(self):
+        src = sqlite3.connect(self.db_path)
+        # Empty request id: passes SQLite, fails closed validation.
+        src.execute(
+            "INSERT INTO jobs(request_id, task_json, workspace, status,"
+            " created_at, updated_at) VALUES(?,?,?,?,?,?)",
+            ("", json.dumps({"issue": "toolboxmd/agent-observer#1",
+                             "goal": "bad job"}),
+             self.ws_plain, "running",
+             "2026-09-23T18:10:00+00:00", "2026-09-23T18:11:00+00:00"))
+        # Invocation without an invocation id.
+        src.execute(
+            "INSERT INTO invocations(request_id, kind, stage, reason,"
+            " session_id, session_kind, started_at, ended_at,"
+            " schema_version) VALUES(?,?,?,?,?,?,?,?,?)",
+            ("wid1", "codex_dispatch", "dispatch", "initial",
+             "thread-null-iid", "codex_task_id",
+             "2026-09-23T18:00:00+00:00", "2026-09-23T18:01:00+00:00", 2))
+        # Invocation with a missing request id.
+        src.execute(
+            "INSERT INTO invocations(invocation_id, kind, stage,"
+            " session_id, session_kind, started_at, ended_at,"
+            " schema_version) VALUES(?,?,?,?,?,?,?,?)",
+            ("noreq1", "codex_dispatch", "dispatch", "thread-noreq",
+             "codex_task_id",
+             "2026-09-23T18:00:00+00:00", "2026-09-23T18:01:00+00:00", 2))
+        # Invocation with a dangling request id.
+        src.execute(
+            "INSERT INTO invocations(invocation_id, request_id, kind,"
+            " stage, session_id, session_kind, started_at, ended_at,"
+            " schema_version) VALUES(?,?,?,?,?,?,?,?,?)",
+            ("dangling1", "wid-missing", "codex_dispatch", "dispatch",
+             "thread-dangling", "codex_task_id",
+             "2026-09-23T18:00:00+00:00", "2026-09-23T18:01:00+00:00", 2))
+        # A later valid job and invocation must still import.
+        src.execute(
+            "INSERT INTO jobs(request_id, task_json, workspace, status,"
+            " created_at, updated_at) VALUES(?,?,?,?,?,?)",
+            ("wid-late", json.dumps({"issue": "toolboxmd/agent-observer#2"}),
+             self.ws_plain, "running",
+             "2026-09-23T18:10:00+00:00", "2026-09-23T18:11:00+00:00"))
+        src.execute(
+            "INSERT INTO invocations(invocation_id, request_id, kind,"
+            " stage, reason, session_id, session_kind, started_at,"
+            " ended_at, schema_version) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("late1", "wid-late", "codex_dispatch", "dispatch", "retry",
+             "thread-late-1", "codex_task_id",
+             "2026-09-23T18:00:00+00:00", "2026-09-23T18:01:00+00:00", 2))
+        src.commit()
+        src.close()
+        stats = router.sync(self.con, root=self.state)
+        # The late valid rows imported despite earlier malformed rows.
+        self.assertIsNotNone(self.con.execute(
+            "SELECT * FROM tasks WHERE task_id='router:wid-late'").fetchone())
+        self.assertIsNotNone(self.con.execute(
+            "SELECT * FROM attempts"
+            " WHERE turn_id='router:late1'").fetchone())
+        # Malformed rows never land under their natural keys.
+        self.assertIsNone(self.con.execute(
+            "SELECT * FROM router_invocations"
+            " WHERE invocation_id='dangling1'").fetchone())
+        self.assertIsNone(self.con.execute(
+            "SELECT * FROM router_invocations"
+            " WHERE invocation_id='noreq1'").fetchone())
+        self.assertIsNone(self.con.execute(
+            "SELECT * FROM attempts WHERE turn_id='router:dangling1'")
+            .fetchone())
+        quarantined = self.con.execute(
+            "SELECT error, line_excerpt FROM import_errors"
+            " WHERE harness='router' AND error='missing_id'").fetchall()
+        # Shape-only dedup collapses identical shapes: one jobs shape and
+        # one invocations shape, so assert the requirement (every bad row
+        # skipped, quarantine recorded, later rows import) not the row
+        # count.
+        self.assertGreaterEqual(len(quarantined), 2)
+        for row in quarantined:
+            self.assertEqual(row["error"], "missing_id")
+            excerpt = row["line_excerpt"] or ""
+            self.assertLessEqual(len(excerpt), 200)
+            self.assertNotIn("wid-missing", excerpt)
+            self.assertNotIn("dangling1", excerpt)
+        self.assertGreaterEqual(stats["malformed"], 2)
+
+    def test_shared_privacy_helpers_and_no_private_copies(self):
+        self.assertFalse(hasattr(router, "ERROR_CATEGORIES"))
+        self.assertFalse(hasattr(router, "_shape_from_record"))
+        self.assertFalse(hasattr(router, "_shape_from_columns"))
+        for name in ("ERROR_CATEGORIES", "_shape_from_record",
+                     "_shape_from_columns", "EVENT_DETAIL_ALLOWLIST"):
+            self.assertNotIn(name, dir(router))
+        import inspect
+        source = inspect.getsource(router)
+        self.assertIn("privacy.error_category", source)
+        self.assertIn("privacy.line_excerpt", source)
+        self.assertIn("privacy.filter_detail", source)
+        self.assertIn("privacy.filter_target", source)
+        # Unknown categories map to the shared fixed fallback.
+        router.sync(self.con, root=self.state)
+        before = self.con.execute(
+            "SELECT COUNT(*) c FROM import_errors").fetchone()["c"]
+        router._record_error(self.con, self.db_path, "exploded_bogus", "")
+        row = self.con.execute(
+            "SELECT error FROM import_errors ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(row["error"], privacy.ERROR_FALLBACK)
+        self.assertEqual(row["error"], "import_error")
+        after = self.con.execute(
+            "SELECT COUNT(*) c FROM import_errors").fetchone()["c"]
+        self.assertEqual(after, before + 1)
+        # Shape excerpts hold only sorted key names, never values.
+        excerpt = router._shape_excerpt(
+            {"zebra": "secret-value", "apple": "other"})
+        self.assertEqual(excerpt, "apple,zebra")
+        self.assertEqual(router._shape_excerpt([1, 2, 3]), "")
+        self.assertEqual(router._shape_excerpt("not json"), "")
+
+    def test_blank_human_unknown_outcome_preserved(self):
+        router.sync(self.con, root=self.state)
+        # A human leaves a blank unknown outcome: no candidate, proof,
+        # repairs or corrections.
+        self.con.execute(
+            "UPDATE outcomes SET candidate=NULL, proof_ref=NULL,"
+            " repairs=NULL, corrections=NULL, acceptance_state='unknown',"
+            " updated_at=1234567890.0 WHERE task_id='router:wid1'")
+        self.con.commit()
+        before = dict(self.con.execute(
+            "SELECT * FROM outcomes WHERE task_id='router:wid1'").fetchone())
+        self.assertEqual(before["acceptance_state"], "unknown")
+        self.assertIsNone(before["repairs"])
+        before_id = self.con.execute(
+            "SELECT rowid FROM outcomes"
+            " WHERE task_id='router:wid1'").fetchone()["rowid"]
+        src = sqlite3.connect(self.db_path)
+        src.execute("UPDATE jobs SET status='complete'"
+                    " WHERE request_id='wid1'")
+        src.commit()
+        src.close()
+        router.sync(self.con, root=self.state)
+        after = dict(self.con.execute(
+            "SELECT * FROM outcomes WHERE task_id='router:wid1'").fetchone())
+        self.assertEqual(after, before)
+        after_id = self.con.execute(
+            "SELECT rowid FROM outcomes"
+            " WHERE task_id='router:wid1'").fetchone()["rowid"]
+        self.assertEqual(after_id, before_id)
+
+    def test_colliding_human_repairs_prefix_preserved(self):
+        router.sync(self.con, root=self.state)
+        self.con.execute(
+            "UPDATE outcomes SET candidate=NULL, proof_ref=NULL,"
+            " repairs='router_status:forged by human', corrections=NULL,"
+            " acceptance_state='unknown', updated_at=1234567890.0"
+            " WHERE task_id='router:wid1'")
+        self.con.commit()
+        before = dict(self.con.execute(
+            "SELECT * FROM outcomes WHERE task_id='router:wid1'").fetchone())
+        src = sqlite3.connect(self.db_path)
+        src.execute("UPDATE jobs SET status='complete'"
+                    " WHERE request_id='wid1'")
+        src.commit()
+        src.close()
+        router.sync(self.con, root=self.state)
+        after = dict(self.con.execute(
+            "SELECT * FROM outcomes WHERE task_id='router:wid1'").fetchone())
+        self.assertEqual(after, before)
+        self.assertEqual(after["repairs"], "router_status:forged by human")
+
+    def test_router_owned_rollouts_go_through_codex_importer(self):
+        calls = []
+        original = _codex.import_codex_file
+
+        def spy(con, path, full=False):
+            calls.append((path, full))
+            return original(con, path, full=full)
+
+        router._codex.import_codex_file = spy
+        try:
+            stats = router.sync(self.con, root=self.state)
+        finally:
+            router._codex.import_codex_file = original
+        self.assertEqual(stats["rollouts"], 2)
+        self.assertEqual(len(calls), 2)
+        # The sync full flag propagates to the Codex importer.
+        for _, full in calls:
+            self.assertFalse(full)
+        paths = sorted(p for p, _ in calls)
+        self.assertTrue(any("thread-match-aaaa" in p for p in paths))
+        calls.clear()
+        router._codex.import_codex_file = spy
+        try:
+            router.sync(self.con, root=self.state, full=True)
+        finally:
+            router._codex.import_codex_file = original
+        self.assertEqual(len(calls), 2)
+        for _, full in calls:
+            self.assertTrue(full)
+        paths = sorted(p for p, _ in calls)
+        self.assertTrue(any("thread-match-aaaa" in p for p in paths))
+        row = self.con.execute(
+            "SELECT * FROM sessions"
+            " WHERE session_key='codex:thread-match-aaaa'").fetchone()
+        self.assertIsNotNone(row)
+
+
+    def test_block_reason_closed_set_and_direction_supply_enum(self):
+        src = sqlite3.connect(self.db_path)
+        src.execute(
+            "INSERT INTO jobs(request_id, task_json, workspace, status,"
+            " block_reason, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?,?)",
+            ("wid-evil", json.dumps({"issue": "toolboxmd/agent-observer#3"}),
+             self.ws_plain, "blocked",
+             "evil_class: rm -rf /tmp/x <script>alert(1)</script>",
+             "2026-09-23T18:10:00+00:00", "2026-09-23T18:11:00+00:00"))
+        src.execute(
+            "INSERT INTO invocations(invocation_id, request_id, kind,"
+            " stage, direction_supply, direction_hash, session_id,"
+            " session_kind, started_at, ended_at, schema_version)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            ("evil1", "wid-evil", "codex_dispatch", "dispatch",
+             "pwned_inline_evil", "not-a-hash!!", "thread-evil-1",
+             "codex_task_id",
+             "2026-09-23T18:00:00+00:00", "2026-09-23T18:01:00+00:00", 2))
+        src.execute(
+            "INSERT INTO invocations(invocation_id, request_id, kind,"
+            " stage, direction_supply, direction_hash, kit_hash,"
+            " session_id, session_kind, started_at, ended_at,"
+            " schema_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("gooddir1", "wid-evil", "codex_dispatch", "dispatch",
+             "hook", KIT_HASH, KIT_HASH, "thread-evil-2", "codex_task_id",
+             "2026-09-23T18:00:00+00:00", "2026-09-23T18:01:00+00:00", 2))
+        src.commit()
+        src.close()
+        router.sync(self.con, root=self.state)
+        job = self.con.execute(
+            "SELECT * FROM router_jobs WHERE request_id='wid-evil'").fetchone()
+        self.assertIsNotNone(job)
+        self.assertIsNone(job["block_reason"])
+        evil = self.con.execute(
+            "SELECT * FROM router_invocations"
+            " WHERE invocation_id='evil1'").fetchone()
+        self.assertIsNotNone(evil)
+        self.assertIsNone(evil["direction_supply"])
+        self.assertIsNone(evil["direction_hash"])
+        good = self.con.execute(
+            "SELECT * FROM router_invocations"
+            " WHERE invocation_id='gooddir1'").fetchone()
+        self.assertIsNotNone(good)
+        self.assertEqual(good["direction_supply"], "hook")
+        self.assertEqual(good["direction_hash"], KIT_HASH)
+        self.assertEqual(good["kit_hash"], KIT_HASH)
+        # The malicious text persists nowhere in the ledger.
+        blob = ""
+        for table in ("router_jobs", "router_invocations", "attempts"):
+            for row in self.con.execute(f"SELECT * FROM {table}"):
+                blob += " ".join(str(row[c] or "") for c in row.keys())
+        self.assertNotIn("evil_class", blob)
+        self.assertNotIn("rm -rf", blob)
+        self.assertNotIn("alert(1)", blob)
+        self.assertNotIn("pwned_inline_evil", blob)
+        self.assertNotIn("not-a-hash", blob)
+        # Known classes still project; valid commit SHAs are preserved.
+        legit = self.con.execute(
+            "SELECT * FROM router_jobs WHERE request_id='wid1'").fetchone()
+        self.assertEqual(legit["block_reason"], "codex_auth_failed")
+        self.assertEqual(legit["base_commit"], BASE_COMMIT)
+        self.assertEqual(legit["head_commit"], HEAD_COMMIT)
+
+    def test_malformed_numerics_hashes_and_timestamps_fail_closed(self):
+        src = sqlite3.connect(self.db_path)
+        src.execute(
+            "INSERT INTO invocations(invocation_id, request_id, kind,"
+            " stage, elapsed_secs, session_id, session_kind, started_at,"
+            " ended_at, schema_version) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("badnum1", "wid1", "codex_dispatch", "dispatch", float("inf"),
+             "thread-badnum", "codex_task_id",
+             "2026-09-23T18:00:00+00:00", "2026-09-23T18:01:00+00:00", 2))
+        src.execute(
+            "INSERT INTO jobs(request_id, task_json, workspace, status,"
+            " base_commit, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?,?)",
+            ("wid-shorthash", json.dumps({"issue": "x"}),
+             self.ws_plain, "running", "abc",
+             "2026-09-23T18:10:00+00:00", "2026-09-23T18:11:00+00:00"))
+        src.execute(
+            "INSERT INTO readings(pool, model, window, used, limit_value,"
+            " reset_at, observed_at, source) VALUES(?,?,?,?,?,?,?,?)",
+            ("codex", "fixture-model", "9h", float("nan"), float("inf"),
+             "not-a-timestamp", "2026-09-23T19:00:00+00:00",
+             "provider_reported"))
+        src.execute(
+            "INSERT INTO readings(pool, model, window, used, limit_value,"
+            " reset_at, observed_at, source) VALUES(?,?,?,?,?,?,?,?)",
+            ("codex", "fixture-model", "10h", 5.0, 100.0,
+             "2026-09-24T00:00:00+00:00", "also-not-a-timestamp",
+             "provider_reported"))
+        src.commit()
+        src.close()
+        router.sync(self.con, root=self.state)
+        inv = self.con.execute(
+            "SELECT * FROM router_invocations"
+            " WHERE invocation_id='badnum1'").fetchone()
+        self.assertIsNotNone(inv)
+        self.assertIsNone(inv["elapsed_secs"])
+        attempt = self.con.execute(
+            "SELECT * FROM attempts"
+            " WHERE turn_id='router:badnum1'").fetchone()
+        self.assertIsNotNone(attempt)
+        self.assertIsNone(attempt["elapsed_s"])
+        job = self.con.execute(
+            "SELECT * FROM router_jobs"
+            " WHERE request_id='wid-shorthash'").fetchone()
+        self.assertIsNotNone(job)
+        self.assertIsNone(job["base_commit"])
+        nan_row = self.con.execute(
+            "SELECT * FROM router_readings WHERE window='9h'").fetchone()
+        self.assertIsNotNone(nan_row)
+        self.assertIsNone(nan_row["used"])
+        self.assertIsNone(nan_row["limit_value"])
+        self.assertIsNone(nan_row["reset_at"])
+        # A reading with an unparseable observed_at is quarantined, never
+        # stored under its natural key.
+        self.assertIsNone(self.con.execute(
+            "SELECT * FROM router_readings WHERE window='10h'").fetchone())
+        quarantined = self.con.execute(
+            "SELECT error FROM import_errors WHERE harness='router'"
+            " AND error='missing_id'").fetchall()
+        self.assertTrue(quarantined)
+
+    def test_router_source_lifecycle_records_version_and_reuses_row(self):
+        first = router.sync(self.con, root=self.state)
+        self.assertEqual(first["unchanged"], 0)
+        canonical = os.path.realpath(os.path.abspath(self.db_path))
+        row = self.con.execute(
+            "SELECT * FROM sources WHERE harness='router' AND path=?",
+            (canonical,)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["privacy_version"], privacy.PRIVACY_VERSION)
+        self.assertTrue(row["sha256"])
+        source_id = row["id"]
+        before_counts = self._counts()
+        again = router.sync(self.con, root=self.state)
+        self.assertEqual(again["unchanged"], 1)
+        self.assertEqual(self._counts(), before_counts)
+        row2 = self.con.execute(
+            "SELECT * FROM sources WHERE harness='router' AND path=?",
+            (canonical,)).fetchone()
+        self.assertEqual(row2["id"], source_id)
+        self.assertEqual(row2["privacy_version"], privacy.PRIVACY_VERSION)
+        self.assertEqual(row2["sha256"], row["sha256"])
+
+    def test_unchanged_source_skips_ledger_projection(self):
+        first = router.sync(self.con, root=self.state)
+        calls = []
+
+        def counting_import_job(con, db_path, job, totals):
+            calls.append(job.get("request_id"))
+            return orig_import_job(con, db_path, job, totals)
+
+        orig_import_job = router._import_job
+        orig_import_inv = router._import_invocation
+        orig_import_reading = router._import_reading
+        router._import_job = counting_import_job
+        router._import_invocation = (
+            lambda *a: calls.append("inv") or orig_import_inv(*a))
+        router._import_reading = (
+            lambda *a: calls.append("reading") or orig_import_reading(*a))
+        try:
+            stats = router.sync(self.con, root=self.state)
+        finally:
+            router._import_job = orig_import_job
+            router._import_invocation = orig_import_inv
+            router._import_reading = orig_import_reading
+        self.assertEqual(stats["unchanged"], 1)
+        self.assertEqual(calls, [])
+        # The ledger counts are still reported from the snapshot read.
+        self.assertEqual(stats["jobs"], 2)
+        self.assertEqual(stats["readings"], 1)
+        # Bindings report consistently with a full projection sync.
+        self.assertEqual(stats["bindings"], first["bindings"])
+        self.assertEqual(stats["bindings"], 7)
+
+    def test_stale_source_version_refreshes_and_replaces_errors(self):
+        src = sqlite3.connect(self.db_path)
+        src.execute(
+            "INSERT INTO invocations(invocation_id, request_id, kind,"
+            " stage, session_id, session_kind, started_at, ended_at,"
+            " schema_version) VALUES(?,?,?,?,?,?,?,?,?)",
+            ("dangling-stale", "wid-missing", "codex_dispatch", "dispatch",
+             "thread-stale", "codex_task_id",
+             "2026-09-23T18:00:00+00:00", "2026-09-23T18:01:00+00:00", 2))
+        src.commit()
+        src.close()
+        router.sync(self.con, root=self.state)
+        canonical = os.path.realpath(os.path.abspath(self.db_path))
+        errors_before = self.con.execute(
+            "SELECT COUNT(*) c FROM import_errors WHERE harness='router'"
+            " AND source_path=?", (canonical,)).fetchone()["c"]
+        self.assertGreaterEqual(errors_before, 1)
+        job_rowid = self.con.execute(
+            "SELECT rowid FROM router_jobs"
+            " WHERE request_id='wid1'").fetchone()["rowid"]
+        # Simulate an import under older privacy rules, plus router
+        # progress that the refresh must pick up in place.
+        self.con.execute(
+            "UPDATE sources SET privacy_version=0"
+            " WHERE harness='router' AND path=?", (canonical,))
+        self.con.commit()
+        src = sqlite3.connect(self.db_path)
+        src.execute("UPDATE jobs SET status='complete'"
+                    " WHERE request_id='wid1'")
+        src.commit()
+        src.close()
+        stats = router.sync(self.con, root=self.state)
+        self.assertEqual(stats["failed"], [])
+        row = self.con.execute(
+            "SELECT * FROM sources WHERE harness='router' AND path=?",
+            (canonical,)).fetchone()
+        self.assertEqual(row["privacy_version"], privacy.PRIVACY_VERSION)
+        # Prior errors for this source were replaced, not duplicated.
+        errors_after = self.con.execute(
+            "SELECT COUNT(*) c FROM import_errors WHERE harness='router'"
+            " AND source_path=?", (canonical,)).fetchone()["c"]
+        self.assertEqual(errors_after, errors_before)
+        # Projections updated in place, never deleted and reinserted.
+        self.assertEqual(
+            self.con.execute(
+                "SELECT rowid FROM router_jobs"
+                " WHERE request_id='wid1'").fetchone()["rowid"], job_rowid)
+        job = self.con.execute(
+            "SELECT * FROM router_jobs WHERE request_id='wid1'").fetchone()
+        self.assertEqual(job["status"], "complete")
+
+    def test_stale_version_replaces_errors_before_guard_failure(self):
+        router.sync(self.con, root=self.state)
+        canonical = os.path.realpath(os.path.abspath(self.db_path))
+        # Seed a prior error under the current version.
+        src = sqlite3.connect(self.db_path)
+        src.execute(
+            "INSERT INTO invocations(invocation_id, request_id, kind,"
+            " stage, session_id, session_kind, started_at, ended_at,"
+            " schema_version) VALUES(?,?,?,?,?,?,?,?,?)",
+            ("dangling-guard", "wid-missing", "codex_dispatch", "dispatch",
+             "thread-guard", "codex_task_id",
+             "2026-09-23T18:00:00+00:00", "2026-09-23T18:01:00+00:00", 2))
+        src.commit()
+        src.close()
+        router.sync(self.con, root=self.state)
+        seeded = self.con.execute(
+            "SELECT error FROM import_errors WHERE harness='router'"
+            " AND source_path=?", (canonical,)).fetchall()
+        self.assertTrue(any(r["error"] == "missing_id" for r in seeded))
+        # Mark the source stale and poison the schema in the same ledger.
+        self.con.execute(
+            "UPDATE sources SET privacy_version=0"
+            " WHERE harness='router' AND path=?", (canonical,))
+        self.con.commit()
+        src = sqlite3.connect(self.db_path)
+        src.execute("UPDATE invocations SET schema_version=3")
+        src.commit()
+        src.close()
+        stats = router.sync(self.con, root=self.state)
+        self.assertEqual(len(stats["failed"]), 1)
+        self.assertEqual(stats["failed"][0]["error"], "unsupported_schema")
+        # Only the current fixed-category error remains; the version stays
+        # stale so a later sync retries the source.
+        remaining = self.con.execute(
+            "SELECT error FROM import_errors WHERE harness='router'"
+            " AND source_path=?", (canonical,)).fetchall()
+        self.assertEqual([r["error"] for r in remaining],
+                         ["unsupported_schema"])
+        row = self.con.execute(
+            "SELECT * FROM sources WHERE harness='router' AND path=?",
+            (canonical,)).fetchone()
+        self.assertEqual(row["privacy_version"], 0)
+        # Repairing the ledger retries cleanly under the current version.
+        src = sqlite3.connect(self.db_path)
+        src.execute("UPDATE invocations SET schema_version=2")
+        src.commit()
+        src.close()
+        recovered = router.sync(self.con, root=self.state)
+        self.assertEqual(recovered["failed"], [])
+        row = self.con.execute(
+            "SELECT * FROM sources WHERE harness='router' AND path=?",
+            (canonical,)).fetchone()
+        self.assertEqual(row["privacy_version"], privacy.PRIVACY_VERSION)
+        retried = self.con.execute(
+            "SELECT error FROM import_errors WHERE harness='router'"
+            " AND source_path=?", (canonical,)).fetchall()
+        self.assertTrue(any(r["error"] == "missing_id" for r in retried))
+
+    def test_unchanged_ledger_still_reconciles_late_rollout(self):
+        rollout_paths = sorted(glob.glob(
+            os.path.join(self.state, "kits", "*", "sessions", "**",
+                         "rollout-*.jsonl"),
+            recursive=True))
+        self.assertEqual(len(rollout_paths), 2)
+        hidden = os.path.join(self.tmp.name, "hidden-rollouts")
+        os.makedirs(hidden)
+        moved = []
+        for path in rollout_paths:
+            dest = os.path.join(hidden, os.path.basename(path))
+            shutil.move(path, dest)
+            moved.append((path, dest))
+        try:
+            first = router.sync(self.con, root=self.state)
+        finally:
+            for path, dest in moved:
+                shutil.move(dest, path)
+        # No rollouts yet: no native sessions, so nothing to reconcile.
+        self.assertEqual(first["rollouts"], 0)
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) c FROM import_errors WHERE harness='router'"
+                " AND error='usage_conflict'").fetchone()["c"], 0)
+        # The second sync skips ledger projections but must still compare
+        # router usage once the restored rollouts land.
+        projection_calls = []
+        orig_job, orig_inv, orig_reading = (
+            router._import_job, router._import_invocation,
+            router._import_reading)
+        router._import_job = (
+            lambda *a: projection_calls.append("job") or orig_job(*a))
+        router._import_invocation = (
+            lambda *a: projection_calls.append("inv") or orig_inv(*a))
+        router._import_reading = (
+            lambda *a: projection_calls.append("reading") or orig_reading(*a))
+        try:
+            second = router.sync(self.con, root=self.state)
+        finally:
+            router._import_job = orig_job
+            router._import_invocation = orig_inv
+            router._import_reading = orig_reading
+        self.assertEqual(projection_calls, [])
+        self.assertEqual(second["rollouts"], 2)
+        self.assertEqual(second["unchanged"], 0)
+        conflicts = self.con.execute(
+            "SELECT error, line_excerpt FROM import_errors"
+            " WHERE harness='router' AND error='usage_conflict'").fetchall()
+        self.assertEqual(len(conflicts), 1)
+        self.assertIn("invocation_id", conflicts[0]["line_excerpt"] or "")
+        self.assertNotIn("thread-mismatch-bbbb",
+                         conflicts[0]["line_excerpt"] or "")
+
+    def test_failed_source_import_stays_stale_for_retry(self):
+        state = os.path.join(self.tmp.name, "poison-state")
+        shutil.copytree(self.state, state)
+        poisoned = os.path.join(state, "jobs.db")
+        src = sqlite3.connect(poisoned)
+        src.execute("UPDATE invocations SET schema_version=3")
+        src.commit()
+        src.close()
+        fresh = os.path.join(self.tmp.name, "obs-poison.db")
+        con = db.connect(fresh)
+        db.init_db(con)
+        try:
+            stats = router.sync(con, root=state)
+            self.assertEqual(len(stats["failed"]), 1)
+            canonical = os.path.realpath(os.path.abspath(poisoned))
+            row = con.execute(
+                "SELECT * FROM sources WHERE harness='router' AND path=?",
+                (canonical,)).fetchone()
+            # No version recorded: the next sync retries the source.
+            self.assertTrue(row is None or
+                            row["privacy_version"] != privacy.PRIVACY_VERSION)
+        finally:
+            con.close()
 
 
 class RouterCliTest(unittest.TestCase):
