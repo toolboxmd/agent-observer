@@ -192,6 +192,19 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=["agentsmd", "model", "harness", "project"])
     _scope(cp)
 
+    pb = sub.add_parser("publish", help="render or post one summary comment on GitHub")
+    target = pb.add_mutually_exclusive_group(required=True)
+    target.add_argument("--task", default=None)
+    target.add_argument("--session", action="append", default=None)
+    pb.add_argument("--repo", default=None, help="owner/name")
+    pb.add_argument("--pr", type=int, default=None)
+    pb.add_argument("--commit", default=None)
+    pb.add_argument("--dry-run", action="store_true", help="print the comment, post nothing")
+    pb.add_argument("--json", action="store_true", dest="as_json")
+
+    hl = sub.add_parser("health", help="find live sessions Observer cannot see")
+    hl.add_argument("--json", action="store_true", dest="as_json")
+
     tr = sub.add_parser("trace", help="inspect the execution timeline")
     tr.add_argument("--task", default=None)
     tr.add_argument("--turn", default=None)
@@ -220,6 +233,22 @@ def main(argv=None) -> int:
 
         if ns.cmd in ("diagnose", "compare"):
             return _analyze(con, ns)
+
+        if ns.cmd == "publish":
+            return _publish(con, ns)
+
+        if ns.cmd == "health":
+            from . import health as _health
+            result = _health.check()
+            if ns.as_json:
+                _emit(result, True)
+            else:
+                print(f"checked {result['checked']['claude_sessions']} Claude sessions and "
+                      f"{result['checked']['processes']} agent processes: "
+                      f"{len(result['findings'])} invisible")
+                for f in result["findings"]:
+                    print(f"- {f['host']} pid {f['pid']} in {f['cwd']}: {f['problem']}. Fix: {f['fix']}")
+            return 4 if result["findings"] else 0
 
         if ns.cmd == "capture":
             return _capture(con, ns)
@@ -440,6 +469,33 @@ def _analyze(con, ns) -> int:
                            if g[d]["incidents"])
         print(line + (f"; {extras}" if extras else ""))
     print(payload["note"])
+    return 0
+
+
+def _publish(con, ns) -> int:
+    from . import publish as _publish_mod
+    if ns.task:
+        keys = _report.task_sessions(con, ns.task)
+        label = f"task {ns.task}"
+    else:
+        keys = set(ns.session)
+        label = f"{len(keys)} session(s)"
+    if not keys:
+        print("nothing to publish: no sessions in scope", file=sys.stderr)
+        return 2
+    body = _publish_mod.render(_publish_mod.summarize(con, keys, label, task_id=ns.task))
+    if ns.dry_run:
+        print(body)
+        return 0
+    if not ns.repo or (ns.pr is None) == (ns.commit is None):
+        print("publish needs --repo and exactly one of --pr or --commit", file=sys.stderr)
+        return 2
+    try:
+        result = _publish_mod.post(ns.repo, body, pr=ns.pr, commit=ns.commit)
+    except (RuntimeError, ValueError) as exc:
+        print(f"publish failed: {exc}", file=sys.stderr)
+        return 1
+    _emit(result, ns.as_json)
     return 0
 
 
