@@ -16,11 +16,10 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sqlite3
 import time
 
-from .. import db
+from .. import db, privacy
 from ..identity import SessionIdentity, skill_from_path
 from ..ingest import fingerprint, insert_event, iso_ts, text_hash
 
@@ -46,40 +45,17 @@ CAPABILITIES = [
 
 # Privacy (ledger privacy spec, planner ruling 2026-09-23; refines
 # docs/contracts.md rules 6 and 7). Fail closed: when in doubt, store less.
+# The single implementation of rules 1 to 6 lives in
+# agent_observer/privacy.py; this adapter keeps no private copies.
 # submissions.text_excerpt is empty unless the row is a genuine human
-# submission from the main session. Genuine text loses every `<tag ...>`
-# through its matching `</tag>` and every `<<<NAME>>>` through its matching
-# `<<<END_NAME>>>`, fail-closed through the end of the text when the closer
-# is missing. Identity observation still sees the full text so
+# submission from the main session, in which case privacy.submission_excerpt
+# keeps the human text only up to the first tag-like marker with no tag
+# parsing. Identity observation still sees the full text so
 # instructions_sha256 / preferences_sha256 keep working.
-_DIRECTION_OPEN = "<<<AGENTSMD_PROJECT_DIRECTION_V1>>>"
-_DIRECTION_CLOSE = "<<<END_AGENTSMD_PROJECT_DIRECTION_V1>>>"
-
-# Closed import_errors.error categories. Every _oops call must use exactly
-# one of these with nothing appended: no exception class names, messages,
-# or record values.
-IMPORT_ERROR_CATEGORIES = frozenset({
-    "malformed_json",
-    "unknown_record",
-    "schema_error",
-    "missing_id",
-    "malformed_usage",
-    "usage_conflict",
-    "source_unreadable",
-    "unsupported_schema",
-})
-
-# Whitelisted events.detail_json keys. Values must be numbers, booleans,
-# hashes, native identifiers, file paths, shell commands, or closed-enum
-# status/kind strings. Never titles, messages, error text, outputs,
-# content, arguments or other free text.
-_SAFE_DETAIL_KEYS = frozenset({"message_id", "status_code", "skill", "hash"})
-
-_TAG_OPEN_RE = re.compile(r"<([A-Za-z_:][A-Za-z0-9_.:-]*)\b[^>]*?>")
-_TRIPLE_OPEN_RE = re.compile(r"<<<([A-Za-z0-9_.:-]+)>>>")
-_WS_COLLAPSE_RE = re.compile(r"\s+")
-_SAFE_IDENT_RE = re.compile(r"[A-Za-z0-9_:.-]+\Z")
-_SAFE_HASH_RE = re.compile(r"[A-Za-z0-9_.-]+\Z")
+#
+# Compatibility alias: tests reference opencode.IMPORT_ERROR_CATEGORIES. It
+# aliases privacy.ERROR_CATEGORIES and must never diverge into a copy.
+IMPORT_ERROR_CATEGORIES = privacy.ERROR_CATEGORIES
 
 # Part types that are known to carry no ledger event. Anything else is
 # quarantined as unknown_part_type instead of being silently dropped.
@@ -213,182 +189,61 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
     return totals
 
 
-def _shape_keys(data) -> list[str] | None:
-    if not isinstance(data, dict):
-        return None
-    try:
-        return sorted(str(k) for k in data.keys())
-    except (TypeError, ValueError):
-        return []
+def _record_line(raw, data=None) -> str:
+    """Original JSON text for privacy.line_excerpt, or a serialization.
 
-
-def _sanitized_excerpt(native_id=None, data=None, role=None,
-                       ptype=None) -> str:
-    """Structure-only import_errors excerpt: sorted top-level key names.
-
-    Names, never values. No native ids, roles, types, paths or any other
-    value. Non-dict/missing records yield the empty structural list.
-    Bounded to 200 characters.
+    Rule 5 keeps only the sorted top-level key names of the native record;
+    privacy.line_excerpt yields an empty excerpt for anything else (bad
+    JSON, lists, scalars, missing records), so no values ever persist.
     """
-    keys = _shape_keys(data)
-    if keys:
-        return ",".join(keys)[:200]
-    return "[]"
+    if isinstance(raw, str) and raw:
+        return raw
+    if isinstance(data, dict):
+        try:
+            return json.dumps(data, sort_keys=True)
+        except (TypeError, ValueError):
+            return ""
+    return ""
 
 
 def _oops(con: sqlite3.Connection, stats: dict, src_path: str,
-          ordinal, message: str, excerpt: str = "") -> None:
-    if message not in IMPORT_ERROR_CATEGORIES:
-        raise ValueError(f"unlisted import error category: {message!r}")
+          ordinal, category: str, line: str = "") -> None:
+    """Quarantine one record: closed category plus structure-only excerpt.
+
+    Rules 4 and 5 via agent_observer/privacy.py: error holds exactly one
+    closed category (anything else maps to the fallback) and the excerpt
+    holds only sorted top-level key names. The same record re-read under
+    the same version never adds a duplicate row: rows match on source
+    path, ordinal (NULL-safe), category and structural excerpt.
+    """
     stats["malformed"] += 1
+    safe = privacy.error_category(category)
+    excerpt = privacy.line_excerpt(line)
+    exists = con.execute(
+        "SELECT 1 FROM import_errors WHERE harness=? AND source_path=?"
+        " AND ordinal_num IS ? AND error=? AND line_excerpt=?",
+        (HARNESS, src_path, ordinal, safe, excerpt)).fetchone()
+    if exists is not None:
+        return
     con.execute(
         "INSERT INTO import_errors(harness, source_path, ordinal_num, error,"
         " line_excerpt, created_at) VALUES(?,?,?,?,?,?)",
-        (HARNESS, src_path, ordinal, message, (excerpt or "")[:200],
-         db.now()))
-
-
-def _remove_triple_blocks(text: str) -> str:
-    """Remove every <<<NAME>>>..<<<END_NAME>>> span, fail-closed to end."""
-    out = text
-    pos = 0
-    while True:
-        match = _TRIPLE_OPEN_RE.search(out, pos)
-        if match is None:
-            return out
-        name = match.group(1)
-        if name.startswith("END_"):
-            # Stray closer without an opener carries no block: skip it.
-            pos = match.end()
-            continue
-        start = match.start()
-        open_end = match.end()
-        closer = f"<<<END_{name}>>>"
-        # Nesting-aware: same NAME opens inside deepen the span.
-        depth = 1
-        cursor = open_end
-        opener = f"<<<{name}>>>"
-        while depth > 0:
-            next_open = out.find(opener, cursor)
-            next_close = out.find(closer, cursor)
-            if next_close == -1:
-                # Fail closed: opening through end of text.
-                return out[:start]
-            if next_open != -1 and next_open < next_close:
-                depth += 1
-                cursor = next_open + len(opener)
-            else:
-                depth -= 1
-                cursor = next_close + len(closer)
-        out = out[:start] + out[cursor:]
-        pos = 0
-
-
-def _remove_tagged_blocks(text: str) -> str:
-    """Remove every <tag ...>..</tag> span for any tag, fail-closed."""
-    out = text
-    while True:
-        match = _TAG_OPEN_RE.search(out)
-        if match is None:
-            return out
-        tag = match.group(1)
-        start = match.start()
-        open_end = match.end()
-        token = match.group(0)
-        if token.endswith("/>"):
-            # Self-closing tag carries only attributes: drop the token.
-            out = out[:start] + out[open_end:]
-            continue
-        # Nesting-aware match for the same tag name.
-        open_pat = re.compile(
-            r"<" + re.escape(tag) + r"(?:\s[^>]*?)?>")
-        close_pat = re.compile(r"</" + re.escape(tag) + r"\s*>")
-        depth = 1
-        cursor = open_end
-        span_end = -1
-        while depth > 0:
-            next_open = open_pat.search(out, cursor)
-            next_close = close_pat.search(out, cursor)
-            if next_close is None:
-                # Fail closed: opening through end of text.
-                return out[:start]
-            if next_open is not None and next_open.start() < next_close.start():
-                # Skip self-closing nested opens.
-                if next_open.group(0).endswith("/>"):
-                    cursor = next_open.end()
-                    continue
-                depth += 1
-                cursor = next_open.end()
-            else:
-                depth -= 1
-                if depth == 0:
-                    span_end = next_close.end()
-                cursor = next_close.end()
-        out = out[:start] + out[span_end:]
-
-
-def _sanitize_user_text(text: str) -> str:
-    """Human-only excerpt basis with all tagged/triple blocks removed.
-
-    Every `<tag ...>`..`</tag>` and every `<<<NAME>>>`..`<<<END_NAME>>>`
-    span is removed, fail-closed through the end of the text when the
-    closer is missing. Whitespace is collapsed; the caller keeps the
-    first 300 characters for the excerpt while the hash covers this full
-    collapsed basis.
-    """
-    if not isinstance(text, str):
-        return ""
-    cleaned = _remove_triple_blocks(text)
-    cleaned = _remove_tagged_blocks(cleaned)
-    return _WS_COLLAPSE_RE.sub(" ", cleaned).strip()
-
-
-def _sanitize_assistant_text(text: str) -> str:
-    """Assistant excerpt basis with the same block removal applied."""
-    return _sanitize_user_text(text)
-
-
-def _safe_detail(detail) -> dict | None:
-    """Whitelisted detail_json subset: safe keys and safe value types only.
-
-    Keeps numbers, booleans, hashes, native identifiers, file paths, shell
-    commands, or closed-enum status/kind strings. Drops titles, messages,
-    error text, outputs, content, arguments and all other free text.
-    """
-    if not isinstance(detail, dict):
-        return None
-    kept: dict = {}
-    for key, value in detail.items():
-        if key not in _SAFE_DETAIL_KEYS:
-            continue
-        if key == "message_id":
-            if isinstance(value, str) and value and len(value) <= 200 \
-                    and _SAFE_IDENT_RE.fullmatch(value) is not None:
-                kept[key] = value[:200]
-        elif key == "status_code":
-            if isinstance(value, int) and not isinstance(value, bool):
-                kept[key] = value
-        elif key == "skill":
-            if isinstance(value, str) and value \
-                    and _SAFE_IDENT_RE.fullmatch(value[:200]) is not None:
-                kept[key] = value[:200]
-        elif key == "hash":
-            if isinstance(value, str) and value and len(value) <= 128 \
-                    and _SAFE_HASH_RE.fullmatch(value) is not None:
-                kept[key] = value
-    return kept or None
+        (HARNESS, src_path, ordinal, safe, excerpt, db.now()))
 
 
 def _target(tool_input: dict) -> str | None:
-    # Rule 7: only identifiers, paths and commands. Patterns and other
-    # free-text arguments never enter the ledger as targets.
+    # Rule 6/7: only non-empty native strings (paths, commands) become
+    # targets, bounded through privacy.filter_target. Dicts, lists,
+    # numbers, booleans and other objects are dropped, never stringified.
     if not isinstance(tool_input, dict):
         return None
     for key in ("filePath", "path"):
-        if tool_input.get(key):
-            return str(tool_input[key])[:500]
-    if tool_input.get("command"):
-        return str(tool_input["command"])[:500]
+        value = tool_input.get(key)
+        if isinstance(value, str) and value:
+            return privacy.filter_target(value)
+    command = tool_input.get("command")
+    if isinstance(command, str) and command:
+        return privacy.filter_target(command)
     return None
 
 
@@ -424,7 +279,7 @@ def _int_or_none(value):
 def _upsert_response(con: sqlite3.Connection, stats: dict, src_path: str,
                      *, response_id: str, source_id, session_key, session_id,
                      ordinal, ts, model, provider, effort, values: dict,
-                     total, semantics, cost_usd) -> None:
+                     total, semantics, cost_usd, line: str = "") -> None:
     existing = con.execute(
         "SELECT * FROM responses WHERE response_id=?",
         (response_id,)).fetchone()
@@ -446,10 +301,7 @@ def _upsert_response(con: sqlite3.Connection, stats: dict, src_path: str,
     # Immutable identity: the same response id must stay in its session.
     if (existing["session_key"] != session_key
             or existing["session_id"] != session_id):
-        _oops(con, stats, src_path, ordinal, "usage_conflict",
-              _sanitized_excerpt(response_id,
-                                 {"keys": "response", "session": session_key},
-                                 role="assistant"))
+        _oops(con, stats, src_path, ordinal, "usage_conflict", line)
         stats["responses_duplicate"] = stats.get("responses_duplicate", 0) + 1
         return
     new_fields = {
@@ -485,13 +337,23 @@ def _upsert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
                   ts=None, turn_id=None, name=None, target=None, status=None,
                   duration_ms=None, size_bytes=None, truncated=None,
                   fingerprint=None, detail=None) -> None:
-    if not native_id:
+    """Insert one event under its natural key; mutable rows update in place.
+
+    Rule 6 via agent_observer/privacy.py: targets keep only bounded native
+    strings (anything else is already dropped by the callers, never
+    coerced) and detail keeps only allowlisted keys with correctly typed
+    values. The full-field comparison updates a changed row in place, so
+    same-version mutable OpenCode behavior (pending tools completing,
+    tool payloads finalizing) keeps working and a privacy-stale re-import
+    replaces outdated targets and detail instead of leaving them stale.
+    """
+    if not isinstance(native_id, str) or not native_id:
         raise ValueError(f"{family} event missing native identity")
-    native_id = str(native_id)
-    safe = _safe_detail(detail)
+    safe_target = privacy.filter_target(target) or None
+    filtered = privacy.filter_detail(family, detail)
     try:
-        detail_json = json.dumps(safe, sort_keys=True)[:4000] \
-            if safe else None
+        detail_json = json.dumps(filtered, sort_keys=True) \
+            if filtered else None
     except (TypeError, ValueError):
         detail_json = None
     existing = con.execute(
@@ -504,16 +366,16 @@ def _upsert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
             " size_bytes, truncated, fingerprint, detail_json)"
             " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (source_id, session_key, ordinal, ts, family, native_id, turn_id,
-             name, target, status, duration_ms, size_bytes, truncated,
+             name, safe_target, status, duration_ms, size_bytes, truncated,
              fingerprint, detail_json))
         stats["events_inserted"] = stats.get("events_inserted", 0) + 1
         return
     new_fields = {
         "source_id": source_id, "ordinal_num": ordinal, "ts": ts,
-        "turn_id": turn_id, "name": name, "target": target, "status": status,
-        "duration_ms": duration_ms, "size_bytes": size_bytes,
-        "truncated": truncated, "fingerprint": fingerprint,
-        "detail_json": detail_json,
+        "turn_id": turn_id, "name": name, "target": safe_target,
+        "status": status, "duration_ms": duration_ms,
+        "size_bytes": size_bytes, "truncated": truncated,
+        "fingerprint": fingerprint, "detail_json": detail_json,
     }
     changed = any(existing[col] != val for col, val in new_fields.items())
     if not changed:
@@ -524,9 +386,9 @@ def _upsert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
         " name=?, target=?, status=?, duration_ms=?, size_bytes=?,"
         " truncated=?, fingerprint=?, detail_json=? WHERE session_key=?"
         " AND family=? AND native_id=?",
-        (source_id, ordinal, ts, turn_id, name, target, status, duration_ms,
-         size_bytes, truncated, fingerprint, detail_json, session_key,
-         family, native_id))
+        (source_id, ordinal, ts, turn_id, name, safe_target, status,
+         duration_ms, size_bytes, truncated, fingerprint, detail_json,
+         session_key, family, native_id))
     stats["events_inserted"] = stats.get("events_inserted", 0) + 1
 
 
@@ -553,7 +415,22 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
         row = con.execute(
             "SELECT * FROM sources WHERE harness=? AND path=?",
             (HARNESS, src_path)).fetchone()
-    if row["sha256"] == fp and not full:
+    stored_version = (row["privacy_version"]
+                      if "privacy_version" in row.keys() else None)
+    # Rule 3: a source imported under older privacy rules is fully
+    # re-imported; existing rows are updated in place and that source's
+    # import_errors are replaced instead of duplicated. The legacy
+    # database-level path is cleared too: errors used to share it across
+    # sessions, while new rows key to this source's own path.
+    privacy_stale = stored_version != privacy.PRIVACY_VERSION
+    if privacy_stale:
+        con.execute(
+            "DELETE FROM import_errors WHERE harness=? AND source_path=?",
+            (HARNESS, src_path))
+        con.execute(
+            "DELETE FROM import_errors WHERE harness=? AND source_path=?",
+            (HARNESS, abs_db_path))
+    if row["sha256"] == fp and not full and not privacy_stale:
         stats["unchanged"] = True
         con.commit()
         return stats
@@ -566,9 +443,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
             where="session_id=?", args=(sess_id,),
             order=["time_created", "id"])
     except sqlite3.Error:
-        _oops(con, stats, abs_db_path, None,
-              "source_unreadable",
-              _sanitized_excerpt(sess_id, None, role="read"))
+        _oops(con, stats, src_path, None, "source_unreadable")
         messages = []
     try:
         parts = _fetch_dicts(
@@ -578,9 +453,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
             where="session_id=?", args=(sess_id,),
             order=["time_created", "id"])
     except sqlite3.Error:
-        _oops(con, stats, abs_db_path, None,
-              "source_unreadable",
-              _sanitized_excerpt(sess_id, None, role="read"))
+        _oops(con, stats, src_path, None, "source_unreadable")
         parts = []
     by_message: dict[str, list] = {}
     for part in parts:
@@ -591,31 +464,30 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
         raw = msg.get("data")
         msg_id = msg.get("id")
         if not msg_id or raw is None:
-            _oops(con, stats, abs_db_path, index, "schema_error",
-                  _sanitized_excerpt(msg_id, None, role=None))
+            _oops(con, stats, src_path, index, "schema_error")
             continue
         try:
             data = json.loads(raw)
         except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
-            _oops(con, stats, abs_db_path, index,
-                  "malformed_json",
-                  _sanitized_excerpt(msg_id, None, role=None))
+            _oops(con, stats, src_path, index, "malformed_json",
+                  _record_line(raw))
             continue
         if not isinstance(data, dict):
-            _oops(con, stats, abs_db_path, index, "schema_error",
-                  _sanitized_excerpt(msg_id, data, role=None))
+            _oops(con, stats, src_path, index, "schema_error",
+                  _record_line(raw, data))
             continue
         parsed_messages.append((index, msg, data))
         roles[msg_id] = data.get("role")
     ordinal = 0
     for index, msg, data in parsed_messages:
         ordinal += 1
-        _ingest_message(con, native, stats, identity, abs_db_path, source_id,
+        _ingest_message(con, native, stats, identity, src_path, source_id,
                         session_key, sess, msg, data, index, ordinal,
-                        by_message.get(msg.get("id"), []))
+                        by_message.get(msg.get("id"), []),
+                        privacy_stale=privacy_stale)
     for part in parts:
         ordinal += 1
-        _ingest_part(con, stats, identity, abs_db_path, source_id,
+        _ingest_part(con, stats, identity, src_path, source_id,
                       session_key, sess, roles, part, ordinal)
     if sess.get("time_compacting") is not None:
         insert_event(con, stats, source_id=source_id,
@@ -633,23 +505,29 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
         fields["role"] = "subagent"
     db.upsert_session(con, session_key, HARNESS, sess_id, source_id,
                       **fields)
+    if privacy_stale:
+        # Rule 7: native free-text titles are never stored; a version
+        # change clears any title an older import kept.
+        con.execute("UPDATE sessions SET title=NULL WHERE session_key=?",
+                    (session_key,))
     try:
         size_bytes = os.path.getsize(abs_db_path)
     except OSError:
         size_bytes = 0
     con.execute(
         "UPDATE sources SET sha256=?, size_bytes=?, imported_at=?,"
-        " import_ms=?, session_id=? WHERE id=?",
+        " import_ms=?, session_id=?, privacy_version=? WHERE id=?",
         (fp, size_bytes, db.now(),
-         int((time.monotonic() - started) * 1000), sess_id, source_id))
+         int((time.monotonic() - started) * 1000), sess_id,
+         privacy.PRIVACY_VERSION, source_id))
     con.commit()
     stats["unchanged"] = False
     return stats
 
 
-def _ingest_message(con, native, stats, identity, abs_db_path, source_id,
+def _ingest_message(con, native, stats, identity, src_path, source_id,
                     session_key, sess, msg, data, index, ordinal,
-                    msg_parts) -> None:
+                    msg_parts, privacy_stale: bool = False) -> None:
     msg_id = msg.get("id")
     timing = data.get("time") if isinstance(data.get("time"), dict) else {}
     completed = timing.get("completed")
@@ -661,29 +539,31 @@ def _ingest_message(con, native, stats, identity, abs_db_path, source_id,
         detail = error.get("data") if isinstance(error.get("data"), dict) \
             else {}
         code = detail.get("statusCode")
-        safe_detail = {"status_code": code} \
-            if isinstance(code, int) and not isinstance(code, bool) else None
+        # Rule 6: the lifecycle family keeps no detail, so error names,
+        # messages and other free text never persist; the numeric status
+        # survives in the status column. update=True lets a privacy-stale
+        # re-import replace or clear an older unsafe detail row.
         insert_event(con, stats, source_id=source_id,
                      session_key=session_key, family="lifecycle",
                      native_id=msg_id, ordinal=ordinal, ts=ts,
                      name="error",
                      status=str(code) if isinstance(
                          code, int) and not isinstance(code, bool) else None,
-                     detail=safe_detail)
+                     detail=None, update=privacy_stale)
     role = data.get("role")
     if role == "assistant":
-        _ingest_response(con, stats, abs_db_path, source_id, session_key,
+        _ingest_response(con, stats, src_path, source_id, session_key,
                          sess, msg, data, index, ts, ordinal)
     elif role == "user":
-        _ingest_submission(con, stats, identity, abs_db_path, source_id,
+        _ingest_submission(con, stats, identity, src_path, source_id,
                            session_key, sess, msg, data, index, ts,
                            msg_parts, ordinal)
     else:
-        _oops(con, stats, abs_db_path, ordinal, "unknown_record",
-              _sanitized_excerpt(msg_id, data, role=role))
+        _oops(con, stats, src_path, ordinal, "unknown_record",
+              _record_line(msg.get("data"), data))
 
 
-def _ingest_response(con, stats, abs_db_path, source_id, session_key, sess,
+def _ingest_response(con, stats, src_path, source_id, session_key, sess,
                      msg, data, index, ts, ordinal) -> None:
     timing = data.get("time") if isinstance(data.get("time"), dict) else {}
     if timing.get("completed") is None:
@@ -707,74 +587,87 @@ def _ingest_response(con, stats, abs_db_path, source_id, session_key, sess,
     cost_usd = cost if isinstance(cost, (int, float)) \
         and not isinstance(cost, bool) else None
     _upsert_response(
-        con, stats, abs_db_path, response_id=f"{HARNESS}:{msg.get('id')}",
+        con, stats, src_path, response_id=f"{HARNESS}:{msg.get('id')}",
         source_id=source_id, session_key=session_key,
         session_id=sess.get("id"), ordinal=index, ts=ts,
         model=data.get("modelID"), provider=data.get("providerID"),
         effort=data.get("variant"), values=values, total=total,
-        semantics=SEMANTICS, cost_usd=cost_usd)
+        semantics=SEMANTICS, cost_usd=cost_usd,
+        line=_record_line(msg.get("data"), data))
 
 
-def _ingest_submission(con, stats, identity, abs_db_path, source_id,
+def _ingest_submission(con, stats, identity, src_path, source_id,
                        session_key, sess, msg, data, index, ts,
                        msg_parts, ordinal) -> None:
     texts: list[str] = []
     flags: list[bool] = []
     for part in msg_parts:
         raw = part.get("data") if isinstance(part, dict) else None
-        part_id = part.get("id") if isinstance(part, dict) else None
         if raw is None:
-            _oops(con, stats, abs_db_path, ordinal, "schema_error",
-                  _sanitized_excerpt(part_id, None, role="user",
-                                     ptype="text"))
+            _oops(con, stats, src_path, ordinal, "schema_error")
             continue
         try:
             pdata = json.loads(raw)
         except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
-            _oops(con, stats, abs_db_path, ordinal,
-                  "malformed_json",
-                  _sanitized_excerpt(part_id, None, role="user",
-                                     ptype="text"))
+            _oops(con, stats, src_path, ordinal, "malformed_json",
+                  _record_line(raw))
             continue
         if not isinstance(pdata, dict):
-            _oops(con, stats, abs_db_path, ordinal, "schema_error",
-                  _sanitized_excerpt(part_id, pdata, role="user"))
+            _oops(con, stats, src_path, ordinal, "schema_error",
+                  _record_line(raw, pdata))
             continue
         if pdata.get("type") != "text":
             continue
         text = pdata.get("text")
         if not isinstance(text, str) or not text:
-            _oops(con, stats, abs_db_path, ordinal, "malformed_usage",
-                  _sanitized_excerpt(part_id, pdata, role="user",
-                                     ptype="text"))
+            _oops(con, stats, src_path, ordinal, "malformed_usage",
+                  _record_line(raw, pdata))
             continue
         texts.append(text)
         flags.append(pdata.get("synthetic") is True)
         # Identity sees the full valid text, including the direction block.
+        # The full text stays transient: only the rule-1 excerpt persists.
         identity.observe_text(text)
-    if not texts:
-        return
-    body = "".join(texts)
+    native_id = f"{HARNESS}:{msg.get('id')}"
     is_child = bool(sess.get("parent_id"))
+    if not texts:
+        # No valid text remains: never leave a stale excerpt behind. Clear
+        # any existing row in place with an empty excerpt and matching
+        # non-genuine classification instead of returning early.
+        existing = con.execute(
+            "SELECT kind, text_hash, text_excerpt, is_genuine FROM submissions"
+            " WHERE native_id=?", (native_id,)).fetchone()
+        if existing is None:
+            return
+        digest = text_hash("")
+        if (existing["kind"] != "synthetic" or existing["text_hash"] != digest
+                or (existing["text_excerpt"] or "") != ""
+                or existing["is_genuine"] != 0):
+            con.execute(
+                "UPDATE submissions SET source_id=?, session_key=?,"
+                " ordinal_num=?, ts=?, kind=?, text_hash=?, text_excerpt=?,"
+                " is_genuine=? WHERE native_id=?",
+                (source_id, session_key, index, ts, "synthetic", digest, "",
+                 0, native_id))
+            stats["submissions_inserted"] += 1
+        return
     if is_child:
         kind = "synthetic"
     elif flags and all(flags):
         kind = "synthetic"
     else:
         kind = "genuine"
-    # Child sessions are sub-agent turns: their prompts are agent-generated,
-    # so no child text ever enters the human excerpt. The row/kind semantics
-    # and identity observation above stay intact.
-    if is_child:
-        excerpt_src = ""
-    else:
-        # Excerpt uses only the human's own (non-synthetic) parts with all
-        # tagged and triple-marker blocks removed, whitespace collapsed.
-        human_texts = [t for t, flag in zip(texts, flags) if not flag]
-        excerpt_src = _sanitize_user_text("".join(human_texts))
-    excerpt = excerpt_src[:300]
-    digest = text_hash(excerpt_src)
-    native_id = f"{HARNESS}:{msg.get('id')}"
+    # Rule 1 via agent_observer/privacy.py: only a genuine main-session
+    # human submission keeps an excerpt, truncated at the first tag-like
+    # marker with no tag parsing (a quoted '>' still ends the excerpt at
+    # the earlier '<'). Child sessions are sub-agent turns: their prompts
+    # are agent-generated, so no child text ever enters the human excerpt.
+    # The row/kind semantics and identity observation above stay intact.
+    human_texts = [t for t, flag in zip(texts, flags) if not flag]
+    excerpt = privacy.submission_excerpt(
+        "".join(human_texts), is_genuine=kind == "genuine",
+        is_main_session=not is_child)
+    digest = text_hash(excerpt)
     is_genuine = 1 if kind == "genuine" else 0
     existing = con.execute(
         "SELECT kind, text_hash, text_excerpt, is_genuine FROM submissions"
@@ -800,36 +693,35 @@ def _ingest_submission(con, stats, identity, abs_db_path, source_id,
         stats["submissions_inserted"] += 1
 
 
-def _ingest_part(con, stats, identity, abs_db_path, source_id, session_key,
-                 sess, roles, part, ordinal) -> None:
+def _ingest_part(con, stats, identity, src_path, source_id, session_key,
+                  sess, roles, part, ordinal) -> None:
     raw = part.get("data") if isinstance(part, dict) else None
     part_id = part.get("id") if isinstance(part, dict) else None
-    message_id = part.get("message_id") if isinstance(part, dict) else None
-    role = roles.get(message_id) if isinstance(roles, dict) else None
     if raw is None:
-        _oops(con, stats, abs_db_path, ordinal, "schema_error",
-              _sanitized_excerpt(part_id, None, role=role))
+        _oops(con, stats, src_path, ordinal, "schema_error")
         return
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
-        _oops(con, stats, abs_db_path, ordinal,
-              "malformed_json",
-              _sanitized_excerpt(part_id, None, role=role))
+        _oops(con, stats, src_path, ordinal, "malformed_json",
+              _record_line(raw))
         return
     if not isinstance(data, dict):
-        _oops(con, stats, abs_db_path, ordinal, "schema_error",
-              _sanitized_excerpt(part_id, data, role=role))
+        _oops(con, stats, src_path, ordinal, "schema_error",
+              _record_line(raw, data))
         return
     ptype = data.get("type")
     ts = iso_ts(part.get("time_created"))
-    if not part_id or (isinstance(part_id, str) and not part_id.strip()):
-        _oops(con, stats, abs_db_path, ordinal, "missing_id",
-              _sanitized_excerpt(part_id, data, role=role, ptype=ptype))
+    # Native identity must be a non-empty string: dicts, lists, numbers
+    # and other objects are quarantined, never stringified into the ledger.
+    if not isinstance(part_id, str) or not part_id.strip():
+        _oops(con, stats, src_path, ordinal, "missing_id",
+              _record_line(raw, data))
         return
     if ptype == "tool":
-        _ingest_tool(con, stats, identity, abs_db_path, source_id,
-                      session_key, sess, roles, part, data, ordinal, ts)
+        _ingest_tool(con, stats, identity, src_path, source_id,
+                      session_key, sess, roles, part, data, ordinal, ts,
+                      line=_record_line(raw, data))
     elif ptype == "patch":
         _ingest_patch(con, stats, source_id, session_key, part, data,
                       ordinal, ts)
@@ -844,20 +736,21 @@ def _ingest_part(con, stats, identity, abs_db_path, source_id, session_key,
         # reasoning bodies and step checkpoints stay out of the ledger.
         return
     else:
-        _oops(con, stats, abs_db_path, ordinal, "unsupported_schema",
-              _sanitized_excerpt(part_id, data, role=role, ptype=ptype))
+        _oops(con, stats, src_path, ordinal, "unsupported_schema",
+              _record_line(raw, data))
 
 
-def _ingest_tool(con, stats, identity, abs_db_path, source_id, session_key,
-                 sess, roles, part, data, ordinal, ts) -> None:
-    tool = data.get("tool") or "unknown"
+def _ingest_tool(con, stats, identity, src_path, source_id, session_key,
+                  sess, roles, part, data, ordinal, ts,
+                  line: str = "") -> None:
+    # Native tool/call/skill names must be strings: dicts, lists,
+    # booleans, numbers and other objects fall back to "unknown" and are
+    # never stringified into names, targets or the skill detail.
+    raw_tool = data.get("tool")
+    tool = raw_tool if isinstance(raw_tool, str) and raw_tool else "unknown"
     call_id = data.get("callID")
-    part_id = part.get("id") if isinstance(part, dict) else None
-    message_id = part.get("message_id") if isinstance(part, dict) else None
-    role = roles.get(message_id) if isinstance(roles, dict) else None
-    if not call_id:
-        _oops(con, stats, abs_db_path, ordinal, "missing_id",
-              _sanitized_excerpt(part_id, data, role=role, ptype="tool"))
+    if not isinstance(call_id, str) or not call_id.strip():
+        _oops(con, stats, src_path, ordinal, "missing_id", line)
         return
     state = data.get("state") if isinstance(data.get("state"), dict) else {}
     status = state.get("status")
@@ -870,12 +763,12 @@ def _ingest_tool(con, stats, identity, abs_db_path, source_id, session_key,
                                               default=str)[:4000])
     except (TypeError, ValueError):
         arg_fp = fingerprint(tool)
-    detail = {"message_id": message_id} \
-        if isinstance(message_id, str) and message_id else None
+    # Rule 6: the tool_call family keeps no detail; the message linkage
+    # some older imports stored is dropped rather than persisted.
     _upsert_event(con, stats, source_id=source_id, session_key=session_key,
                   family="tool_call", native_id=call_id, ordinal=ordinal,
-                  ts=ts, name=str(tool)[:200], target=target,
-                  fingerprint=arg_fp, detail=detail)
+                  ts=ts, name=tool[:200], target=target,
+                  fingerprint=arg_fp, detail=None)
     if status in _INCOMPLETE_TOOL_STATUSES or status is None:
         # No terminal result yet; a later snapshot must add it.
         pass
@@ -884,13 +777,12 @@ def _ingest_tool(con, stats, identity, abs_db_path, source_id, session_key,
         _upsert_event(con, stats, source_id=source_id,
                       session_key=session_key, family="tool_result",
                       native_id=call_id, ordinal=ordinal, ts=ts,
-                      name=str(tool)[:200], target=target,
+                      name=tool[:200], target=target,
                       status=result_status, duration_ms=_duration_ms(state),
                       size_bytes=_output_size(output),
                       detail=None)
     else:
-        _oops(con, stats, abs_db_path, ordinal, "unknown_record",
-              _sanitized_excerpt(part_id, data, role=role, ptype="tool"))
+        _oops(con, stats, src_path, ordinal, "unknown_record", line)
     if tool == "read" and status == "completed" and target:
         identity.observe_path(target)
         skill = skill_from_path(target)
@@ -903,25 +795,27 @@ def _ingest_tool(con, stats, identity, abs_db_path, source_id, session_key,
                       fingerprint=fingerprint(target),
                       detail={"skill": skill} if skill else None)
     if tool == "skill":
-        name = tool_input.get("name") if isinstance(tool_input, dict) \
-            else None
-        skill_name = str(name) if name else "unknown"
+        raw_name = tool_input.get("name")
+        skill_name = raw_name \
+            if isinstance(raw_name, str) and raw_name else "unknown"
         metadata = state.get("metadata") if isinstance(
             state.get("metadata"), dict) else {}
         skill_dir = metadata.get("dir")
         if isinstance(skill_dir, str) and skill_dir:
             identity.observe_path(
                 os.path.join(skill_dir, "SKILL.md"))
+        # Rule 6: the skill_invoke family keeps no detail; the skill name
+        # survives bounded in the name and target columns.
         _upsert_event(con, stats, source_id=source_id,
                       session_key=session_key, family="skill_invoke",
                       native_id=call_id, ordinal=ordinal, ts=ts,
-                      name=skill_name[:200], target=skill_name[:500],
-                      detail={"skill": skill_name[:200]})
+                      name=skill_name[:200], target=skill_name,
+                      detail=None)
     if tool in ("edit", "write", "patch") and target:
         _upsert_event(con, stats, source_id=source_id,
                       session_key=session_key, family="file_change",
                       native_id=call_id, ordinal=ordinal, ts=ts,
-                      name=str(tool)[:200], target=target,
+                      name=tool[:200], target=target,
                       fingerprint=fingerprint(tool, target),
                       detail=None)
 
@@ -931,9 +825,20 @@ def _ingest_patch(con, stats, source_id, session_key, part, data, ordinal,
     digest = data.get("hash")
     files = data.get("files")
     file_list = files if isinstance(files, list) else []
-    target = str(file_list[0])[:500] if file_list and file_list[0] else None
+    # Only a non-empty native string selects the file target; anything
+    # else is dropped, never stringified into the ledger.
+    first = file_list[0] if file_list else None
+    target = privacy.filter_target(first) \
+        if isinstance(first, str) and first else None
+    part_id = part.get("id") if isinstance(part, dict) else None
+    if not isinstance(part_id, str) or not part_id:
+        # The caller guarantees a valid part id; fail closed otherwise.
+        return
+    # Rule 6: the file_change family keeps only path lists, so an
+    # arbitrary native hash is omitted, never coerced. The fingerprint
+    # column keeps only our own fixed-format generated digest.
     _upsert_event(con, stats, source_id=source_id, session_key=session_key,
-                  family="file_change", native_id=part.get("id"),
+                  family="file_change", native_id=part_id,
                   ordinal=ordinal, ts=ts, name="patch", target=target,
                   fingerprint=fingerprint("patch", digest, file_list),
-                  detail={"hash": digest} if isinstance(digest, str) else None)
+                  detail=None)

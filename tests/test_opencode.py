@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from agent_observer import db
+from agent_observer import db, privacy
 from agent_observer.adapters import opencode
 
 T0 = 1788000000000
@@ -412,10 +412,11 @@ class OpencodeAdapterTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["name"], "error")
         self.assertIn("403", rows[0]["status"] or "")
-        detail = json.loads(rows[0]["detail_json"] or "{}")
-        # Whitelisted safe metadata only: numeric status code, no error
-        # name, message or other free text.
-        self.assertEqual(detail, {"status_code": 403})
+        # Rule 6: the lifecycle family keeps no detail. The numeric status
+        # survives in the status column while the error name, message and
+        # any status_code key never persist.
+        self.assertIsNone(rows[0]["detail_json"])
+        self.assertEqual(json.loads(rows[0]["detail_json"] or "{}"), {})
         self.assertNotIn("APIError", rows[0]["detail_json"] or "")
         self.assertNotIn(SECRET_ERRMSG, rows[0]["detail_json"] or "")
         self._assert_no_secret_anywhere(("APIError", SECRET_ERRMSG))
@@ -776,7 +777,11 @@ class OpencodeAdapterTest(unittest.TestCase):
                                 ("opencode:msg_alien",)), [])
 
 
-    def test_privacy_spec_tagged_blocks_titles_errors_and_shape_only(self):
+    def test_privacy_spec_first_marker_titles_errors_and_shape_only(self):
+        # Rewritten under the closed ruling: excerpts keep only the human
+        # text before the first tag-like marker ('<' followed by a letter,
+        # '/' or '!', or '<<<') with no tag parsing, so everything from
+        # the first '<user_rule>' on is dropped fail-closed.
         s_user_rule = "SECRET_USER_RULE_zzz_qqq"
         s_sys_rem = "SECRET_SYS_REM_zzz_qqq"
         s_unterm_tag = "SECRET_UNTERM_TAG_zzz_qqq"
@@ -800,9 +805,9 @@ class OpencodeAdapterTest(unittest.TestCase):
                  " tail keep "
                  f"<mytag attr=\"x\">leak {s_unterm_tag}"
                  f"<<<MYSTUFF>>>leak {s_unterm_triple}")
-        # Note: the unterminated generic tag swallows the unterminated
-        # triple block too (fail-closed through end of text), so the
-        # excerpt must end at "tail keep".
+        # Note: the first tag-like marker ('<user_rule>') ends the excerpt
+        # fail-closed with no tag parsing, so "middle keep", "tail keep"
+        # and every later block are dropped, not preserved.
         native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
                        ("p_priv_t", "msg_priv_u", "ses_priv",
                         T0 + 900, T0 + 900,
@@ -838,19 +843,20 @@ class OpencodeAdapterTest(unittest.TestCase):
         secrets = (s_user_rule, s_sys_rem, s_unterm_tag, s_unterm_triple,
                    s_tool_title, s_lifecycle, s_mal, s_session_title)
         self._assert_no_secret_anywhere(secrets)
-        # Sanitized genuine excerpt: collapsed, bounded, safe prefix kept.
+        # Genuine excerpt under rule 1: collapsed, bounded, and only the
+        # prefix before the first tag-like marker. Everything after that
+        # marker is dropped, never parsed for closers or tails.
         sub = self.q("SELECT * FROM submissions WHERE native_id=?",
                      ("opencode:msg_priv_u",))[0]
         self.assertEqual(sub["kind"], "genuine")
         self.assertEqual(sub["is_genuine"], 1)
         excerpt = sub["text_excerpt"] or ""
         self.assertLessEqual(len(excerpt), 300)
-        self.assertIn("Safe human request", excerpt)
-        self.assertIn("whitespace noise here", excerpt)
-        self.assertIn("middle keep", excerpt)
-        self.assertIn("tail keep", excerpt)
+        self.assertEqual(excerpt, "Safe human request with whitespace noise here")
         self.assertNotIn("  ", excerpt)
         self.assertNotIn("\n", excerpt)
+        self.assertNotIn("middle keep", excerpt)
+        self.assertNotIn("tail keep", excerpt)
         for marker in ("<user_rule>", "</user_rule>", "<system-reminder>",
                        "</system-reminder>", "<mytag", "<<<MYSTUFF>>>",
                        s_user_rule, s_sys_rem, s_unterm_tag, s_unterm_triple):
@@ -863,44 +869,47 @@ class OpencodeAdapterTest(unittest.TestCase):
             self.assertLessEqual(len(lx), 200)
             for secret in secrets:
                 self.assertNotIn(secret, lx)
-            # No values: ids, roles, types, paths must not appear as values.
-            self.assertNotIn("id=", lx)
-            self.assertNotIn("role=", lx)
-            self.assertNotIn("type=", lx)
-            self.assertNotIn("shape=", lx)
-            self.assertNotIn("keys=", lx)
-            if lx != "[]":
-                # Only comma-delimited key names.
+            # No values: an empty excerpt or comma-delimited sorted key
+            # names only, never ids, roles, types or paths as values.
+            if lx:
                 self.assertNotIn(" ", lx)
                 self.assertNotIn("=", lx)
+                self.assertEqual(lx, ",".join(sorted(lx.split(","))))
         mal_rows = self.q("SELECT * FROM import_errors WHERE error=?",
                           ("missing_id",))
         self.assertTrue(mal_rows)
         self.assertTrue(any(
             (r["line_excerpt"] or "") == "state,tool,type" for r in mal_rows))
-        # events.detail_json: whitelisted safe metadata only.
-        allowed_keys = {"message_id", "status_code", "skill", "hash"}
+        # events.detail_json: only per-family allowlisted keys from
+        # privacy.py with correctly typed values. The OpenCode families in
+        # this fixture (tool_call, tool_result, lifecycle) keep no detail,
+        # so titles, messages, error text and linkage ids never persist.
         for row in self.q("SELECT * FROM events"):
             detail_json = row["detail_json"] or ""
             for secret in secrets:
                 self.assertNotIn(secret, detail_json)
             if detail_json:
                 detail = json.loads(detail_json)
-                self.assertTrue(set(detail.keys()) <= allowed_keys,
+                allowed = privacy.EVENT_DETAIL_ALLOWLIST.get(
+                    row["family"], {})
+                self.assertTrue(set(detail.keys()) <= set(allowed.keys()),
                                 f"unsafe detail keys: {detail}")
                 for key in ("title", "error", "message", "output",
-                            "content", "arguments", "args", "input"):
+                            "content", "arguments", "args", "input",
+                            "message_id", "status_code", "hash"):
+                    # Never allowlisted for any family the adapter writes;
+                    # "skill" stays valid for skill_read and is checked
+                    # against the per-family allowlist above.
                     self.assertNotIn(key, detail)
         call = self.q("SELECT * FROM events WHERE family='tool_call'"
                       " AND native_id=?", ("call_priv1",))[0]
         self.assertNotIn(s_tool_title, call["detail_json"] or "")
-        call_detail = json.loads(call["detail_json"] or "{}")
-        self.assertEqual(set(call_detail.keys()), {"message_id"})
-        self.assertEqual(call_detail["message_id"], "msg_priv_a")
+        self.assertIsNone(call["detail_json"])
+        self.assertEqual(call["target"], "echo hi")
         life = self.q("SELECT * FROM events WHERE family='lifecycle'"
                       " AND native_id=?", ("msg_priv_a",))[0]
-        self.assertEqual(json.loads(life["detail_json"] or "{}"),
-                         {"status_code": 500})
+        self.assertEqual(life["status"], "500")
+        self.assertIsNone(life["detail_json"])
         result = self.q("SELECT * FROM events WHERE family='tool_result'"
                         " AND native_id=?", ("call_priv1",))[0]
         self.assertIsNone(result["detail_json"])
@@ -909,7 +918,11 @@ class OpencodeAdapterTest(unittest.TestCase):
                       ("opencode:ses_priv",))[0]
         self.assertNotIn(s_session_title, json.dumps(dict(sess)))
 
-    def test_dotted_and_namespaced_tags_remove_exact_block_and_keep_tail(self):
+    def test_first_marker_truncates_dotted_and_namespaced_tags(self):
+        # Rewritten under the closed ruling: the excerpt ends at the first
+        # tag-like marker with no tag parsing, so dotted and namespaced
+        # tags truncate the same way as any other marker. Nothing after
+        # the first '<custom.tag' is kept.
         s_dot = "SECRET_DOT_TAG_zzz_qqq"
         s_ns = "SECRET_NS_TAG_zzz_qqq"
         native = sqlite3.connect(self.db_file)
@@ -937,9 +950,9 @@ class OpencodeAdapterTest(unittest.TestCase):
                      ("opencode:msg_dottag_u",))[0]
         self.assertEqual(sub["kind"], "genuine")
         excerpt = sub["text_excerpt"] or ""
-        self.assertIn("Head keep", excerpt)
-        self.assertIn("middle keep", excerpt)
-        self.assertIn("tail keep", excerpt)
+        self.assertEqual(excerpt, "Head keep")
+        self.assertNotIn("middle keep", excerpt)
+        self.assertNotIn("tail keep", excerpt)
         for marker in ("<custom.tag", "</custom.tag>", "<x:y>", "</x:y>",
                        s_dot, s_ns):
             self.assertNotIn(marker, excerpt)
@@ -1010,6 +1023,295 @@ class OpencodeAdapterTest(unittest.TestCase):
         self.assertEqual(third["is_genuine"], 0)
         self.assertEqual(third["text_excerpt"], "")
         self.assertNotIn("now synthetic", third["text_excerpt"] or "")
+
+
+    def test_quoted_greater_than_still_truncates_at_first_marker(self):
+        # Review finding 1: a quoted '>' inside a tag attribute must not
+        # rescue later text into the excerpt. With no tag parsing, the
+        # excerpt ends at the earlier '<'.
+        secret = "SECRET_QUOTED_ATTR_zzz_qqq"
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_quote", None, "/repo", "Quote", "1.2.3", None,
+                        "build", T0 + 940, T0 + 940, None))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_quote_u", "ses_quote", T0 + 940, T0 + 940,
+                        json.dumps({"role": "user",
+                                    "time": {"created": T0 + 940}})))
+        text = ('Keep this <a title="quoted > inside"> drop all of this '
+                + secret)
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_quote_t", "msg_quote_u", "ses_quote",
+                        T0 + 940, T0 + 940,
+                        json.dumps({"type": "text", "text": text})))
+        native.commit()
+        native.close()
+        opencode.sync(self.con, source=self.db_file)
+        self._assert_no_secret_anywhere((secret,))
+        sub = self.q("SELECT * FROM submissions WHERE native_id=?",
+                     ("opencode:msg_quote_u",))[0]
+        self.assertEqual(sub["kind"], "genuine")
+        self.assertEqual(sub["text_excerpt"], "Keep this")
+        self.assertNotIn("drop all of this", sub["text_excerpt"] or "")
+
+    def test_privacy_stale_reimport_corrects_rows_and_replaces_errors(self):
+        # Rule 3: a source whose stored privacy version differs is fully
+        # re-imported even though its fingerprint is unchanged; existing
+        # rows are corrected in place and import_errors are replaced,
+        # never duplicated.
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_stale", None, "/repo", "Stale", "1.2.3", None,
+                        "build", T0 + 965, T0 + 965, None))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_stale_u", "ses_stale", T0 + 965, T0 + 965,
+                        json.dumps({"role": "user",
+                                    "time": {"created": T0 + 965}})))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_stale_t", "msg_stale_u", "ses_stale",
+                        T0 + 965, T0 + 965,
+                        json.dumps({"type": "text",
+                                    "text": "Fresh prompt "
+                                            "<tag>hidden</tag> tail"})))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_stale_a", "ses_stale", T0 + 966, T0 + 966,
+                        _msg("assistant", T0 + 966, T0 + 976,
+                             _tokens(0, 0, 0, 0, 0),
+                             error={"name": "APIError",
+                                    "data": {"statusCode": 429,
+                                             "message": "slow down"}})))
+        native.commit()
+        native.close()
+        opencode.sync(self.con, source=self.db_file)
+        # Poison rows the way a pre-fix import kept them, then mark every
+        # source stale. Native fingerprints are untouched, so only the
+        # version mismatch may trigger the re-import.
+        self.con.execute(
+            "UPDATE submissions SET text_excerpt="
+            "'leaked <tag>SECRET-STALE-OLD-zzz', text_hash='oldhash'"
+            " WHERE native_id='opencode:msg_stale_u'")
+        self.con.execute(
+            "UPDATE events SET detail_json=? WHERE family='lifecycle'"
+            " AND native_id='msg_stale_a'",
+            (json.dumps({"error": "APIError",
+                         "message": "slow down"}),))
+        self.con.execute(
+            "UPDATE sources SET privacy_version=0 WHERE harness='opencode'")
+        self.con.commit()
+        counts_before = {
+            table: self.q(f"SELECT COUNT(*) n FROM {table}")[0]["n"]
+            for table in ("submissions", "events", "import_errors",
+                          "responses", "sources")}
+        stats = opencode.sync(self.con, source=self.db_file)
+        self.assertEqual(stats["unchanged"], 0)
+        for table in counts_before:
+            self.assertEqual(
+                self.q(f"SELECT COUNT(*) n FROM {table}")[0]["n"],
+                counts_before[table], table)
+        sub = self.q("SELECT * FROM submissions WHERE native_id=?",
+                     ("opencode:msg_stale_u",))[0]
+        self.assertEqual(sub["text_excerpt"], "Fresh prompt")
+        self.assertNotEqual(sub["text_hash"], "oldhash")
+        self.assertNotIn("SECRET-STALE-OLD-zzz",
+                         sub["text_excerpt"] or "")
+        life = self.q("SELECT * FROM events WHERE family='lifecycle'"
+                      " AND native_id=?", ("msg_stale_a",))[0]
+        self.assertEqual(life["status"], "429")
+        self.assertIsNone(life["detail_json"])
+        self._assert_no_secret_anywhere(
+            ("SECRET-STALE-OLD-zzz", "slow down", "APIError"))
+        versions = {r["privacy_version"] for r in self.q(
+            "SELECT privacy_version FROM sources")}
+        self.assertEqual(versions, {privacy.PRIVACY_VERSION})
+
+    def test_stale_resync_clears_excerpt_when_no_valid_text_remains(self):
+        # A genuine submission whose native text parts all disappear must
+        # not keep its old excerpt: the stale re-import clears the row in
+        # place instead of returning early.
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_clear", None, "/repo", "Clear", "1.2.3", None,
+                        "build", T0 + 975, T0 + 975, None))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_clear_u", "ses_clear", T0 + 975, T0 + 975,
+                        json.dumps({"role": "user",
+                                    "time": {"created": T0 + 975}})))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_clear_t", "msg_clear_u", "ses_clear",
+                        T0 + 975, T0 + 975,
+                        json.dumps({"type": "text",
+                                    "text": "Visible prompt here"})))
+        native.commit()
+        native.close()
+        opencode.sync(self.con, source=self.db_file)
+        first = self.q("SELECT * FROM submissions WHERE native_id=?",
+                       ("opencode:msg_clear_u",))[0]
+        self.assertIn("Visible prompt here", first["text_excerpt"])
+        # Replace the text part with a non-text part without touching any
+        # timestamp, so the snapshot fingerprint is unchanged and only the
+        # privacy version mismatch can trigger the re-import.
+        native = sqlite3.connect(self.db_file)
+        native.execute("UPDATE part SET data=? WHERE id=?",
+                       (json.dumps({"type": "reasoning",
+                                    "text": "no longer user text"}),
+                        "p_clear_t"))
+        native.commit()
+        native.close()
+        self.con.execute(
+            "UPDATE sources SET privacy_version=0 WHERE harness='opencode'")
+        self.con.commit()
+        opencode.sync(self.con, source=self.db_file)
+        cleared = self.q("SELECT * FROM submissions WHERE native_id=?",
+                         ("opencode:msg_clear_u",))[0]
+        self.assertEqual(
+            self.q("SELECT COUNT(*) n FROM submissions WHERE native_id=?",
+                   ("opencode:msg_clear_u",))[0]["n"], 1)
+        self.assertEqual(cleared["text_excerpt"], "")
+        self.assertEqual(cleared["is_genuine"], 0)
+        self.assertNotIn("Visible prompt here",
+                         cleared["text_excerpt"] or "")
+
+    def test_non_string_targets_and_native_hashes_are_dropped(self):
+        # Review finding 4: dicts, lists and other objects are never
+        # stringified into event targets, names or detail. Only
+        # fixed-format generated fingerprints persist as fingerprints.
+        s_target = "SECRET_DICT_TARGET_zzz_qqq"
+        s_hash = "SECRET_NATIVE_HASH_zzz_qqq"
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_types", None, "/repo", "Types", "1.2.3", None,
+                        "build", T0 + 985, T0 + 985, None))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_types_a", "ses_types", T0 + 985, T0 + 985,
+                        _msg("assistant", T0 + 985, T0 + 995,
+                             _tokens(2, 2, 0, 0, 0))))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_types_tool", "msg_types_a", "ses_types",
+                        T0 + 986, T0 + 986,
+                        json.dumps({"type": "tool", "tool": "bash",
+                                    "callID": "call_types1",
+                                    "state": {"status": "completed",
+                                              "input": {
+                                                  "filePath": {
+                                                      "path": s_target},
+                                                  "command": ["not",
+                                                              "a string"]},
+                                              "output": "ok",
+                                              "time": {"start": T0 + 986,
+                                                       "end": T0 + 996}}})))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_types_patch", "msg_types_a", "ses_types",
+                        T0 + 987, T0 + 987,
+                        json.dumps({"type": "patch",
+                                    "hash": {"h": s_hash},
+                                    "files": [{"p": s_target}, 42]})))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_types_name", "msg_types_a", "ses_types",
+                        T0 + 988, T0 + 988,
+                        json.dumps({"type": "tool",
+                                    "tool": {"name": "evil"},
+                                    "callID": "call_types2",
+                                    "state": {"status": "completed",
+                                              "input": {"command": "echo hi"},
+                                              "output": "ok",
+                                              "time": {"start": T0 + 988,
+                                                       "end": T0 + 998}}})))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_types_call", "msg_types_a", "ses_types",
+                        T0 + 989, T0 + 989,
+                        json.dumps({"type": "tool", "tool": "bash",
+                                    "callID": {"id": "evil"},
+                                    "state": {"status": "completed",
+                                              "input": {"command": "echo hi"},
+                                              "output": "ok",
+                                              "time": {"start": T0 + 989,
+                                                       "end": T0 + 999}}})))
+        native.commit()
+        native.close()
+        stats = opencode.sync(self.con, source=self.db_file)
+        self.assertGreaterEqual(stats["malformed"], 1)
+        self._assert_no_secret_anywhere((s_target, s_hash))
+        for family, native_id in (("tool_call", "call_types1"),
+                                  ("tool_result", "call_types1")):
+            row = self.q("SELECT * FROM events WHERE family=?"
+                         " AND native_id=?", (family, native_id))[0]
+            self.assertIsNone(row["target"])
+        # A dict file entry and a dict hash leave no target and no detail;
+        # only our own generated fingerprint persists.
+        patch = self.q("SELECT * FROM events WHERE family='file_change'"
+                       " AND native_id=?", ("p_types_patch",))[0]
+        self.assertIsNone(patch["target"])
+        self.assertIsNone(patch["detail_json"])
+        self.assertRegex(patch["fingerprint"] or "", r"\A[0-9a-f]{16}\Z")
+        # A non-string tool name falls back to "unknown", never its repr.
+        named = self.q("SELECT * FROM events WHERE family='tool_call'"
+                       " AND native_id=?", ("call_types2",))[0]
+        self.assertEqual(named["name"], "unknown")
+        self.assertNotIn("evil", json.dumps(dict(named), default=str))
+        # A non-string callID is quarantined, never an event identity.
+        errs = self.q("SELECT * FROM import_errors WHERE error=?",
+                      ("missing_id",))
+        self.assertTrue(any("callID" in (r["line_excerpt"] or "")
+                            for r in errs))
+        for row in errs:
+            self.assertNotIn(s_target, row["line_excerpt"] or "")
+        self.assertEqual(self.q("SELECT * FROM events WHERE native_id LIKE"
+                                " '%evil%'"), [])
+
+    def test_repeated_full_resync_never_duplicates_import_errors(self):
+        # Review finding 5: every quarantine inserts once per record per
+        # version. Same-version full re-syncs add no rows, including for
+        # NULL-ordinal errors and unlisted categories (fallback).
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_dup_broken", "ses_parent", T0 + 995, T0 + 995,
+                        "not json at all"))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_dup_mal", "msg_a1", "ses_parent", T0 + 996,
+                        T0 + 996,
+                        json.dumps({"type": "tool", "tool": "bash",
+                                    "state": {"status": "completed",
+                                              "input": {}, "output": "x",
+                                              "time": {"start": T0,
+                                                       "end": T0 + 1}}})))
+        native.execute("UPDATE session SET time_updated=? WHERE id=?",
+                       (T0 + 996, "ses_parent"))
+        native.commit()
+        native.close()
+        opencode.sync(self.con, source=self.db_file)
+        # NULL ordinals dedup through IS-comparison, and anything outside
+        # the closed set maps to the fixed fallback.
+        opencode._oops(self.con, {"malformed": 0}, "opencode:probe-src",
+                       None, "source_unreadable", "")
+        opencode._oops(self.con, {"malformed": 0}, "opencode:probe-src",
+                       None, "source_unreadable", "")
+        opencode._oops(self.con, {"malformed": 0}, "opencode:probe-src",
+                       7, "boom: explode", '{"a": 1}')
+        self.con.commit()
+        probe = self.q("SELECT * FROM import_errors WHERE source_path=?",
+                       ("opencode:probe-src",))
+        self.assertEqual(len(probe), 2)
+        self.assertEqual(
+            [r for r in probe if r["ordinal_num"] is None][0]["error"],
+            "source_unreadable")
+        fallback = [r for r in probe if r["ordinal_num"] == 7][0]
+        self.assertEqual(fallback["error"], privacy.ERROR_FALLBACK)
+        self.assertEqual(fallback["line_excerpt"], "a")
+
+        def snapshot():
+            return sorted(
+                ((r["source_path"] or "",
+                  r["ordinal_num"]
+                  if r["ordinal_num"] is not None else -1,
+                  r["error"], r["line_excerpt"])
+                 for r in self.q("SELECT * FROM import_errors")))
+
+        before = snapshot()
+        self.assertTrue(before)
+        opencode.sync(self.con, source=self.db_file, full=True)
+        self.assertEqual(snapshot(), before)
+        opencode.sync(self.con, source=self.db_file, full=True)
+        self.assertEqual(snapshot(), before)
 
 
 if __name__ == "__main__":
