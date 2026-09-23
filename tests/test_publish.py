@@ -1,9 +1,48 @@
-"""GitHub summary: offline render, one Observer comment created then updated."""
+"""GitHub summary: offline render, owned comments patched, foreign left alone."""
 
 from unittest import mock
 
 from agent_observer import db, publish
 from tests.helpers import LedgerCase
+
+ME = "observer-bot"
+FOREIGN = "spoof-account"
+
+
+def comment(cid, body, author, created="2026-09-20T10:00:00Z"):
+    return {"id": cid, "body": body, "html_url": f"u{cid}",
+            "user": {"login": author}, "created_at": created,
+            "updated_at": created}
+
+
+class PublishGh:
+    """Fake gh api: answers the login lookup, records PATCH/POST calls."""
+
+    def __init__(self, comments, login=ME):
+        self.comments = comments
+        self.login = login
+        self.patched = []
+        self.posted = []
+        self.next_id = max([c["id"] for c in comments] + [100]) + 1
+
+    def __call__(self, args, payload=None):
+        if args == ["user"]:
+            return {"login": self.login}
+        if args[0].endswith("per_page=100"):
+            return list(self.comments)
+        if args[:2] == ["-X", "POST"]:
+            new = comment(self.next_id, payload["body"], self.login)
+            self.next_id += 1
+            self.comments.append(new)
+            self.posted.append(new)
+            return new
+        if args[:2] == ["-X", "PATCH"]:
+            cid = int(args[2].rstrip("/").rsplit("/", 1)[-1])
+            target = next(c for c in self.comments if c["id"] == cid)
+            target["body"] = payload["body"]
+            self.patched.append(cid)
+            return target
+        raise AssertionError(args)
 
 
 class PublishTest(LedgerCase):
@@ -26,27 +65,56 @@ class PublishTest(LedgerCase):
         self.assertIn("| claude | claude-fable-5-1 | unknown | 1 | 1,234 |", body)
         self.assertIn("AgentsMD 12.1.0", body)
 
-    def test_second_publish_edits_the_same_comment(self):
-        comments = []
+    def test_render_marks_unknown_counters_honestly(self):
+        self.con.execute(
+            "INSERT INTO responses(response_id, source_id, harness, session_key,"
+            " model, total_tokens, semantics) VALUES('claude:m2', 1, 'claude',"
+            " 'claude:s1', NULL, NULL, 'claude:x')")
+        self.con.commit()
+        body = publish.render(publish.summarize(self.con, {"claude:s1"}, "task T"))
+        self.assertIn("unknown", body)
+        self.assertIn("lower bound", body)
 
-        def fake_gh(args, payload=None):
-            if args[0].endswith("per_page=100"):
-                return list(comments)
-            if args[:2] == ["-X", "POST"]:
-                comments.append({"id": 7, "body": payload["body"], "html_url": "u7"})
-                return comments[-1]
-            if args[:2] == ["-X", "PATCH"]:
-                self.assertTrue(args[2].endswith("/comments/7"))
-                comments[0]["body"] = payload["body"]
-                return comments[0]
-            raise AssertionError(args)
-
-        with mock.patch.object(publish, "_gh", fake_gh):
+    def test_second_publish_edits_the_same_owned_comment(self):
+        gh = PublishGh([])
+        with mock.patch.object(publish, "_gh", gh):
             first = publish.post("o/r", publish.MARKER + " one", pr=5)
             second = publish.post("o/r", publish.MARKER + " two", pr=5)
         self.assertEqual((first["action"], second["action"]), ("created", "updated"))
-        self.assertEqual(len(comments), 1)
-        self.assertTrue(comments[0]["body"].endswith("two"))
+        self.assertEqual(len(gh.comments), 1)
+        self.assertEqual(gh.patched, [gh.comments[0]["id"]])
+        self.assertTrue(gh.comments[0]["body"].endswith("two"))
+
+    def test_foreign_marker_is_never_patched(self):
+        gh = PublishGh([comment(9, publish.MARKER + " spoofed", FOREIGN)])
+        with mock.patch.object(publish, "_gh", gh):
+            result = publish.post("o/r", publish.MARKER + " mine", pr=5)
+        self.assertEqual(result["action"], "created")
+        self.assertEqual(gh.patched, [])
+        self.assertEqual(len(gh.posted), 1)
+        self.assertEqual(result["foreign_markers_left_alone"], [9])
+        spoofed = next(c for c in gh.comments if c["id"] == 9)
+        self.assertIn("spoofed", spoofed["body"])
+
+    def test_duplicate_owned_markers_update_newest_and_report(self):
+        gh = PublishGh([
+            comment(11, publish.MARKER + " old", ME, "2026-09-20T10:00:00Z"),
+            comment(12, publish.MARKER + " newer", ME, "2026-09-20T11:00:00Z"),
+        ])
+        with mock.patch.object(publish, "_gh", gh):
+            result = publish.post("o/r", publish.MARKER + " fresh", pr=5)
+        self.assertEqual(result["action"], "updated")
+        self.assertEqual(result["id"], 12)
+        self.assertEqual(result["duplicates"], 1)
+        self.assertEqual(result["duplicate_ids"], [11])
+        self.assertEqual(gh.patched, [12])
+
+    def test_commit_comments_check_authorship_too(self):
+        gh = PublishGh([comment(21, publish.MARKER + " spoofed", FOREIGN)])
+        with mock.patch.object(publish, "_gh", gh):
+            result = publish.post("o/r", publish.MARKER + " mine", commit="abc123")
+        self.assertEqual(result["action"], "created")
+        self.assertEqual(gh.patched, [])
 
     def test_target_must_be_exactly_one(self):
         with self.assertRaises(ValueError):

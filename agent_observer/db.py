@@ -324,12 +324,36 @@ def default_path() -> str:
     return os.environ.get("AGENT_OBSERVER_DB") or DEFAULT_DB
 
 
+def _harden_path(path: str) -> None:
+    """Tighten the ledger directory to 0700 and db sidecars to 0600.
+
+    Applied to existing paths as well as new ones. Exact modes are set
+    so a permissive umask cannot leave the private ledger readable by
+    other local users; SQLite keeps working because the owner retains
+    read/write and directory search permission.
+    """
+    parent = os.path.dirname(os.path.abspath(path))
+    try:
+        if os.path.isdir(parent):
+            os.chmod(parent, 0o700)
+    except OSError:
+        pass
+    for candidate in (path, path + "-wal", path + "-shm", path + "-journal"):
+        try:
+            if os.path.exists(candidate):
+                os.chmod(candidate, 0o600)
+        except OSError:
+            pass
+
+
 def connect(path: str) -> sqlite3.Connection:
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
+    _harden_path(path)
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
+    _harden_path(path)
     return con
 
 
@@ -353,6 +377,14 @@ def init_db(con: sqlite3.Connection) -> None:
          str(CAPTURE_CONTRACT_VERSION)),
     )
     con.commit()
+    try:
+        row = con.execute("PRAGMA database_list").fetchone()
+        if row is not None:
+            main_file = row["file"] if "file" in row.keys() else row[2]
+            if main_file:
+                _harden_path(main_file)
+    except (OSError, sqlite3.DatabaseError):
+        pass
 
 
 def now() -> float:

@@ -28,6 +28,24 @@ def _emit(payload, as_json: bool) -> None:
         print(_text(payload))
 
 
+def _fmt_tokens(value, unknown: int = 0) -> str:
+    """Human rendering of a counter that may be unknown.
+
+    Fully unknown renders as unknown; a partial sum renders as an
+    explicitly labeled lower bound, never as an exact figure.
+    """
+    if value is None:
+        return "unknown"
+    text = f"{int(value):,}"
+    if unknown:
+        return f">={text} (lower bound)"
+    return text
+
+
+def _bucket_unknown(bucket: dict, field: str = "total_tokens") -> int:
+    return (bucket.get("unknown_counts") or {}).get(field, 0)
+
+
 def _text(payload) -> str:
     if isinstance(payload, dict) and payload.get("_view") == "sync":
         lines = []
@@ -52,18 +70,19 @@ def _text(payload) -> str:
             lines.append(
                 f"{r['session_key']}  {r.get('project_dir') or '?'}  "
                 f"agentsmd={r.get('agentsmd_version') or 'unknown'}  "
-                f"responses={r.get('responses', 0)} total={r.get('total_tokens', 0)}")
+                f"responses={r.get('responses', 0)} "
+                f"total={_fmt_tokens(r.get('total_tokens'), r.get('unknown_tokens') or 0)}")
         return "\n".join(lines) or "no sessions"
     if isinstance(payload, dict) and payload.get("_view") == "task":
         r = payload
         lines = [
             f"task {r['task']['task_id']}: {r['task'].get('title') or ''}",
             f"  attributed responses: {r['attributed']['responses']} "
-            f"total={r['attributed']['total_tokens']}",
+            f"total={_fmt_tokens(r['attributed']['total_tokens'], _bucket_unknown(r['attributed']))}",
             f"  shared joint responses: {r['shared_joint']['responses']} "
-            f"total={r['shared_joint']['total_tokens']}",
+            f"total={_fmt_tokens(r['shared_joint']['total_tokens'], _bucket_unknown(r['shared_joint']))}",
             f"  unassigned in scope: {r['unassigned_in_scope']['responses']} "
-            f"total={r['unassigned_in_scope']['total_tokens']}",
+            f"total={_fmt_tokens(r['unassigned_in_scope']['total_tokens'], _bucket_unknown(r['unassigned_in_scope']))}",
             f"  reconciles against scope: {r['reconciles']}",
             f"  missing assignments: {r['missing_assignments'] or 'none'}",
             f"  conflicting: {r['conflicting_assignments'] or 'none'}",
@@ -461,8 +480,12 @@ def _analyze(con, ns) -> int:
     for g in payload["groups"]:
         tokens = g["tokens_per_session"]
         prompts = g["genuine_prompts_per_session"]
+        median = tokens.get("median", "-")
+        median = "-" if median is None else f"{median:,}" if isinstance(median, (int, float)) else median
+        if g.get("unknown_token_responses"):
+            median = f">={median} (lower bound)" if median != "-" else "unknown"
         line = (f"{g['group']}: {g['sessions']} sessions, {g['projects']} projects, "
-                f"median tokens {tokens.get('median', '-')}, "
+                f"median tokens {median}, "
                 f"prompts/session {prompts.get('median', '-')} (n={prompts['n']}), "
                 f"interrupts {g['interrupts']}")
         extras = ", ".join(f"{d} {g[d]['incidents']}" for d in _analysis.DETECTORS
@@ -517,8 +540,11 @@ def _sessions(con, ns) -> int:
         _emit(payload, True)
         return 0
     q = ("SELECT s.*, COUNT(r.response_id) responses,"
-         " COALESCE(SUM(CASE WHEN r.is_overlap=0 THEN r.total_tokens END), 0)"
-         " total_tokens FROM sessions s LEFT JOIN responses r"
+         " SUM(CASE WHEN r.is_overlap=0 THEN r.total_tokens END)"
+         " total_tokens,"
+         " SUM(CASE WHEN r.is_overlap=0 AND r.total_tokens IS NULL"
+         " THEN 1 ELSE 0 END) unknown_tokens"
+         " FROM sessions s LEFT JOIN responses r"
          " ON r.session_key=s.session_key WHERE 1=1")
     args: list = []
     if ns.harness:
