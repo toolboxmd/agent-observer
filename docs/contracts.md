@@ -56,11 +56,28 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
 5. Keep native counter meaning. `responses.semantics` names it; the raw
    columns hold native values; `total_tokens` is the harness's own total.
    Unknown counters stay NULL, never zero.
-6. Quarantine unknown record shapes in `import_errors` with an excerpt no
-   longer than 200 characters, and continue.
-7. Store no file contents, tool outputs or preference contents. Excerpts
-   are limited to 300 characters of a user submission and the last 400
-   characters of an assistant message, in the private ledger only.
+6. Ledger privacy, fail closed, implemented once in
+   `agent_observer/privacy.py` (adapters keep no private copies):
+   `submissions.text_excerpt` is empty unless the submission is a genuine
+   human submission of the main session; then the human text up to the
+   first tag-like marker (`<` followed by a letter, `/` or `!`, or the
+   first `<<<`), whitespace-collapsed, at most 300 characters. Assistant
+   excerpts keep the last 400 characters only when that span holds no
+   marker. Every source records the privacy rules version; a version
+   change fully re-imports the source, updating rows in place and
+   replacing that source's `import_errors`. `import_errors.error` is
+   exactly one closed category (`malformed_json`, `unknown_record`,
+   `schema_error`, `missing_id`, `malformed_usage`, `usage_conflict`,
+   `source_unreadable`, `unsupported_schema`, fallback `import_error`);
+   `line_excerpt` holds only sorted top-level JSON key names (200 chars
+   max). `events.detail_json` keeps only per-family allowlisted keys with
+   correctly typed values (numbers, booleans, fixed-length hashes, native
+   identifiers, paths, commands, closed status/kind enums); targets follow
+   the same type rules. Never titles, messages, error text, outputs,
+   content, arguments or other free text.
+7. Tables not named above store no free text from native records beyond
+   identifiers, model and provider names, paths and commands. Native
+   free-text titles are discarded.
 
 ### Counter semantics by harness
 

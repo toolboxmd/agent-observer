@@ -262,7 +262,7 @@ class ClaudeExcerptTest(LedgerCase):
                "SECRET-CLAUDE-CMD-5f6e7d8c9b0a",
                "SECRET-CLAUDE-META-112233445566")
 
-    def test_only_genuine_and_interrupt_input_keep_excerpts(self):
+    def test_only_genuine_input_keeps_an_excerpt(self):
         claude.import_claude_file(self.con, fixture("claude-secrets.jsonl"))
         claude.import_claude_file(
             self.con, fixture("claude-secrets-side.jsonl"))
@@ -271,9 +271,9 @@ class ClaudeExcerptTest(LedgerCase):
         self.assertEqual(rows["claude:u-sec-1"]["kind"], "genuine")
         self.assertEqual(len(rows["claude:u-sec-1"]["text_excerpt"]), 300)
         self.assertEqual(rows["claude:u-sec-int"]["kind"], "interrupt")
-        self.assertEqual(len(rows["claude:u-sec-int"]["text_excerpt"]), 300)
-        self.assertTrue(rows["claude:u-sec-int"]["text_excerpt"].startswith(
-            "[Request interrupted"))
+        # Interrupt text is never stored, though the kind still marks the
+        # turn for the human-correction detector.
+        self.assertEqual(rows["claude:u-sec-int"]["text_excerpt"], "")
         self.assertEqual(rows["claude:su-sec-1"]["kind"], "synthetic")
         self.assertEqual(rows["claude:u-sec-skill"]["kind"], "scaffolding")
         self.assertEqual(rows["claude:u-sec-cmd"]["kind"], "command")
@@ -281,7 +281,7 @@ class ClaudeExcerptTest(LedgerCase):
         self.assertEqual(rows["claude:ssu-sec-1"]["kind"], "synthetic")
         for native in ("claude:su-sec-1", "claude:u-sec-skill",
                        "claude:u-sec-cmd", "claude:u-sec-meta",
-                       "claude:ssu-sec-1"):
+                       "claude:ssu-sec-1", "claude:u-sec-int"):
             self.assertEqual(rows[native]["text_excerpt"], "", native)
         blob = _excerpts(self)
         blob += "".join(r["detail_json"] or "" for r in self.query(

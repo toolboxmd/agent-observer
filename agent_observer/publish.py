@@ -134,7 +134,7 @@ def _list_all_comments(listing: str) -> list:
 
     The first page is fetched at the given listing URL; later pages
     append page numbers. Collection stops at the first short or empty
-    page so a marker beyond the first 100 comments is still found.
+    page, with no page cap, so a marker at any position is found.
     """
     comments: list = []
     page = 1
@@ -147,8 +147,6 @@ def _list_all_comments(listing: str) -> list:
         if len(batch) < 100:
             break
         page += 1
-        if page > 100:
-            break
     return comments
 
 

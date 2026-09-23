@@ -152,6 +152,21 @@ class PublishTest(LedgerCase):
         spoofed = next(c for c in gh.comments if c["id"] == 1002)
         self.assertIn("spoofed", spoofed["body"])
 
+    def test_pagination_has_no_page_cap(self):
+        # 101 full pages of fillers: an owned marker past the old
+        # page-100 cutoff is still found and updated, not duplicated.
+        fillers = [comment(i, f"filler {i}", "someone-else")
+                   for i in range(1, 101 * 100 + 1)]
+        owned = comment(20001, publish.MARKER + " old", ME,
+                        "2026-09-20T12:00:00Z")
+        gh = PublishGh(fillers + [owned])
+        with mock.patch.object(publish, "_gh", gh):
+            result = publish.post("o/r", publish.MARKER + " fresh", pr=5)
+        self.assertEqual(result["action"], "updated")
+        self.assertEqual(result["id"], 20001)
+        self.assertEqual(gh.patched, [20001])
+        self.assertEqual(len(gh.posted), 0)
+
     def test_shared_unknown_total_with_unknown_count_renders(self):
         summary = publish.summarize(self.con, {"claude:s1"}, "task T")
         summary["shared_tokens"] = None

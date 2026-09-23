@@ -3,7 +3,7 @@
 import os
 import shutil
 
-from agent_observer import report
+from agent_observer import privacy, report
 from agent_observer.adapters.codex import import_codex_file
 from agent_observer.ingest import JsonlSource
 from tests.helpers import LedgerCase, fixture
@@ -97,19 +97,17 @@ class QuarantineRedactionTest(LedgerCase):
             self.assertNotIn(SECRET, row["line_excerpt"] or "")
             self.assertNotIn(SECRET, row["error"] or "")
             self.assertLessEqual(len(row["line_excerpt"] or ""), 200)
-            # The error column holds only a fixed safe category.
-            self.assertRegex(row["error"] or "", r"\A[a-z_]{1,40}\Z")
+            # The error column holds only a closed privacy category.
+            self.assertIn(row["error"],
+                          set(privacy.ERROR_CATEGORIES)
+                          | {privacy.ERROR_FALLBACK})
         by_error = {r["error"]: r["line_excerpt"] for r in errors}
-        # Invalid JSON keeps only a safe category, no raw excerpt.
-        self.assertEqual(by_error["json_error"], "json_error")
-        # A JSON line keeps the category plus sorted top-level keys, but
-        # no record values: the unknown type value is never retained and
-        # payload contents never persist.
-        excerpt = next(v for k, v in by_error.items()
-                       if k.startswith("schema_error"))
-        self.assertIn("schema_error", excerpt)
-        self.assertIn("keys=ordinal,payload,timestamp,type", excerpt)
-        self.assertNotIn("future_unknown_type", excerpt)
+        # Invalid JSON keeps no excerpt at all, only the category.
+        self.assertEqual(by_error["malformed_json"], "")
+        # A JSON line keeps only sorted top-level key names, never values:
+        # the unknown type value and payload contents never persist.
+        self.assertEqual(by_error["unsupported_schema"],
+                         "ordinal,payload,timestamp,type")
 
     def test_secret_in_type_and_exception_never_reaches_ledger(self):
         """An unknown type carrying a secret and the exception built from
@@ -131,18 +129,19 @@ class QuarantineRedactionTest(LedgerCase):
                 for row in rows:
                     self.assertNotIn(secret, row[column] or "",
                                      f"{table}.{column} leaks type/payload secret")
-        # The quarantined row keeps only a safe category and key names.
+        # The quarantined row keeps only a closed category and key names.
         row = self.query(
             "SELECT error, line_excerpt FROM import_errors")[0]
-        self.assertEqual(row["error"], "schema_error")
-        self.assertRegex(row["error"], r"\A[a-z_]{1,40}\Z")
-        self.assertIn("schema_error", row["line_excerpt"])
-        self.assertIn("keys=", row["line_excerpt"])
+        self.assertEqual(row["error"], "unsupported_schema")
+        self.assertIn(row["error"], privacy.ERROR_CATEGORIES)
+        self.assertEqual(row["line_excerpt"],
+                         "ordinal,payload,timestamp,type")
         self.assertNotIn(type_secret, row["line_excerpt"])
         self.assertNotIn(payload_secret, row["line_excerpt"])
         self.assertLessEqual(len(row["line_excerpt"]), 200)
-        # An exception message carrying a secret is reduced to its safe
-        # leading category before it reaches the ledger.
+        # An exception message carrying a secret is reduced to the fixed
+        # fallback before it reaches the ledger: only an exact closed
+        # category persists, never a suffixed or decorated one.
         path = os.path.join(self.tmp.name, "direct.jsonl")
         with open(path, "w") as fh:
             fh.write("{}\n")
@@ -157,8 +156,10 @@ class QuarantineRedactionTest(LedgerCase):
                 self.assertNotIn(exc_secret, r[column] or "",
                                  f"{table}.{column} leaks exception secret")
         direct = self.query(
-            "SELECT error FROM import_errors ORDER BY id DESC LIMIT 1")[0]
-        self.assertEqual(direct["error"], "schema_error")
+            "SELECT error, line_excerpt FROM import_errors"
+            " ORDER BY id DESC LIMIT 1")[0]
+        self.assertEqual(direct["error"], privacy.ERROR_FALLBACK)
+        self.assertEqual(direct["line_excerpt"], "type")
 
     def test_secret_in_no_ledger_text(self):
         self.sync("codex-secrets-quarantine.jsonl")

@@ -12,14 +12,14 @@ output, so total_tokens = input_tokens + output_tokens.
 from __future__ import annotations
 
 import glob
-import hashlib
 import json
 import os
 import sqlite3
 
-from .. import db
+from .. import db, privacy
 from ..identity import SessionIdentity
-from ..ingest import JsonlSource, fingerprint, insert_event, iso_ts, text_hash
+from ..ingest import (JsonlSource, MissingNativeId, fingerprint, insert_event,
+                      iso_ts, text_hash)
 
 HARNESS = "codex"
 SEMANTICS = "codex:input_includes_cached,output_includes_reasoning"
@@ -53,6 +53,10 @@ class _MalformedUsage(ValueError):
 
 class _UsageConflict(ValueError):
     """An exact-ID repeat whose counters differ from the stored row."""
+
+
+class _UnsupportedSchema(ValueError):
+    """A record type the adapter does not support."""
 
 
 _CODEX_BUCKET_KEYS = ("input_tokens", "cached_input_tokens",
@@ -186,7 +190,8 @@ class _Reader:
         insert_event(self.con, self.stats, source_id=self.src.source_id,
                      session_key=self.session_key, family=family,
                      native_id=native_id, ordinal=obj.get("ordinal"),
-                     ts=iso_ts(obj.get("timestamp")), **kw)
+                     ts=iso_ts(obj.get("timestamp")),
+                     update=self.src.privacy_stale, **kw)
 
 
 def import_codex_file(con: sqlite3.Connection, path: str,
@@ -207,7 +212,9 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         stats["lines"] += 1
         if obj is None or not isinstance(obj, dict):
             stats["malformed"] += 1
-            src.error(ordinal, "json_error" if obj is None else "shape_error", line)
+            src.error(ordinal,
+                      "malformed_json" if obj is None else "unknown_record",
+                      line)
             continue
         try:
             _ingest_record(reader, obj)
@@ -218,6 +225,14 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         except _MalformedUsage:
             stats["malformed"] += 1
             src.error(obj.get("ordinal", ordinal), "malformed_usage", line)
+            continue
+        except MissingNativeId:
+            stats["malformed"] += 1
+            src.error(obj.get("ordinal", ordinal), "missing_id", line)
+            continue
+        except _UnsupportedSchema:
+            stats["malformed"] += 1
+            src.error(obj.get("ordinal", ordinal), "unsupported_schema", line)
             continue
         except (KeyError, TypeError, ValueError, AttributeError):
             stats["malformed"] += 1
@@ -246,7 +261,7 @@ def _ingest_record(r: _Reader, obj: dict) -> None:
     if rtype not in ("session_meta", "event_msg", "response_item",
                      "token_usage_record", "turn_context", "compacted",
                      "world_state", "inter_agent_communication_metadata"):
-        raise ValueError(f"unsupported record type: {rtype!r}")
+        raise _UnsupportedSchema(f"unsupported record type: {rtype!r}")
     payload = obj.get("payload", {})
     if not isinstance(payload, dict):
         raise ValueError(f"unsupported payload shape for {rtype}: "
@@ -526,40 +541,56 @@ def _ingest_response_item(r: _Reader, obj: dict) -> None:
             return
         kind = _submission_kind(p)
         native = p.get("id") or f"ordinal:{obj.get('ordinal')}"
-        # Excerpts persist only genuine human input (or an interrupt); every
-        # other kind keeps an empty excerpt so skill bodies, question replies
-        # and scaffolding can never persist file or preference contents.
-        # Identity extraction above already saw the complete text.
-        excerpt = text[:300] if kind in ("genuine", "interrupt") else ""
+        # Privacy rule 1 via agent_observer/privacy.py: only a genuine
+        # main-session human submission keeps an excerpt, truncated at the
+        # first tag-like marker. Identity extraction above already saw the
+        # complete text.
+        excerpt = privacy.submission_excerpt(
+            text, is_genuine=kind == "genuine", is_main_session=True)
+        genuine = 1 if kind == "genuine" else 0
         cur = r.con.execute(
             "INSERT OR IGNORE INTO submissions(native_id, source_id,"
             " session_key, turn_id, ordinal_num, ts, kind, text_hash,"
             " text_excerpt, is_genuine) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (f"{HARNESS}:{native}", r.src.source_id, r.session_key, turn_id,
              obj.get("ordinal"), iso_ts(obj.get("timestamp")), kind,
-             text_hash(text), excerpt, 1 if kind == "genuine" else 0))
+             text_hash(text), excerpt, genuine))
         if cur.rowcount:
             r.stats["submissions_inserted"] += 1
+        elif r.src.privacy_stale:
+            # Rule 3: a privacy version change corrects rows in place.
+            r.con.execute(
+                "UPDATE submissions SET source_id=?, session_key=?, turn_id=?,"
+                " ordinal_num=?, ts=?, kind=?, text_hash=?, text_excerpt=?,"
+                " is_genuine=? WHERE native_id=?",
+                (r.src.source_id, r.session_key, turn_id, obj.get("ordinal"),
+                 iso_ts(obj.get("timestamp")), kind, text_hash(text), excerpt,
+                 genuine, f"{HARNESS}:{native}"))
+            r.stats["submissions_updated"] = \
+                r.stats.get("submissions_updated", 0) + 1
         return
     if ptype == "message" and p.get("role") == "assistant":
         text = _text_of_message(p)
         if text:
+            excerpt = privacy.assistant_excerpt(text)
             r.event(obj, "assistant_message", p.get("id") or f"ordinal:{obj.get('ordinal')}",
                     turn_id=turn_id, name="assistant_message",
                     size_bytes=len(text), fingerprint=text_hash(text),
-                    detail={"excerpt": text[-400:]})
+                    detail={"excerpt": excerpt} if excerpt else None)
         return
     if ptype in ("function_call", "custom_tool_call"):
         call_id = p.get("call_id")
         name = p.get("name") or (
             p.get("custom_tool_call") or {}).get("name", "unknown")
+        if not isinstance(name, str):
+            name = "unknown"
+        namespace = p.get("namespace")
+        prefix = f"{namespace}." if isinstance(namespace, str) else ""
         args = p.get("arguments") if ptype == "function_call" else p.get("input")
         r.event(obj, "tool_call", call_id or p.get("id"), turn_id=turn_id,
-                name=f"{p.get('namespace') + '.' if p.get('namespace') else ''}{name}",
+                name=f"{prefix}{name}",
                 status=p.get("status"),
-                fingerprint=fingerprint(name, str(args)[:2000]),
-                detail={"kind": ptype, "args_chars": len(str(args or "")),
-                        "item_id": p.get("id")})
+                fingerprint=fingerprint(name, str(args)[:2000]))
     elif ptype in ("function_call_output", "custom_tool_call_output"):
         call_id = p.get("call_id")
         out = p.get("output")
@@ -569,8 +600,7 @@ def _ingest_response_item(r: _Reader, obj: dict) -> None:
         else:
             size = len(str(out or ""))
         r.event(obj, "tool_result", call_id or p.get("id"), turn_id=turn_id,
-                name=ptype, size_bytes=size,
-                detail={"kind": ptype, "item_id": p.get("id")})
+                name=ptype, size_bytes=size)
 
 
 def _ingest_event_msg(r: _Reader, obj: dict) -> None:
@@ -596,8 +626,7 @@ def _ingest_event_msg(r: _Reader, obj: dict) -> None:
                 (iso_ts(obj.get("timestamp")), p.get("duration_ms"), turn_id))
         r.event(obj, "lifecycle", f"task_complete:{p.get('turn_id')}",
                 turn_id=turn_id, name="task_complete", status="completed",
-                duration_ms=p.get("duration_ms"),
-                detail={"time_to_first_token_ms": p.get("time_to_first_token_ms")})
+                duration_ms=p.get("duration_ms"))
     elif etype == "item_completed":
         item = p.get("item", {}) or {}
         itype = item.get("type")
@@ -608,64 +637,60 @@ def _ingest_event_msg(r: _Reader, obj: dict) -> None:
             content = result.get("content") or []
             size = sum(len(str(c.get("text", ""))) for c in content
                        if isinstance(c, dict))
+            server = item.get("server")
+            tool = item.get("tool")
+            if isinstance(server, str) and isinstance(tool, str):
+                mcp_name = f"mcp.{server}.{tool}"
+            else:
+                mcp_name = "mcp.unknown"
             r.event(obj, "tool_result", item.get("id"), turn_id=turn_id,
-                    name=f"mcp.{item.get('server')}.{item.get('tool')}",
-                    status=item.get("status"), size_bytes=size,
-                    detail={"call_id_match": "exact native id retained; "
-                            "join to calls only on equal call_id"})
+                    name=mcp_name,
+                    status=item.get("status"), size_bytes=size)
         elif itype == "SubAgentActivity":
             r.event(obj, "lifecycle", item.get("id"), turn_id=turn_id,
-                    name="subagent_activity", status=item.get("kind"),
-                    detail={"agent_thread_id": item.get("agent_thread_id"),
-                            "agent_path": item.get("agent_path")})
+                    name="subagent_activity", status=item.get("kind"))
         elif itype == "FileChange":
-            # Paths and change kinds are reread evidence; contents stay out.
+            # Paths are reread evidence; contents stay out. Detail keeps the
+            # sorted path list only (privacy rule 6).
             changes = item.get("changes") or {}
-            summary = {}
-            for path, ch in changes.items():
-                if isinstance(ch, dict):
-                    body = str(ch.get("content") or "")
-                    summary[path] = {
-                        "type": ch.get("type"),
-                        "content_chars": len(body),
-                        "content_sha": hashlib.sha256(
-                            body.encode("utf-8", "replace")).hexdigest()[:16],
-                    }
-                else:
-                    summary[path] = {"type": "unknown"}
+            paths = sorted(p for p in changes.keys()
+                           if isinstance(p, str) and p)
             r.event(obj, "file_change", item.get("id"), turn_id=turn_id,
                     name="file_change",
-                    target=next(iter(sorted(summary)), None),
-                    fingerprint=fingerprint(sorted(summary)),
-                    detail={"paths": summary})
+                    target=paths[0] if paths else None,
+                    fingerprint=fingerprint(paths),
+                    detail={"paths": paths} if paths else None)
         elif itype == "ContextCompaction":
             # Sparse native compaction marker: boundary identity only.
             r.stats["compactions"] += 1
             r.event(obj, "compaction", item.get("id"),
                     turn_id=f"{HARNESS}:{item['turn_id']}" if item.get("turn_id") else turn_id,
-                    name="context_compaction",
-                    detail={"native": "ContextCompaction marker; "
-                            "window detail unknown"})
+                    name="context_compaction")
         elif itype == "CollabAgentToolCall":
             # Sub-agent collaboration (spawn, send, wait): the dispatch edge
             # between threads, kept with its native thread identities.
+            collab_tool = item.get("tool")
+            collab_name = (f"collab.{collab_tool}"
+                           if isinstance(collab_tool, str) and collab_tool
+                           else "collab.unknown")
             r.event(obj, "lifecycle", item.get("id"), turn_id=turn_id,
-                    name=f"collab.{item.get('tool') or 'unknown'}",
-                    status=item.get("status"),
-                    detail={"sender_thread_id": item.get("sender_thread_id"),
-                            "receiver_thread_ids": item.get("receiver_thread_ids"),
-                            "receiver_agents": item.get("receiver_agents")})
+                    name=collab_name,
+                    status=item.get("status"))
         elif itype in ("ImageView", "WebSearch", "DynamicToolCall",
                        "FunctionCallOutput"):
-            target = item.get("path") or item.get("query") or item.get("tool")
+            raw_target = item.get("path") or item.get("tool")
+            target = raw_target if isinstance(raw_target, str) else None
+            raw_tool = item.get("tool")
+            dynamic_name = ({"ImageView": "image_view", "WebSearch": "web_search",
+                             "FunctionCallOutput": "function_call_output"}.get(itype)
+                            or (f"dynamic.{raw_tool}"
+                                if isinstance(raw_tool, str) and raw_tool
+                                else "dynamic.unknown"))
             r.event(obj, "tool_result", item.get("call_id") or item.get("id"),
                     turn_id=turn_id,
-                    name={"ImageView": "image_view", "WebSearch": "web_search",
-                          "FunctionCallOutput": "function_call_output"}.get(
-                              itype, f"dynamic.{item.get('tool') or 'unknown'}"),
-                    target=str(target)[:500] if target else None,
-                    status=item.get("status"),
-                    detail={"kind": itype})
+                    name=dynamic_name,
+                    target=target[:500] if target else None,
+                    status=item.get("status"))
         elif itype in ("Plan", "HookPrompt", "EnteredReviewMode",
                        "ExitedReviewMode"):
             r.event(obj, "lifecycle", item.get("id") or f"{itype}:{obj.get('ordinal')}",
@@ -710,8 +735,7 @@ def _ingest_event_msg(r: _Reader, obj: dict) -> None:
                 (iso_ts(obj.get("timestamp")), p.get("duration_ms"), turn_id))
         r.event(obj, "lifecycle", f"turn_aborted:{p.get('turn_id')}",
                 turn_id=turn_id, name="turn_aborted", status="cancelled",
-                duration_ms=p.get("duration_ms"),
-                detail={"reason": p.get("reason")})
+                duration_ms=p.get("duration_ms"))
     else:
         raise ValueError(f"unsupported event_msg type: {etype!r}")
 
@@ -720,21 +744,32 @@ def _ingest_command(r: _Reader, obj: dict, item: dict, turn_id) -> None:
     cmd = item.get("command") or []
     output = item.get("stdout") or item.get("output") or ""
     size = len(str(output))
-    shown = cmd[-1] if isinstance(cmd, list) and cmd else str(cmd)
+    # The target is the executed shell command (string parts only); native
+    # structures never stringify into the ledger.
+    shown = None
+    if isinstance(cmd, list):
+        parts = [p for p in cmd if isinstance(p, str) and p]
+        shown = parts[-1] if parts else None
+    elif isinstance(cmd, str) and cmd:
+        shown = cmd
     r.event(obj, "tool_result", item.get("id"), turn_id=turn_id,
-            name="exec", target=str(shown)[:500],
+            name="exec", target=shown[:500] if shown else None,
             status=item.get("status"), duration_ms=_duration(item),
             size_bytes=size,
             truncated=1 if item.get("truncated") else None,
             fingerprint=fingerprint(cmd),
-            detail={"command": cmd[:3] if isinstance(cmd, list) else cmd,
-                    "cwd": item.get("cwd"),
-                    "exit_code": item.get("exit_code"),
-                    "parsed_cmd": item.get("parsed_cmd")})
+            detail={"exit_code": item.get("exit_code")})
     # Observed file reads come only from parsed_cmd entries, never mentions.
+    # Only a native string path or name is accepted: anything else drops the
+    # read safely, so a non-string value can never reach events.target,
+    # identity, or the derived native id through coercion.
     for entry in item.get("parsed_cmd") or []:
         if isinstance(entry, dict) and entry.get("type") == "read":
-            target = str(entry.get("path") or entry.get("name") or "unknown")
+            target = entry.get("path")
+            if not isinstance(target, str) or not target:
+                target = entry.get("name")
+            if not isinstance(target, str) or not target:
+                continue
             r.identity.observe_path(target)
             fam = "skill_read" if (target.endswith("SKILL.md")
                                    or "/skills/" in target) else "read"
@@ -743,8 +778,7 @@ def _ingest_command(r: _Reader, obj: dict, item: dict, turn_id) -> None:
                     status=item.get("status"),
                     duration_ms=_duration(item), size_bytes=size,
                     fingerprint=fingerprint(target),
-                    detail={"cmd": entry.get("cmd"), "observed_bytes": size,
-                            "evidence": "parsed_cmd"})
+                    detail={"cmd": entry.get("cmd")})
 
 
 def _ingest_compacted(r: _Reader, obj: dict) -> None:
@@ -754,26 +788,13 @@ def _ingest_compacted(r: _Reader, obj: dict) -> None:
         # Older rollouts record a compaction with its replacement history
         # but no window identity; the boundary is kept by position.
         r.event(obj, "compaction", f"compacted:{obj.get('ordinal')}",
-                name="context_compaction",
-                detail={"native": "compacted record without window identity",
-                        "replacement_items": len(p.get("replacement_history") or [])})
+                name="context_compaction")
         return
     latest = p.get("latest_token_usage_record") or {}
     rid = latest.get("response_id")
     # The embedded latest usage repeats an already counted response and is
-    # never inserted. Record whether it resolves so overlap stays checkable.
-    resolves = None
-    if rid:
-        resolves = r.con.execute(
-            "SELECT 1 FROM responses WHERE response_id=?",
-            (f"{HARNESS}:{rid}",)).fetchone()
-    r.event(obj, "compaction", p.get("window_id"), name="context_compaction",
-            detail={k: p.get(k) for k in (
-                "window_number", "first_window_id", "previous_window_id",
-                "window_id", "compaction_response_id")} | {
-                "latest_usage_response_id": rid,
-                "latest_usage_resolves": bool(resolves) if rid else None,
-                "overlap_rule": "embedded usage never summed"})
+    # never inserted; the boundary event alone marks the compaction.
+    r.event(obj, "compaction", p.get("window_id"), name="context_compaction")
 
 
 def _duration(item: dict):

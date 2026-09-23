@@ -347,8 +347,11 @@ def _human_corrections(con, session, events) -> list:
                                  f"said: {(row['text_excerpt'] or '')[:120]}",
                                  [row["native_id"]], {"signal": "correction wording"}))
     for e in events:
+        # An aborted turn is an interrupt by construction (the adapter keeps
+        # no abort reason text under privacy rule 6); a denied permission is
+        # a denial by status.
         if e["family"] == "lifecycle" and e["name"] == "turn_aborted" and \
-                "interrupt" in str(_detail(e).get("reason") or "").lower():
+                e["status"] == "cancelled":
             out.append(_incident(session, "human_correction", e["ts"],
                                  "interrupted the agent", [e["id"]], {"signal": "interrupt"}))
         if e["family"] == "permission" and e["status"] == "denied":

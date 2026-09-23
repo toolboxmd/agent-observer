@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS sources (
   raw_bytes INTEGER NOT NULL DEFAULT 0,
   imported_at REAL NOT NULL,
   import_ms INTEGER,
+  privacy_version INTEGER,
   UNIQUE (harness, path)
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -369,6 +370,9 @@ def init_db(con: sqlite3.Connection) -> None:
                 f"ledger schema {row['value']} is not {SCHEMA_VERSION}; "
                 "move the old ledger aside and sync again")
     con.executescript(SCHEMA_SQL)
+    columns = {row["name"] for row in con.execute("PRAGMA table_info(sources)")}
+    if "privacy_version" not in columns:
+        con.execute("ALTER TABLE sources ADD COLUMN privacy_version INTEGER")
     con.execute(
         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES "
         "('schema_version', ?), ('event_contract_version', ?), "

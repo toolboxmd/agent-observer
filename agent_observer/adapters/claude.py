@@ -18,9 +18,10 @@ import json
 import os
 import sqlite3
 
-from .. import db
+from .. import db, privacy
 from ..identity import SessionIdentity, skill_from_path
-from ..ingest import JsonlSource, fingerprint, insert_event, iso_ts, text_hash
+from ..ingest import (JsonlSource, MissingNativeId, fingerprint, insert_event,
+                      iso_ts, text_hash)
 
 HARNESS = "claude"
 SEMANTICS = "claude:input_excludes_cache,output_includes_thinking"
@@ -55,6 +56,10 @@ class _MalformedUsage(ValueError):
 
 class _UsageConflict(ValueError):
     """An exact-ID repeat whose counters differ from the stored final row."""
+
+
+class _UnsupportedSchema(ValueError):
+    """A record type the adapter does not support."""
 
 
 _CLAUDE_COUNTER_KEYS = ("input_tokens", "cache_creation_input_tokens",
@@ -144,19 +149,24 @@ def _text(content) -> str:
 
 
 def _target(name: str, tool_input: dict):
+    """A string target only: paths, commands and skill names.
+
+    Non-string native values never stringify into the ledger; the caller
+    then stores no target. Search patterns and URLs are free text and are
+    not targets.
+    """
     if not isinstance(tool_input, dict):
         return None
     for key in ("file_path", "notebook_path", "path"):
-        if tool_input.get(key):
-            return str(tool_input[key])
-    if tool_input.get("command"):
-        return str(tool_input["command"])[:500]
-    if tool_input.get("pattern"):
-        return str(tool_input["pattern"])[:500]
-    if tool_input.get("skill"):
-        return str(tool_input["skill"])
-    if tool_input.get("url"):
-        return str(tool_input["url"])[:500]
+        value = tool_input.get(key)
+        if isinstance(value, str) and value:
+            return value
+    command = tool_input.get("command")
+    if isinstance(command, str) and command:
+        return command[:500]
+    skill = tool_input.get("skill")
+    if isinstance(skill, str) and skill:
+        return skill
     return None
 
 
@@ -191,7 +201,7 @@ class _Reader:
         insert_event(self.con, self.stats, source_id=self.src.source_id,
                      session_key=self.session_key, family=family,
                      native_id=native_id, ordinal=ordinal, ts=ts,
-                     turn_id=self.turn, **kw)
+                     turn_id=self.turn, update=self.src.privacy_stale, **kw)
 
 
 def import_claude_file(con: sqlite3.Connection, path: str,
@@ -225,7 +235,9 @@ def import_claude_file(con: sqlite3.Connection, path: str,
         stats["lines"] += 1
         if obj is None or not isinstance(obj, dict):
             stats["malformed"] += 1
-            src.error(ordinal, "json_error", line)
+            src.error(ordinal,
+                      "malformed_json" if obj is None else "unknown_record",
+                      line)
             continue
         try:
             _ingest(r, obj, ordinal)
@@ -235,6 +247,12 @@ def import_claude_file(con: sqlite3.Connection, path: str,
         except _MalformedUsage:
             stats["malformed"] += 1
             src.error(ordinal, "malformed_usage", line)
+        except MissingNativeId:
+            stats["malformed"] += 1
+            src.error(ordinal, "missing_id", line)
+        except _UnsupportedSchema:
+            stats["malformed"] += 1
+            src.error(ordinal, "unsupported_schema", line)
         except (KeyError, TypeError, ValueError, AttributeError):
             stats["malformed"] += 1
             src.error(ordinal, "schema_error", line)
@@ -246,6 +264,11 @@ def import_claude_file(con: sqlite3.Connection, path: str,
             fields["role"] = "subagent"
         db.upsert_session(con, r.session_key, HARNESS,
                           r.session_key.split(":", 1)[1], src.source_id, **fields)
+        if src.privacy_stale:
+            # Rule 7: native free-text titles are never stored; a version
+            # change clears any title an older import kept.
+            con.execute("UPDATE sessions SET title=NULL WHERE session_key=?",
+                        (r.session_key,))
     stats.update(src.finish(session_id=r.native_session, thread_id=r.agent_id))
     stats["session_key"] = r.session_key
     con.commit()
@@ -275,10 +298,10 @@ def _ingest(r: _Reader, obj: dict, ordinal: int) -> None:
     elif kind == "system":
         _system(r, obj, ordinal, ts)
     elif kind == "ai-title":
-        if obj.get("aiTitle"):
-            r.meta.setdefault("title", str(obj["aiTitle"])[:200])
+        # Rule 7: native free-text titles are discarded, never stored.
+        return
     else:
-        raise ValueError(f"unsupported record type: {kind!r}")
+        raise _UnsupportedSchema(f"unsupported record type: {kind!r}")
 
 
 def _usage_values(usage) -> dict:
@@ -418,42 +441,60 @@ def _assistant(r: _Reader, obj: dict, ordinal: int, ts) -> None:
             continue
         btype = block.get("type")
         if btype == "tool_use" and block.get("id"):
-            name = str(block.get("name") or "unknown")
+            raw_name = block.get("name")
+            name = raw_name if isinstance(raw_name, str) and raw_name \
+                else "unknown"
             tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
             target = _target(name, tool_input)
             r.pending[block["id"]] = (name, tool_input)
             r.event("tool_call", block["id"], ordinal, ts, name=name, target=target,
-                    fingerprint=fingerprint(name, json.dumps(tool_input, sort_keys=True)[:4000]),
-                    detail={"message_id": mid})
+                    fingerprint=fingerprint(name, json.dumps(tool_input, sort_keys=True)[:4000]))
             if name == "Skill":
-                skill = str(tool_input.get("skill") or tool_input.get("command") or "unknown")
+                raw_skill = tool_input.get("skill") or tool_input.get("command")
+                skill = raw_skill if isinstance(raw_skill, str) and raw_skill \
+                    else "unknown"
                 r.event("skill_invoke", block["id"], ordinal, ts, name=skill,
-                        target=skill, detail={"attribution": obj.get("attributionSkill")})
+                        target=skill)
             if target and name in EDIT_TOOLS:
                 r.event("file_change", block["id"], ordinal, ts, name=name,
                         target=target, fingerprint=fingerprint(target))
         elif btype == "text" and block.get("text"):
             text = block["text"]
+            excerpt = privacy.assistant_excerpt(text)
             r.event("assistant_message", f"{obj.get('uuid') or mid}:{index}", ordinal, ts,
                     name="assistant_message", size_bytes=len(text),
                     fingerprint=text_hash(text),
-                    detail={"excerpt": text[-400:], "stop_reason": message.get("stop_reason")})
+                    detail={"excerpt": excerpt} if excerpt else None)
 
 
 def _submission(r: _Reader, native_id, ordinal, ts, kind: str, text: str) -> None:
-    # Excerpts persist only genuine human input (or an interrupt); every
-    # other kind keeps an empty excerpt so skill bodies, sidechain prompts,
-    # hook output and scaffolding can never persist file or preference
-    # contents. Identity extraction already saw the complete text.
-    excerpt = text[:300] if kind in ("genuine", "interrupt") else ""
+    # Privacy rule 1 via agent_observer/privacy.py: only a genuine
+    # main-session human submission keeps an excerpt. Interrupt, synthetic,
+    # command and scaffolding kinds keep an empty excerpt, as does any text
+    # from a child sub-agent session, so file and preference contents can
+    # never persist. Identity extraction already saw the complete text.
+    excerpt = privacy.submission_excerpt(
+        text, is_genuine=kind == "genuine",
+        is_main_session=r.agent_id is None)
+    genuine = 1 if kind == "genuine" else 0
     cur = r.con.execute(
         "INSERT OR IGNORE INTO submissions(native_id, source_id, session_key,"
         " turn_id, ordinal_num, ts, kind, text_hash, text_excerpt, is_genuine)"
         " VALUES(?,?,?,?,?,?,?,?,?,?)",
         (f"{HARNESS}:{native_id}", r.src.source_id, r.session_key, r.turn, ordinal,
-         ts, kind, text_hash(text), excerpt, 1 if kind == "genuine" else 0))
+         ts, kind, text_hash(text), excerpt, genuine))
     if cur.rowcount:
         r.stats["submissions_inserted"] += 1
+    elif r.src.privacy_stale:
+        # Rule 3: a privacy version change corrects rows in place.
+        r.con.execute(
+            "UPDATE submissions SET source_id=?, session_key=?, turn_id=?,"
+            " ordinal_num=?, ts=?, kind=?, text_hash=?, text_excerpt=?,"
+            " is_genuine=? WHERE native_id=?",
+            (r.src.source_id, r.session_key, r.turn, ordinal, ts, kind,
+             text_hash(text), excerpt, genuine, f"{HARNESS}:{native_id}"))
+        r.stats["submissions_updated"] = \
+            r.stats.get("submissions_updated", 0) + 1
 
 
 def _user_kind(r: _Reader, obj: dict, text: str) -> str:
@@ -503,7 +544,7 @@ def _user(r: _Reader, obj: dict, ordinal: int, ts) -> None:
         r.event("skill_read", obj.get("uuid") or f"ordinal:{ordinal}", ordinal, ts,
                 name=skill_from_path(base + "/") or os.path.basename(base),
                 target=base, size_bytes=len(text),
-                detail={"skill": skill_from_path(base + "/"), "evidence": "skill base directory"})
+                detail={"skill": skill_from_path(base + "/")})
     kind = _user_kind(r, obj, text)
     native = obj.get("uuid") or f"ordinal:{ordinal}"
     if kind == "genuine":
@@ -521,20 +562,18 @@ def _tool_result(r: _Reader, obj: dict, result: dict, ordinal: int, ts) -> None:
     denied = obj.get("toolDenialKind")
     status = "denied" if denied else ("error" if result.get("is_error") else "ok")
     structured = obj.get("toolUseResult") if isinstance(obj.get("toolUseResult"), dict) else {}
-    detail = {"tool": name}
-    if denied:
-        detail["denial"] = denied
-    for key in ("interrupted", "returnCodeInterpretation", "exitCode", "exit_code"):
-        if key in structured:
-            detail[key] = structured[key]
+    detail = {"exit_code": structured.get("exit_code"),
+              "exitCode": structured.get("exitCode")}
     r.event("tool_result", call_id, ordinal, ts, name=name or "unknown",
             target=_target(name or "", tool_input), status=status, size_bytes=size,
             detail=detail)
     if denied:
         r.event("permission", call_id, ordinal, ts, name=name or "unknown",
-                status="denied", detail={"denial": denied})
+                status="denied")
     file_info = structured.get("file") if isinstance(structured.get("file"), dict) else None
     path = (file_info or {}).get("filePath") or (tool_input or {}).get(READ_TOOLS.get(name or "", ""), None)
+    if not isinstance(path, str):
+        path = None
     if name in READ_TOOLS and path and status == "ok":
         r.identity.observe_path(path)
         family = "skill_read" if skill_from_path(path) else "read"
@@ -544,10 +583,7 @@ def _tool_result(r: _Reader, obj: dict, result: dict, ordinal: int, ts) -> None:
                 target=path, size_bytes=size,
                 fingerprint=fingerprint(path, start, lines),
                 detail={"start_line": start, "num_lines": lines,
-                        "total_lines": (file_info or {}).get("totalLines"),
-                        "skill": skill_from_path(path),
-                        "content_sha": text_hash((file_info or {}).get("content") or "")
-                        if file_info and file_info.get("content") is not None else None})
+                        "skill": skill_from_path(path)})
 
 
 def _attachment(r: _Reader, obj: dict, ordinal: int, ts) -> None:
@@ -562,7 +598,9 @@ def _attachment(r: _Reader, obj: dict, ordinal: int, ts) -> None:
                     ("/.claude/CLAUDE.md", "/AGENTS.md")):
                 r.identity.observe_loaded_instructions(str(entry.get("content") or ""))
     elif atype == "queued_command":
-        prompt = str(attachment.get("prompt") or "")
+        prompt = attachment.get("prompt")
+        if not isinstance(prompt, str) or not prompt:
+            return
         stripped = prompt.lstrip()
         # Scaffolding markers fail closed before human metadata: a queued
         # prompt that is a known marker is never genuine even when it
@@ -588,15 +626,10 @@ def _system(r: _Reader, obj: dict, ordinal: int, ts) -> None:
     native = obj.get("uuid") or f"ordinal:{ordinal}"
     if subtype == "compact_boundary":
         r.stats["compactions"] += 1
-        meta = obj.get("compactMetadata") or {}
-        r.event("compaction", native, ordinal, ts, name="compact_boundary",
-                detail={"trigger": meta.get("trigger"),
-                        "pre_tokens": meta.get("preTokens")})
+        r.event("compaction", native, ordinal, ts, name="compact_boundary")
     elif subtype == "turn_duration":
         r.event("lifecycle", native, ordinal, ts, name="turn_duration",
-                duration_ms=obj.get("durationMs"),
-                detail={"message_count": obj.get("messageCount")})
+                duration_ms=obj.get("durationMs"))
     elif subtype in ("api_error", "stop_hook_summary", "informational"):
         r.event("lifecycle", native, ordinal, ts, name=subtype,
-                status=obj.get("level"),
-                detail={"excerpt": str(obj.get("content") or "")[:300]})
+                status=obj.get("level"))

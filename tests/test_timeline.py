@@ -13,24 +13,20 @@ class TimelineTest(LedgerCase):
         tl = report.timeline(self.con, family="compaction")
         self.assertEqual(len(tl["events"]), 2)
         by_id = {e["native_id"]: e for e in tl["events"]}
-        ev = by_id["window-mini-01"]
-        detail = ev["detail"]
-        self.assertEqual(detail["window_number"], 1)
-        self.assertEqual(detail["compaction_response_id"], "resp-mini-002")
+        self.assertIn("window-mini-01", by_id)
         # The compacted latest usage is overlap, not additional tokens.
         row = self.query(
             "SELECT response_id FROM responses "
             "WHERE response_id='codex:resp-mini-002'")
         self.assertEqual(len(row), 1)
-        self.assertEqual(detail["latest_usage_response_id"], "resp-mini-002")
-        self.assertTrue(detail["latest_usage_resolves"])
         self.assertEqual(report.scope_totals(self.con)["responses"], 3)
-        # Sparse native compaction markers import as boundaries with
-        # unknown detail, never quarantined as malformed.
+        # Sparse native compaction markers import as boundaries with no
+        # free-text detail, never quarantined as malformed.
         markers = [e for e in tl["events"]
                    if e["native_id"] == "ctx-mini-001"]
         self.assertEqual(len(markers), 1)
-        self.assertIn("unknown", markers[0]["detail"]["native"])
+        for event in tl["events"]:
+            self.assertIsNone(event["detail"])
 
     def test_tool_call_result_join_only_on_equal_call_id(self):
         tl = report.timeline(self.con)
@@ -65,10 +61,8 @@ class TimelineTest(LedgerCase):
     def test_file_change_keeps_paths_without_contents(self):
         tl = report.timeline(self.con, family="file_change")
         self.assertEqual(len(tl["events"]), 1)
-        paths = tl["events"][0]["detail"]["paths"]
-        self.assertEqual(list(paths),
+        self.assertEqual(tl["events"][0]["detail"]["paths"],
                          ["/redacted/workspace/notes.md"])
-        self.assertEqual(paths["/redacted/workspace/notes.md"]["type"], "edit")
         self.assertNotIn("redacted body",
                          tl["events"][0]["detail"].__repr__())
 
