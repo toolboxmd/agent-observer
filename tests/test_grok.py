@@ -235,13 +235,16 @@ class GrokAdapterTest(LedgerCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["total_tokens"], 1200)
         conflicts = self.query(
-            "SELECT * FROM import_errors WHERE error LIKE 'conflicting usage%'")
+            "SELECT * FROM import_errors WHERE error='conflicting_usage'")
         self.assertEqual(len(conflicts), 1)
-        # Strengthened: safe shape only, no raw usage values, bounded.
+        # Fixed category only, safe shape only, no record values, bounded.
         err = conflicts[0]
+        self.assertEqual(err["error"], "conflicting_usage")
         self.assertLessEqual(len(err["line_excerpt"] or ""), 200)
         self.assertNotIn("1201", err["line_excerpt"] or "")
         self.assertNotIn("1201", err["error"] or "")
+        self.assertNotIn("p-aaa", err["error"] or "")
+        self.assertNotIn("p-aaa", err["line_excerpt"] or "")
         self.assertIn("method=", err["line_excerpt"] or "")
         self.assertIn("update=", err["line_excerpt"] or "")
         self.assertIn("keys=", err["line_excerpt"] or "")
@@ -469,7 +472,7 @@ class GrokAdapterTest(LedgerCase):
             (f"{S1}:p-ddd",)).fetchone()["n"]
         self.assertEqual(n, 1)
         conflicts = list(con.execute(
-            "SELECT * FROM import_errors WHERE error LIKE 'conflicting usage%'"))
+            "SELECT * FROM import_errors WHERE error='conflicting_usage'"))
         self.assertEqual(len(conflicts), 0)
         con.close()
 
@@ -517,10 +520,21 @@ class GrokAdapterTest(LedgerCase):
             self.assertNotIn("sk-fake-secret-999", row["line_excerpt"] or "")
             self.assertNotIn("should never persist", row["line_excerpt"] or "")
             self.assertNotIn("sk-fake-secret-999", row["error"] or "")
-        # At least one safe shape mentions the unsupported method.
-        self.assertTrue(any("session/unknown" in (r["error"] or "") or
-                            "method=" in (r["line_excerpt"] or "")
+            self.assertNotIn("session/unknown", row["error"] or "")
+            self.assertNotIn("session/unknown", row["line_excerpt"] or "")
+        # Unknown method value never appears anywhere; error is fixed only.
+        for table, col, val in self._all_text_values(con):
+            self.assertNotIn("session/unknown", val,
+                             f"{table}.{col} leaks unknown method value")
+        self.assertTrue(any((r["error"] or "") == "unknown_method"
                             for r in errors))
+        # Fixed categories only, never exception text or record values.
+        allowed = {"malformed_json", "schema_error", "unknown_method",
+                   "unknown_update", "missing_prompt_index",
+                   "missing_prompt_id", "conflicting_prompt",
+                   "conflicting_usage", "unknown_event"}
+        for row in errors:
+            self.assertIn(row["error"], allowed)
         con.close()
 
     def _copy_session_without_chat(self, dest_root, sid):
@@ -597,4 +611,179 @@ class GrokAdapterTest(LedgerCase):
         self.assertEqual(after[f"{S1}:prompt:1"]["kind"], "genuine")
         self.assertIn("Now the second prompt",
                       after[f"{S1}:prompt:1"]["text_excerpt"])
+        con.close()
+
+    def test_unterminated_blocks_of_each_kind_leak_nothing(self):
+        tmp = os.path.join(self.tmp.name, "unterm")
+        shutil.copytree(ROOT, tmp)
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        sdir = os.path.join(tmp, "%2Fredacted%2Frepo", sid)
+        cases = [
+            (20, "p-unterm-dir",
+             "Human prefix DIR-HUMAN\n"
+             "<<<AGENTSMD_PROJECT_DIRECTION_V1>>>\n"
+             "UNTERM-DIRECTION-SENTINEL-aaa {\"status\":\"ready\"} trailing",
+             "DIR-HUMAN", "UNTERM-DIRECTION-SENTINEL-aaa"),
+            (21, "p-unterm-rule",
+             "Human prefix RULE-HUMAN\n"
+             "<user_rule>UNTERM-USERRULE-SENTINEL-bbb secret tail",
+             "RULE-HUMAN", "UNTERM-USERRULE-SENTINEL-bbb"),
+            (22, "p-unterm-instr",
+             "Human prefix INSTR-HUMAN\n"
+             "<INSTRUCTIONS>\nUNTERM-INSTRUCTIONS-SENTINEL-ccc secret tail",
+             "INSTR-HUMAN", "UNTERM-INSTRUCTIONS-SENTINEL-ccc"),
+            (23, "p-unterm-gen",
+             "Human prefix GEN-HUMAN\n"
+             "<<<UNTERM-GENERIC-SENTINEL-ddd injected tail",
+             "GEN-HUMAN", "UNTERM-GENERIC-SENTINEL-ddd"),
+        ]
+        with open(os.path.join(sdir, "updates.jsonl"), "a") as fh:
+            for idx, pid, text, _human, _sent in cases:
+                fh.write(json.dumps({
+                    "timestamp": 1788800200 + idx,
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": sid,
+                        "update": {
+                            "sessionUpdate": "user_message_chunk",
+                            "content": {"type": "text", "text": text},
+                            "_meta": {"modelId": "grok-4.6",
+                                      "promptIndex": idx},
+                        },
+                        "_meta": {"eventId": f"unterm-{idx}",
+                                  "promptId": pid},
+                    },
+                }) + "\n")
+                fh.write(json.dumps({
+                    "timestamp": 1788800210 + idx,
+                    "method": "_x.ai/session/update",
+                    "params": {
+                        "sessionId": sid,
+                        "update": {"sessionUpdate": "turn_completed",
+                                   "prompt_id": pid,
+                                   "stop_reason": "end_turn",
+                                   "usage": {"inputTokens": 10,
+                                             "outputTokens": 1,
+                                             "totalTokens": 11}},
+                        "_meta": {"eventId": f"unterm-c-{idx}"},
+                    },
+                }) + "\n")
+        with open(os.path.join(sdir, "chat_history.jsonl"), "a") as fh:
+            for idx, _pid, text, _human, _sent in cases:
+                fh.write(json.dumps({
+                    "type": "user",
+                    "content": [{"type": "text", "text": text}],
+                    "prompt_index": idx,
+                }) + "\n")
+        con = self._isolated_con("unterm")
+        grok.sync(con, root=tmp)
+        texts = self._all_text_values(con)
+        self.assertTrue(texts)
+        for _idx, _pid, _text, human, sentinel in cases:
+            for table, col, val in texts:
+                self.assertNotIn(sentinel, val,
+                                 f"{table}.{col} leaks unterminated block")
+            row = con.execute(
+                "SELECT kind, is_genuine, text_excerpt FROM submissions"
+                " WHERE native_id=?", (f"{S1}:prompt:{_idx}",)).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["kind"], "genuine")
+            self.assertEqual(row["is_genuine"], 1)
+            self.assertIn(human, row["text_excerpt"] or "")
+            self.assertNotIn(sentinel, row["text_excerpt"] or "")
+            self.assertNotIn("<user_rule>", row["text_excerpt"] or "")
+            self.assertNotIn("<INSTRUCTIONS>", row["text_excerpt"] or "")
+            self.assertNotIn("<<<", row["text_excerpt"] or "")
+        con.close()
+
+    def test_secret_output_in_event_never_persists(self):
+        tmp = os.path.join(self.tmp.name, "secrevent")
+        shutil.copytree(ROOT, tmp)
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        sdir = os.path.join(tmp, "%2Fredacted%2Frepo", sid)
+        secret = "SECRET-EVENT-SENTINEL-xyz sk-fake-secret-event-777"
+        known_extra = {
+            "ts": "2026-09-01T10:00:09Z",
+            "type": "tool_completed",
+            "tool_name": "read_file",
+            "tool_call_id": "call-read-1",
+            "duration_ms": 5,
+            "outcome": "success",
+            "output": secret,
+            "content": secret,
+            "message": secret,
+        }
+        unknown_evt = {
+            "ts": "2026-09-01T10:00:10Z",
+            "type": "mystery_harness_event",
+            "output": secret,
+            "detail": secret,
+        }
+        with open(os.path.join(sdir, "events.jsonl"), "a") as fh:
+            fh.write(json.dumps(known_extra) + "\n")
+            fh.write(json.dumps(unknown_evt) + "\n")
+        con = self._isolated_con("secrevent")
+        grok.sync(con, root=tmp)
+        for table, col, val in self._all_text_values(con):
+            self.assertNotIn(secret, val,
+                             f"{table}.{col} leaks event free text")
+            self.assertNotIn("sk-fake-secret-event-777", val,
+                             f"{table}.{col} leaks event secret")
+            self.assertNotIn("mystery_harness_event", val,
+                             f"{table}.{col} leaks unknown event value")
+        unknowns = list(con.execute(
+            "SELECT error, line_excerpt FROM import_errors"
+            " WHERE error='unknown_event'"))
+        self.assertTrue(unknowns)
+        for row in unknowns:
+            self.assertNotIn(secret, row["line_excerpt"] or "")
+            self.assertNotIn("mystery_harness_event",
+                             row["line_excerpt"] or "")
+            self.assertNotIn(secret, row["error"] or "")
+        con.close()
+
+    def test_late_chat_with_growing_events_reclassifies(self):
+        tmp = os.path.join(self.tmp.name, "latechatgrow")
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        self._copy_session_without_chat(tmp, sid)
+        con = self._isolated_con("latechatgrow")
+        grok.sync(con, root=tmp)
+        before = {r["native_id"]: r for r in con.execute(
+            "SELECT native_id, kind, is_genuine, text_excerpt, turn_id"
+            " FROM submissions")}
+        self.assertTrue(before)
+        for row in before.values():
+            self.assertEqual(row["is_genuine"], 0)
+            self.assertEqual(row["text_excerpt"], "")
+        n_before = len(before)
+        # Events grow while chat metadata arrives late.
+        with open(os.path.join(
+                tmp, "%2Fredacted%2Frepo", sid, "events.jsonl"), "a") as fh:
+            fh.write(json.dumps({
+                "ts": "2026-09-01T10:00:09Z",
+                "type": "turn_ended",
+                "outcome": "completed",
+            }) + "\n")
+        shutil.copy(
+            os.path.join(ROOT, "%2Fredacted%2Frepo", sid, "chat_history.jsonl"),
+            os.path.join(tmp, "%2Fredacted%2Frepo", sid, "chat_history.jsonl"))
+        grok.sync(con, root=tmp)
+        after = {r["native_id"]: r for r in con.execute(
+            "SELECT native_id, kind, is_genuine, text_excerpt, turn_id"
+            " FROM submissions")}
+        self.assertEqual(len(after), n_before)
+        self.assertEqual(after[f"{S1}:prompt:0"]["kind"], "genuine")
+        self.assertEqual(after[f"{S1}:prompt:0"]["is_genuine"], 1)
+        self.assertIn("Implement the widget",
+                      after[f"{S1}:prompt:0"]["text_excerpt"])
+        self.assertEqual(after[f"{S1}:prompt:0"]["turn_id"], f"{S1}:p-aaa")
+        sess = con.execute(
+            "SELECT instructions_sha256, preferences_sha256,"
+            " direction_status FROM sessions WHERE session_key=?",
+            (S1,)).fetchone()
+        self.assertEqual(sess["instructions_sha256"],
+                         "fixture-grok-instructions")
+        self.assertEqual(sess["preferences_sha256"],
+                         "fixture-grok-preferences")
+        self.assertEqual(sess["direction_status"], "ready")
         con.close()

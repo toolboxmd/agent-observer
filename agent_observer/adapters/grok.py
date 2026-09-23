@@ -64,6 +64,12 @@ DIRECTION_BLOCK_RE = re.compile(
     re.S)
 USER_QUERY_TAG_RE = re.compile(r"</?user_query\s*>", re.I)
 GENERIC_BLOCK_RE = re.compile(r"<<<.*?>>>", re.S)
+DIRECTION_OPEN = "<<<AGENTSMD_PROJECT_DIRECTION_V1>>>"
+DIRECTION_CLOSE = "<<<END_AGENTSMD_PROJECT_DIRECTION_V1>>>"
+_USER_RULE_OPEN_RE = re.compile(r"<user_rule\b[^>]*>", re.I)
+_USER_RULE_CLOSE_RE = re.compile(r"</user_rule\s*>", re.I)
+_INSTRUCTIONS_OPEN_RE = re.compile(r"<instructions\b[^>]*>", re.I)
+_INSTRUCTIONS_CLOSE_RE = re.compile(r"</instructions\s*>", re.I)
 SECRET_SK_RE = re.compile(r"sk-[A-Za-z0-9\-_]{8,}")
 SECRET_TOKEN_RE = re.compile(r"SECRET[A-Za-z0-9\-_]*")
 TARGET_KEYS = ("target_file", "path", "file_path", "file", "command",
@@ -72,21 +78,62 @@ EXCERPT_LEN = 300
 ERROR_EXCERPT_LEN = 200
 
 
+def _remove_direction_block(text: str) -> str:
+    """Direction block through its close, or through end when unterminated."""
+    while True:
+        start = text.find(DIRECTION_OPEN)
+        if start == -1:
+            return text
+        end = text.find(DIRECTION_CLOSE, start + len(DIRECTION_OPEN))
+        if end == -1:
+            return text[:start]
+        text = text[:start] + text[end + len(DIRECTION_CLOSE):]
+
+
+def _remove_tag_block(text: str, open_re, close_re) -> str:
+    """Matched tag pair through its close, or through end when unterminated."""
+    while True:
+        m = open_re.search(text)
+        if m is None:
+            return text
+        c = close_re.search(text, m.end())
+        if c is None:
+            return text[:m.start()]
+        text = text[:m.start()] + text[c.end():]
+
+
+def _remove_generic_blocks(text: str) -> str:
+    """Any <<<...>>> through its close, or through end when unterminated."""
+    while True:
+        start = text.find("<<<")
+        if start == -1:
+            return text
+        end = text.find(">>>", start + 3)
+        if end == -1:
+            return text[:start]
+        text = text[:start] + text[end + 3:]
+
+
 def _sanitize_human_text(text: str) -> str:
     """Human's own text without injected instruction or preference content.
 
-    Removes the full AgentsMD direction block, <user_rule> bodies, the
-    <user_query> wrapper tags (keeping the inner human text) and any other
-    <<<...>>> injected block, then redacts secret-looking tokens. Full native
-    text still feeds SessionIdentity; only this sanitized form reaches the
-    ledger excerpt.
+    Fail-closed: every recognized injected or system block is removed from
+    its opening marker through its closing marker, or through the end of the
+    record when the closing marker is missing. Covers the AgentsMD direction
+    block, <user_rule> bodies, <INSTRUCTIONS> bodies and any other <<<...>>>
+    block. The <user_query> wrapper tags are removed but the inner human text
+    is kept, then secret-looking tokens are redacted. Full native text still
+    feeds SessionIdentity; only this sanitized form reaches the ledger.
     """
     if not text:
         return ""
-    cleaned = DIRECTION_BLOCK_RE.sub("", text)
-    cleaned = USER_RULE_RE.sub("", cleaned)
+    cleaned = _remove_direction_block(text)
+    cleaned = _remove_tag_block(cleaned, _USER_RULE_OPEN_RE,
+                                _USER_RULE_CLOSE_RE)
+    cleaned = _remove_tag_block(cleaned, _INSTRUCTIONS_OPEN_RE,
+                                _INSTRUCTIONS_CLOSE_RE)
     cleaned = USER_QUERY_TAG_RE.sub("", cleaned)
-    cleaned = GENERIC_BLOCK_RE.sub("", cleaned)
+    cleaned = _remove_generic_blocks(cleaned)
     cleaned = SECRET_SK_RE.sub("[redacted]", cleaned)
     cleaned = SECRET_TOKEN_RE.sub("[redacted]", cleaned)
     return cleaned.strip()
@@ -99,31 +146,58 @@ def _build_excerpt(full_text: str, is_genuine: bool) -> str:
     return _sanitize_human_text(full_text)[:EXCERPT_LEN]
 
 
+def _type_name(value) -> str:
+    if isinstance(value, dict):
+        return "dict"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, str):
+        return "str"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if value is None:
+        return "none"
+    return "other"
+
+
+class _AdapterError(ValueError):
+    """Fixed-category adapter failure; never carries record values."""
+
+    def __init__(self, category: str):
+        super().__init__(category)
+        self.category = category
+
+
 def _shape_parts(obj) -> tuple[str, str, str]:
-    """Sorted top-level keys, method and update type without any values."""
+    """Sorted top-level field names plus value types, never values."""
     if not isinstance(obj, dict):
         return "", "?", "?"
     try:
-        keys = sorted(str(k) for k in obj.keys())
+        keys = sorted(str(k)[:64] for k in obj.keys())
     except Exception:
         keys = []
-    method = obj.get("method")
-    method_s = method if isinstance(method, str) else "?"
-    update_s = "?"
+    method_t = _type_name(obj.get("method"))
+    update_t = "?"
     params = obj.get("params")
     if isinstance(params, dict):
         upd = params.get("update")
         if isinstance(upd, dict):
-            su = upd.get("sessionUpdate")
-            if isinstance(su, str):
-                update_s = su
-    return ",".join(keys), method_s, update_s
+            update_t = _type_name(upd.get("sessionUpdate"))
+        else:
+            update_t = _type_name(upd)
+    else:
+        update_t = _type_name(params)
+    return ",".join(keys)[:160], method_t, update_t
 
 
 def _safe_error_excerpt(category: str, obj) -> str:
-    """Error category plus bounded record shape, never raw text."""
-    keys_s, method_s, update_s = _shape_parts(obj)
-    base = f"{category} keys=[{keys_s}] method={method_s} update={update_s}"
+    """Fixed category plus bounded shape metadata, never record values."""
+    keys_s, method_t, update_t = _shape_parts(obj)
+    base = f"{category} keys=[{keys_s}] method={method_t} update={update_t}"
     return base[:ERROR_EXCERPT_LEN]
 
 
@@ -131,11 +205,9 @@ def _safe_unparsable(category: str) -> str:
     return f"{category} unparsable method=? update=?"[:ERROR_EXCERPT_LEN]
 
 
-def _safe_conflict_excerpt(category: str, method: str, update: str,
-                            extra: str = "") -> str:
-    base = f"{category} method={method} update={update}"
-    if extra:
-        base += f" {extra}"
+def _safe_conflict_excerpt(category: str, *args, **kwargs) -> str:
+    """Fixed category plus generic shape; ignores any record-derived args."""
+    base = f"{category} keys=[method,params] method=str update=str"
     return base[:ERROR_EXCERPT_LEN]
 
 
@@ -274,22 +346,52 @@ def _safe_target(raw) -> str | None:
     for key in TARGET_KEYS:
         value = raw.get(key)
         if value:
-            return str(value)[:500]
+            text = str(value)
+            text = SECRET_SK_RE.sub("[redacted]", text)
+            text = SECRET_TOKEN_RE.sub("[redacted]", text)
+            return text[:500]
     return None
 
 
-def _scalars(obj: dict) -> dict:
-    """Top-level scalar fields only; nested tool output never survives.
+# Whitelisted lifecycle metadata for event detail_json. Only identifiers,
+# types, statuses, counts, durations, timestamps and model names survive;
+# free-text fields (output, content, message, text, arguments, error bodies,
+# tool result contents) are never persisted.
+_UPDATE_DETAIL_ALLOW = {
+    "auto_compact_started": frozenset(
+        {"tokens_used", "context_window", "percentage"}),
+    "auto_compact_completed": frozenset(
+        {"tokens_used", "context_window", "percentage"}),
+    "retry_state": frozenset({"type", "error_type"}),
+    "subagent_spawned": frozenset(
+        {"subagent_id", "parent_session_id", "parent_prompt_id",
+         "child_session_id", "subagent_type"}),
+    "subagent_finished": frozenset(
+        {"subagent_id", "parent_session_id", "child_session_id",
+         "status", "subagent_type"}),
+}
+_GENERIC_SAFE_UPDATE_KEYS = frozenset({
+    "type", "status", "error_type", "kind", "subagent_type", "subagent_id",
+    "parent_session_id", "child_session_id", "parent_prompt_id",
+    "tokens_used", "context_window", "percentage", "count", "duration_ms",
+    "model_id",
+})
 
-    Free text is bounded: lifecycle detail keeps evidence, never contents.
-    """
-    out = {}
-    for key, value in obj.items():
+
+def _whitelisted_update_detail(kind: str, update: dict) -> dict | None:
+    """Only allowlisted lifecycle scalars for one update kind."""
+    allow = _UPDATE_DETAIL_ALLOW.get(kind, _GENERIC_SAFE_UPDATE_KEYS)
+    out: dict = {}
+    for key in allow:
+        if key not in update:
+            continue
+        value = update[key]
         if isinstance(value, str):
-            out[key] = value[:300]
+            if value:
+                out[key] = value[:200]
         elif isinstance(value, (int, float, bool)) or value is None:
             out[key] = value
-    return out
+    return out or None
 
 
 class _Reader:
@@ -366,8 +468,17 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     chat = _read_chat(session_dir, r)
     if known and not updates_new and not events_new:
         reclassified = _reclassify_existing(con, r, session_dir, chat)
-        if reclassified:
-            con.commit()
+        # Persist late identity even when no JSONL bytes changed.
+        late_fields = {"started_at": r.first_ts, "ended_at": r.last_ts,
+                       **r.meta, **r.identity.fields(con)}
+        if r.parent_key:
+            late_fields["parent_session_key"] = r.parent_key
+        db.upsert_session(
+            con, r.session_key, HARNESS, r.native_sid,
+            updates_src.source_id if updates_src is not None
+            else (events_src.source_id if events_src is not None else None),
+            **late_fields)
+        con.commit()
         stats["unchanged"] = not bool(reclassified)
         stats["session_key"] = r.session_key
         return stats
@@ -379,15 +490,20 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             if obj is None or not isinstance(obj, dict):
                 stats["malformed"] += 1
                 updates_src.error(
-                    ordinal, "json_error",
-                    _safe_unparsable("json_error"))
+                    ordinal, "malformed_json",
+                    _safe_unparsable("malformed_json"))
                 continue
             try:
                 _ingest_update(r, updates_src, obj, ordinal)
-            except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            except _AdapterError as exc:
                 stats["malformed"] += 1
                 updates_src.error(
-                    ordinal, f"schema_error: {exc}",
+                    ordinal, exc.category,
+                    _safe_error_excerpt(exc.category, obj))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                stats["malformed"] += 1
+                updates_src.error(
+                    ordinal, "schema_error",
                     _safe_error_excerpt("schema_error", obj))
     if events_src is not None and (events_new or not known):
         for ordinal, obj, line in events_src.records():
@@ -395,16 +511,26 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             if obj is None or not isinstance(obj, dict):
                 stats["malformed"] += 1
                 events_src.error(
-                    ordinal, "json_error",
-                    _safe_unparsable("json_error"))
+                    ordinal, "malformed_json",
+                    _safe_unparsable("malformed_json"))
                 continue
             try:
                 _ingest_event(r, events_src, obj, ordinal)
-            except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            except _AdapterError as exc:
                 stats["malformed"] += 1
                 events_src.error(
-                    ordinal, f"schema_error: {exc}",
+                    ordinal, exc.category,
+                    _safe_error_excerpt(exc.category, obj))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                stats["malformed"] += 1
+                events_src.error(
+                    ordinal, "schema_error",
                     _safe_error_excerpt("schema_error", obj))
+    # Late chat metadata reclassifies provisional submissions even when only
+    # events.jsonl grew and updates.jsonl did not. Runs silently (no duplicate
+    # import_errors) and never duplicates rows.
+    if known:
+        _reclassify_existing(con, r, session_dir, chat)
 
     fields = {"started_at": r.first_ts, "ended_at": r.last_ts, **r.meta,
               **r.identity.fields(con)}
@@ -728,21 +854,19 @@ def _replay_updates(con, r: _Reader, src: JsonlSource, chat: dict,
     def record_error(ordinal: int, category: str, obj) -> None:
         r.stats["malformed"] += 1
         if category == "user chunk without promptIndex":
-            src.error(ordinal, category,
+            src.error(ordinal, "missing_prompt_index",
                       _safe_error_excerpt("missing_prompt_index", obj))
         elif category == "turn_completed without prompt_id":
-            src.error(ordinal, category,
+            src.error(ordinal, "missing_prompt_id",
                       _safe_error_excerpt("missing_prompt_id", obj))
         elif category == "conflicting prompt id":
-            src.error(ordinal, "conflicting prompt id",
+            src.error(ordinal, "conflicting_prompt",
                       _safe_error_excerpt("conflicting_prompt", obj))
         elif category == "conflicting prompt":
-            src.error(ordinal, category,
-                      _safe_conflict_excerpt(
-                          "conflicting_prompt", "session/update",
-                          "user_message_chunk"))
+            src.error(ordinal, "conflicting_prompt",
+                      _safe_conflict_excerpt("conflicting_prompt"))
         else:
-            src.error(ordinal, category,
+            src.error(ordinal, "schema_error",
                       _safe_error_excerpt("schema_error", obj))
 
     prompts, order, completions_ordered = _collect_prompts(
@@ -842,14 +966,11 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
         old, new = existing[key], counters[key]
         if old is not None and new is not None and old != new:
             r.stats["malformed"] += 1
-            shape = _safe_error_excerpt("conflicting_usage", outer_obj) \
-                if isinstance(outer_obj, dict) else _safe_conflict_excerpt(
-                    "conflicting_usage", "session/update", "turn_completed",
-                    f"prompt_id={prompt_id}")
-            # Ensure prompt_id travels without any counter values.
-            if "prompt_id=" not in shape:
-                shape = (shape + f" prompt_id={prompt_id}")[:ERROR_EXCERPT_LEN]
-            src.error(ordinal, f"conflicting usage for {prompt_id}", shape)
+            if isinstance(outer_obj, dict):
+                shape = _safe_error_excerpt("conflicting_usage", outer_obj)
+            else:
+                shape = _safe_conflict_excerpt("conflicting_usage")
+            src.error(ordinal, "conflicting_usage", shape)
             return
     fill = {key: counters[key] for key in counters
             if existing[key] is None and counters[key] is not None}
@@ -871,12 +992,12 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
 def _ingest_update(r: _Reader, src: JsonlSource, obj: dict,
                    ordinal: int) -> None:
     if obj.get("method") not in METHODS:
-        raise ValueError(f"unsupported method: {obj.get('method')!r}")
+        raise _AdapterError("unknown_method")
     params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
     update = params.get("update") if isinstance(params, dict) else {}
     if not isinstance(update, dict) or \
             not isinstance(update.get("sessionUpdate"), str):
-        raise ValueError("record without sessionUpdate")
+        raise _AdapterError("unknown_update")
     ts = iso_ts(obj.get("timestamp"))
     r.note_ts(ts)
     kind = update["sessionUpdate"]
@@ -902,8 +1023,7 @@ def _ingest_update(r: _Reader, src: JsonlSource, obj: dict,
             if isinstance(params.get("_meta"), dict) else None
         r.event(src, "compaction", event_id or f"{kind}:{ordinal}", ordinal,
                 ts, name=kind,
-                detail=_scalars({k: v for k, v in update.items()
-                                 if k != "sessionUpdate"}))
+                detail=_whitelisted_update_detail(kind, update))
     elif kind in EXTENSION_KINDS:
         if kind == "subagent_spawned":
             _subagent_link(r, update)
@@ -911,10 +1031,9 @@ def _ingest_update(r: _Reader, src: JsonlSource, obj: dict,
             if isinstance(params.get("_meta"), dict) else None
         r.event(src, "lifecycle", event_id or f"{kind}:{ordinal}", ordinal,
                 ts, name=kind,
-                detail=_scalars({k: v for k, v in update.items()
-                                 if k != "sessionUpdate"}))
+                detail=_whitelisted_update_detail(kind, update))
     else:
-        raise ValueError(f"unsupported sessionUpdate: {kind!r}")
+        raise _AdapterError("unknown_update")
 
 
 def _turn_id(r: _Reader, params: dict):
@@ -928,39 +1047,48 @@ def _turn_id(r: _Reader, params: dict):
 def _tool_name(update: dict):
     title = update.get("title")
     if title:
-        return str(title)
+        return str(title)[:200]
     meta = update.get("_meta") if isinstance(update.get("_meta"), dict) \
         else {}
     tool = meta.get("x.ai/tool") if isinstance(meta, dict) else None
     name = tool.get("name") if isinstance(tool, dict) else None
-    return str(name) if name else "unknown"
+    return str(name)[:200] if name else "unknown"
 
 
 def _tool_call(r: _Reader, src: JsonlSource, update: dict, params: dict,
                ordinal: int, ts) -> None:
     call_id = update.get("toolCallId")
     if not call_id:
-        raise ValueError("tool_call without toolCallId")
+        raise _AdapterError("schema_error")
     raw = update.get("rawInput")
     name = _tool_name(update)
     meta = update.get("_meta") if isinstance(update.get("_meta"), dict) \
         else {}
     tool = meta.get("x.ai/tool") if isinstance(meta, dict) else {}
-    detail = {"tool": tool.get("name") if isinstance(tool, dict) else None,
-              "kind": tool.get("kind") if isinstance(tool, dict) else None}
+    raw_tool = tool.get("name") if isinstance(tool, dict) else None
+    raw_kind = tool.get("kind") if isinstance(tool, dict) else None
+    detail = {}
+    if isinstance(raw_tool, str) and raw_tool:
+        detail["tool"] = raw_tool[:200]
+    elif raw_tool is not None and not isinstance(raw_tool, str):
+        detail["tool"] = str(raw_tool)[:200]
+    if isinstance(raw_kind, str) and raw_kind:
+        detail["kind"] = raw_kind[:200]
+    elif raw_kind is not None and not isinstance(raw_kind, str):
+        detail["kind"] = str(raw_kind)[:200]
     r.event(src, "tool_call", call_id, ordinal, ts,
-            turn_id=_turn_id(r, params), name=name,
+            turn_id=_turn_id(r, params), name=name[:200],
             target=_safe_target(raw),
             fingerprint=fingerprint(
                 name, json.dumps(raw, sort_keys=True, default=str)[:4000]),
-            detail={k: v for k, v in detail.items() if v is not None})
+            detail=detail or None)
 
 
 def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
                       params: dict, ordinal: int, ts) -> None:
     call_id = update.get("toolCallId")
     if not call_id:
-        raise ValueError("tool_call_update without toolCallId")
+        raise _AdapterError("schema_error")
     turn_id = _turn_id(r, params)
     locations = update.get("locations")
     if update.get("kind") == "read" and isinstance(locations, list) \
@@ -1019,54 +1147,76 @@ def _subagent_link(r: _Reader, update: dict) -> None:
 def _ingest_event(r: _Reader, src: JsonlSource, obj: dict,
                   ordinal: int) -> None:
     if not isinstance(obj.get("type"), str):
-        raise ValueError("event without type")
+        raise _AdapterError("schema_error")
     kind = obj["type"]
     if kind in SKIP_EVENT_TYPES:
         return
     ts = iso_ts(obj.get("ts"))
     r.note_ts(ts)
     if kind == "turn_started":
+        detail = {}
+        if isinstance(obj.get("turn_number"), int):
+            detail["turn_number"] = obj.get("turn_number")
+        if isinstance(obj.get("model_id"), str) and obj.get("model_id"):
+            detail["model_id"] = obj.get("model_id")[:200]
+        if isinstance(obj.get("session_relationship"), str) \
+                and obj.get("session_relationship"):
+            detail["session_relationship"] = \
+                obj.get("session_relationship")[:200]
         r.event(src, "lifecycle", f"turn_started:{ordinal}", ordinal, ts,
-                name="turn_started",
-                detail={"turn_number": obj.get("turn_number"),
-                        "model_id": obj.get("model_id"),
-                        "session_relationship":
-                            obj.get("session_relationship")})
+                name="turn_started", detail=detail or None)
     elif kind == "turn_ended":
+        outcome = obj.get("outcome")
+        detail = {"outcome": outcome[:200]} \
+            if isinstance(outcome, str) and outcome else None
         r.event(src, "lifecycle", f"turn_ended:{ordinal}", ordinal, ts,
-                name="turn_ended", status=obj.get("outcome"),
-                detail={"outcome": obj.get("outcome")})
+                name="turn_ended",
+                status=outcome[:200] if isinstance(outcome, str) else None,
+                detail=detail)
     elif kind == "tool_started":
+        tool = obj.get("tool_name")
+        tool_s = tool[:200] if isinstance(tool, str) and tool else "unknown"
+        detail = {"tool": tool[:200]} \
+            if isinstance(tool, str) and tool else None
         r.event(src, "lifecycle", f"tool_started:{ordinal}", ordinal, ts,
-                name=str(obj.get("tool_name") or "unknown"),
-                detail={"tool": obj.get("tool_name")})
+                name=tool_s, detail=detail)
     elif kind == "tool_completed":
         _tool_completed(r, src, obj, ordinal, ts)
     elif kind == "permission_requested":
+        tool = obj.get("tool_name")
+        tool_s = tool[:200] if isinstance(tool, str) and tool else "unknown"
+        detail = {"phase": "requested"}
+        if isinstance(tool, str) and tool:
+            detail["tool"] = tool[:200]
         r.event(src, "permission", f"permission:{ordinal}", ordinal, ts,
-                name=str(obj.get("tool_name") or "unknown"),
-                detail={"tool": obj.get("tool_name"), "phase": "requested"})
+                name=tool_s, detail=detail)
     elif kind == "permission_resolved":
+        tool = obj.get("tool_name")
+        tool_s = tool[:200] if isinstance(tool, str) and tool else "unknown"
+        decision = obj.get("decision")
+        decision_s = decision[:200] \
+            if isinstance(decision, str) and decision else None
+        wait = obj.get("wait_ms") \
+            if isinstance(obj.get("wait_ms"), int) else None
+        detail = {}
+        if isinstance(tool, str) and tool:
+            detail["tool"] = tool[:200]
+        if decision_s is not None:
+            detail["decision"] = decision_s
+        if wait is not None:
+            detail["wait_ms"] = wait
         r.event(src, "permission", f"permission:{ordinal}", ordinal, ts,
-                name=str(obj.get("tool_name") or "unknown"),
-                status=obj.get("decision"),
-                duration_ms=obj.get("wait_ms")
-                if isinstance(obj.get("wait_ms"), int) else None,
-                detail={"tool": obj.get("tool_name"),
-                        "decision": obj.get("decision"),
-                        "wait_ms": obj.get("wait_ms")})
+                name=tool_s, status=decision_s, duration_ms=wait,
+                detail=detail or None)
     else:
-        r.event(src, "lifecycle", f"{kind}:{ordinal}", ordinal, ts,
-                name=kind, detail=_scalars(
-                    {k: v for k, v in obj.items() if k not in ("ts", "type")})
-                or None)
+        raise _AdapterError("unknown_event")
 
 
 def _tool_completed(r: _Reader, src: JsonlSource, obj: dict, ordinal: int,
                     ts) -> None:
     call_id = obj.get("tool_call_id")
     if not call_id:
-        raise ValueError("tool_completed without tool_call_id")
+        raise _AdapterError("schema_error")
     outcome = obj.get("outcome")
     status = "ok" if outcome in ("success", "completed") else "error"
     duration = obj.get("duration_ms") \
@@ -1076,10 +1226,17 @@ def _tool_completed(r: _Reader, src: JsonlSource, obj: dict, ordinal: int,
         " WHERE session_key=? AND family='tool_result' AND native_id=?",
         (r.session_key, str(call_id))).fetchone()
     if row is None:
+        tool = obj.get("tool_name")
+        tool_s = tool[:200] if isinstance(tool, str) and tool else "unknown"
+        detail = {}
+        if isinstance(tool, str) and tool:
+            detail["tool"] = tool[:200]
+        if isinstance(outcome, str) and outcome:
+            detail["outcome"] = outcome[:200]
         r.event(src, "tool_result", call_id, ordinal, ts,
-                name=str(obj.get("tool_name") or "unknown"), status=status,
+                name=tool_s, status=status,
                 duration_ms=duration,
-                detail={"tool": obj.get("tool_name"), "outcome": outcome})
+                detail=detail or None)
         return
     try:
         detail = json.loads(row["detail_json"]) if row["detail_json"] else {}
@@ -1090,7 +1247,11 @@ def _tool_completed(r: _Reader, src: JsonlSource, obj: dict, ordinal: int,
         changed = True
     if row["status"] is None and status:
         changed = True
-    for key, value in (("tool", obj.get("tool_name")), ("outcome", outcome)):
+    tool = obj.get("tool_name")
+    tool_s = tool[:200] if isinstance(tool, str) and tool else None
+    outcome_s = outcome[:200] \
+        if isinstance(outcome, str) and outcome else None
+    for key, value in (("tool", tool_s), ("outcome", outcome_s)):
         if value is not None and key not in detail:
             detail[key] = value
             changed = True
