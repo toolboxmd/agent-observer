@@ -390,6 +390,38 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         "events_duplicate": 0, "compactions": 0, "malformed": 0,
     }
     src = JsonlSource(con, HARNESS, path, full=full)
+    if src.unchanged:
+        # Unchanged fast path: same source bytes, same privacy version,
+        # not full, no new complete records. Skip every per-source SQL
+        # beyond JsonlSource's stat/tail check: no cumulative table, no
+        # reader, no prescan, no prior-event query, no JSON parsing, no
+        # token flush, no fallback reconciliation, no submission or
+        # session writes, and no finish() source bookkeeping. The stored
+        # fingerprint is the sha256 contract existing tests compare.
+        try:
+            stored_sha = src.row["sha256"]
+            stored_ordinal = src.row["ordinal_max"]
+            sess_id = src.row["session_id"]
+            thr_id = src.row["thread_id"]
+        except (KeyError, TypeError, IndexError):
+            stored_sha = ""
+            stored_ordinal = -1
+            sess_id = None
+            thr_id = None
+        native = thr_id or sess_id
+        if native:
+            session_key = f"{HARNESS}:{native}"
+        else:
+            session_key = f"{HARNESS}:file:{os.path.basename(path)}"
+        stats.update({
+            "source_id": src.source_id,
+            "sha256": stored_sha,
+            "ordinal_max": stored_ordinal,
+            "incremental": src.incremental,
+            "unchanged": True,
+            "session_key": session_key,
+        })
+        return stats
     reader = _Reader(con, src, stats)
     _ensure_cumulative_table(con)
     # Seed the rollout's own thread identity before any row is written, so
@@ -746,6 +778,31 @@ def _flush_token_counts(r: _Reader) -> None:
                 r.src.error(ordinal, "schema_error", _deferred_line(obj))
                 continue
         r.token_counts = []
+    # Cheap guards before the correlated reconciliation UPDATE: when the
+    # session holds no fallback checkpoints or no authoritative responses,
+    # the UPDATE could match nothing and its full scan is pure overhead.
+    # Both checks are indexed point lookups through idx_responses_reconcile.
+    # Changed/full imports that actually need reconciliation (both sides
+    # present) still run it; the unchanged fast path above never reaches
+    # here at all.
+    try:
+        has_fallback = r.con.execute(
+            "SELECT 1 FROM responses WHERE session_key=? AND semantics=?"
+            " LIMIT 1",
+            (r.session_key, TOKEN_COUNT_SEMANTICS)).fetchone() is not None
+    except sqlite3.DatabaseError:
+        has_fallback = True
+    if not has_fallback:
+        return
+    try:
+        has_auth = r.con.execute(
+            "SELECT 1 FROM responses WHERE session_key=? AND semantics=?"
+            " LIMIT 1",
+            (r.session_key, SEMANTICS)).fetchone() is not None
+    except sqlite3.DatabaseError:
+        has_auth = True
+    if not has_auth:
+        return
     _reconcile_fallback(r)
 
 

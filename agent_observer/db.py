@@ -302,6 +302,7 @@ CREATE TABLE IF NOT EXISTS import_errors (
   created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_responses_session ON responses(session_key);
+CREATE INDEX IF NOT EXISTS idx_responses_reconcile ON responses(session_key, semantics, is_overlap, thread_total_tokens, total_tokens);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_key, ts);
 CREATE INDEX IF NOT EXISTS idx_events_family ON events(family);
 CREATE INDEX IF NOT EXISTS idx_submissions_session ON submissions(session_key);

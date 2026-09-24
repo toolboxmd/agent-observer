@@ -59,6 +59,39 @@ TERMINAL_TOOL_STATUS = {"completed": "ok", "failed": "error", "success": "ok"}
 # High-volume run-loop noise with no task evidence; never stored.
 SKIP_EVENT_TYPES = frozenset({"phase_changed", "loop_started", "first_token"})
 
+# Benign MCP server lifecycle/config event shapes: recognized and ignored.
+# Storing nothing keeps server names, targets, transports, errors, tools
+# and other MCP values out of the ledger with no new privacy allowlist.
+# Exact top-level key sets only; a known MCP type with any other shape
+# stays unknown_record. Observed on this Mac across 1,127 events.jsonl
+# files (read-only aggregate of type values and sorted key names).
+_MCP_IGNORED_SHAPES: dict[str, set[frozenset]] = {
+    "mcp_server_starting": {
+        frozenset({"server_name", "target", "timeout_sec", "transport",
+                   "ts", "type"}),
+    },
+    "mcp_config_resolved": {
+        frozenset({"disabled", "servers", "ts", "type"}),
+    },
+    "mcp_server_connected": {
+        frozenset({"duration_ms", "server_name", "tool_count", "tools",
+                   "transport", "ts", "type"}),
+    },
+    "mcp_init_completed": {
+        frozenset({"auth_required", "duration_ms", "failed", "is_reinit",
+                   "succeeded", "total_servers", "total_tools", "ts",
+                   "type"}),
+        frozenset({"auth_required", "duration_ms", "failed", "failed_servers",
+                   "is_reinit", "succeeded", "total_servers", "total_tools",
+                   "ts", "type"}),
+    },
+    "mcp_server_failed": {
+        frozenset({"duration_ms", "error_message", "error_type",
+                   "server_name", "target", "timeout_sec", "transport",
+                   "ts", "type"}),
+    },
+}
+
 USER_RULE_RE = re.compile(r"<user_rule>(.*?)</user_rule>", re.S)
 SECRET_SK_RE = re.compile(r"sk-[A-Za-z0-9\-_]{8,}")
 SECRET_TOKEN_RE = re.compile(r"SECRET[A-Za-z0-9\-_]*")
@@ -1439,20 +1472,10 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             # Fully unchanged: no parse of updates/events and no JSON parse
             # of chat. Per-sync I/O is summary.json, one raw chat read for
             # the fingerprint, and stat/tail checks. Persisted links, roles
-            # and chat marks already cover classification.
-            chat = stored_marks
-            late_fields = {"started_at": r.first_ts, "ended_at": r.last_ts,
-                           **r.meta, **r.identity.fields(con)}
-            if r.parent_key:
-                late_fields["parent_session_key"] = r.parent_key
-            db.upsert_session(
-                con, r.session_key, HARNESS, r.native_sid,
-                updates_src.source_id if updates_src is not None
-                else (events_src.source_id if events_src is not None else None),
-                **late_fields)
-            _store_meta(con, r.session_key, summary_fp, chat_fp_current,
-                        chat)
-            con.commit()
+            # and chat marks already cover classification, and the stored
+            # session/meta rows already match, so no session, meta or
+            # source writes happen here. The late parent/role branch below
+            # keeps its convergence writes.
             stats["unchanged"] = True
             stats["session_key"] = r.session_key
             return stats
@@ -2568,6 +2591,19 @@ def _ingest_event(r: _Reader, src: JsonlSource, obj: dict,
             wait = None
         r.event(src, "permission", f"permission:{ordinal}", ordinal, ts,
                 name=tool_s, status=decision_s, duration_ms=wait)
+    elif kind in _MCP_IGNORED_SHAPES:
+        # Benign MCP lifecycle/config records: ignored entirely when the
+        # top-level key set matches exactly one known shape. No event, no
+        # error, and no MCP value (server names, targets, transports,
+        # errors, tools) reaches any ledger column. Any other shape,
+        # including an extra or missing key, stays unknown_record.
+        try:
+            shape = frozenset(obj.keys())
+        except AttributeError:
+            raise _AdapterError("unknown_record")
+        if shape not in _MCP_IGNORED_SHAPES[kind]:
+            raise _AdapterError("unknown_record")
+        return
     else:
         raise _AdapterError("unknown_record")
 
