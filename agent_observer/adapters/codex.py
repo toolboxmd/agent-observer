@@ -59,6 +59,90 @@ class _UnsupportedSchema(ValueError):
     """A record type the adapter does not support."""
 
 
+_CUMULATIVE_TABLE = "codex_fallback_cumulative"
+
+
+def _ensure_cumulative_table(con: sqlite3.Connection) -> None:
+    """Adapter-owned store of first-seen cumulative fallback signatures.
+
+    One row per session and cumulative total holds all six
+    _CODEX_BUCKET_KEYS from total_token_usage. It seeds the
+    post-compaction repeat comparison on later incremental imports whose
+    suffix begins with the repeat, so a split import is treated exactly
+    like a full one. Unknown prior signatures stay absent and fail
+    closed into usage_conflict.
+    """
+    con.execute(
+        f"CREATE TABLE IF NOT EXISTS {_CUMULATIVE_TABLE}"
+        "(session_key TEXT NOT NULL, thread_total INTEGER NOT NULL,"
+        " input_tokens INTEGER, cached_input_tokens INTEGER,"
+        " cache_write_input_tokens INTEGER, output_tokens INTEGER,"
+        " reasoning_output_tokens INTEGER, total_tokens INTEGER,"
+        " PRIMARY KEY(session_key, thread_total))")
+
+
+def _load_cumulative_sigs(con: sqlite3.Connection,
+                          session_key: str) -> dict:
+    """First-seen cumulative signatures persisted by earlier imports."""
+    sigs: dict = {}
+    try:
+        rows = con.execute(
+            f"SELECT input_tokens, cached_input_tokens,"
+            f" cache_write_input_tokens, output_tokens,"
+            f" reasoning_output_tokens, total_tokens, thread_total"
+            f" FROM {_CUMULATIVE_TABLE} WHERE session_key=?",
+            (session_key,))
+    except sqlite3.DatabaseError:
+        return sigs
+    for row in rows:
+        try:
+            total = row["thread_total"]
+            sigs[total] = tuple((k, row[k]) for k in _CODEX_BUCKET_KEYS)
+        except (KeyError, IndexError, TypeError):
+            continue
+    return sigs
+
+
+def _remember_cumulative_sig(r: _Reader, total: int, total_raw: dict) -> None:
+    """Persist the first-seen cumulative signature for one total.
+
+    First-seen only (INSERT OR IGNORE): a later observation never moves
+    the reference, so a changed cumulative bucket always conflicts
+    instead of becoming its own proof.
+    """
+    try:
+        r.con.execute(
+            f"INSERT OR IGNORE INTO {_CUMULATIVE_TABLE}"
+            "(session_key, thread_total, input_tokens,"
+            " cached_input_tokens, cache_write_input_tokens,"
+            " output_tokens, reasoning_output_tokens, total_tokens)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            (r.session_key, total,
+             total_raw.get("input_tokens"),
+             total_raw.get("cached_input_tokens"),
+             total_raw.get("cache_write_input_tokens"),
+             total_raw.get("output_tokens"),
+             total_raw.get("reasoning_output_tokens"),
+             total_raw.get("total_tokens")))
+    except sqlite3.DatabaseError:
+        pass
+
+
+def _deferred_line(obj) -> str:
+    """Key-only JSON form of a deferred record for the privacy helper.
+
+    The deferred token_count path carries the parsed record but no raw
+    line; the privacy line_excerpt keeps only sorted top-level key names
+    (never values), so a names-only object is sufficient and safest.
+    """
+    if isinstance(obj, dict):
+        try:
+            return json.dumps({k: None for k in obj})
+        except (TypeError, ValueError):
+            return ""
+    return ""
+
+
 _CODEX_BUCKET_KEYS = ("input_tokens", "cached_input_tokens",
                       "cache_write_input_tokens", "output_tokens",
                       "reasoning_output_tokens", "total_tokens")
@@ -307,6 +391,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
     }
     src = JsonlSource(con, HARNESS, path, full=full)
     reader = _Reader(con, src, stats)
+    _ensure_cumulative_table(con)
     # Seed the rollout's own thread identity before any row is written, so
     # a genuine user message keeps its excerpt only when the whole new
     # portion (plus persisted metadata) already proves a human main
@@ -521,11 +606,14 @@ def _flush_token_counts(r: _Reader) -> None:
             (r.session_key, TOKEN_COUNT_SEMANTICS)).fetchone()
         previous = row["t"] or 0
         # First cumulative bucket per total seen in this import, in file
-        # order. A repeat can only be compaction evidence when this import
-        # already saw the total's first checkpoint to compare against;
-        # a lone repeat of a row stored by an earlier import fails closed
-        # into the usage_conflict path below.
-        first_cumulative: dict = {}
+        # order. The map is seeded from the persisted first-seen
+        # signatures of earlier imports, so an incremental suffix that
+        # begins with a post-compaction repeat compares against the same
+        # reference as a full import. A repeat can only be compaction
+        # evidence when the total's first checkpoint is already known;
+        # a lone repeat with no prior signature fails closed into the
+        # usage_conflict path below.
+        first_cumulative: dict = _load_cumulative_sigs(r.con, r.session_key)
         prior_compaction = None
 
         def _post_compaction(captured: bool) -> bool:
@@ -581,6 +669,7 @@ def _flush_token_counts(r: _Reader) -> None:
                 first = first_cumulative.get(total)
                 if total not in first_cumulative:
                     first_cumulative[total] = sig
+                    _remember_cumulative_sig(r, total, total_raw)
                 existing = r.con.execute(
                     "SELECT input_tokens, cached_input_tokens,"
                     " cache_write_input_tokens, output_tokens,"
@@ -646,15 +735,15 @@ def _flush_token_counts(r: _Reader) -> None:
                     r.stats["responses_duplicate"] += 1
             except _UsageConflict:
                 r.stats["malformed"] += 1
-                r.src.error(ordinal, "usage_conflict", "")
+                r.src.error(ordinal, "usage_conflict", _deferred_line(obj))
                 continue
             except _MalformedUsage:
                 r.stats["malformed"] += 1
-                r.src.error(ordinal, "malformed_usage", "")
+                r.src.error(ordinal, "malformed_usage", _deferred_line(obj))
                 continue
             except (KeyError, TypeError, ValueError, AttributeError):
                 r.stats["malformed"] += 1
-                r.src.error(ordinal, "schema_error", "")
+                r.src.error(ordinal, "schema_error", _deferred_line(obj))
                 continue
         r.token_counts = []
     _reconcile_fallback(r)

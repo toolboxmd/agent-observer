@@ -5,7 +5,7 @@
 {"atis":{"synthetic":true},"sessionId":"sess-meta","type":"atis-latch"}
 {"attachment":{"synthetic":true,"type":"synthetic-probe"},"cwd":"/redacted/repo","entrypoint":"cli","gitBranch":"main","isSidechain":false,"parentUuid":"u-meta-1","rendered":false,"sessionId":"sess-meta","timestamp":"2026-09-14T10:00:03Z","type":"attachment","userType":"external","uuid":"at-meta-1","version":"2.1.280"}
 {"bridgeSessionId":"synthetic-bridge","lastSequenceNum":1,"ownerAccountUuid":"synthetic-owner","ownerOrganizationUuid":"synthetic-org","sessionId":"sess-meta","type":"bridge-session"}
-{"hasUnknownModelCost":false,"modelUsage":{},"sessionId":"sess-meta","startTime":"2026-09-14T10:00:00Z","totalAPIDuration":1,"totalAPIDurationWithoutRetries":1,"totalCostUSD":0,"totalDuration":1,"totalLinesAdded":0,"totalLinesRemoved":0,"totalToolDuration":0,"type":"cost-state"}
+{"hasUnknownModelCost":false,"modelUsage":{"claude-opus-5-5":{"cacheCreationInputTokens":46843,"cacheReadInputTokens":703577,"costUSD":1.0082185,"inputTokens":26343,"outputTokens":7496,"thinkingTokens":2671,"webSearchRequests":0}},"sessionId":"sess-meta","startTime":"2026-09-14T10:00:00Z","totalAPIDuration":1,"totalAPIDurationWithoutRetries":1,"totalCostUSD":0,"totalDuration":1,"totalLinesAdded":0,"totalLinesRemoved":0,"totalToolDuration":0,"type":"cost-state"}
 {"customTitle":"Synthetic custom title","sessionId":"sess-meta","type":"custom-title"}
 {"backup":false,"messageId":"synthetic-message","snapshotMessageId":"synthetic-snapshot","timestamp":"2026-09-14T10:00:04Z","trackingPath":"/redacted/file","type":"file-history-delta"}
 {"isSnapshotUpdate":false,"messageId":"synthetic-message","snapshot":{},"type":"file-history-snapshot"}

@@ -140,6 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     sw.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
     c = sub.add_parser("capture", help="record workload facts")
+    c.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     csub = c.add_subparsers(dest="op", required=True)
     t = csub.add_parser("create-task")
     t.add_argument("--task", required=True)
@@ -147,6 +148,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--family", default=None)
     t.add_argument("--title", default=None)
     t.add_argument("--issue", default=None)
+    t.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     a = csub.add_parser("assign")
     a.add_argument("--submission", required=True)
     a.add_argument("--task", required=True)
@@ -154,6 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--phase", default=None)
     a.add_argument("--evidence", default=None)
     a.add_argument("--shared", action="store_true")
+    a.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     d = csub.add_parser("dispatch")
     d.add_argument("--submission", required=True)
     d.add_argument("--worker", required=True)
@@ -164,6 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--policy", default=None)
     d.add_argument("--reason", default=None)
     d.add_argument("--task-name", default=None)
+    d.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     at = csub.add_parser("attempt")
     at.add_argument("--task", required=True)
     at.add_argument("--turn", required=True)
@@ -175,6 +179,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "quota_blocked", "crashed"])
     at.add_argument("--usable", action="store_true", default=None)
     at.add_argument("--not-usable", action="store_true")
+    at.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     o = csub.add_parser("outcome")
     o.add_argument("--task", required=True)
     o.add_argument("--state", required=True,
@@ -184,6 +189,7 @@ def build_parser() -> argparse.ArgumentParser:
     o.add_argument("--proof", default=None)
     o.add_argument("--repairs", default=None)
     o.add_argument("--corrections", default=None)
+    o.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
     k = sub.add_parser("task", help="inspect tasks and usage")
     ksub = k.add_subparsers(dest="op", required=True)

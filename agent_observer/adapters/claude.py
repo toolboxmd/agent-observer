@@ -54,11 +54,20 @@ CAPABILITIES = [
 # dispatch (identifiers, never free text) are kept. Anything not listed
 # here still raises _UnsupportedSchema, so arbitrary future record types
 # stay quarantined instead of being silently dropped.
+#
+# last-prompt stays here deliberately: it is known duplicate state that
+# repeats the latest human prompt already carried by user and
+# queue-operation records, which are the canonical prompt evidence. It
+# stores nothing.
+#
+# cost-state is NOT ignored: it carries per-model token counters whose
+# reconciliation with assistant usage is an open follow-up, so it stays
+# quarantined as unsupported_schema (nothing stored) instead of being
+# silently dropped.
 IGNORED_METADATA_TYPES = frozenset({
     "agent-name",
     "atis-latch",
     "bridge-session",
-    "cost-state",
     "custom-title",
     "file-history-delta",
     "file-history-snapshot",
@@ -66,7 +75,6 @@ IGNORED_METADATA_TYPES = frozenset({
     "mode",
     "permission-mode",
     "pr-link",
-    "queue-operation",
 })
 
 
@@ -315,6 +323,8 @@ def _ingest(r: _Reader, obj: dict, ordinal: int) -> None:
         _user(r, obj, ordinal, ts)
     elif kind == "attachment":
         _attachment(r, obj, ordinal, ts)
+    elif kind == "queue-operation":
+        _queue_operation(r, obj, ordinal, ts)
     elif kind == "system":
         _system(r, obj, ordinal, ts)
     elif kind == "ai-title":
@@ -522,6 +532,110 @@ def _submission(r: _Reader, native_id, ordinal, ts, kind: str, text: str) -> Non
             r.stats.get("submissions_updated", 0) + 1
 
 
+def _queue_native(r: _Reader, ordinal: int) -> str:
+    """Stable deterministic identity for one enqueue record.
+
+    queue-operation records carry no native uuid, so the identity is the
+    session plus the structural source ordinal: deterministic across full
+    and incremental reimports of the append-only file.
+    """
+    sess = r.native_session or f"file:{os.path.basename(r.src.path)}"
+    return f"queue:{sess}:{ordinal}"
+
+
+def _queue_operation(r: _Reader, obj: dict, ordinal: int, ts) -> None:
+    """One mid-turn typed prompt from a queue-operation record.
+
+    Only operation enqueue with a string prompt payload (the real native
+    shape is a plain `content` string) may create a submission. It is a
+    genuine human submission typed mid-turn in the main session: the text
+    is routed through privacy.submission_excerpt and only the safe
+    excerpt plus text_hash/kind/identifiers persist. dequeue, remove and
+    every other operation store nothing and create no import error, as
+    does an enqueue without prompt text (fail closed).
+    """
+    if obj.get("operation") != "enqueue":
+        return
+    content = obj.get("content")
+    if not isinstance(content, str) or not content:
+        return
+    native = _queue_native(r, ordinal)
+    full = f"{HARNESS}:{native}"
+    # Already merged into its user record (reimport): no-op.
+    if r.con.execute("SELECT 1 FROM submissions WHERE alias_id=?",
+                     (full,)).fetchone():
+        return
+    # Reverse ordering: the user record this prompt became already
+    # imported in this turn. Fold the queue identity into it instead of
+    # adding a second row. Only a never-merged user row qualifies, so a
+    # repeated identical prompt in a later turn keeps its own row.
+    if r.turn is not None:
+        user = r.con.execute(
+            "SELECT native_id FROM submissions"
+            " WHERE session_key=? AND text_hash=? AND turn_id=?"
+            " AND alias_id IS NULL AND native_id NOT LIKE ?"
+            " ORDER BY ordinal_num LIMIT 1",
+            (r.session_key, text_hash(content), r.turn,
+             f"{HARNESS}:queue:%")).fetchone()
+        if user is not None:
+            r.con.execute("UPDATE submissions SET alias_id=? WHERE native_id=?",
+                          (full, user["native_id"]))
+            r.stats["submissions_dedup"] = \
+                r.stats.get("submissions_dedup", 0) + 1
+            return
+    # The queued prompt opens its turn, mirroring attachment queued_command.
+    r.turn = f"{HARNESS}:{native}"
+    _submission(r, native, ordinal, ts, "genuine", content)
+
+
+def _merge_queue_record(r: _Reader, obj: dict, native: str, ordinal: int,
+                        ts, kind: str, text: str) -> bool:
+    """Fold a user record into its earlier enqueue row. True when merged.
+
+    The enqueue this prompt was typed as is the unmerged queue row with
+    the same session, text hash and turn (the turn the enqueue opened,
+    still current). The merged row keeps the canonical user native id
+    and retains the queue identity in alias_id without adding a second
+    row, so each prompt counts once; a queue-only prompt keeps its row.
+    The user record is the canonical kind authority, so its
+    classification wins on merge while the excerpt is recomputed from
+    the same text through the same privacy gate.
+    """
+    full = f"{HARNESS}:{native}"
+    if r.con.execute("SELECT 1 FROM submissions WHERE native_id=?",
+                     (full,)).fetchone():
+        # Canonical row already exists (reimport): the normal path keeps
+        # it a no-op or corrects it in place under a stale version.
+        return False
+    if r.turn is None:
+        return False
+    row = r.con.execute(
+        "SELECT native_id FROM submissions"
+        " WHERE session_key=? AND text_hash=? AND turn_id=?"
+        " AND native_id LIKE ? ORDER BY ordinal_num LIMIT 1",
+        (r.session_key, text_hash(text), r.turn,
+         f"{HARNESS}:queue:%")).fetchone()
+    if row is None:
+        return False
+    queue_native = row["native_id"]
+    new_turn = f"{HARNESS}:{obj.get('promptId') or native}" \
+        if kind == "genuine" else r.turn
+    excerpt = privacy.submission_excerpt(
+        text, is_genuine=kind == "genuine",
+        is_main_session=r.agent_id is None and r.native_session is not None)
+    r.con.execute(
+        "UPDATE submissions SET native_id=?, alias_id=?, source_id=?,"
+        " session_key=?, turn_id=?, ordinal_num=?, ts=?, kind=?,"
+        " text_hash=?, text_excerpt=?, is_genuine=? WHERE native_id=?",
+        (full, queue_native, r.src.source_id, r.session_key, new_turn,
+         ordinal, ts, kind, text_hash(text), excerpt,
+         1 if kind == "genuine" else 0, queue_native))
+    if kind == "genuine":
+        r.turn = new_turn
+    r.stats["submissions_dedup"] = r.stats.get("submissions_dedup", 0) + 1
+    return True
+
+
 def _user_kind(r: _Reader, obj: dict, text: str) -> str:
     if obj.get("isSidechain") or r.agent_id:
         return "synthetic"
@@ -572,6 +686,8 @@ def _user(r: _Reader, obj: dict, ordinal: int, ts) -> None:
                 detail={"skill": skill_from_path(base + "/")})
     kind = _user_kind(r, obj, text)
     native = obj.get("uuid") or f"ordinal:{ordinal}"
+    if _merge_queue_record(r, obj, native, ordinal, ts, kind, text):
+        return
     if kind == "genuine":
         r.turn = f"{HARNESS}:{obj.get('promptId') or native}"
     _submission(r, native, ordinal, ts, kind, text)
