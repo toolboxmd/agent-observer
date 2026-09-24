@@ -69,6 +69,29 @@ def _usage_totals(rows, include_responses: bool = True) -> dict:
     return _bucket_totals(rows, include_responses=include_responses)
 
 
+def model_usage(rows) -> list[dict]:
+    """Model buckets over an already selected response scope.
+
+    Task callers pass the existing attribution partition, never all
+    responses from the sessions that happen to contain that task.
+    """
+    groups = {}
+    for row in _live(rows):
+        key = (row["harness"], row["model"], row["effort"], _semantics_key(row))
+        groups.setdefault(key, []).append(row)
+    models = []
+    for (harness, model, effort, semantics), group in groups.items():
+        totals = _bucket_totals(group)
+        models.append({"harness": harness, "model": model, "effort": effort,
+                       "semantics": semantics, **totals,
+                       "tokens": totals["total_tokens"],
+                       "unknown_tokens": (totals.get("unknown_counts") or {}).get(
+                           "total_tokens", 0)})
+    return sorted(models, key=lambda m: (
+        m["tokens"] is None, -(m["tokens"] or 0), m["harness"],
+        m["model"] or "", m["effort"] or "", m["semantics"]))
+
+
 def _responses(con: sqlite3.Connection, session_keys=None) -> list:
     if session_keys is None:
         return con.execute("SELECT * FROM responses").fetchall()
@@ -196,7 +219,9 @@ def task_report(con: sqlite3.Connection, task_id: str) -> dict:
     report = {
         "task": dict(task),
         "attributed": total(attributed),
+        "models": model_usage(attributed),
         "shared_joint": total(shared),
+        "shared_models": model_usage(shared),
         "unassigned_in_scope": total(unassigned),
         "scope": scope,
         "scope_sessions": sorted(scope_keys),

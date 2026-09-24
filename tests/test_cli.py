@@ -59,6 +59,51 @@ class CliTest(unittest.TestCase):
         self.assertEqual(r.returncode, 3)
         self.assertIn("missing assignments", r.stdout)
 
+    def test_publish_uses_each_tasks_usage_inside_one_session(self):
+        self.assertEqual(run(self.db, "sync", "--source", self.mini).returncode, 0)
+        for task, submission in (("T-A", "msg-mini-sub-01"),
+                                 ("T-B", "msg-mini-sub-02")):
+            for args in (("capture", "create-task", "--task", task),
+                         ("capture", "assign", "--task", task,
+                          "--submission", submission)):
+                result = run(self.db, *args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        for task, tokens, input_tokens, output_tokens, effort in (
+                ("T-A", 3350, 3000, 350, "high"),
+                ("T-B", 2150, 2000, 150, "medium")):
+            local = json.loads(run(self.db, "task", "show", "--task", task,
+                                   "--json").stdout)
+            result = run(self.db, "publish", "--task", task,
+                         "--dry-run", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            published = json.loads(result.stdout)
+            summary = published["summary"]
+            self.assertEqual(summary["usage"]["total_tokens"], tokens)
+            self.assertEqual(summary["usage"], local["attributed"])
+            self.assertEqual(len(summary["models"]), 1)
+            model = summary["models"][0]
+            self.assertEqual(model["tokens"], tokens)
+            self.assertEqual(model["input_tokens"], input_tokens)
+            self.assertEqual(model["output_tokens"], output_tokens)
+            self.assertEqual(model["effort"], effort)
+            self.assertNotIn("5,500", published["body"])
+
+    def test_publish_keeps_shared_usage_out_of_attributed_total(self):
+        self.assertEqual(run(self.db, "sync", "--source", self.mini).returncode, 0)
+        for task in ("T-A", "T-B"):
+            self.assertEqual(run(self.db, "capture", "create-task", "--task",
+                                 task).returncode, 0)
+            self.assertEqual(run(self.db, "capture", "assign", "--task", task,
+                                 "--submission", "msg-mini-sub-01",
+                                 "--shared").returncode, 0)
+        result = run(self.db, "publish", "--task", "T-A", "--dry-run", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        published = json.loads(result.stdout)
+        self.assertEqual(published["summary"]["usage"]["total_tokens"], 0)
+        self.assertEqual(published["summary"]["shared_tokens"], 3350)
+        self.assertEqual(published["summary"]["models"], [])
+        self.assertIn("Shared with other tasks and not divided", published["body"])
+
     def test_runtime_never_touches_ccusage(self):
         import re
         banned = re.compile(

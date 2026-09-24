@@ -36,15 +36,13 @@ def _fmt_tokens(value, unknown: int = 0) -> str:
 
 
 def summarize(con, session_keys: set, label: str, task_id: str | None = None) -> dict:
+    rep = report.task_report(con, task_id) if task_id else None
+    if rep is not None:
+        session_keys = set(rep["scope_sessions"])
     keys = sorted(session_keys)
-    usage = report.scope_totals(con, set(keys))
-    models = [dict(r) for r in con.execute(
-        f"SELECT harness, model, effort, COALESCE(semantics, 'unknown') semantics,"
-        f" COUNT(*) responses, SUM(total_tokens) tokens,"
-        f" SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END) unknown_tokens"
-        f" FROM responses WHERE is_overlap=0 AND session_key IN ({','.join('?' * len(keys))})"
-        f" GROUP BY harness, model, effort, semantics ORDER BY tokens DESC",
-        keys)] if keys else []
+    usage = rep["attributed"] if rep is not None else report.scope_totals(con, set(keys))
+    models = (rep["models"] if rep is not None else
+              report.model_usage(report._responses(con, keys)))
     sessions = [dict(r) for r in con.execute(
         f"SELECT session_key, harness, started_at, ended_at, agentsmd_version FROM sessions"
         f" WHERE session_key IN ({','.join('?' * len(keys))})", keys)] if keys else []
@@ -59,8 +57,7 @@ def summarize(con, session_keys: set, label: str, task_id: str | None = None) ->
     shared = None
     shared_unknown = 0
     shared_by_semantics = None
-    if task_id:
-        rep = report.task_report(con, task_id)
+    if rep is not None:
         shared = rep["shared_joint"].get("total_tokens")
         unknown_counts = rep["shared_joint"].get("unknown_counts") or {}
         shared_unknown = unknown_counts.get("total_tokens", 0)
