@@ -134,9 +134,13 @@ session: the human's own text up to the first tag-like marker (`<`
 followed by a letter, `/` or `!`, or the first `<<<`),
 whitespace-collapsed, at most 300 characters. Pasted blocks, injected
 instructions and preference contents after such a marker are therefore
-never kept. An assistant excerpt is the last 400 characters of the
-assistant's own message, kept only when that span contains no such
-marker. Error records keep only a fixed category and the sorted
+never kept. An assistant excerpt is the last 400 characters of each
+assistant text block, kept only when that span contains no such
+marker: Claude Code emits one assistant_message event per nonempty
+assistant text block, so a message streamed as several blocks keeps
+one excerpt per block. Codex instead concatenates the text items of
+an assistant message and keeps one excerpt for the combined message.
+No other adapter emits assistant_message excerpts. Error records keep only a fixed category and the sorted
 top-level key names of the record, never its values. Event details keep
 only allowlisted, correctly typed metadata (identifiers, paths,
 commands, numbers, closed status and kind values), never titles,
