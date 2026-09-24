@@ -91,7 +91,7 @@ def _safe_token(value) -> str | None:
     """Validated native-identifier string, or None when it must not persist."""
     if not isinstance(value, str) or not value:
         return None
-    if not _SAFE_TOKEN_RE.match(value):
+    if _SAFE_TOKEN_RE.fullmatch(value) is None:
         return None
     return value
 
@@ -577,18 +577,142 @@ def _force_child_synthetic(con: sqlite3.Connection, stats: dict | None,
     return changed
 
 
+def _validated_usage_model(update: dict) -> str | None:
+    """modelUsage name only when usage counters validate.
+
+    Malformed present usage never yields metadata: the completion is
+    quarantined elsewhere, and its modelUsage must not become a response
+    model or downgrade a recorded one. Absent/null/empty usage yields None.
+    """
+    try:
+        _validated_usage_counters(update)
+    except _AdapterError:
+        return None
+    usage = update.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    model_usage = usage.get("modelUsage")
+    if isinstance(model_usage, dict) and len(model_usage) == 1:
+        name = next(iter(model_usage))
+        if isinstance(name, str) and _safe_token(name) is not None:
+            return name
+    return None
+
+
+def _counters_compatible(first: dict | None, new: dict | None) -> bool:
+    """Whether two validated counter dicts can merge without conflict."""
+    if not first or not new:
+        return True
+    for key in first:
+        old, cur = first.get(key), new.get(key)
+        if old is not None and cur is not None and old != cur:
+            return False
+    return True
+
+
+def _deduplicate_completions(completions_ordered) -> dict:
+    """Shared first-wins selection with late valid fill for bindings.
+
+    Keeps the first ordinal/ts/obj/method per prompt id for stable prompt
+    bindings, but merges late valid usage (counters and modelUsage) when the
+    first lacked valid counters, was malformed, or lacked a validated model
+    while the later brings a compatible one. A malformed or conflicting
+    later completion never replaces the selected usage; conflicting
+    counters stay for the response path to quarantine. Later valid
+    modelUsage wins over fallback evidence. Returns dict pid ->
+    (ordinal, update, ts, obj, method, raw).
+    """
+    selected: dict = {}
+    for ordinal, update, ts, obj, method, raw in completions_ordered:
+        raw_pid = update.get("prompt_id") or update.get("promptId")
+        pid = raw_pid if isinstance(raw_pid, str) \
+            and _safe_token(raw_pid) is not None else None
+        if pid is None:
+            continue
+        if pid not in selected:
+            selected[pid] = (ordinal, update, ts, obj, method, raw)
+            continue
+        _, first_update, _, _, _, _ = selected[pid]
+        try:
+            first_counters = _validated_usage_counters(first_update)
+            first_ok = True
+            first_has = _has_any_counter(first_counters)
+        except _AdapterError:
+            first_ok = False
+            first_has = False
+            first_counters = None
+        try:
+            new_counters = _validated_usage_counters(update)
+            new_ok = True
+            new_has = _has_any_counter(new_counters)
+        except _AdapterError:
+            new_ok = False
+            new_has = False
+            new_counters = None
+        if not new_ok:
+            continue
+        first_model = _validated_usage_model(first_update) \
+            if first_ok else None
+        new_model = _validated_usage_model(update)
+        if not first_ok or not first_has:
+            if new_has or new_model is not None:
+                merged = dict(first_update)
+                merged["usage"] = update.get("usage")
+                selected[pid] = (selected[pid][0], merged,
+                                 selected[pid][2], selected[pid][3],
+                                 selected[pid][4], selected[pid][5])
+        elif first_model is None and new_model is not None:
+            if _counters_compatible(first_counters, new_counters):
+                merged = dict(first_update)
+                merged["usage"] = update.get("usage")
+                selected[pid] = (selected[pid][0], merged,
+                                 selected[pid][2], selected[pid][3],
+                                 selected[pid][4], selected[pid][5])
+        elif new_model is not None and new_model != first_model:
+            if _counters_compatible(first_counters, new_counters):
+                merged = dict(first_update)
+                merged["usage"] = update.get("usage")
+                selected[pid] = (selected[pid][0], merged,
+                                 selected[pid][2], selected[pid][3],
+                                 selected[pid][4], selected[pid][5])
+    return selected
+
+
+def _model_ranks(model, turn_m, usage_models, summary_m, chunk_m) -> int:
+    """Evidence rank for a model value: turn 3, usage 2, summary 1, chunk 0.
+
+    usage_models is a set of validated usage models for the prompt. Unknown
+    or missing values rank -1 so a current best can replace stale evidence,
+    while a weaker fallback never downgrades a stronger recorded value.
+    """
+    if model is None:
+        return -1
+    if turn_m is not None and model == turn_m:
+        return 3
+    if usage_models and model in usage_models:
+        return 2
+    if summary_m is not None and model == summary_m:
+        return 1
+    if chunk_m is not None and model == chunk_m:
+        return 0
+    return -1
+
+
 def _reconcile_response_metadata(con: sqlite3.Connection, r: _Reader,
                                  session_dir: str, model_fallback,
-                                 effort_combined) -> int:
+                                 summary_effort, chat_effort=None) -> int:
     """Update stale or NULL model/effort on existing responses in place.
 
     Recomputes validated model and effort with the existing precedence
     (turn_started stream, usage modelUsage, summary fallback, chunk model;
     summary effort else chat effort) from current summary/events files.
-    Only a new valid value differing from the stored one updates the row;
-    a missing new value never clears a known one. Never inserts or
-    duplicates rows; counters and usage_conflict behavior are untouched.
-    Returns rows changed.
+    Reuses the replay duplicate-selection logic so a later valid modelUsage
+    wins over fallback evidence, validates usage before accepting its
+    metadata, and never lets weaker evidence downgrade a valid stronger
+    model or effort already recorded. Only a new valid value differing
+    from the stored one updates the row; a missing new value never clears
+    a known one. Never inserts or duplicates rows; counters and
+    usage_conflict behavior are untouched. Returns rows changed.
     """
     updates_path = os.path.join(session_dir, "updates.jsonl")
     if not os.path.isfile(updates_path):
@@ -603,18 +727,30 @@ def _reconcile_response_metadata(con: sqlite3.Connection, r: _Reader,
     turn_models = _turn_models(os.path.join(session_dir, "events.jsonl"))
     safe_turns = [(t, m) for t, m in turn_models
                   if isinstance(m, str) and _safe_token(m) is not None]
-    first_per_pid: dict = {}
-    for _ordinal, update, ts, _obj, _method, _raw in completions_ordered:
+    # Reuse the replay duplicate-selection logic: stable first binding with
+    # late valid usage/model merged, so later valid modelUsage wins and an
+    # unchanged re-sync retains it instead of reverting to the fallback.
+    selected = _deduplicate_completions(completions_ordered)
+    # All validated usage models per pid for strength comparison: an
+    # existing model matching any of them is strong evidence.
+    all_usage_models: dict = {}
+    for _ordinal, update, _ts, _obj, _method, _raw in completions_ordered:
         raw_pid = update.get("prompt_id") or update.get("promptId")
         pid = raw_pid if isinstance(raw_pid, str) \
             and _safe_token(raw_pid) is not None else None
         if pid is None:
             continue
-        if pid not in first_per_pid:
-            first_per_pid[pid] = (update, ts)
-    valid_effort = _valid_model(effort_combined)
+        umodel = _validated_usage_model(update)
+        if umodel is not None:
+            all_usage_models.setdefault(pid, set()).add(umodel)
+    valid_summary_effort = _valid_model(summary_effort)
+    valid_chat_effort = _valid_model(chat_effort)
+    valid_effort = valid_summary_effort or valid_chat_effort
+    new_effort_rank = -1
+    if valid_effort is not None:
+        new_effort_rank = 1 if valid_effort == valid_summary_effort else 0
     changed = 0
-    for pid, (update, ts) in first_per_pid.items():
+    for pid, (_ordinal, update, ts, _obj, _method, _raw) in selected.items():
         response_id = f"{HARNESS}:{r.native_sid}:{pid}"
         try:
             existing = con.execute(
@@ -625,10 +761,16 @@ def _reconcile_response_metadata(con: sqlite3.Connection, r: _Reader,
         if existing is None:
             continue
         chunk_model = _valid_model(pid_to_model.get(pid))
-        usage_model = _valid_model(_usage_model(update))
+        usage_model = _validated_usage_model(update)
         summary_model = _valid_model(model_fallback)
         new_model = _model_at(ts, safe_turns, usage_model, summary_model,
                               chunk_model)
+        # Applicable turn at this completion for rank comparison.
+        turn_m = None
+        for started, name in safe_turns:
+            if ts is not None and started <= ts:
+                turn_m = name
+        usage_set = all_usage_models.get(pid, set())
         sets: list[str] = []
         args: list = []
         try:
@@ -640,11 +782,29 @@ def _reconcile_response_metadata(con: sqlite3.Connection, r: _Reader,
         except (KeyError, TypeError, IndexError):
             old_effort = None
         if new_model is not None and old_model != new_model:
-            sets.append("model=?")
-            args.append(new_model)
+            new_rank = _model_ranks(new_model, turn_m, usage_set,
+                                    summary_model, chunk_model)
+            old_rank = _model_ranks(old_model, turn_m, usage_set,
+                                    summary_model, chunk_model)
+            # Stronger wins; weaker never downgrades. Unknown stale
+            # evidence (-1) yields to the current best.
+            if old_model is None or old_rank == -1 or new_rank >= old_rank:
+                sets.append("model=?")
+                args.append(new_model)
         if valid_effort is not None and old_effort != valid_effort:
-            sets.append("effort=?")
-            args.append(valid_effort)
+            if old_effort is None:
+                sets.append("effort=?")
+                args.append(valid_effort)
+            else:
+                if old_effort == valid_summary_effort:
+                    old_erank = 1
+                elif old_effort == valid_chat_effort:
+                    old_erank = 0
+                else:
+                    old_erank = -1
+                if old_erank == -1 or new_effort_rank >= old_erank:
+                    sets.append("effort=?")
+                    args.append(valid_effort)
         if sets:
             args.append(response_id)
             try:
@@ -720,7 +880,7 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         reclassified = _reclassify_existing(con, r, session_dir, chat)
         reconciled = _reconcile_response_metadata(
             con, r, session_dir, model_fallback,
-            effort or chat.get("effort"))
+            effort, chat.get("effort"))
         # Persist late identity even when no JSONL bytes changed.
         late_fields = {"started_at": r.first_ts, "ended_at": r.last_ts,
                        **r.meta, **r.identity.fields(con)}
@@ -791,7 +951,7 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         # response rows in place without duplicates or counter changes.
         reconciled = _reconcile_response_metadata(
             con, r, session_dir, model_fallback,
-            effort or chat.get("effort"))
+            effort, chat.get("effort"))
         if reconciled:
             stats["responses_updated"] = \
                 stats.get("responses_updated", 0) + reconciled
@@ -1074,15 +1234,7 @@ def _reclassify_existing(con, r: _Reader, session_dir: str,
     # replacement and wipe the errors this sync just recorded.
     prompts, order, completions_ordered = _collect_prompts(
         updates_path, record_error=None)
-    completions_by_id = {}
-    for ordinal, update, ts, obj, method, raw in completions_ordered:
-        raw_pid = update.get("prompt_id") or update.get("promptId")
-        pid = raw_pid if isinstance(
-            raw_pid, str) and _safe_token(raw_pid) is not None else None
-        if pid is None:
-            continue
-        if pid not in completions_by_id:
-            completions_by_id[pid] = (ordinal, update, ts, obj, method)
+    completions_by_id = _deduplicate_completions(completions_ordered)
     before = con.total_changes
     for key in order:
         _upsert_submission(con, r, r.updates_src, chat, key, prompts[key],
@@ -1114,43 +1266,7 @@ def _replay_updates(con, r: _Reader, src: JsonlSource, chat: dict,
 
     prompts, order, completions_ordered = _collect_prompts(
         src.path, record_error=record_error)
-    completions_by_id: dict = {}
-    for ordinal, update, ts, obj, method, raw in completions_ordered:
-        raw_pid = update.get("prompt_id") or update.get("promptId")
-        pid = raw_pid if isinstance(
-            raw_pid, str) and _safe_token(raw_pid) is not None else None
-        if pid is None:
-            continue
-        if pid not in completions_by_id:
-            completions_by_id[pid] = (ordinal, update, ts, obj, method)
-        else:
-            # Duplicate turn_completed: keep first binding but merge late
-            # usage when the first lacked valid counters or was malformed,
-            # so a repeated completion can fill NULL counters without
-            # shifting any prompt binding. A malformed first never blocks a
-            # later valid record for the same prompt id.
-            _, first_update, _, _, _ = completions_by_id[pid]
-            try:
-                first_counters = _validated_usage_counters(first_update)
-                first_has = _has_any_counter(first_counters)
-                first_ok = True
-            except _AdapterError:
-                first_has = False
-                first_ok = False
-            try:
-                new_counters = _validated_usage_counters(update)
-                new_has = _has_any_counter(new_counters)
-                new_ok = True
-            except _AdapterError:
-                new_has = False
-                new_ok = False
-            if (not first_ok or not first_has) and new_ok and new_has:
-                merged = dict(first_update)
-                merged["usage"] = update.get("usage")
-                completions_by_id[pid] = (
-                    completions_by_id[pid][0], merged,
-                    completions_by_id[pid][2], completions_by_id[pid][3],
-                    completions_by_id[pid][4])
+    completions_by_id = _deduplicate_completions(completions_ordered)
     # Prompt-ID to chunk model for response model fallback.
     pid_to_model: dict = {}
     for key in order:
@@ -1159,6 +1275,18 @@ def _replay_updates(con, r: _Reader, src: JsonlSource, chat: dict,
             pid_to_model[pid] = prompts[key]["model"]
     turn_models = _turn_models(
         os.path.join(os.path.dirname(src.path), "events.jsonl"))
+    # All validated usage models per pid for strength comparison in the
+    # response path: an existing model matching any of them is strong.
+    all_usage_models: dict = {}
+    for _o, _u, _t, _ob, _m, _rw in completions_ordered:
+        _rp = _u.get("prompt_id") or _u.get("promptId")
+        _pid = _rp if isinstance(_rp, str) \
+            and _safe_token(_rp) is not None else None
+        if _pid is None:
+            continue
+        _um = _validated_usage_model(_u)
+        if _um is not None:
+            all_usage_models.setdefault(_pid, set()).add(_um)
     for key in order:
         _upsert_submission(con, r, src, chat, key, prompts[key],
                            completions_by_id)
@@ -1170,8 +1298,10 @@ def _replay_updates(con, r: _Reader, src: JsonlSource, chat: dict,
             continue
         chunk_model = pid_to_model.get(pid)
         _store_response(con, r, src, ordinal, update, ts,
-                        _usage_model(update), model_fallback, chunk_model,
-                        effort or chat.get("effort"), turn_models, raw)
+                        _validated_usage_model(update), model_fallback,
+                        chunk_model, effort, chat.get("effort"),
+                        turn_models, raw,
+                        all_usage_models.get(pid, set()))
 
 
 def _usage_model(update: dict):
@@ -1193,7 +1323,8 @@ def _valid_model(value):
 
 def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
                     update: dict, ts, usage_model, summary_model, chunk_model,
-                    effort, turn_models, raw_line: str = "") -> None:
+                    summary_effort, chat_effort, turn_models,
+                    raw_line: str = "", all_usage_models=None) -> None:
     raw_pid = update.get("prompt_id") or update.get("promptId")
     if not isinstance(raw_pid, str) or _safe_token(raw_pid) is None:
         return
@@ -1205,13 +1336,16 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
         # Present malformed usage: quarantine under the fixed category with
         # only the raw line's top-level key names, never record values or
         # exception text. No partial response row is created; later valid
-        # records for other (or the same) prompt ids still import.
+        # records for other (or the same) prompt ids still import. Usage
+        # is validated before its modelUsage metadata is accepted.
         _record_error_once(src, r.stats, ordinal, exc.category, raw_line)
         return
     usage_model = _valid_model(usage_model)
     summary_model = _valid_model(summary_model)
     chunk_model = _valid_model(chunk_model)
-    valid_effort = _valid_model(effort)
+    valid_summary_effort = _valid_model(summary_effort)
+    valid_chat_effort = _valid_model(chat_effort)
+    valid_effort = valid_summary_effort or valid_chat_effort
     # Turn-model entries are pre-validated; drop anything unexpected.
     safe_turns = [(t, m) for t, m in turn_models
                   if isinstance(m, str) and _safe_token(m) is not None]
@@ -1263,8 +1397,19 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
              fill.get("reasoning_output_tokens"), fill.get("total_tokens"),
              response_id))
     # Late model or effort evidence updates the existing row in place with
-    # validated values, without duplicates. A missing new value never
-    # clears a known one; only a new valid differing value writes.
+    # validated values, without duplicates. Stronger evidence wins; weaker
+    # never downgrades a recorded value; missing never clears a known one.
+    # Only a new valid differing value of equal or stronger rank writes.
+    turn_m = None
+    for started, name in safe_turns:
+        if ts is not None and started <= ts:
+            turn_m = name
+    if all_usage_models is None:
+        usage_set = {usage_model} if usage_model is not None else set()
+    else:
+        usage_set = set(all_usage_models)
+        if usage_model is not None:
+            usage_set.add(usage_model)
     meta_sets: list[str] = []
     meta_args: list = []
     try:
@@ -1276,11 +1421,28 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
     except (KeyError, TypeError, IndexError):
         old_effort = None
     if model is not None and old_model != model:
-        meta_sets.append("model=?")
-        meta_args.append(model)
+        new_rank = _model_ranks(model, turn_m, usage_set,
+                                summary_model, chunk_model)
+        old_rank = _model_ranks(old_model, turn_m, usage_set,
+                                summary_model, chunk_model)
+        if old_model is None or old_rank == -1 or new_rank >= old_rank:
+            meta_sets.append("model=?")
+            meta_args.append(model)
     if valid_effort is not None and old_effort != valid_effort:
-        meta_sets.append("effort=?")
-        meta_args.append(valid_effort)
+        if old_effort is None:
+            meta_sets.append("effort=?")
+            meta_args.append(valid_effort)
+        else:
+            if old_effort == valid_summary_effort:
+                old_erank = 1
+            elif old_effort == valid_chat_effort:
+                old_erank = 0
+            else:
+                old_erank = -1
+            new_erank = 1 if valid_effort == valid_summary_effort else 0
+            if old_erank == -1 or new_erank >= old_erank:
+                meta_sets.append("effort=?")
+                meta_args.append(valid_effort)
     if meta_sets:
         meta_args.append(response_id)
         con.execute(

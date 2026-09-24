@@ -1944,3 +1944,134 @@ class GrokAdapterTest(LedgerCase):
         self.assertEqual(len(list(con.execute(
             "SELECT 1 FROM import_errors WHERE error='malformed_usage'"))), 3)
         con.close()
+
+    def test_later_valid_model_usage_beats_fallback_and_survives_resync(self):
+        # P2: reconciliation reuses the replay duplicate selection, so a
+        # later valid modelUsage wins over the summary fallback and an
+        # unchanged re-sync retains it instead of reverting.
+        tmp = os.path.join(self.tmp.name, "latemodelusage")
+        group = os.path.join(tmp, "%2Flatermodelusage")
+        sid = "07latemodelusage-cccc-4b5c-8d6e-000000000008"
+        text = "Late modelUsage probe"
+        sdir = self._write_session(
+            group, sid,
+            {"info": {"id": sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-01T16:00:00Z",
+             "current_model_id": "grok-4.6",
+             "reasoning_effort": "medium"},
+            [{"timestamp": 1788808000, "method": "session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text",
+                                                "text": text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "lmu-1", "promptId": "p-lmu"}}},
+             {"timestamp": 1788808001, "method": "_x.ai/session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-lmu",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 10,
+                                              "outputTokens": 2,
+                                              "totalTokens": 12}},
+                         "_meta": {"eventId": "lmu-2"}}},
+             {"timestamp": 1788808002, "method": "_x.ai/session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-lmu",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 10,
+                                              "outputTokens": 2,
+                                              "totalTokens": 12,
+                                              "modelUsage": {
+                                                  "grok-4.7-late": {
+                                                      "inputTokens": 10}}}},
+                         "_meta": {"eventId": "lmu-3"}}}],
+            [{"ts": "2026-09-01T16:00:01Z", "type": "turn_ended",
+              "outcome": "completed"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": text}],
+              "prompt_index": 0}])
+        con = self._isolated_con("latemodelusage")
+        grok.sync(con, root=tmp)
+        key = f"grok:{sid}"
+        row = con.execute(
+            "SELECT model, input_tokens, total_tokens FROM responses"
+            " WHERE response_id=?", (f"{key}:p-lmu",)).fetchone()
+        self.assertIsNotNone(row)
+        # Later valid modelUsage wins over the summary fallback.
+        self.assertEqual(row["model"], "grok-4.7-late")
+        self.assertEqual((row["input_tokens"], row["total_tokens"]),
+                         (10, 12))
+        self.assertEqual(
+            con.execute("SELECT COUNT(*) n FROM responses"
+                        " WHERE response_id=?",
+                        (f"{key}:p-lmu",)).fetchone()["n"], 1)
+        # An unchanged re-sync retains the stronger model, never reverting
+        # to the weaker summary fallback.
+        again = grok.sync(con, root=tmp)
+        self.assertEqual(again["responses_inserted"], 0)
+        kept = con.execute(
+            "SELECT model, input_tokens, total_tokens FROM responses"
+            " WHERE response_id=?", (f"{key}:p-lmu",)).fetchone()
+        self.assertEqual(kept["model"], "grok-4.7-late")
+        self.assertEqual((kept["input_tokens"], kept["total_tokens"]),
+                         (10, 12))
+        con.close()
+
+    def test_safe_token_rejects_trailing_newline(self):
+        # P2: identifiers with a trailing newline never persist in native
+        # IDs or model/effort fields.
+        self.assertEqual(grok._safe_token("grok-4.6"), "grok-4.6")
+        self.assertIsNone(grok._safe_token("grok-4.6\n"))
+        self.assertIsNone(grok._safe_token("abc\n"))
+        self.assertIsNone(grok._safe_token("a\nb"))
+        tmp = os.path.join(self.tmp.name, "trailingnl")
+        group = os.path.join(tmp, "%2Ftrailingnl")
+        sid = "08trailingnl-cccc-4b5c-8d6e-000000000009"
+        text = "Trailing newline probe"
+        sdir = self._write_session(
+            group, sid,
+            {"info": {"id": sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-01T17:00:00Z",
+             "current_model_id": "grok-4.6",
+             "reasoning_effort": "medium"},
+            [{"timestamp": 1788809000, "method": "session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text",
+                                                "text": text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "tn-1", "promptId": "p-tn"}}},
+             {"timestamp": 1788809001, "method": "_x.ai/session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-tn",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 10,
+                                              "outputTokens": 2,
+                                              "totalTokens": 12,
+                                              "modelUsage": {
+                                                  "grok-4.7\n": {
+                                                      "inputTokens": 10}}}},
+                         "_meta": {"eventId": "tn-2"}}}],
+            [{"ts": "2026-09-01T17:00:01Z", "type": "turn_ended",
+              "outcome": "completed"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": text}],
+              "prompt_index": 0}])
+        con = self._isolated_con("trailingnl")
+        grok.sync(con, root=tmp)
+        key = f"grok:{sid}"
+        row = con.execute(
+            "SELECT model, effort FROM responses WHERE response_id=?",
+            (f"{key}:p-tn",)).fetchone()
+        self.assertIsNotNone(row)
+        # The newline modelUsage is rejected; the summary fallback wins.
+        self.assertEqual(row["model"], "grok-4.6")
+        for table, col, val in self._all_text_values(con):
+            self.assertNotIn("grok-4.7\n", val,
+                             f"{table}.{col} leaks newline identifier")
+            if val == "grok-4.7\n" or val.endswith("\n"):
+                self.fail(f"{table}.{col} holds a trailing-newline value")
+        con.close()
