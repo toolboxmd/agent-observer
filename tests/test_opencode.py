@@ -1673,9 +1673,156 @@ class OpencodeAdapterTest(unittest.TestCase):
         self.assertEqual(len(valid_call), 1)
         self.assertEqual(valid_call[0]["name"], "bash")
         valid_res = self.q("SELECT * FROM events WHERE family='tool_result'"
-                           " AND native_id=?", ("call_shape_valid",))
+                            " AND native_id=?", ("call_shape_valid",))
         self.assertEqual(len(valid_res), 1)
         self.assertEqual(valid_res[0]["status"], "ok")
+
+    def test_multi_file_patch_preserves_every_path(self):
+        # Review P2: a patch part with several files must keep every valid
+        # path in detail={"paths": [...]}, so reread invalidation and
+        # test-edit detection see each changed file, not just files[0].
+        from agent_observer import analysis
+        s_hash = "SECRET_MULTI_HASH_zzz_qqq"
+        first = "/repo/a.py"
+        second = "/repo/tests/test_a.py"
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_multipatch", None, "/repo", "Multi", "1.2.3",
+                        None, "build", T0 + 1200, T0 + 1200, None))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_multipatch_a", "ses_multipatch",
+                        T0 + 1200, T0 + 1200,
+                        _msg("assistant", T0 + 1200, T0 + 1210,
+                             _tokens(2, 2, 0, 0, 0))))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_multi_patch", "msg_multipatch_a",
+                        "ses_multipatch", T0 + 1201, T0 + 1201,
+                        json.dumps({"type": "patch", "hash": s_hash,
+                                    "files": [first, 42, {"p": "evil"},
+                                              second]})))
+        native.commit()
+        native.close()
+        opencode.sync(self.con, source=self.db_file)
+        row = self.q("SELECT * FROM events WHERE family='file_change'"
+                     " AND native_id=?", ("p_multi_patch",))[0]
+        # The target stays the first path; the native hash and invalid
+        # path values never persist.
+        self.assertEqual(row["target"], first)
+        detail = json.loads(row["detail_json"] or "{}")
+        self.assertEqual(detail.get("paths"), [first, second])
+        self.assertNotIn(s_hash, row["detail_json"] or "")
+        self.assertNotIn("evil", row["detail_json"] or "")
+        self._assert_no_secret_anywhere((s_hash,))
+        # The secondary path reaches the downstream analysis path set.
+        change = dict(row)
+        self.assertIn(second, analysis._changed_paths(change))
+        # A reread of the secondary path after the patch is explained by
+        # the patch; with only the first-path target (the old bug) the
+        # same reread would be flagged as a repeated read.
+        session = {"session_key": "opencode:ses_multipatch",
+                   "harness": "opencode", "project_dir": "/repo",
+                   "agentsmd_version": None}
+        read1 = {"family": "read", "target": second, "ts": 1,
+                 "detail_json": None, "id": 101}
+        read2 = {"family": "read", "target": second, "ts": 3,
+                 "detail_json": None, "id": 103}
+        explained = dict(change, ts=2, id=102)
+        self.assertEqual(analysis._repeated_reads(
+            session, [read1, explained, read2]), [])
+        target_only = dict(change, ts=2, id=102, target=first,
+                           detail_json=None)
+        flagged = analysis._repeated_reads(
+            session, [read1, target_only, read2])
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0]["detector"], "repeated_read")
+
+    def test_malformed_token_counter_quarantined_without_response(self):
+        # Review P2: a present malformed counter quarantines the record
+        # under malformed_usage before any response insert; the import
+        # continues to later valid records.
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_maluse", None, "/repo", "MalUse", "1.2.3",
+                        None, "build", T0 + 1230, T0 + 1230, None))
+        bad_tokens = {"input": "bad", "output": 5, "reasoning": 0,
+                      "cache": {"read": 0, "write": 0}}
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_maluse_bad", "ses_maluse", T0 + 1230, T0 + 1230,
+                        _msg("assistant", T0 + 1230, T0 + 1240,
+                             bad_tokens)))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_maluse_good", "ses_maluse", T0 + 1250, T0 + 1250,
+                        _msg("assistant", T0 + 1250, T0 + 1260,
+                             _tokens(3, 4, 0, 0, 0))))
+        native.commit()
+        native.close()
+        stats = opencode.sync(self.con, source=self.db_file)
+        self.assertGreaterEqual(stats["malformed"], 1)
+        errs = self.q("SELECT * FROM import_errors WHERE error=?",
+                      ("malformed_usage",))
+        self.assertTrue(errs)
+        for err_row in errs:
+            self.assertIn(err_row["error"],
+                          opencode.IMPORT_ERROR_CATEGORIES)
+            excerpt = err_row["line_excerpt"] or ""
+            self.assertLessEqual(len(excerpt), 200)
+            # Structure only: sorted top-level key names, no values.
+            self.assertNotIn("bad", excerpt)
+            self.assertEqual(excerpt, ",".join(sorted(excerpt.split(","))))
+        self.assertTrue(any(
+            (r["line_excerpt"] or "")
+            == "cost,finish,modelID,providerID,role,time,tokens,variant"
+            for r in errs))
+        # No response for the malformed message; the later valid
+        # response in the same session still imports.
+        self.assertEqual(self.q("SELECT * FROM responses WHERE response_id=?",
+                                ("opencode:msg_maluse_bad",)), [])
+        good = self.q("SELECT * FROM responses WHERE response_id=?",
+                      ("opencode:msg_maluse_good",))
+        self.assertEqual(len(good), 1)
+        self.assertEqual(good[0]["input_tokens"], 3)
+        self.assertEqual(good[0]["output_tokens"], 4)
+        self.assertEqual(good[0]["total_tokens"], 7)
+
+    def test_explicit_null_token_counter_quarantined(self):
+        # Coordinator repair: key presence decides. A missing counter key
+        # stays unknown, but an explicitly present null is malformed and
+        # quarantines the record before any response insert.
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_nulluse", None, "/repo", "NullUse", "1.2.3",
+                        None, "build", T0 + 1270, T0 + 1270, None))
+        null_tokens = {"input": None, "output": 5, "reasoning": 0,
+                       "cache": {"read": 0, "write": 0}}
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_nulluse_bad", "ses_nulluse",
+                        T0 + 1270, T0 + 1270,
+                        _msg("assistant", T0 + 1270, T0 + 1280,
+                             null_tokens)))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_nulluse_good", "ses_nulluse",
+                        T0 + 1290, T0 + 1290,
+                        _msg("assistant", T0 + 1290, T0 + 1300,
+                             _tokens(3, 4, 0, 0, 0))))
+        native.commit()
+        native.close()
+        stats = opencode.sync(self.con, source=self.db_file)
+        self.assertGreaterEqual(stats["malformed"], 1)
+        errs = self.q("SELECT * FROM import_errors WHERE error=?",
+                      ("malformed_usage",))
+        self.assertTrue(errs)
+        self.assertTrue(any(
+            (r["line_excerpt"] or "")
+            == "cost,finish,modelID,providerID,role,time,tokens,variant"
+            for r in errs))
+        # No response for the explicitly-null message; a missing key
+        # would stay unknown, but presence with null must not insert.
+        self.assertEqual(self.q("SELECT * FROM responses WHERE response_id=?",
+                                ("opencode:msg_nulluse_bad",)), [])
+        good = self.q("SELECT * FROM responses WHERE response_id=?",
+                      ("opencode:msg_nulluse_good",))
+        self.assertEqual(len(good), 1)
+        self.assertEqual(good[0]["total_tokens"], 7)
 
 
 if __name__ == "__main__":

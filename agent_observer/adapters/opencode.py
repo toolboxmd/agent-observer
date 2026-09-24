@@ -595,16 +595,47 @@ def _ingest_response(con, stats, src_path, source_id, session_key, sess,
     timing = data.get("time") if isinstance(data.get("time"), dict) else {}
     if timing.get("completed") is None:
         return
-    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) \
-        else {}
-    cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) \
-        else {}
-    values = {"input_tokens": _int_or_none(tokens.get("input")),
-              "output_tokens": _int_or_none(tokens.get("output")),
-              "reasoning_output_tokens": _int_or_none(
-                  tokens.get("reasoning")),
-              "cached_input_tokens": _int_or_none(cache.get("read")),
-              "cache_write_input_tokens": _int_or_none(cache.get("write"))}
+    raw_tokens = data.get("tokens")
+    if raw_tokens is None:
+        tokens: dict = {}
+    elif isinstance(raw_tokens, dict):
+        tokens = raw_tokens
+    else:
+        # A present non-object tokens block is malformed usage, never
+        # silently unknown; quarantine before any response insert.
+        _oops(con, stats, src_path, ordinal, "malformed_usage",
+              _record_line(msg.get("data"), data))
+        return
+    raw_cache = tokens.get("cache")
+    if raw_cache is None:
+        cache: dict = {}
+    elif isinstance(raw_cache, dict):
+        cache = raw_cache
+    else:
+        _oops(con, stats, src_path, ordinal, "malformed_usage",
+              _record_line(msg.get("data"), data))
+        return
+    # A present counter must be a non-boolean integer; only a missing
+    # key stays unknown and maps to NULL. An explicitly present null,
+    # bool, string, float, list or other non-integer quarantines the
+    # record before the all-zero check, the total or any response
+    # insert, and the import continues.
+    values: dict = {}
+    for field, container, key in (
+            ("input_tokens", tokens, "input"),
+            ("output_tokens", tokens, "output"),
+            ("reasoning_output_tokens", tokens, "reasoning"),
+            ("cached_input_tokens", cache, "read"),
+            ("cache_write_input_tokens", cache, "write")):
+        if key not in container:
+            values[field] = None
+            continue
+        raw = container[key]
+        if not isinstance(raw, int) or isinstance(raw, bool):
+            _oops(con, stats, src_path, ordinal, "malformed_usage",
+                  _record_line(msg.get("data"), data))
+            return
+        values[field] = raw
     if all(v == 0 for v in values.values()):
         return
     total = None
@@ -896,6 +927,12 @@ def _ingest_patch(con, stats, source_id, session_key, part, data, ordinal,
     first = file_list[0] if file_list else None
     target = privacy.filter_target(first) \
         if isinstance(first, str) and first else None
+    # Every valid native path survives in detail so reread invalidation
+    # and test-edit detection see each changed file; the shared writer
+    # validates the list through privacy.filter_detail. The native hash
+    # and invalid path values are omitted, never coerced.
+    valid_paths = sorted({p for p in file_list
+                          if isinstance(p, str) and p})
     part_id = part.get("id") if isinstance(part, dict) else None
     if not isinstance(part_id, str) or not part_id:
         # The caller guarantees a valid part id; fail closed otherwise.
@@ -907,4 +944,4 @@ def _ingest_patch(con, stats, source_id, session_key, part, data, ordinal,
                   family="file_change", native_id=part_id,
                   ordinal=ordinal, ts=ts, name="patch", target=target,
                   fingerprint=fingerprint("patch", digest, file_list),
-                  detail=None)
+                  detail={"paths": valid_paths} if valid_paths else None)
