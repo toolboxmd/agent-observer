@@ -2622,3 +2622,252 @@ class GrokAdapterTest(LedgerCase):
         self.assertEqual(row["text_excerpt"], "")
         self.assertIn(row["kind"], ("unknown", "synthetic"))
         con.close()
+
+    def test_sync_parses_each_updates_once(self):
+        # Linear sync: each updates.jsonl is fully opened/parsed at most
+        # once per sync. The old quadratic implementation rescanned every
+        # sibling updates file per imported session via
+        # _find_parent_via_dispatches, so per-path _complete_lines calls grew
+        # with the tree size. Counting at the adapter read boundary fails
+        # there but passes with the per-sync parent index plus single cached
+        # parse reused for indexing, prompts, replay, ingestion and
+        # reclassification.
+        tmp = os.path.join(self.tmp.name, "perflinear")
+        group = os.path.join(tmp, "%2Fperfgroup")
+        os.makedirs(group, exist_ok=True)
+        parent_sid = "zzperfparent-ffff-4b5c-8d6e-000000000099"
+        child_sids = [
+            "aaperfchild-aaaa-4b5c-8d6e-000000000101",
+            "bbperfchild-bbbb-4b5c-8d6e-000000000102",
+            "ccperfchild-cccc-4b5c-8d6e-000000000103",
+            "ddperfchild-dddd-4b5c-8d6e-000000000104",
+        ]
+        for i, child_sid in enumerate(child_sids):
+            text = f"Human probe child {i}"
+            self._write_session(
+                group, child_sid,
+                {"info": {"id": child_sid, "cwd": "/redacted/repo"},
+                 "created_at": "2026-09-01T23:00:00Z",
+                 "current_model_id": "grok-4.6"},
+                [{"timestamp": 1788820000 + i,
+                  "method": "session/update",
+                  "params": {"sessionId": child_sid,
+                             "update": {"sessionUpdate": "user_message_chunk",
+                                        "content": {"type": "text",
+                                                    "text": text},
+                                        "_meta": {"promptIndex": 0}},
+                             "_meta": {"eventId": f"perf-c-{i}",
+                                       "promptId": f"p-perf-{i}"}}},
+                 {"timestamp": 1788820010 + i,
+                  "method": "_x.ai/session/update",
+                  "params": {"sessionId": child_sid,
+                             "update": {"sessionUpdate": "turn_completed",
+                                        "prompt_id": f"p-perf-{i}",
+                                        "stop_reason": "end_turn",
+                                        "usage": {"inputTokens": 5,
+                                                  "outputTokens": 1,
+                                                  "totalTokens": 6}},
+                             "_meta": {"eventId": f"perf-cc-{i}"}}}],
+                [{"ts": "2026-09-01T23:00:01Z", "type": "turn_started",
+                  "session_id": child_sid, "turn_number": 0,
+                  "model_id": "grok-4.6",
+                  "session_relationship": "primary"},
+                 {"ts": "2026-09-01T23:00:02Z", "type": "turn_ended",
+                  "outcome": "completed"}],
+                [{"type": "user",
+                  "content": [{"type": "text", "text": text}],
+                  "prompt_index": 0}])
+        parent_text = "Human parent probe"
+        spawns = []
+        for i, child_sid in enumerate(child_sids):
+            spawns.append({
+                "timestamp": 1788820100 + i,
+                "method": "_x.ai/session/update",
+                "params": {"sessionId": parent_sid,
+                           "update": {"sessionUpdate": "subagent_spawned",
+                                      "subagent_id": child_sid,
+                                      "parent_session_id": parent_sid,
+                                      "parent_prompt_id": "p-parent",
+                                      "child_session_id": child_sid},
+                           "_meta": {"eventId": f"perf-spawn-{i}"}}})
+        self._write_session(
+            group, parent_sid,
+            {"info": {"id": parent_sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-01T23:05:00Z",
+             "current_model_id": "grok-4.6"},
+            [{"timestamp": 1788820200, "method": "session/update",
+              "params": {"sessionId": parent_sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text",
+                                                "text": parent_text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "perf-p-1",
+                                   "promptId": "p-parent"}}},
+             {"timestamp": 1788820201, "method": "_x.ai/session/update",
+              "params": {"sessionId": parent_sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-parent",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 10,
+                                              "outputTokens": 2,
+                                              "totalTokens": 12}},
+                         "_meta": {"eventId": "perf-p-2"}}}] + spawns,
+            [{"ts": "2026-09-01T23:05:01Z", "type": "turn_started",
+              "session_id": parent_sid, "turn_number": 0,
+              "model_id": "grok-4.6",
+              "session_relationship": "primary"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": parent_text}],
+              "prompt_index": 0}])
+        con = self._isolated_con("perflinear")
+        orig_complete = grok._complete_lines
+        counts: dict = {}
+
+        def counting_complete(path):
+            if isinstance(path, str) and path.endswith("updates.jsonl"):
+                counts[path] = counts.get(path, 0) + 1
+            yield from orig_complete(path)
+
+        grok._complete_lines = counting_complete
+        try:
+            stats = grok.sync(con, root=tmp)
+        finally:
+            grok._complete_lines = orig_complete
+        self.assertEqual(stats["sources"], 5)
+        # Five updates files, each fully parsed exactly once. The quadratic
+        # implementation parsed each file once per importing session.
+        self.assertEqual(len(counts), 5)
+        for path, n in counts.items():
+            self.assertLessEqual(
+                n, 1, f"{path} parsed {n} times, expected at most once")
+            self.assertEqual(n, 1)
+        # Children stay non-genuine with empty excerpts regardless of order
+        # (they sort before the parent, so the late-parent reclassification
+        # path must have run), and the parent stays genuine.
+        for i, child_sid in enumerate(child_sids):
+            key = f"grok:{child_sid}"
+            sess = con.execute(
+                "SELECT parent_session_key FROM sessions WHERE session_key=?",
+                (key,)).fetchone()
+            self.assertIsNotNone(sess)
+            self.assertEqual(sess["parent_session_key"],
+                             f"grok:{parent_sid}")
+            row = con.execute(
+                "SELECT kind, is_genuine, text_excerpt FROM submissions"
+                " WHERE session_key=?", (key,)).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["kind"], "synthetic")
+            self.assertEqual(row["is_genuine"], 0)
+            self.assertEqual(row["text_excerpt"], "")
+        parent_key = f"grok:{parent_sid}"
+        parent_row = con.execute(
+            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            " WHERE session_key=?", (parent_key,)).fetchone()
+        self.assertIsNotNone(parent_row)
+        self.assertEqual(parent_row["kind"], "genuine")
+        self.assertEqual(parent_row["is_genuine"], 1)
+        self.assertEqual(parent_row["text_excerpt"], parent_text)
+        con.close()
+
+    def test_unchanged_parent_repairs_earlier_child_in_same_sync(self):
+        # Ordering gap: the parent was imported in an earlier sync and is
+        # unchanged; a newly appearing child sorts before that parent and
+        # its parent dispatch lives in the already-imported parent
+        # updates.jsonl. The child must still converge to synthetic/empty
+        # even though the unchanged parent takes the early return without
+        # reaching _subagent_link.
+        tmp = os.path.join(self.tmp.name, "unchangedparent")
+        group = os.path.join(tmp, "%2Fordergroup2")
+        os.makedirs(group, exist_ok=True)
+        parent_sid = "zzunchangedparent-ffff-4b5c-8d6e-000000000201"
+        child_sid = "aaunchangedchild-aaaa-4b5c-8d6e-000000000202"
+        parent_text = "Human unchanged parent"
+        child_text = "Human late child"
+        self._write_session(
+            group, parent_sid,
+            {"info": {"id": parent_sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-02T10:00:00Z",
+             "current_model_id": "grok-4.6"},
+            [{"timestamp": 1788900000, "method": "session/update",
+              "params": {"sessionId": parent_sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text",
+                                                "text": parent_text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "up-1",
+                                   "promptId": "p-up"}}},
+             {"timestamp": 1788900001, "method": "_x.ai/session/update",
+              "params": {"sessionId": parent_sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-up",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 10,
+                                              "outputTokens": 2,
+                                              "totalTokens": 12}},
+                         "_meta": {"eventId": "up-2"}}},
+             {"timestamp": 1788900002, "method": "_x.ai/session/update",
+              "params": {"sessionId": parent_sid,
+                         "update": {"sessionUpdate": "subagent_spawned",
+                                    "subagent_id": child_sid,
+                                    "parent_session_id": parent_sid,
+                                    "parent_prompt_id": "p-up",
+                                    "child_session_id": child_sid},
+                         "_meta": {"eventId": "up-spawn"}}}],
+            [{"ts": "2026-09-02T10:00:01Z", "type": "turn_started",
+              "session_id": parent_sid, "turn_number": 0,
+              "model_id": "grok-4.6",
+              "session_relationship": "primary"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": parent_text}],
+              "prompt_index": 0}])
+        con = self._isolated_con("unchangedparent")
+        first = grok.sync(con, root=tmp)
+        self.assertEqual(first["sources"], 1)
+        self._write_session(
+            group, child_sid,
+            {"info": {"id": child_sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-02T11:00:00Z",
+             "current_model_id": "grok-4.6"},
+            [{"timestamp": 1788900100, "method": "session/update",
+              "params": {"sessionId": child_sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text",
+                                                "text": child_text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "uc-1", "promptId": "p-uc"}}},
+             {"timestamp": 1788900101, "method": "_x.ai/session/update",
+              "params": {"sessionId": child_sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-uc",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 5,
+                                              "outputTokens": 1,
+                                              "totalTokens": 6}},
+                         "_meta": {"eventId": "uc-2"}}}],
+            [{"ts": "2026-09-02T11:00:01Z", "type": "turn_started",
+              "session_id": child_sid, "turn_number": 0,
+              "model_id": "grok-4.6",
+              "session_relationship": "primary"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": child_text}],
+              "prompt_index": 0}])
+        second = grok.sync(con, root=tmp)
+        self.assertEqual(second["sources"], 2)
+        child_key = f"grok:{child_sid}"
+        sess = con.execute(
+            "SELECT parent_session_key FROM sessions WHERE session_key=?",
+            (child_key,)).fetchone()
+        self.assertIsNotNone(sess)
+        self.assertEqual(sess["parent_session_key"], f"grok:{parent_sid}")
+        row = con.execute(
+            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            " WHERE session_key=?", (child_key,)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["kind"], "synthetic")
+        self.assertEqual(row["is_genuine"], 0)
+        self.assertEqual(row["text_excerpt"], "")
+        self.assertEqual(
+            con.execute("SELECT COUNT(*) n FROM submissions"
+                        " WHERE session_key=?", (child_key,)).fetchone()["n"],
+            1)
+        con.close()

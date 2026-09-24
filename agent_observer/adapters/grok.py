@@ -228,6 +228,22 @@ def _looks_like_session(path: str) -> bool:
                 "chat_history.jsonl"))
 
 
+class _SyncCtx:
+    """Per-sync shared state: linear parent lookup with no whole-tree rescans.
+
+    parent_index maps child native session id -> parent session key, built
+    incrementally in the single sync pass from each session's own
+    subagent_spawned records (plus persisted ledger links consulted in
+    _precompute). A child imported before its parent misses the index but is
+    reclassified in place when the parent later imports via _subagent_link,
+    so the final rows match the old quadratic scan without rescanning
+    sibling files per session.
+    """
+
+    def __init__(self) -> None:
+        self.parent_index: dict[str, str] = {}
+
+
 def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
          source: str | None = None) -> dict:
     """Import every session under root, or one session directory."""
@@ -235,9 +251,10 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
     totals = {"harness": HARNESS, "sources": 0, "unchanged": 0,
               "responses_inserted": 0, "events_inserted": 0,
               "submissions_inserted": 0, "malformed": 0, "failed": []}
+    ctx = _SyncCtx()
     for path in paths:
         try:
-            stats = import_grok_session(con, path, full=full)
+            stats = import_grok_session(con, path, full=full, _sync_ctx=ctx)
         except (OSError, sqlite3.DatabaseError, UnicodeDecodeError) as exc:
             totals["failed"].append({"path": path, "error": str(exc)})
             continue
@@ -317,7 +334,7 @@ def _safe_target(raw) -> str | None:
 
 
 class _Reader:
-    def __init__(self, con, session_key, native_sid, stats):
+    def __init__(self, con, session_key, native_sid, stats, sync_ctx=None):
         self.con = con
         self.session_key = session_key
         self.native_sid = native_sid
@@ -329,6 +346,7 @@ class _Reader:
         self.parent_key = None
         self.updates_src = None
         self.events_src = None
+        self.sync_ctx = sync_ctx
 
     def note_ts(self, ts) -> None:
         if ts is None:
@@ -510,14 +528,22 @@ def _find_parent_via_dispatches(session_dir: str,
 
 
 def _precompute_child_status(con: sqlite3.Connection, r: _Reader,
-                             session_dir: str) -> None:
+                             session_dir: str,
+                             updates_records: list | None = None,
+                             events_records: list | None = None) -> None:
     """Set parent link and subagent role before any replay.
 
     Order: summary role (already in r.meta), persisted
-    sessions.parent_session_key/role, parent subagent_spawned dispatches on
-    disk (own file first, then siblings for import-order), and
-    events.jsonl turn_started session_relationship='subagent'. A proven
-    child is non-genuine with an empty excerpt via privacy.py rule 1.
+    sessions.parent_session_key/role, per-sync parent index plus this
+    session's own spawn records (sync path, linear), and events
+    turn_started session_relationship='subagent'. A proven child is
+    non-genuine with an empty excerpt via privacy.py rule 1.
+
+    Direct single-session imports (no per-sync context) keep the old
+    own-plus-sibling disk scan so a child imported alone still finds a
+    parent that exists on disk but not yet in the ledger. Sync imports
+    never scan siblings: earlier parents are in the ledger or the sync
+    index, later parents reclassify the child in place via _subagent_link.
     """
     try:
         row = con.execute(
@@ -538,19 +564,51 @@ def _precompute_child_status(con: sqlite3.Connection, r: _Reader,
             r.parent_key = persisted_parent
         if persisted_role == "subagent" and r.meta.get("role") != "subagent":
             r.meta["role"] = "subagent"
+    sync_ctx = getattr(r, "sync_ctx", None)
+    if sync_ctx is not None:
+        if r.parent_key is None:
+            indexed = sync_ctx.parent_index.get(r.native_sid)
+            if indexed is not None:
+                r.parent_key = indexed
+        if r.parent_key is None and updates_records is not None:
+            found = _find_parent_in_records(updates_records, r.native_sid)
+            if found is not None:
+                r.parent_key = found
+        if r.meta.get("role") != "subagent":
+            if events_records is not None:
+                if _has_subagent_in_records(events_records):
+                    r.meta["role"] = "subagent"
+            else:
+                if _has_subagent_relationship(session_dir):
+                    r.meta["role"] = "subagent"
+        return
     if r.parent_key is None and r.meta.get("role") != "subagent":
-        found = _find_parent_via_dispatches(session_dir, r.native_sid)
+        if updates_records is not None:
+            found = _find_parent_in_records(updates_records, r.native_sid)
+            if found is None:
+                found = _find_parent_via_dispatches(session_dir, r.native_sid)
+        else:
+            found = _find_parent_via_dispatches(session_dir, r.native_sid)
         if found is not None:
             r.parent_key = found
     elif r.parent_key is None:
         # Already proven via summary/persisted role, but a parent link may
         # still exist on disk; record it for the session row.
-        found = _find_parent_via_dispatches(session_dir, r.native_sid)
+        if updates_records is not None:
+            found = _find_parent_in_records(updates_records, r.native_sid)
+            if found is None:
+                found = _find_parent_via_dispatches(session_dir, r.native_sid)
+        else:
+            found = _find_parent_via_dispatches(session_dir, r.native_sid)
         if found is not None:
             r.parent_key = found
     if r.meta.get("role") != "subagent":
-        if _has_subagent_relationship(session_dir):
-            r.meta["role"] = "subagent"
+        if events_records is not None:
+            if _has_subagent_in_records(events_records):
+                r.meta["role"] = "subagent"
+        else:
+            if _has_subagent_relationship(session_dir):
+                r.meta["role"] = "subagent"
 
 
 def _force_child_synthetic(con: sqlite3.Connection, stats: dict | None,
@@ -795,7 +853,10 @@ def _has_unproven_model_usage(update: dict) -> bool:
 
 def _reconcile_response_metadata(con: sqlite3.Connection, r: _Reader,
                                  session_dir: str, model_fallback,
-                                 summary_effort, chat_effort=None) -> int:
+                                 summary_effort, chat_effort=None,
+                                 updates_records: list | None = None,
+                                 events_records: list | None = None,
+                                 precomputed: tuple | None = None) -> int:
     """Update stale or NULL model/effort on existing responses in place.
 
     Recomputes validated model and effort with the existing precedence
@@ -813,17 +874,31 @@ def _reconcile_response_metadata(con: sqlite3.Connection, r: _Reader,
     inserts or duplicates rows; counters and usage_conflict behavior are
     untouched. Returns rows changed.
     """
-    updates_path = os.path.join(session_dir, "updates.jsonl")
-    if not os.path.isfile(updates_path):
-        return 0
-    prompts, order, completions_ordered = _collect_prompts(
-        updates_path, record_error=None)
+    if precomputed is not None:
+        prompts, order, completions_ordered, turn_models = precomputed
+    elif updates_records is not None:
+        if not updates_records and not os.path.isfile(
+                os.path.join(session_dir, "updates.jsonl")):
+            return 0
+        prompts, order, completions_ordered = _collect_prompts_from_records(
+            updates_records, record_error=None)
+        if events_records is not None:
+            turn_models = _turn_models_from_records(events_records)
+        else:
+            turn_models = _turn_models(
+                os.path.join(session_dir, "events.jsonl"))
+    else:
+        updates_path = os.path.join(session_dir, "updates.jsonl")
+        if not os.path.isfile(updates_path):
+            return 0
+        prompts, order, completions_ordered = _collect_prompts(
+            updates_path, record_error=None)
+        turn_models = _turn_models(os.path.join(session_dir, "events.jsonl"))
     pid_to_model: dict = {}
     for key in order:
         pid = prompts[key].get("prompt_id")
         if pid and pid not in pid_to_model and prompts[key].get("model"):
             pid_to_model[pid] = prompts[key]["model"]
-    turn_models = _turn_models(os.path.join(session_dir, "events.jsonl"))
     safe_turns = [(t, m) for t, m in turn_models
                   if isinstance(m, str) and _safe_token(m) is not None]
     # Reuse the replay duplicate-selection logic: stable first binding with
@@ -967,8 +1042,84 @@ def _reconcile_response_metadata(con: sqlite3.Connection, r: _Reader,
     return changed
 
 
+def _advance_source_to_cached(src, path: str, records: list) -> None:
+    """Advance a JsonlSource's offsets to the cached full read without I/O.
+
+    Consumes the single parse for finish() bookkeeping: when the file ends
+    with a newline the end is the file size, otherwise the byte offset just
+    after the last complete line (found via small tail reads). A trailing
+    partial line stays for the next import. Blank lines advance the offset
+    but never the ordinal, matching JsonlSource.records().
+    """
+    if src is None:
+        return
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    if size == 0:
+        src.end_offset = 0
+        return
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(-1, os.SEEK_END)
+            ends_newline = fh.read(1) == b"\n"
+    except OSError:
+        return
+    if ends_newline:
+        src.end_offset = size
+        if records:
+            try:
+                src.last_ordinal = max(o for o, _, _ in records)
+            except ValueError:
+                pass
+        return
+    try:
+        with open(path, "rb") as fh:
+            chunk_size = 65536
+            pos = size
+            found = None
+            while pos > 0:
+                read_size = min(chunk_size, pos)
+                pos -= read_size
+                fh.seek(pos)
+                chunk = fh.read(read_size)
+                idx = chunk.rfind(b"\n")
+                if idx != -1:
+                    found = pos + idx + 1
+                    break
+            if found is not None:
+                src.end_offset = found
+                if records:
+                    src.last_ordinal = max(o for o, _, _ in records)
+    except OSError:
+        pass
+
+
+def _delta_records(records: list, src) -> list:
+    """Cached records after the source's start offset (no re-read).
+
+    Ordinals count non-blank complete lines from the start in both the
+    cache and JsonlSource, so filtering by the stored ordinal_max replays
+    exactly the lines records() would yield. A privacy-stale or full
+    re-read has start_offset 0 and yields the whole cache.
+    """
+    if src is None:
+        return []
+    if not getattr(src, "incremental", False):
+        return list(records)
+    try:
+        row = src.row
+        start_ord = (row["ordinal_max"] + 1) \
+            if row is not None and row["ordinal_max"] is not None else 0
+    except (KeyError, TypeError, IndexError):
+        start_ord = 0
+    return [rec for rec in records if rec[0] >= start_ord]
+
+
 def import_grok_session(con: sqlite3.Connection, session_dir: str,
-                        full: bool = False) -> dict:
+                        full: bool = False,
+                        _sync_ctx=None) -> dict:
     """Import one Grok session directory. Idempotent; growing logs resume."""
     stats = {"lines": 0, "responses_inserted": 0, "responses_duplicate": 0,
              "submissions_inserted": 0, "events_inserted": 0,
@@ -1005,7 +1156,8 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             stats["malformed"] = stats.get("malformed", 0) + 1
             con.commit()
         return stats
-    r = _Reader(con, f"{HARNESS}:{native_sid}", native_sid, stats)
+    r = _Reader(con, f"{HARNESS}:{native_sid}", native_sid, stats,
+                sync_ctx=_sync_ctx)
     group_name = os.path.basename(os.path.dirname(session_dir.rstrip(os.sep)))
     fallback_dir = urllib.parse.unquote(group_name)
     project_dir = (summary.get("git_root_dir") if isinstance(
@@ -1032,10 +1184,43 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         if ts is not None:
             r.note_ts(ts)
 
+    # Single parse per file per session: every downstream path reuses these
+    # cached records instead of reopening and reparsing updates.jsonl and
+    # events.jsonl for parent indexing, prompt collection, replay, normal
+    # ingestion, reclassification and reconciliation.
+    updates_records = _load_jsonl_records(updates_path)
+    events_records = _load_jsonl_records(events_path)
+    if _sync_ctx is not None:
+        try:
+            _spawns = _extract_spawns_from_records(updates_records)
+        except (AttributeError, TypeError):
+            _spawns = {}
+        for _child, _pkey in _spawns.items():
+            try:
+                _sync_ctx.parent_index.setdefault(_child, _pkey)
+            except (AttributeError, TypeError):
+                pass
+            # Persist immediately from the same cached parse (no extra scan
+            # or reparse): a newly appearing child that sorts before this
+            # parent must converge even when this parent is unchanged and
+            # takes the early return below without reaching _subagent_link.
+            # Upsert only fills unknowns and the synthetic force only touches
+            # non-synthetic rows, so repeats stay idempotent.
+            _child_key = f"{HARNESS}:{_child}"
+            try:
+                db.upsert_session(con, _child_key, HARNESS, _child, None,
+                                  parent_session_key=_pkey)
+            except (sqlite3.DatabaseError, ValueError):
+                pass
+            if _child_key != r.session_key:
+                _force_child_synthetic(con, stats, _child_key)
+
     # Child status is available before any replay: summary role is already
-    # in r.meta; persisted links, parent dispatches (import-order) and the
-    # turn_started subagent relationship complete it here.
-    _precompute_child_status(con, r, session_dir)
+    # in r.meta; persisted links, the per-sync parent index plus this
+    # session's own dispatches, and the turn_started subagent relationship
+    # complete it here. Sync imports never scan sibling files.
+    _precompute_child_status(con, r, session_dir, updates_records,
+                             events_records)
 
     updates_src = (JsonlSource(con, HARNESS, updates_path, full=full)
                    if os.path.isfile(updates_path) else None)
@@ -1049,10 +1234,11 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     events_new = full or events_src is None or not events_src.unchanged
     chat = _read_chat(session_dir, r)
     if known and not updates_new and not events_new:
-        reclassified = _reclassify_existing(con, r, session_dir, chat)
+        reclassified = _reclassify_existing(con, r, session_dir, chat,
+                                            updates_records)
         reconciled = _reconcile_response_metadata(
             con, r, session_dir, model_fallback,
-            effort, chat.get("effort"))
+            effort, chat.get("effort"), updates_records, events_records)
         # Persist late identity even when no JSONL bytes changed.
         late_fields = {"started_at": r.first_ts, "ended_at": r.last_ts,
                        **r.meta, **r.identity.fields(con)}
@@ -1076,8 +1262,19 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     # correct those rows to non-genuine in place.
     parent_before = r.parent_key
     if updates_src is not None and (updates_new or not known):
-        _replay_updates(con, r, updates_src, chat, model_fallback, effort)
-        for ordinal, obj, line in updates_src.records():
+        def _replay_error(ordinal: int, category: str, line: str = "") -> None:
+            _record_error_once(updates_src, stats, ordinal, category, line)
+
+        _prompts, _order, _completions = _collect_prompts_from_records(
+            updates_records, record_error=_replay_error)
+        _turn_models_cached = _turn_models_from_records(events_records)
+        _replay_updates(
+            con, r, updates_src, chat, model_fallback, effort,
+            updates_records, events_records,
+            (_prompts, _order, _completions, _turn_models_cached))
+        _advance_source_to_cached(updates_src, updates_path, updates_records)
+        for ordinal, obj, line in _delta_records(
+                updates_records, updates_src):
             stats["lines"] += 1
             if obj is None or not isinstance(obj, dict):
                 _record_error_once(
@@ -1092,7 +1289,9 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                 _record_error_once(
                     updates_src, stats, ordinal, "schema_error", line)
     if events_src is not None and (events_new or not known):
-        for ordinal, obj, line in events_src.records():
+        _advance_source_to_cached(events_src, events_path, events_records)
+        for ordinal, obj, line in _delta_records(
+                events_records, events_src):
             stats["lines"] += 1
             if obj is None or not isinstance(obj, dict):
                 _record_error_once(
@@ -1115,7 +1314,7 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     # arrives.
     if known or (r.parent_key is not None
                  and r.parent_key != parent_before):
-        _reclassify_existing(con, r, session_dir, chat)
+        _reclassify_existing(con, r, session_dir, chat, updates_records)
     replayed_updates = updates_src is not None and (updates_new or not known)
     if not replayed_updates:
         # Only events (or only summary/chat) changed: turn_started models,
@@ -1123,7 +1322,7 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         # response rows in place without duplicates or counter changes.
         reconciled = _reconcile_response_metadata(
             con, r, session_dir, model_fallback,
-            effort, chat.get("effort"))
+            effort, chat.get("effort"), updates_records, events_records)
         if reconciled:
             stats["responses_updated"] = \
                 stats.get("responses_updated", 0) + reconciled
@@ -1234,6 +1433,76 @@ def _complete_lines(path: str):
                 ordinal += 1
 
 
+def _load_jsonl_records(path: str | None) -> list:
+    """All complete-line records from path in a single open+parse.
+
+    Returns [(ordinal, obj, raw)] where obj is None for malformed JSON.
+    Ordinals count non-blank complete lines from the start, matching
+    JsonlSource and _complete_lines; a trailing partial line is left for
+    the next import. Callers reuse the list for parent indexing, prompt
+    collection, replay, ingestion and reclassification instead of
+    reopening and reparsing the file per path.
+    """
+    if not path or not os.path.isfile(path):
+        return []
+    try:
+        lines = list(_complete_lines(path))
+    except OSError:
+        return []
+    out: list = []
+    for ordinal, raw in lines:
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            obj = None
+        out.append((ordinal, obj, raw))
+    return out
+
+
+def _extract_spawns_from_records(records: list) -> dict:
+    """Child native sid -> parent session key from spawn records only."""
+    out: dict = {}
+    for _, obj, _ in records:
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("method") not in METHODS:
+            continue
+        params = obj.get("params") if isinstance(obj.get("params"), dict) \
+            else {}
+        update = params.get("update") if isinstance(params, dict) else {}
+        if not isinstance(update, dict):
+            continue
+        if update.get("sessionUpdate") != "subagent_spawned":
+            continue
+        parent = update.get("parent_session_id")
+        child = update.get("child_session_id") or update.get("subagent_id")
+        if not isinstance(parent, str) or _safe_token(parent) is None:
+            continue
+        if not isinstance(child, str) or _safe_token(child) is None:
+            continue
+        out.setdefault(child, f"{HARNESS}:{parent}")
+    return out
+
+
+def _find_parent_in_records(records: list, native_sid: str) -> str | None:
+    """Parent key from this file's own spawn records naming native_sid."""
+    if not records or not native_sid:
+        return None
+    return _extract_spawns_from_records(records).get(native_sid)
+
+
+def _has_subagent_in_records(records: list) -> bool:
+    """Whether cached events prove a subagent via session_relationship."""
+    for _, obj, _ in records:
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") != "turn_started":
+            continue
+        if obj.get("session_relationship") == "subagent":
+            return True
+    return False
+
+
 def _turn_models(events_path: str | None) -> list:
     """(ts, model_id) of every turn_started, oldest first."""
     models = []
@@ -1245,6 +1514,22 @@ def _turn_models(events_path: str | None) -> list:
         except ValueError:
             continue
         if isinstance(obj, dict) and obj.get("type") == "turn_started" \
+                and isinstance(obj.get("model_id"), str) \
+                and _safe_token(obj.get("model_id")) is not None:
+            ts = iso_ts(obj.get("ts"))
+            if ts is not None:
+                models.append((ts, obj["model_id"]))
+    models.sort()
+    return models
+
+
+def _turn_models_from_records(records: list) -> list:
+    """Turn models from cached events records without reopening the file."""
+    models = []
+    for _, obj, _ in records:
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") == "turn_started" \
                 and isinstance(obj.get("model_id"), str) \
                 and _safe_token(obj.get("model_id")) is not None:
             ts = iso_ts(obj.get("ts"))
@@ -1289,6 +1574,72 @@ def _collect_prompts(path: str, record_error=None) -> tuple[dict, list, list]:
         except ValueError:
             continue
         if not isinstance(obj, dict):
+            continue
+        if obj.get("method") not in METHODS:
+            continue
+        params = obj.get("params") if isinstance(obj.get("params"), dict) \
+            else {}
+        update = params.get("update") if isinstance(params, dict) else {}
+        if not isinstance(update, dict):
+            continue
+        kind = update.get("sessionUpdate")
+        if kind == "user_message_chunk":
+            meta = update.get("_meta") if isinstance(
+                update.get("_meta"), dict) else {}
+            pidx = meta.get("promptIndex")
+            key = _valid_prompt_index(pidx)
+            if key is None:
+                if record_error is not None:
+                    record_error(ordinal, "missing_id", raw)
+                continue
+            pid = _extract_prompt_id(obj, update)
+            entry = prompts.get(key)
+            if entry is None:
+                entry = {"texts": [], "model": None, "first": ordinal,
+                         "ts": iso_ts(obj.get("timestamp")), "prompt_id": pid}
+                prompts[key] = entry
+                order.append(key)
+            else:
+                if entry.get("prompt_id") is None and pid is not None:
+                    entry["prompt_id"] = pid
+                elif pid is not None and entry.get("prompt_id") is not None \
+                        and pid != entry["prompt_id"]:
+                    if record_error is not None:
+                        record_error(ordinal, "schema_error", raw)
+            entry["texts"].append(_content_text(update.get("content")))
+            if entry["model"] is None and isinstance(
+                    meta.get("modelId"), str) and _safe_token(
+                        meta.get("modelId")) is not None:
+                entry["model"] = meta["modelId"]
+        elif kind == "turn_completed":
+            raw_pid = update.get("prompt_id") or update.get("promptId")
+            pid = raw_pid if isinstance(
+                raw_pid, str) and _safe_token(raw_pid) is not None else None
+            if not pid:
+                if record_error is not None:
+                    record_error(ordinal, "missing_id", raw)
+                continue
+            completions_ordered.append(
+                (ordinal, update, iso_ts(obj.get("timestamp")), obj,
+                 obj.get("method"), raw))
+        else:
+            continue
+    return prompts, order, completions_ordered
+
+
+def _collect_prompts_from_records(records: list,
+                                  record_error=None) -> tuple[dict, list, list]:
+    """Same as _collect_prompts but over cached (ordinal, obj, raw) records.
+
+    No file I/O or re-parsing: malformed (None) and non-dict records are
+    skipped silently here exactly like the path version; the incremental
+    ingest loop quarantines them once from the same cached list.
+    """
+    prompts: dict = {}
+    order: list = []
+    completions_ordered: list = []
+    for ordinal, obj, raw in records:
+        if obj is None or not isinstance(obj, dict):
             continue
         if obj.get("method") not in METHODS:
             continue
@@ -1398,22 +1749,27 @@ def _upsert_submission(con, r: _Reader, src, chat: dict, key: str,
 
 
 def _reclassify_existing(con, r: _Reader, session_dir: str,
-                         chat: dict) -> int:
+                         chat: dict,
+                         updates_records: list | None = None) -> int:
     """Update stored submissions when chat metadata arrives later.
 
-    Runs even when updates.jsonl/events.jsonl are unchanged. Re-reads the
-    updates file silently (no duplicate import_errors) and applies
-    evidence-aware kind/excerpt/turn updates in place without duplicates.
-    Returns the number of rows changed.
+    Runs even when updates.jsonl/events.jsonl are unchanged. Reuses the
+    single cached parse of updates.jsonl when provided (no duplicate
+    import_errors) and applies evidence-aware kind/excerpt/turn updates in
+    place without duplicates. Returns the number of rows changed.
     """
-    updates_path = os.path.join(session_dir, "updates.jsonl")
-    if not os.path.isfile(updates_path):
-        return 0
     # The reader's updates source carries the ledger source id; building a
     # second JsonlSource here would repeat its privacy-stale import_errors
     # replacement and wipe the errors this sync just recorded.
-    prompts, order, completions_ordered = _collect_prompts(
-        updates_path, record_error=None)
+    if updates_records is not None:
+        prompts, order, completions_ordered = _collect_prompts_from_records(
+            updates_records, record_error=None)
+    else:
+        updates_path = os.path.join(session_dir, "updates.jsonl")
+        if not os.path.isfile(updates_path):
+            return 0
+        prompts, order, completions_ordered = _collect_prompts(
+            updates_path, record_error=None)
     completions_by_id = _deduplicate_completions(completions_ordered)
     before = con.total_changes
     for key in order:
@@ -1426,7 +1782,10 @@ def _reclassify_existing(con, r: _Reader, session_dir: str,
 
 
 def _replay_updates(con, r: _Reader, src: JsonlSource, chat: dict,
-                    model_fallback, effort) -> None:
+                    model_fallback, effort,
+                    updates_records: list | None = None,
+                    events_records: list | None = None,
+                    precomputed: tuple | None = None) -> None:
     """Rebuild prompts and per-prompt usage from the whole updates.jsonl.
 
     A growing file can extend an open prompt or finalize it on a later sync,
@@ -1436,6 +1795,9 @@ def _replay_updates(con, r: _Reader, src: JsonlSource, chat: dict,
     Completions bind to prompts by native prompt id (deduplicated); position
     never shifts bindings. Unmatched prompts stay unbound; unmatched
     completions still store one response row by their own key.
+
+    When cached records (or precomputed prompts/completions/turn models)
+    are provided the single parse is reused instead of reopening the files.
     """
 
     def record_error(ordinal: int, category: str, line: str = "") -> None:
@@ -1444,8 +1806,21 @@ def _replay_updates(con, r: _Reader, src: JsonlSource, chat: dict,
         # top-level key names from the raw line.
         _record_error_once(src, r.stats, ordinal, category, line)
 
-    prompts, order, completions_ordered = _collect_prompts(
-        src.path, record_error=record_error)
+    if precomputed is not None:
+        prompts, order, completions_ordered, turn_models = precomputed
+    elif updates_records is not None:
+        prompts, order, completions_ordered = _collect_prompts_from_records(
+            updates_records, record_error=record_error)
+        if events_records is not None:
+            turn_models = _turn_models_from_records(events_records)
+        else:
+            turn_models = _turn_models(
+                os.path.join(os.path.dirname(src.path), "events.jsonl"))
+    else:
+        prompts, order, completions_ordered = _collect_prompts(
+            src.path, record_error=record_error)
+        turn_models = _turn_models(
+            os.path.join(os.path.dirname(src.path), "events.jsonl"))
     completions_by_id = _deduplicate_completions(completions_ordered)
     # Prompt-ID to chunk model for response model fallback.
     pid_to_model: dict = {}
@@ -1453,8 +1828,6 @@ def _replay_updates(con, r: _Reader, src: JsonlSource, chat: dict,
         pid = prompts[key].get("prompt_id")
         if pid and pid not in pid_to_model and prompts[key].get("model"):
             pid_to_model[pid] = prompts[key]["model"]
-    turn_models = _turn_models(
-        os.path.join(os.path.dirname(src.path), "events.jsonl"))
     # All validated usage models per pid for strength comparison in the
     # response path: an existing model matching any of them is strong.
     all_usage_models: dict = {}
@@ -1817,6 +2190,12 @@ def _subagent_link(r: _Reader, update: dict) -> None:
         return
     if child == r.native_sid:
         r.parent_key = f"{HARNESS}:{parent}"
+    sync_ctx = getattr(r, "sync_ctx", None)
+    if sync_ctx is not None:
+        try:
+            sync_ctx.parent_index.setdefault(child, f"{HARNESS}:{parent}")
+        except (AttributeError, TypeError):
+            pass
     if parent and child:
         # The child row may be imported before or after this record; the
         # parent link survives either order because session fields only fill
