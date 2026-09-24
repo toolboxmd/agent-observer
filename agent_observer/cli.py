@@ -108,6 +108,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="agent_observer",
                                  description="Observe agent work from native records.")
     ap.add_argument("--db", default=_db.default_path())
+    # The global flag owns the default: every subparser-level --json uses
+    # SUPPRESS so it never overrides a global --json with its own default.
     ap.add_argument("--json", action="store_true", dest="as_json")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -123,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="re-read sources from the start")
     s.add_argument("--agentsmd-repo", default=None,
                    help="AgentsMD repository for the version map")
-    s.add_argument("--json", action="store_true", dest="as_json")
+    s.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
     ss = sub.add_parser("sessions", help="list or show imported sessions")
     ssub = ss.add_subparsers(dest="op", required=True)
@@ -132,10 +134,10 @@ def build_parser() -> argparse.ArgumentParser:
     sl.add_argument("--project", default=None)
     sl.add_argument("--since", default=None, help="ISO date or epoch seconds")
     sl.add_argument("--limit", type=int, default=50)
-    sl.add_argument("--json", action="store_true", dest="as_json")
+    sl.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     sw = ssub.add_parser("show")
     sw.add_argument("--session", required=True)
-    sw.add_argument("--json", action="store_true", dest="as_json")
+    sw.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
     c = sub.add_parser("capture", help="record workload facts")
     csub = c.add_subparsers(dest="op", required=True)
@@ -186,10 +188,11 @@ def build_parser() -> argparse.ArgumentParser:
     k = sub.add_parser("task", help="inspect tasks and usage")
     ksub = k.add_subparsers(dest="op", required=True)
     ksub.add_parser("list").add_argument("--json", action="store_true",
-                                              dest="as_json")
+                                              dest="as_json",
+                                              default=argparse.SUPPRESS)
     sh = ksub.add_parser("show")
     sh.add_argument("--task", required=True)
-    sh.add_argument("--json", action="store_true", dest="as_json")
+    sh.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
     def _scope(parser):
         parser.add_argument("--since", default=None, help="ISO date or epoch seconds")
@@ -197,7 +200,7 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument("--project", default=None)
         parser.add_argument("--harness", default=None)
         parser.add_argument("--agentsmd-version", default=None)
-        parser.add_argument("--json", action="store_true", dest="as_json")
+        parser.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
     dg = sub.add_parser("diagnose", help="find repeated work and behavior incidents")
     dg.add_argument("--detector", action="append", default=None,
@@ -219,10 +222,10 @@ def build_parser() -> argparse.ArgumentParser:
     pb.add_argument("--pr", type=int, default=None)
     pb.add_argument("--commit", default=None)
     pb.add_argument("--dry-run", action="store_true", help="print the comment, post nothing")
-    pb.add_argument("--json", action="store_true", dest="as_json")
+    pb.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
     hl = sub.add_parser("health", help="find live sessions Observer cannot see")
-    hl.add_argument("--json", action="store_true", dest="as_json")
+    hl.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
     tr = sub.add_parser("trace", help="inspect the execution timeline")
     tr.add_argument("--task", default=None)
@@ -231,7 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--family", default=None)
     tr.add_argument("--limit", type=int, default=200)
     tr.add_argument("--capabilities", action="store_true")
-    tr.add_argument("--json", action="store_true", dest="as_json")
+    tr.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     return ap
 
 

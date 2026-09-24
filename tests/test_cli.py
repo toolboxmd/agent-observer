@@ -153,3 +153,38 @@ class UnknownCountersCliTest(unittest.TestCase):
         self.assertEqual(
             groups["gpt-6-fixture"]["tokens_per_session"]["total"], 100)
         self.assertEqual(groups["gpt-6-fixture"]["unknown_token_responses"], 2)
+
+
+class JsonFlagPositionTest(unittest.TestCase):
+    """--json works before and after the subcommand for every subparser."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.mini = os.path.join(REPO, "tests", "fixtures", "codex-mini.jsonl")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _db(self, name):
+        return os.path.join(self.tmp.name, name)
+
+    def test_json_before_and_after_sync_parses(self):
+        cases = (("before.db", ["--json", "sync", "--source", self.mini]),
+                 ("after.db", ["sync", "--source", self.mini, "--json"]))
+        for name, args in cases:
+            with self.subTest(args=args):
+                r = run(self._db(name), *args)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                payload = json.loads(r.stdout)
+                self.assertEqual(payload["_view"], "sync")
+                self.assertEqual(
+                    payload["harnesses"][0]["responses_inserted"], 3)
+
+    def test_json_before_and_after_read_views_parse(self):
+        run(self._db("views.db"), "sync", "--source", self.mini)
+        for args in (["--json", "sessions", "list"],
+                     ["sessions", "list", "--json"]):
+            with self.subTest(args=args):
+                r = run(self._db("views.db"), *args)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("sessions", json.loads(r.stdout))

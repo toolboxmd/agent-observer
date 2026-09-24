@@ -49,6 +49,26 @@ CAPABILITIES = [
     ("subagents", True, "subagent transcripts as child sessions of their parent"),
 ]
 
+# Benign native metadata records: recognized as known and ignored. Their
+# contents are never stored; only the session/timing fields read before
+# dispatch (identifiers, never free text) are kept. Anything not listed
+# here still raises _UnsupportedSchema, so arbitrary future record types
+# stay quarantined instead of being silently dropped.
+IGNORED_METADATA_TYPES = frozenset({
+    "agent-name",
+    "atis-latch",
+    "bridge-session",
+    "cost-state",
+    "custom-title",
+    "file-history-delta",
+    "file-history-snapshot",
+    "last-prompt",
+    "mode",
+    "permission-mode",
+    "pr-link",
+    "queue-operation",
+})
+
 
 class _MalformedUsage(ValueError):
     """A usage bucket that is not NULL or a real integer counter."""
@@ -299,6 +319,9 @@ def _ingest(r: _Reader, obj: dict, ordinal: int) -> None:
         _system(r, obj, ordinal, ts)
     elif kind == "ai-title":
         # Rule 7: native free-text titles are discarded, never stored.
+        return
+    elif kind in IGNORED_METADATA_TYPES:
+        # Known benign metadata: recognized, never stored, never an error.
         return
     else:
         raise _UnsupportedSchema(f"unsupported record type: {kind!r}")

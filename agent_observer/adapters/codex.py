@@ -179,6 +179,25 @@ class _Reader:
         self.last_ts = None
         self.meta: dict = {}
         self.token_counts: list = []
+        # Compaction context for deferred token_count flushing: token_count
+        # checkpoints are collected during ingestion and reconciled only at
+        # flush, so each checkpoint captures whether a compaction boundary
+        # (compacted record or ContextCompaction item) already preceded it.
+        # A repeated cumulative checkpoint after compaction whose cumulative
+        # bucket is unchanged is duplicate evidence, not a conflict.
+        self.compaction_seen = False
+        # Ordering guard for the deferred flush (set by import_codex_file
+        # before ingestion): the structural ordinal where this import's
+        # prefix begins, and a high-water mark over the events table. A
+        # checkpoint counts as post-compaction only when the boundary
+        # precedes it: the captured flag covers this import, and the ledger
+        # query below additionally requires id <= prior_event_ceiling (so
+        # compaction events written later in this same import never leak
+        # in) and ordinal_num < import_start_ordinal (so only evidence from
+        # before the imported prefix counts on incremental imports; full
+        # re-reads start at zero and consult nothing but the captured flag).
+        self.import_start_ordinal = 0
+        self.prior_event_ceiling = None
         # Every own-thread identity seen so far (persisted plus prescanned
         # plus streamed): the main-session gate fails closed on divergence.
         # Referenced worker threads (spawn targets) never enter this set.
@@ -300,6 +319,16 @@ def import_codex_file(con: sqlite3.Connection, path: str,
     if reader.thread_source is None:
         reader.thread_source = pre["thread_source"]
     reader.observed_threads.update(pre["observed_thread_ids"])
+    # Ordering guard for the deferred token_count flush, snapshotted before
+    # any row of this import is written. The start ordinal mirrors
+    # JsonlSource.records: an incremental import resumes after the previous
+    # max, a full re-read starts at zero. The ceiling marks every event that
+    # already existed, so the flush can tell prior-prefix compaction evidence
+    # apart from compaction events this import is about to write.
+    reader.import_start_ordinal = \
+        (src.row["ordinal_max"] + 1) if src.incremental else 0
+    reader.prior_event_ceiling = con.execute(
+        "SELECT MAX(id) FROM events").fetchone()[0]
     for ordinal, obj, line in src.records():
         stats["lines"] += 1
         if obj is None or not isinstance(obj, dict):
@@ -443,6 +472,16 @@ def _reconcile_fallback(r: _Reader) -> None:
         (r.session_key, TOKEN_COUNT_SEMANTICS, SEMANTICS))
 
 
+def _cumulative_sig(total_raw: dict) -> tuple:
+    """The cumulative accounting bucket of one fallback checkpoint.
+
+    Only the six known usage counters identify the cumulative point; extra
+    native metadata (context window, rate-limit snapshots) never does, so
+    differing metadata alone can never look like an accounting change.
+    """
+    return tuple((key, total_raw.get(key)) for key in _CODEX_BUCKET_KEYS)
+
+
 def _fallback_want(last: dict, total: int) -> dict:
     return {
         "input_tokens": last.get("input_tokens"),
@@ -461,11 +500,19 @@ def _flush_token_counts(r: _Reader) -> None:
     Each rising cumulative total is one new response keyed by that total, so
     appended logs, copied snapshots and full reimports all converge. Every
     duplicate fallback key is compared across all fallback counters: an exact
-    repeat is a no-op and any difference is quarantined without overwriting.
-    Malformed buckets are quarantined before any SQL and later valid records
-    still import. Rising checkpoints are always preserved as evidence,
-    wherever they appear; reconciliation then marks only the checkpoints an
-    authoritative span genuinely covers as overlap."""
+    repeat is a no-op and any difference is quarantined without overwriting,
+    with one narrow exception. A repeated checkpoint with the same cumulative
+    identity that arrives after a compaction boundary, and whose cumulative
+    bucket repeats this import's first checkpoint for that total while only
+    last-token or rate-limit metadata changed, is duplicate compaction
+    evidence: it is ignored without inserting another response, changing the
+    stored row, or recording an error. Pre-compaction repeats with changed
+    counters, and post-compaction repeats with a changed cumulative bucket,
+    stay quarantined as usage conflicts. Malformed buckets are quarantined
+    before any SQL and later valid records still import. Rising checkpoints
+    are always preserved as evidence, wherever they appear; reconciliation
+    then marks only the checkpoints an authoritative span genuinely covers
+    as overlap."""
 
     if r.token_counts:
         row = r.con.execute(
@@ -473,7 +520,42 @@ def _flush_token_counts(r: _Reader) -> None:
             " WHERE session_key=? AND semantics=?",
             (r.session_key, TOKEN_COUNT_SEMANTICS)).fetchone()
         previous = row["t"] or 0
-        for struct_ordinal, obj, info in r.token_counts:
+        # First cumulative bucket per total seen in this import, in file
+        # order. A repeat can only be compaction evidence when this import
+        # already saw the total's first checkpoint to compare against;
+        # a lone repeat of a row stored by an earlier import fails closed
+        # into the usage_conflict path below.
+        first_cumulative: dict = {}
+        prior_compaction = None
+
+        def _post_compaction(captured: bool) -> bool:
+            """Whether a compaction boundary precedes this checkpoint.
+
+            The flag captured at collection covers this import in file order.
+            The ledger covers earlier incremental prefixes only: the row-id
+            ceiling excludes compaction events this import wrote (including
+            ones positioned later in the same file), and the ordinal bound
+            excludes anything not from before the imported prefix. A
+            same-total conflict before a later compaction therefore still
+            quarantines; a repeat after an earlier-prefix boundary does not.
+            """
+            nonlocal prior_compaction
+            if captured:
+                return True
+            if prior_compaction is None:
+                prior_compaction = False
+                if r.prior_event_ceiling is not None:
+                    hit = r.con.execute(
+                        "SELECT 1 FROM events WHERE session_key=?"
+                        " AND family='compaction' AND id <= ?"
+                        " AND ordinal_num IS NOT NULL"
+                        " AND ordinal_num < ? LIMIT 1",
+                        (r.session_key, r.prior_event_ceiling,
+                         r.import_start_ordinal)).fetchone()
+                    prior_compaction = hit is not None
+            return prior_compaction
+
+        for struct_ordinal, obj, info, compacted_before in r.token_counts:
             ordinal = struct_ordinal
             try:
                 if not isinstance(info, dict):
@@ -495,6 +577,10 @@ def _flush_token_counts(r: _Reader) -> None:
                 if not isinstance(total, int) or isinstance(total, bool):
                     raise _MalformedUsage("malformed usage counter")
                 rid = f"{r.session_key}:tc:{total}"
+                sig = _cumulative_sig(total_raw)
+                first = first_cumulative.get(total)
+                if total not in first_cumulative:
+                    first_cumulative[total] = sig
                 existing = r.con.execute(
                     "SELECT input_tokens, cached_input_tokens,"
                     " cache_write_input_tokens, output_tokens,"
@@ -508,6 +594,14 @@ def _flush_token_counts(r: _Reader) -> None:
                     seen = dict(existing)
                     want = _fallback_want(last_raw, total)
                     if seen != want:
+                        if first is not None and first == sig \
+                                and _post_compaction(compacted_before):
+                            # Post-compaction duplicate evidence: no new
+                            # response, no row change, no error.
+                            r.stats["responses_duplicate"] += 1
+                            if total > previous:
+                                previous = total
+                            continue
                         raise _UsageConflict("usage conflict")
                     r.stats["responses_duplicate"] += 1
                     if total > previous:
@@ -532,6 +626,9 @@ def _flush_token_counts(r: _Reader) -> None:
                     r.stats["responses_inserted"] += 1
                 else:
                     # Lost a race with an existing row: compare before counting.
+                    # The same post-compaction duplicate-evidence rule applies
+                    # as above, so a copied snapshot converging here stays
+                    # silent while genuine mismatches still quarantine.
                     existing = r.con.execute(
                         "SELECT input_tokens, cached_input_tokens,"
                         " cache_write_input_tokens, output_tokens,"
@@ -541,6 +638,10 @@ def _flush_token_counts(r: _Reader) -> None:
                     seen = dict(existing) if existing is not None else {}
                     want = _fallback_want(last_raw, total)
                     if seen != want:
+                        if first is not None and first == sig \
+                                and _post_compaction(compacted_before):
+                            r.stats["responses_duplicate"] += 1
+                            continue
                         raise _UsageConflict("usage conflict")
                     r.stats["responses_duplicate"] += 1
             except _UsageConflict:
@@ -785,6 +886,7 @@ def _ingest_event_msg(r: _Reader, obj: dict, ordinal: int) -> None:
         elif itype == "ContextCompaction":
             # Sparse native compaction marker: boundary identity only.
             r.stats["compactions"] += 1
+            r.compaction_seen = True
             r.event(obj, "compaction", item.get("id"),
                     turn_id=f"{HARNESS}:{item['turn_id']}" if item.get("turn_id") else turn_id,
                     name="context_compaction")
@@ -841,8 +943,11 @@ def _ingest_event_msg(r: _Reader, obj: dict, ordinal: int) -> None:
         # counters quarantine there without losing later valid checkpoints.
         # The structural source ordinal travels along so deferred errors
         # deduplicate NULL-safely instead of passing a native ordinal that
-        # may be absent.
-        r.token_counts.append((ordinal, obj, info_raw))
+        # may be absent. The compaction flag travels along for the same
+        # reason: flushing happens after the whole file is read, so each
+        # checkpoint must remember whether a compaction boundary already
+        # preceded it at collection time.
+        r.token_counts.append((ordinal, obj, info_raw, r.compaction_seen))
     elif etype == "thread_settings_applied":
         return
     elif etype == "turn_aborted":
@@ -906,6 +1011,7 @@ def _ingest_command(r: _Reader, obj: dict, item: dict, turn_id) -> None:
 def _ingest_compacted(r: _Reader, obj: dict) -> None:
     p = obj["payload"]
     r.stats["compactions"] += 1
+    r.compaction_seen = True
     if "window_id" not in p:
         # Older rollouts record a compaction with its replacement history
         # but no window identity; the boundary is kept by position.

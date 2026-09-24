@@ -89,6 +89,47 @@ class ClaudeAdapterTest(LedgerCase):
         self.assertEqual(report.scope_totals(self.con)["responses"], 3)
 
 
+class ClaudeMetadataTest(LedgerCase):
+    """Known benign metadata records are recognized and ignored: no rows,
+    no stored contents, no import errors. Genuinely unknown types stay
+    quarantined as unsupported_schema."""
+
+    def test_known_metadata_is_ignored_and_unknown_stays_quarantined(self):
+        stats = claude.import_claude_file(
+            self.con, fixture("claude-metadata.jsonl"))
+        self.assertEqual(stats["responses_inserted"], 1)
+        self.assertEqual(stats["malformed"], 1)
+        errors = self.query(
+            "SELECT error, line_excerpt FROM import_errors ORDER BY id")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["error"], "unsupported_schema")
+        # Privacy rule 5: structure only, key names never values.
+        self.assertEqual(errors[0]["line_excerpt"],
+                         "sessionId,timestamp,type,uuid")
+        # Existing behavior is intact: the genuine submission and the
+        # usage row still import.
+        self.assertEqual(
+            self.query("SELECT kind FROM submissions"
+                       " WHERE native_id='claude:u-meta-1'")[0]["kind"],
+            "genuine")
+        self.assertEqual(
+            self.query("SELECT total_tokens t FROM responses"
+                       " WHERE response_id='claude:msg-meta-1'")[0]["t"],
+            10 + 100 + 1000 + 50)
+        # No metadata contents persist anywhere in the ledger.
+        blob = "".join(r["detail_json"] or "" for r in self.query(
+            "SELECT detail_json FROM events"))
+        blob += "".join(r["identity_json"] or "" for r in self.query(
+            "SELECT identity_json FROM sessions"))
+        blob += "".join(
+            (r["error"] or "") + (r["line_excerpt"] or "")
+            for r in self.query("SELECT error, line_excerpt FROM import_errors"))
+        for sentinel in ("synthetic-bridge", "synthetic-leaf",
+                         "synthetic-operation", "Synthetic title probe",
+                         "synthetic-permission"):
+            self.assertNotIn(sentinel, blob)
+
+
 class ClaudeContradictoryMarkersTest(LedgerCase):
     """Human-origin metadata never makes a known marker genuine."""
 
