@@ -2622,3 +2622,618 @@ class GrokAdapterTest(LedgerCase):
         self.assertEqual(row["text_excerpt"], "")
         self.assertIn(row["kind"], ("unknown", "synthetic"))
         con.close()
+
+    def test_sync_parses_each_updates_once(self):
+        # Linear sync: each updates.jsonl is fully opened/parsed at most
+        # once per sync. Per-session sibling rescans would make per-path
+        # _complete_lines calls grow with the tree size. Counting at the
+        # adapter read boundary passes with the per-operation parent index
+        # plus a single cached parse reused for indexing, prompts, replay,
+        # ingestion and reclassification.
+        tmp = os.path.join(self.tmp.name, "perflinear")
+        group = os.path.join(tmp, "%2Fperfgroup")
+        os.makedirs(group, exist_ok=True)
+        parent_sid = "zzperfparent-ffff-4b5c-8d6e-000000000099"
+        child_sids = [
+            "aaperfchild-aaaa-4b5c-8d6e-000000000101",
+            "bbperfchild-bbbb-4b5c-8d6e-000000000102",
+            "ccperfchild-cccc-4b5c-8d6e-000000000103",
+            "ddperfchild-dddd-4b5c-8d6e-000000000104",
+        ]
+        for i, child_sid in enumerate(child_sids):
+            text = f"Human probe child {i}"
+            self._write_session(
+                group, child_sid,
+                {"info": {"id": child_sid, "cwd": "/redacted/repo"},
+                 "created_at": "2026-09-01T23:00:00Z",
+                 "current_model_id": "grok-4.6"},
+                [{"timestamp": 1788820000 + i,
+                  "method": "session/update",
+                  "params": {"sessionId": child_sid,
+                             "update": {"sessionUpdate": "user_message_chunk",
+                                        "content": {"type": "text",
+                                                    "text": text},
+                                        "_meta": {"promptIndex": 0}},
+                             "_meta": {"eventId": f"perf-c-{i}",
+                                       "promptId": f"p-perf-{i}"}}},
+                 {"timestamp": 1788820010 + i,
+                  "method": "_x.ai/session/update",
+                  "params": {"sessionId": child_sid,
+                             "update": {"sessionUpdate": "turn_completed",
+                                        "prompt_id": f"p-perf-{i}",
+                                        "stop_reason": "end_turn",
+                                        "usage": {"inputTokens": 5,
+                                                  "outputTokens": 1,
+                                                  "totalTokens": 6}},
+                             "_meta": {"eventId": f"perf-cc-{i}"}}}],
+                [{"ts": "2026-09-01T23:00:01Z", "type": "turn_started",
+                  "session_id": child_sid, "turn_number": 0,
+                  "model_id": "grok-4.6",
+                  "session_relationship": "primary"},
+                 {"ts": "2026-09-01T23:00:02Z", "type": "turn_ended",
+                  "outcome": "completed"}],
+                [{"type": "user",
+                  "content": [{"type": "text", "text": text}],
+                  "prompt_index": 0}])
+        parent_text = "Human parent probe"
+        spawns = []
+        for i, child_sid in enumerate(child_sids):
+            spawns.append({
+                "timestamp": 1788820100 + i,
+                "method": "_x.ai/session/update",
+                "params": {"sessionId": parent_sid,
+                           "update": {"sessionUpdate": "subagent_spawned",
+                                      "subagent_id": child_sid,
+                                      "parent_session_id": parent_sid,
+                                      "parent_prompt_id": "p-parent",
+                                      "child_session_id": child_sid},
+                           "_meta": {"eventId": f"perf-spawn-{i}"}}})
+        self._write_session(
+            group, parent_sid,
+            {"info": {"id": parent_sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-01T23:05:00Z",
+             "current_model_id": "grok-4.6"},
+            [{"timestamp": 1788820200, "method": "session/update",
+              "params": {"sessionId": parent_sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text",
+                                                "text": parent_text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "perf-p-1",
+                                   "promptId": "p-parent"}}},
+             {"timestamp": 1788820201, "method": "_x.ai/session/update",
+              "params": {"sessionId": parent_sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-parent",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 10,
+                                              "outputTokens": 2,
+                                              "totalTokens": 12}},
+                         "_meta": {"eventId": "perf-p-2"}}}] + spawns,
+            [{"ts": "2026-09-01T23:05:01Z", "type": "turn_started",
+              "session_id": parent_sid, "turn_number": 0,
+              "model_id": "grok-4.6",
+              "session_relationship": "primary"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": parent_text}],
+              "prompt_index": 0}])
+        con = self._isolated_con("perflinear")
+        orig_complete = grok._complete_lines
+        counts: dict = {}
+
+        def counting_complete(path):
+            if isinstance(path, str) and path.endswith("updates.jsonl"):
+                counts[path] = counts.get(path, 0) + 1
+            yield from orig_complete(path)
+
+        grok._complete_lines = counting_complete
+        try:
+            stats = grok.sync(con, root=tmp)
+        finally:
+            grok._complete_lines = orig_complete
+        self.assertEqual(stats["sources"], 5)
+        # Five updates files, each fully parsed exactly once. The quadratic
+        # implementation parsed each file once per importing session.
+        self.assertEqual(len(counts), 5)
+        for path, n in counts.items():
+            self.assertLessEqual(
+                n, 1, f"{path} parsed {n} times, expected at most once")
+            self.assertEqual(n, 1)
+        # Children stay non-genuine with empty excerpts regardless of order
+        # (they sort before the parent, so the late-parent reclassification
+        # path must have run), and the parent stays genuine.
+        for i, child_sid in enumerate(child_sids):
+            key = f"grok:{child_sid}"
+            sess = con.execute(
+                "SELECT parent_session_key FROM sessions WHERE session_key=?",
+                (key,)).fetchone()
+            self.assertIsNotNone(sess)
+            self.assertEqual(sess["parent_session_key"],
+                             f"grok:{parent_sid}")
+            row = con.execute(
+                "SELECT kind, is_genuine, text_excerpt FROM submissions"
+                " WHERE session_key=?", (key,)).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["kind"], "synthetic")
+            self.assertEqual(row["is_genuine"], 0)
+            self.assertEqual(row["text_excerpt"], "")
+        parent_key = f"grok:{parent_sid}"
+        parent_row = con.execute(
+            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            " WHERE session_key=?", (parent_key,)).fetchone()
+        self.assertIsNotNone(parent_row)
+        self.assertEqual(parent_row["kind"], "genuine")
+        self.assertEqual(parent_row["is_genuine"], 1)
+        self.assertEqual(parent_row["text_excerpt"], parent_text)
+        con.close()
+
+    def test_unchanged_parent_repairs_earlier_child_in_same_sync(self):
+        # Ordering gap: the parent was imported in an earlier sync and is
+        # unchanged; a newly appearing child sorts before that parent and
+        # its parent dispatch lives in the already-imported parent
+        # updates.jsonl. The child must still converge to synthetic/empty
+        # even though the unchanged parent takes the early return without
+        # reaching _subagent_link.
+        tmp = os.path.join(self.tmp.name, "unchangedparent")
+        group = os.path.join(tmp, "%2Fordergroup2")
+        os.makedirs(group, exist_ok=True)
+        parent_sid = "zzunchangedparent-ffff-4b5c-8d6e-000000000201"
+        child_sid = "aaunchangedchild-aaaa-4b5c-8d6e-000000000202"
+        parent_text = "Human unchanged parent"
+        child_text = "Human late child"
+        self._write_session(
+            group, parent_sid,
+            {"info": {"id": parent_sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-02T10:00:00Z",
+             "current_model_id": "grok-4.6"},
+            [{"timestamp": 1788900000, "method": "session/update",
+              "params": {"sessionId": parent_sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text",
+                                                "text": parent_text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "up-1",
+                                   "promptId": "p-up"}}},
+             {"timestamp": 1788900001, "method": "_x.ai/session/update",
+              "params": {"sessionId": parent_sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-up",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 10,
+                                              "outputTokens": 2,
+                                              "totalTokens": 12}},
+                         "_meta": {"eventId": "up-2"}}},
+             {"timestamp": 1788900002, "method": "_x.ai/session/update",
+              "params": {"sessionId": parent_sid,
+                         "update": {"sessionUpdate": "subagent_spawned",
+                                    "subagent_id": child_sid,
+                                    "parent_session_id": parent_sid,
+                                    "parent_prompt_id": "p-up",
+                                    "child_session_id": child_sid},
+                         "_meta": {"eventId": "up-spawn"}}}],
+            [{"ts": "2026-09-02T10:00:01Z", "type": "turn_started",
+              "session_id": parent_sid, "turn_number": 0,
+              "model_id": "grok-4.6",
+              "session_relationship": "primary"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": parent_text}],
+              "prompt_index": 0}])
+        con = self._isolated_con("unchangedparent")
+        first = grok.sync(con, root=tmp)
+        self.assertEqual(first["sources"], 1)
+        self._write_session(
+            group, child_sid,
+            {"info": {"id": child_sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-02T11:00:00Z",
+             "current_model_id": "grok-4.6"},
+            [{"timestamp": 1788900100, "method": "session/update",
+              "params": {"sessionId": child_sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text",
+                                                "text": child_text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "uc-1", "promptId": "p-uc"}}},
+             {"timestamp": 1788900101, "method": "_x.ai/session/update",
+              "params": {"sessionId": child_sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-uc",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 5,
+                                              "outputTokens": 1,
+                                              "totalTokens": 6}},
+                         "_meta": {"eventId": "uc-2"}}}],
+            [{"ts": "2026-09-02T11:00:01Z", "type": "turn_started",
+              "session_id": child_sid, "turn_number": 0,
+              "model_id": "grok-4.6",
+              "session_relationship": "primary"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": child_text}],
+              "prompt_index": 0}])
+        second = grok.sync(con, root=tmp)
+        self.assertEqual(second["sources"], 2)
+        child_key = f"grok:{child_sid}"
+        sess = con.execute(
+            "SELECT parent_session_key FROM sessions WHERE session_key=?",
+            (child_key,)).fetchone()
+        self.assertIsNotNone(sess)
+        self.assertEqual(sess["parent_session_key"], f"grok:{parent_sid}")
+        row = con.execute(
+            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            " WHERE session_key=?", (child_key,)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["kind"], "synthetic")
+        self.assertEqual(row["is_genuine"], 0)
+        self.assertEqual(row["text_excerpt"], "")
+        self.assertEqual(
+            con.execute("SELECT COUNT(*) n FROM submissions"
+                        " WHERE session_key=?", (child_key,)).fetchone()["n"],
+            1)
+        con.close()
+
+    def test_source_scoped_sync_finds_sibling_spawn_parent(self):
+        # Source-scoped sync supplies only the child directory, yet the
+        # child whose only parent evidence is a sibling parent's
+        # subagent_spawned record must still classify as a child. sync()
+        # builds the containing-tree parent index once before importing (no
+        # per-session sibling scan) and persists the link. The child here
+        # is already proven subagent by summary session_kind, so its role
+        # alone cannot supply the missing parent link: the index must be
+        # consulted regardless of role.
+        tmp = os.path.join(self.tmp.name, "sourcescoped")
+        group = os.path.join(tmp, "%2Fsrcgroup")
+        os.makedirs(group, exist_ok=True)
+        parent_sid = "zzsrcparent-ffff-4b5c-8d6e-000000000301"
+        child_sid = "aasrcchild-aaaa-4b5c-8d6e-000000000302"
+        parent_text = "Human source parent"
+        child_text = "Human source child"
+        self._write_session(
+            group, parent_sid,
+            {"info": {"id": parent_sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-02T10:00:00Z",
+             "current_model_id": "grok-4.6"},
+            [{"timestamp": 1788900000, "method": "session/update",
+              "params": {"sessionId": parent_sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text",
+                                                "text": parent_text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "sp-1",
+                                   "promptId": "p-sp"}}},
+             {"timestamp": 1788900001, "method": "_x.ai/session/update",
+              "params": {"sessionId": parent_sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-sp",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 10,
+                                              "outputTokens": 2,
+                                              "totalTokens": 12}},
+                         "_meta": {"eventId": "sp-2"}}},
+             {"timestamp": 1788900002, "method": "_x.ai/session/update",
+              "params": {"sessionId": parent_sid,
+                         "update": {"sessionUpdate": "subagent_spawned",
+                                    "subagent_id": child_sid,
+                                    "parent_session_id": parent_sid,
+                                    "parent_prompt_id": "p-sp",
+                                    "child_session_id": child_sid},
+                         "_meta": {"eventId": "sp-spawn"}}}],
+            [{"ts": "2026-09-02T10:00:01Z", "type": "turn_started",
+              "session_id": parent_sid, "turn_number": 0,
+              "model_id": "grok-4.6",
+              "session_relationship": "primary"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": parent_text}],
+              "prompt_index": 0}])
+        child_dir = self._write_session(
+            group, child_sid,
+            {"info": {"id": child_sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-02T11:00:00Z",
+             "current_model_id": "grok-4.6",
+             "session_kind": "subagent"},
+            [{"timestamp": 1788900100, "method": "session/update",
+              "params": {"sessionId": child_sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text",
+                                                "text": child_text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "sc-1", "promptId": "p-sc"}}},
+             {"timestamp": 1788900101, "method": "_x.ai/session/update",
+              "params": {"sessionId": child_sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-sc",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 5,
+                                              "outputTokens": 1,
+                                              "totalTokens": 6}},
+                         "_meta": {"eventId": "sc-2"}}}],
+            [{"ts": "2026-09-02T11:00:01Z", "type": "turn_started",
+              "session_id": child_sid, "turn_number": 0,
+              "model_id": "grok-4.6",
+              "session_relationship": "primary"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": child_text}],
+              "prompt_index": 0}])
+        con = self._isolated_con("sourcescoped")
+        # Genuinely source-scoped: only the child directory is synced on a
+        # fresh ledger, so the parent dispatch is not in the sync set. The
+        # child's subagent role is already proven by summary; only the
+        # parent SESSION link can come from the sibling file.
+        stats = grok.sync(con, root=tmp, source=child_dir)
+        self.assertEqual(stats["sources"], 1)
+        child_key = f"grok:{child_sid}"
+        sess = con.execute(
+            "SELECT parent_session_key, role FROM sessions WHERE session_key=?",
+            (child_key,)).fetchone()
+        self.assertIsNotNone(sess)
+        self.assertEqual(sess["parent_session_key"], f"grok:{parent_sid}")
+        self.assertEqual(sess["role"], "subagent")
+        row = con.execute(
+            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            " WHERE session_key=?", (child_key,)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["kind"], "synthetic")
+        self.assertEqual(row["is_genuine"], 0)
+        self.assertEqual(row["text_excerpt"], "")
+        for table, col, val in self._all_text_values(con):
+            self.assertNotIn("Human source child", val,
+                             f"{table}.{col} leaks child prompt text")
+        con.close()
+
+    def test_source_scoped_fixture_child_keeps_parent_link(self):
+        # The shipped fixture's subagent child (summary session_kind plus
+        # events session_relationship, both subagent) has its only parent
+        # SESSION evidence in the sibling parent's subagent_spawned record.
+        # A source-scoped sync of just that child directory on a fresh
+        # ledger must still persist the parent link, not only the role.
+        child_dir = os.path.join(
+            ROOT, "%2Fredacted%2Frepo",
+            "01fixture2-bbbb-4b5c-8d6e-000000000002")
+        con = self._isolated_con("fixturesourcescoped")
+        stats = grok.sync(con, root=ROOT, source=child_dir)
+        self.assertEqual(stats["sources"], 1)
+        sess = con.execute(
+            "SELECT parent_session_key, role FROM sessions WHERE session_key=?",
+            (S2,)).fetchone()
+        self.assertIsNotNone(sess)
+        self.assertEqual(sess["parent_session_key"], S1)
+        self.assertEqual(sess["role"], "subagent")
+        row = con.execute(
+            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            " WHERE session_key=?", (S2,)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["kind"], "synthetic")
+        self.assertEqual(row["is_genuine"], 0)
+        self.assertEqual(row["text_excerpt"], "")
+        con.close()
+
+    def test_second_unchanged_sync_parses_no_jsonl(self):
+        # Unchanged re-syncs are near-free: change detection (JsonlSource
+        # stat/tail checks for updates/events, raw-byte fingerprints for
+        # chat_history) runs before any JSONL parse, and persisted parent
+        # links, roles and chat marks (grok_session_meta) supply everything
+        # the fast path needs.
+        #
+        # Allowed work on a fully unchanged second sync: summary.json reads
+        # (small, required for the fingerprint and model/effort), one raw
+        # byte read per chat file for its fingerprint (no JSON parsing),
+        # and stat/tail checks per updates/events file. Full parses of
+        # unchanged files are never required: unchanged parents already
+        # persisted their child links on the first import, the shared
+        # operation index plus the ledger cover ordering, and chat marks
+        # are reused from the ledger. The allowed parse count is therefore
+        # exactly zero _load_jsonl_records calls (updates/events boundary)
+        # and zero _read_chat calls (chat JSON boundary).
+        tmp = os.path.join(self.tmp.name, "parsefree")
+        group = os.path.join(tmp, "%2Fparsefree")
+        os.makedirs(group, exist_ok=True)
+        parent_sid = "zzparseparent-ffff-4b5c-8d6e-000000000401"
+        child_sid = "aaparsechild-aaaa-4b5c-8d6e-000000000402"
+        parent_text = "Human parse parent"
+        child_text = "Human parse child"
+        self._write_session(
+            group, parent_sid,
+            {"info": {"id": parent_sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-03T10:00:00Z",
+             "current_model_id": "grok-4.6"},
+            [{"timestamp": 1788910000, "method": "session/update",
+              "params": {"sessionId": parent_sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text",
+                                                "text": parent_text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "pf-1",
+                                   "promptId": "p-pf"}}},
+             {"timestamp": 1788910001, "method": "_x.ai/session/update",
+              "params": {"sessionId": parent_sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-pf",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 10,
+                                              "outputTokens": 2,
+                                              "totalTokens": 12}},
+                         "_meta": {"eventId": "pf-2"}}},
+             {"timestamp": 1788910002, "method": "_x.ai/session/update",
+              "params": {"sessionId": parent_sid,
+                         "update": {"sessionUpdate": "subagent_spawned",
+                                    "subagent_id": child_sid,
+                                    "parent_session_id": parent_sid,
+                                    "parent_prompt_id": "p-pf",
+                                    "child_session_id": child_sid},
+                         "_meta": {"eventId": "pf-spawn"}}}],
+            [{"ts": "2026-09-03T10:00:01Z", "type": "turn_started",
+              "session_id": parent_sid, "turn_number": 0,
+              "model_id": "grok-4.6",
+              "session_relationship": "primary"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": parent_text}],
+              "prompt_index": 0}])
+        self._write_session(
+            group, child_sid,
+            {"info": {"id": child_sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-03T11:00:00Z",
+             "current_model_id": "grok-4.6"},
+            [{"timestamp": 1788910100, "method": "session/update",
+              "params": {"sessionId": child_sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text",
+                                                "text": child_text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "pc-1", "promptId": "p-pc"}}},
+             {"timestamp": 1788910101, "method": "_x.ai/session/update",
+              "params": {"sessionId": child_sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-pc",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 5,
+                                              "outputTokens": 1,
+                                              "totalTokens": 6}},
+                         "_meta": {"eventId": "pc-2"}}}],
+            [{"ts": "2026-09-03T11:00:01Z", "type": "turn_started",
+              "session_id": child_sid, "turn_number": 0,
+              "model_id": "grok-4.6",
+              "session_relationship": "primary"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": child_text}],
+              "prompt_index": 0}])
+        con = self._isolated_con("parsefree")
+        first = grok.sync(con, root=tmp)
+        self.assertEqual(first["sources"], 2)
+        orig_load = grok._load_jsonl_records
+        orig_chat = grok._read_chat
+        counts: dict = {}
+        chat_calls: list = []
+
+        def counting_load(path):
+            counts[path] = counts.get(path, 0) + 1
+            return orig_load(path)
+
+        def counting_chat(session_dir, r):
+            chat_calls.append(session_dir)
+            return orig_chat(session_dir, r)
+
+        grok._load_jsonl_records = counting_load
+        grok._read_chat = counting_chat
+        try:
+            second = grok.sync(con, root=tmp)
+        finally:
+            grok._load_jsonl_records = orig_load
+            grok._read_chat = orig_chat
+        self.assertEqual(second["sources"], 2)
+        self.assertEqual(second["unchanged"], 2)
+        self.assertEqual(second["responses_inserted"], 0)
+        self.assertEqual(second["submissions_inserted"], 0)
+        self.assertEqual(second["events_inserted"], 0)
+        # Zero parses of unchanged updates/events files and zero JSON
+        # parses of unchanged chat files on the second sync.
+        self.assertEqual(counts, {})
+        self.assertEqual(chat_calls, [])
+        # Events-only growth must not reparse the unchanged updates file:
+        # only the grown events file is loaded, unless its own parse
+        # proves a new subagent role (not the case here: roles and chat
+        # metadata are unchanged). The updates replay and the response
+        # reconciliation are skipped because neither can change anything.
+        child_events = os.path.join(
+            group, child_sid, "events.jsonl")
+        with open(child_events, "a") as fh:
+            fh.write(json.dumps({
+                "ts": "2026-09-03T11:00:09Z", "type": "turn_ended",
+                "outcome": "completed"}) + "\n")
+        counts3: dict = {}
+        chat_calls3: list = []
+
+        def counting_load3(path):
+            counts3[path] = counts3.get(path, 0) + 1
+            return orig_load(path)
+
+        def counting_chat3(session_dir, r):
+            chat_calls3.append(session_dir)
+            return orig_chat(session_dir, r)
+
+        grok._load_jsonl_records = counting_load3
+        grok._read_chat = counting_chat3
+        try:
+            third = grok.sync(con, root=tmp)
+        finally:
+            grok._load_jsonl_records = orig_load
+            grok._read_chat = orig_chat
+        self.assertEqual(third["sources"], 2)
+        for path in counts3:
+            self.assertNotIn("updates.jsonl", path,
+                             f"unchanged {path} reparsed on events-only sync")
+        self.assertIn(child_events, counts3)
+        self.assertEqual(chat_calls3, [])
+        con.close()
+
+    def test_events_only_turn_model_updates_response_in_place(self):
+        # P2: events-only growth carrying a new valid turn_started model
+        # reconciles the existing response in place. The unchanged
+        # updates.jsonl is loaded strictly for this reconciliation;
+        # unrelated event growth (turn_ended only) keeps it unparsed.
+        tmp = os.path.join(self.tmp.name, "eventsmodel")
+        group = os.path.join(tmp, "%2Feventsmodel")
+        os.makedirs(group, exist_ok=True)
+        sid = "08eventsmodel-cccc-4b5c-8d6e-000000000501"
+        text = "Events model probe"
+        sdir = self._write_session(
+            group, sid,
+            {"info": {"id": sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-01T14:00:00Z",
+             "current_model_id": "grok-4.6",
+             "reasoning_effort": "medium"},
+            [{"timestamp": 1788806000, "method": "session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text", "text": text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "em-1", "promptId": "p-ev"}}},
+             {"timestamp": 1788806001, "method": "_x.ai/session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-ev",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 10,
+                                              "outputTokens": 2,
+                                              "totalTokens": 12}},
+                         "_meta": {"eventId": "em-2"}}}],
+            [{"ts": "2026-09-01T14:00:01Z", "type": "turn_started",
+              "session_id": sid, "turn_number": 0,
+              "model_id": "grok-4.6",
+              "session_relationship": "primary"},
+             {"ts": "2026-09-01T14:00:02Z", "type": "turn_ended",
+              "outcome": "completed"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": text}],
+              "prompt_index": 0}])
+        con = self._isolated_con("eventsmodel")
+        grok.sync(con, root=tmp)
+        key = f"grok:{sid}"
+        first = con.execute(
+            "SELECT model, effort, input_tokens, total_tokens FROM responses"
+            " WHERE response_id=?", (f"{key}:p-ev",)).fetchone()
+        self.assertIsNotNone(first)
+        self.assertEqual(first["model"], "grok-4.6")
+        self.assertEqual(first["effort"], "medium")
+        self.assertEqual((first["input_tokens"], first["total_tokens"]),
+                         (10, 12))
+        # Append only events: a new valid turn_started with a changed model
+        # whose ts still precedes the existing completion.
+        with open(os.path.join(sdir, "events.jsonl"), "a") as fh:
+            fh.write(json.dumps({
+                "ts": "2026-09-01T14:00:03Z", "type": "turn_started",
+                "session_id": sid, "turn_number": 1,
+                "model_id": "grok-4.7",
+                "session_relationship": "primary"}) + "\n")
+        second = grok.sync(con, root=tmp)
+        self.assertEqual(second["responses_inserted"], 0)
+        rows = list(con.execute(
+            "SELECT model, effort, input_tokens, total_tokens FROM responses"
+            " WHERE session_key=?", (key,)))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["model"], "grok-4.7")
+        self.assertEqual(rows[0]["effort"], "medium")
+        self.assertEqual((rows[0]["input_tokens"], rows[0]["total_tokens"]),
+                         (10, 12))
+        self.assertEqual(
+            con.execute("SELECT COUNT(*) n FROM responses"
+                        " WHERE response_id=?",
+                        (f"{key}:p-ev",)).fetchone()["n"], 1)
+        con.close()
