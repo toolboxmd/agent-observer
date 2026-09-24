@@ -3162,3 +3162,78 @@ class GrokAdapterTest(LedgerCase):
         self.assertIn(child_events, counts3)
         self.assertEqual(chat_calls3, [])
         con.close()
+
+    def test_events_only_turn_model_updates_response_in_place(self):
+        # P2: events-only growth carrying a new valid turn_started model
+        # reconciles the existing response in place. The unchanged
+        # updates.jsonl is loaded strictly for this reconciliation;
+        # unrelated event growth (turn_ended only) keeps it unparsed.
+        tmp = os.path.join(self.tmp.name, "eventsmodel")
+        group = os.path.join(tmp, "%2Feventsmodel")
+        os.makedirs(group, exist_ok=True)
+        sid = "08eventsmodel-cccc-4b5c-8d6e-000000000501"
+        text = "Events model probe"
+        sdir = self._write_session(
+            group, sid,
+            {"info": {"id": sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-01T14:00:00Z",
+             "current_model_id": "grok-4.6",
+             "reasoning_effort": "medium"},
+            [{"timestamp": 1788806000, "method": "session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text", "text": text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "em-1", "promptId": "p-ev"}}},
+             {"timestamp": 1788806001, "method": "_x.ai/session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-ev",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 10,
+                                              "outputTokens": 2,
+                                              "totalTokens": 12}},
+                         "_meta": {"eventId": "em-2"}}}],
+            [{"ts": "2026-09-01T14:00:01Z", "type": "turn_started",
+              "session_id": sid, "turn_number": 0,
+              "model_id": "grok-4.6",
+              "session_relationship": "primary"},
+             {"ts": "2026-09-01T14:00:02Z", "type": "turn_ended",
+              "outcome": "completed"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": text}],
+              "prompt_index": 0}])
+        con = self._isolated_con("eventsmodel")
+        grok.sync(con, root=tmp)
+        key = f"grok:{sid}"
+        first = con.execute(
+            "SELECT model, effort, input_tokens, total_tokens FROM responses"
+            " WHERE response_id=?", (f"{key}:p-ev",)).fetchone()
+        self.assertIsNotNone(first)
+        self.assertEqual(first["model"], "grok-4.6")
+        self.assertEqual(first["effort"], "medium")
+        self.assertEqual((first["input_tokens"], first["total_tokens"]),
+                         (10, 12))
+        # Append only events: a new valid turn_started with a changed model
+        # whose ts still precedes the existing completion.
+        with open(os.path.join(sdir, "events.jsonl"), "a") as fh:
+            fh.write(json.dumps({
+                "ts": "2026-09-01T14:00:03Z", "type": "turn_started",
+                "session_id": sid, "turn_number": 1,
+                "model_id": "grok-4.7",
+                "session_relationship": "primary"}) + "\n")
+        second = grok.sync(con, root=tmp)
+        self.assertEqual(second["responses_inserted"], 0)
+        rows = list(con.execute(
+            "SELECT model, effort, input_tokens, total_tokens FROM responses"
+            " WHERE session_key=?", (key,)))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["model"], "grok-4.7")
+        self.assertEqual(rows[0]["effort"], "medium")
+        self.assertEqual((rows[0]["input_tokens"], rows[0]["total_tokens"]),
+                         (10, 12))
+        self.assertEqual(
+            con.execute("SELECT COUNT(*) n FROM responses"
+                        " WHERE response_id=?",
+                        (f"{key}:p-ev",)).fetchone()["n"], 1)
+        con.close()

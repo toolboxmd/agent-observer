@@ -1520,6 +1520,15 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                 and _has_subagent_in_records(events_records):
             updates_records = _load_jsonl_records(updates_path) \
                 if os.path.isfile(updates_path) else []
+        elif _turn_models_from_records(
+                _delta_records(events_records, events_src)):
+            # Events-only model change: a new valid turn_started in the
+            # changed delta can move existing responses off stale models.
+            # Load the unchanged updates file strictly for response
+            # reconciliation. Unrelated event growth (turn_ended only)
+            # yields no turn model and keeps updates unparsed.
+            updates_records = _load_jsonl_records(updates_path) \
+                if os.path.isfile(updates_path) else []
     if updates_records is not None:
         try:
             _spawns = _extract_spawns_from_records(updates_records)
