@@ -126,6 +126,108 @@ def _text(payload) -> str:
             f"session span {r.get('time', {}).get('session_span_s')} "
             f"({r.get('time', {}).get('session_span_label')})",
         ]
+        timing = r.get("timing") or {}
+        lines.append(
+            f"  completion: {timing.get('completion_elapsed_s')} "
+            f"({timing.get('completion_label')}); "
+            f"submission={timing.get('submission_time')} "
+            f"accepted={timing.get('accepted_completion_time')} "
+            f"cutoff={timing.get('cutoff')}")
+        if timing.get("submissions_missing_timing"):
+            lines.append(
+                f"  missing submission timing: {timing['submissions_missing_timing']}")
+        if timing.get("missing"):
+            lines.append(f"  timing missing: {timing['missing']}")
+        attempt_time = r.get("attempt_timing") or {}
+        lines.append(
+            f"  executions reconciled: {attempt_time.get('reconciled_execution_count')} "
+            f"from {attempt_time.get('raw_attempt_count')} attempts "
+            f"({attempt_time.get('duplicate_router_native_groups', 0)} router/native duplicates); "
+            f"{attempt_time.get('reconciliation_note')}")
+        for sess in attempt_time.get("per_session", []):
+            lines.append(
+                f"  session {sess.get('session_key') or 'unknown'}: "
+                f"attempts={sess.get('attempts')} "
+                f"roles={sess.get('roles') or 'unknown'} "
+                f"completed={sess.get('completed_attempts')} active={sess.get('active_attempts')} "
+                f"union_span={sess.get('union_span_s')} wall_sum={sess.get('wall_sum_s')} "
+                f"(observed wall time; parallel sums never become task elapsed)"
+                + (" [shared]" if sess.get("shared_session") else "")
+                + (" [unknown ownership]" if sess.get("unknown_ownership") else "")
+                + (" [router/native duplicate]" if sess.get("duplicate_native") else ""))
+        for att in attempt_time.get("attempts", []):
+            lines.append(
+                f"  attempt {att.get('turn_id')} role={att.get('role')} stage={att.get('stage')} "
+                f"session={att.get('session_key') or 'unknown'} state={att.get('state')} "
+                f"wall={att.get('wall_time_s')} ({att.get('wall_time_source')}); "
+                f"reconciled_wall={att.get('reconciled_wall_time_s')} "
+                f"sources={','.join(att.get('reconciled_sources') or [])}"
+                + (f" failure_class={att.get('failure_class')}" if att.get("failure_class") else "")
+                + (" [shared]" if att.get("shared_session") else "")
+                + (" [unknown ownership]" if att.get("unknown_ownership") else ""))
+        for wait in attempt_time.get("waiting_intervals", []):
+            scope = wait.get("scope")
+            lines.append(
+                f"  {wait.get('kind')}: {wait.get('from_turn')} -> {wait.get('to_turn')} "
+                f"gap={wait.get('gap_s')} s"
+                + (f" scope={scope}" if scope else "")
+                + f" ({wait.get('note')})")
+        failures = r.get("failures") or {}
+        lines.append(
+            f"  failures: {failures.get('failed_attempts', 0)}/{failures.get('production_attempts', 0)} "
+            f"failed/production attempts"
+            + (f" rate={failures.get('failure_rate')}" if failures.get("failure_rate") is not None else " rate=unknown")
+            + f"; {failures.get('denominator_note')}")
+        if failures.get("by_class"):
+            lines.append(
+                "  failures by class: " + ", ".join(
+                    f"{k} {v}" for k, v in sorted(failures["by_class"].items())))
+        for cell in failures.get("by_role_model", []):
+            lines.append(
+                f"  failure role={cell.get('role')} model={cell.get('model')}: "
+                f"{cell.get('failed')}/{cell.get('production_total')}")
+        if failures.get("missing_classification"):
+            lines.append(
+                f"  failures missing classification: {failures['missing_classification']}")
+        cancelled_total = failures.get("cancelled",
+                                       failures.get("cancelled_intentional", 0))
+        lines.append(
+            f"  non-failure outcomes: cancelled={cancelled_total} "
+            f"(intentional={failures.get('cancelled_intentional', 0)}, "
+            f"unknown_intent={failures.get('cancelled_unknown_intent', cancelled_total)}) "
+            f"crashed_separate={failures.get('crashed_separate', 0)} "
+            f"active={failures.get('active_attempts', 0)} "
+            f"quota_blocked={failures.get('quota_blocked', 0)} "
+            f"unknown_state={failures.get('unknown_state', 0)}")
+        if failures.get("cancelled_intent_note"):
+            lines.append(f"  cancellation intent: {failures['cancelled_intent_note']}")
+        if failures.get("quota_note"):
+            lines.append(f"  quota: {failures['quota_note']}")
+        for job in r.get("job_outcomes", []):
+            lines.append(
+                f"  job {job.get('request_id')}: status={job.get('status')} "
+                f"(job outcome is separate from attempt failure counts)")
+        for rec in r.get("recovery", []):
+            scope = rec.get("compat_scope")
+            lines.append(
+                f"  recovery {rec.get('failed_turn')} -> {rec.get('next_attempt_turn') or 'none'}: "
+                f"failure_to_next_start={rec.get('failure_to_next_start_s')} s; "
+                f"first_progress={rec.get('first_progress_turn') or 'none'} "
+                f"in {rec.get('time_to_first_progress_s')} s; "
+                f"{rec.get('recovery_outcome')}"
+                + (f" scope={scope}" if scope else "")
+                + (f" class={rec.get('failed_class')}" if rec.get("failed_class") else ""))
+            if rec.get("gap_missing"):
+                lines.append(f"    recovery missing: {rec['gap_missing']}")
+        coverage_u = r.get("usage_coverage") or {}
+        lines.append(
+            f"  usage source coverage: router {coverage_u.get('router_with_usage', 0)}/"
+            f"{coverage_u.get('router_attempts', 0)} with usage; "
+            f"null with reconciled native={coverage_u.get('null_with_reconciled_native', 0)}; "
+            f"null without native={coverage_u.get('null_without_native', 0)}; "
+            f"priced {coverage_u.get('priced_responses', 0)} "
+            f"unpriced {coverage_u.get('unpriced_responses', 0)}; "
+            f"{coverage_u.get('note')}")
         est = r.get("estimated_cost") or {}
         if est.get("schedule_source"):
             lines.append(
@@ -525,6 +627,18 @@ def _capture(con, ns) -> int:
         return 0
     if ns.op == "outcome":
         # Exit 0 never implies acceptance: acceptance_state stays explicit.
+        # The first explicit accepted-completion timestamp never moves:
+        # re-recording complete to add proof, candidate or metadata keeps
+        # the original updated_at so reports keep the first endpoint.
+        existing = con.execute(
+            "SELECT acceptance_state, updated_at FROM outcomes WHERE task_id=?",
+            (ns.task,)).fetchone()
+        now = _db.now()
+        if (existing is not None and existing["acceptance_state"] == "complete"
+                and ns.state == "complete"
+                and isinstance(existing["updated_at"], (int, float))
+                and not isinstance(existing["updated_at"], bool)):
+            now = existing["updated_at"]
         con.execute(
             "INSERT INTO outcomes(task_id, candidate, proof_ref,"
             " acceptance_state, repairs, corrections, updated_at)"
@@ -534,7 +648,7 @@ def _capture(con, ns) -> int:
             " repairs=excluded.repairs, corrections=excluded.corrections,"
             " updated_at=excluded.updated_at",
             (ns.task, ns.candidate, ns.proof, ns.state, ns.repairs,
-             ns.corrections, _db.now()))
+             ns.corrections, now))
         con.commit()
         _emit({"ok": True, "task": ns.task, "state": ns.state}, ns.as_json)
         return 0

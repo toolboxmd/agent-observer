@@ -188,6 +188,12 @@ def summarize(con, session_keys: set, label: str, task_id: str | None = None,
             "measured": rep["measured"],
             "diagnostics": rep["diagnostics"],
             "time": rep["time"],
+            "timing": rep["timing"],
+            "attempt_timing": rep["attempt_timing"],
+            "failures": rep["failures"],
+            "job_outcomes": rep["job_outcomes"],
+            "recovery": rep["recovery"],
+            "usage_coverage": rep["usage_coverage"],
             "native_cost": rep["native_cost"],
             "native_cost_shared": rep["native_cost_shared"],
             "estimated_cost": rep["estimated_cost"],
@@ -457,6 +463,50 @@ def render(summary: dict) -> str:
         if summary.get("has_active_work"):
             lines.append("Active work remains visible; arithmetic reconciliation "
                          "alone is not completion.")
+        timing = summary.get("timing") or {}
+        if timing:
+            lines.append(
+                f"Completion: {_safe_field(timing.get('completion_elapsed_s'))} s "
+                f"({_safe_field(timing.get('completion_label'))}); "
+                f"partial execution span {_safe_field(timing.get('partial_execution_span_s'))} s "
+                f"({_safe_field(timing.get('partial_execution_span_source'))}).")
+            if timing.get("missing"):
+                lines.append(
+                    f"Timing missing: {_safe_field(', '.join(timing['missing']))}.")
+        attempt_time = summary.get("attempt_timing") or {}
+        if attempt_time:
+            lines.append(
+                f"Executions reconciled: {_safe_field(attempt_time.get('reconciled_execution_count'))} "
+                f"from {_safe_field(attempt_time.get('raw_attempt_count'))} attempts "
+                f"({_safe_field(attempt_time.get('duplicate_router_native_groups'))} router/native duplicates; "
+                "parallel durations never become task elapsed).")
+            for sess in attempt_time.get("per_session", []):
+                lines.append(
+                    f"Session {_safe_field(sess.get('session_key') or 'unknown')}: "
+                    f"{_safe_field(sess.get('attempts'))} attempts, union span "
+                    f"{_safe_field(sess.get('union_span_s'))} s "
+                    "(merged covered duration of explicit attempt windows; gaps excluded).")
+        failures = summary.get("failures") or {}
+        if failures:
+            by_class = ", ".join(
+                f"{_safe_field(k)} {v}" for k, v in sorted((failures.get("by_class") or {}).items())) or "none"
+            lines.append(
+                f"Failures: {_safe_field(failures.get('failed_attempts'))}/"
+                f"{_safe_field(failures.get('production_attempts'))} failed/production attempts "
+                f"(by class: {by_class}; {_safe_field(failures.get('denominator_note'))}).")
+            for rec in summary.get("recovery", []):
+                lines.append(
+                    f"Recovery {_safe_field(rec.get('failed_turn'))} -> "
+                    f"{_safe_field(rec.get('next_attempt_turn') or 'none')}: "
+                    f"{_safe_field(rec.get('failure_to_next_start_s'))} s to next start; "
+                    f"{_safe_field(rec.get('recovery_outcome'))}.")
+        coverage_u = summary.get("usage_coverage") or {}
+        if coverage_u:
+            lines.append(
+                f"Usage source coverage: router {_safe_field(coverage_u.get('router_with_usage'))}/"
+                f"{_safe_field(coverage_u.get('router_attempts'))} with usage; "
+                f"null with reconciled native {_safe_field(coverage_u.get('null_with_reconciled_native'))}; "
+                f"{_safe_field(coverage_u.get('note'))}.")
         gaps = summary.get("coverage") or {}
         for key, label in (("missing_sessions", "Missing native sessions"),
                            ("sessions_without_usage", "Sessions without native usage"),

@@ -483,6 +483,18 @@ def task_report(con: sqlite3.Connection, task_id: str,
     diagnostics = _task_diagnostics(con, scope_keys, whole, task_turns)
     phases, activity_context = _phase_report(con, task_id, attributed, set(whole)-whole_shared,
                                              attempts_rows, schedule)
+    from . import timing as _timing
+    completion = _timing.completion_timing(
+        con, task_id, outcome_row, cutoff,
+        diagnostics["task_elapsed_s"], diagnostics["task_elapsed_source"],
+        diagnostics["session_span_s"])
+    attempt_time = _timing.attempt_timing(
+        con, attempts_rows, set(whole_shared), set(whole_conflicts))
+    executions = attempt_time.get("executions") or attempts_rows
+    failures = _timing.failure_summary(executions)
+    jobs = _timing.job_outcomes(con, attempts_rows)
+    recovery = _timing.recovery_summary(
+        executions, con, set(whole_shared), set(whole_conflicts))
 
     def _resp_tuple(r) -> list:
         return [r.get("response_id"), r.get("harness"), r.get("model"),
@@ -516,6 +528,44 @@ def task_report(con: sqlite3.Connection, task_id: str,
         "outcome": outcome_row,
         "attempts": sorted(
             [a.get("turn_id"), a.get("role"), a.get("state")] for a in attempts_rows),
+        "attempt_timing_evidence": sorted(
+            [a.get("turn_id"), a.get("started_at"), a.get("ended_at"),
+             a.get("elapsed_s"), a.get("terminal_class")] for a in attempts_rows),
+        "attempt_report_inputs": sorted(
+            [a.get("turn_id"), a.get("role"), a.get("harness"),
+             a.get("session_key"), a.get("stage"), a.get("reason"),
+             a.get("model_observed"), a.get("effort_observed"),
+             a.get("route_requested"), a.get("state"),
+             a.get("terminal_class"), a.get("started_at"),
+             a.get("ended_at"), a.get("elapsed_s"),
+             a.get("usage_json") is not None] for a in attempts_rows),
+        "job_evidence": sorted(
+            [j.get("request_id"), j.get("status"), j.get("updated_at")]
+            for j in jobs),
+        "reconciliation_evidence": sorted(
+            [g.get("representative"), sorted(g.get("members") or []),
+             g.get("is_duplicate_group")] for g in (
+                attempt_time.get("reconciliation_groups") or [])),
+        "recovery_inputs": sorted(
+            [r.get("failed_turn"), r.get("compat_scope"),
+             r.get("next_attempt_turn"), r.get("first_progress_turn"),
+             r.get("failure_to_next_start_s"),
+             r.get("time_to_first_progress_s"),
+             r.get("recovery_outcome")] for r in recovery),
+        "usage_attribution": sorted(
+            [u.get("turn_id"), u.get("session_key"),
+             u.get("router_usage_present"), u.get("native_responses"),
+             u.get("attribution")] for u in (
+                _timing.usage_source_coverage(
+                    con, executions, {"priced_responses": 0,
+                                      "unpriced_responses": 0},
+                    set(whole_shared),
+                    set(whole_conflicts)).get("per_attempt") or [])),
+        "submission_timing": sorted(
+            [r["native_id"], r["ts"]] for r in con.execute(
+                "SELECT s.native_id AS native_id, s.ts AS ts FROM assignments a"
+                " JOIN submissions s ON s.native_id=a.submission_native_id"
+                " WHERE a.task_id=?", (task_id,))),
         "dispatches": sorted(
             [d.get("owning_submission"), d.get("worker_thread")] for d in dispatches_rows),
         "source_cutoff": cutoff,
@@ -532,6 +582,8 @@ def task_report(con: sqlite3.Connection, task_id: str,
     native_cost = _native_cost(attributed)
     if unavailable_usage:
         native_cost["total_usd"] = None
+    usage_coverage = _timing.usage_source_coverage(
+        con, executions, estimated, set(whole_shared), set(whole_conflicts))
     acceptance = (outcome_row or {}).get("acceptance_state") or "unknown"
     # Acceptance is explicit only: process success, zero exit or a
     # successful attempt never implies an accepted outcome.
@@ -584,6 +636,12 @@ def task_report(con: sqlite3.Connection, task_id: str,
             "session_span_s": diagnostics["session_span_s"],
             "session_span_label": diagnostics["session_span_label"],
         },
+        "timing": completion,
+        "attempt_timing": attempt_time,
+        "failures": failures,
+        "job_outcomes": jobs,
+        "recovery": recovery,
+        "usage_coverage": usage_coverage,
         "native_cost": native_cost,
         "native_cost_shared": _native_cost(shared),
         "estimated_cost": estimated,

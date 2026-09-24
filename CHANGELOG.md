@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.0] - 2026-09-24
+
+### Added
+
+- issue25 completion failure recovery timing in task report
+
 ## [0.3.0] - 2026-09-24
 
 ### Added

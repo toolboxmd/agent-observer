@@ -115,11 +115,24 @@ or successful attempt never implies an accepted outcome.
 
 Task reports carry a stable snapshot identity (`snapshot_id`, a SHA-256
 over the selected task, sessions, response counters, assignments, outcome,
-attempts, dispatches, source cutoff and price schedule) and a measured set (task, sessions
+attempts with timing evidence, submission timestamps, dispatches, source cutoff
+and price schedule) and a measured set (task, sessions
 and attributed/shared/unassigned response ids). Repeated rendering without
 ledger changes keeps the same identity; new evidence changes it. Time and
 diagnostics are task-turn scoped when turn timing exists, otherwise labeled
 unavailable with the whole-session span kept explicitly as session context.
+`task show` also reports submission-to-accepted-completion time only with
+explicit endpoints (active tasks show elapsed-so-far at the named source
+cutoff), observed wall time per attempt/session/role with waiting intervals
+for the same known session or Router request only, failures by class
+from explicit terminal and stage with production denominators
+including quota provider exhaustion and cancellation intent unknown
+unless explicit, separate job outcomes,
+per-failure recovery inside compatible identities, and attributable
+Router usage source coverage. Parallel attempt
+durations never become task elapsed time; Router and native rows for one
+execution merge only on explicit turn/session/time evidence and count once.
+Union span is merged covered duration with gaps excluded.
 
 The bundled dated price schedule supplies standard API list-price equivalents
 for supported exact model identities. `task show --prices schedule.json` and
