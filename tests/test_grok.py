@@ -2075,3 +2075,381 @@ class GrokAdapterTest(LedgerCase):
             if val == "grok-4.7\n" or val.endswith("\n"):
                 self.fail(f"{table}.{col} holds a trailing-newline value")
         con.close()
+
+    def test_malformed_rewrite_then_unchanged_sync_preserves_valid_model(self):
+        # P2: a malformed rewrite must not downgrade a valid recorded model
+        # to the summary fallback on the next unchanged sync. Valid
+        # usage/model beats fallback; malformed usage never becomes valid
+        # evidence; counters and idempotency stay unchanged.
+        tmp = os.path.join(self.tmp.name, "malformedmodel")
+        group = os.path.join(tmp, "%2Fmalformedmodel")
+        sid = "09malformedmodel-cccc-4b5c-8d6e-000000000010"
+        text = "Malformed model probe"
+        sdir = self._write_session(
+            group, sid,
+            {"info": {"id": sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-01T18:00:00Z",
+             "current_model_id": "grok-4.6",
+             "reasoning_effort": "medium"},
+            [{"timestamp": 1788810000, "method": "session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text", "text": text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "mm-1", "promptId": "p-mm1"}}},
+             {"timestamp": 1788810001, "method": "_x.ai/session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-mm1",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 10,
+                                              "outputTokens": 2,
+                                              "totalTokens": 12,
+                                              "modelUsage": {
+                                                  "grok-4.7-valid": {
+                                                      "inputTokens": 10}}}},
+                         "_meta": {"eventId": "mm-2"}}}],
+            [{"ts": "2026-09-01T18:00:01Z", "type": "turn_ended",
+              "outcome": "completed"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": text}],
+              "prompt_index": 0}])
+        con = self._isolated_con("malformedmodel")
+        grok.sync(con, root=tmp)
+        key = f"grok:{sid}"
+        first = con.execute(
+            "SELECT model, input_tokens, total_tokens FROM responses"
+            " WHERE response_id=?", (f"{key}:p-mm1",)).fetchone()
+        self.assertIsNotNone(first)
+        self.assertEqual(first["model"], "grok-4.7-valid")
+        self.assertEqual((first["input_tokens"], first["total_tokens"]),
+                         (10, 12))
+        # Rewrite the completion with malformed present usage.
+        updates_path = os.path.join(sdir, "updates.jsonl")
+        with open(updates_path) as fh:
+            lines = fh.read().splitlines()
+        rewritten = []
+        for line in lines:
+            obj = json.loads(line)
+            params = obj.get("params") if isinstance(
+                obj.get("params"), dict) else {}
+            update = params.get("update") if isinstance(params, dict) \
+                else {}
+            if isinstance(update, dict) and update.get("sessionUpdate") == \
+                    "turn_completed":
+                update["usage"] = {"inputTokens": "10",
+                                   "outputTokens": 2,
+                                   "totalTokens": 12,
+                                   "modelUsage": {"grok-4.7-valid": {
+                                       "inputTokens": 10}}}
+            rewritten.append(json.dumps(obj))
+        with open(updates_path, "w") as fh:
+            fh.write("\n".join(rewritten) + "\n")
+        second = grok.sync(con, root=tmp)
+        self.assertEqual(second["responses_inserted"], 0)
+        kept = con.execute(
+            "SELECT model, input_tokens, total_tokens FROM responses"
+            " WHERE response_id=?", (f"{key}:p-mm1",)).fetchone()
+        self.assertEqual(kept["model"], "grok-4.7-valid")
+        self.assertEqual((kept["input_tokens"], kept["total_tokens"]),
+                         (10, 12))
+        self.assertEqual(
+            con.execute("SELECT COUNT(*) n FROM responses"
+                        " WHERE response_id=?",
+                        (f"{key}:p-mm1",)).fetchone()["n"], 1)
+        malformed = list(con.execute(
+            "SELECT error FROM import_errors WHERE error='malformed_usage'"))
+        self.assertTrue(malformed)
+        # An unchanged re-sync retains the valid model, never reverting to
+        # the summary fallback.
+        third = grok.sync(con, root=tmp)
+        self.assertEqual(third["responses_inserted"], 0)
+        again = con.execute(
+            "SELECT model, input_tokens, total_tokens FROM responses"
+            " WHERE response_id=?", (f"{key}:p-mm1",)).fetchone()
+        self.assertEqual(again["model"], "grok-4.7-valid")
+        self.assertEqual((again["input_tokens"], again["total_tokens"]),
+                         (10, 12))
+        self.assertEqual(
+            con.execute("SELECT COUNT(*) n FROM responses"
+                        " WHERE response_id=?",
+                        (f"{key}:p-mm1",)).fetchone()["n"], 1)
+        con.close()
+
+    def test_invalid_modelusage_rewrite_then_unchanged_sync_preserves_valid(self):
+        # P2 follow-up: valid unchanged counters with present-but-invalid
+        # modelUsage must not downgrade a recorded usage model to the
+        # summary fallback, on rewrite or on the next unchanged sync.
+        tmp = os.path.join(self.tmp.name, "badmodelusage")
+        group = os.path.join(tmp, "%2Fbadmodelusage")
+        sid = "09badmodelusage-cccc-4b5c-8d6e-000000000012"
+        text = "Invalid modelUsage probe"
+        sdir = self._write_session(
+            group, sid,
+            {"info": {"id": sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-01T18:30:00Z",
+             "current_model_id": "grok-4.6",
+             "reasoning_effort": "medium"},
+            [{"timestamp": 1788810500, "method": "session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text", "text": text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "bmu-1",
+                                   "promptId": "p-bmu"}}},
+             {"timestamp": 1788810501, "method": "_x.ai/session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-bmu",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 10,
+                                              "outputTokens": 2,
+                                              "totalTokens": 12,
+                                              "modelUsage": {
+                                                  "grok-4.7-valid": {
+                                                      "inputTokens": 10}}}},
+                         "_meta": {"eventId": "bmu-2"}}}],
+            [{"ts": "2026-09-01T18:30:01Z", "type": "turn_ended",
+              "outcome": "completed"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": text}],
+              "prompt_index": 0}])
+        con = self._isolated_con("badmodelusage")
+        grok.sync(con, root=tmp)
+        key = f"grok:{sid}"
+        first = con.execute(
+            "SELECT model, input_tokens, output_tokens, total_tokens"
+            " FROM responses WHERE response_id=?",
+            (f"{key}:p-bmu",)).fetchone()
+        self.assertEqual(first["model"], "grok-4.7-valid")
+        self.assertEqual(
+            (first["input_tokens"], first["output_tokens"],
+             first["total_tokens"]), (10, 2, 12))
+        # Rewrite with the same valid counters but invalid modelUsage.
+        updates_path = os.path.join(sdir, "updates.jsonl")
+        with open(updates_path) as fh:
+            lines = fh.read().splitlines()
+        rewritten = []
+        for line in lines:
+            obj = json.loads(line)
+            params = obj.get("params") if isinstance(
+                obj.get("params"), dict) else {}
+            update = params.get("update") if isinstance(params, dict) \
+                else {}
+            if isinstance(update, dict) and update.get("sessionUpdate") == \
+                    "turn_completed":
+                update["usage"] = {"inputTokens": 10,
+                                   "outputTokens": 2,
+                                   "totalTokens": 12,
+                                   "modelUsage": "malformed-model-usage"}
+            rewritten.append(json.dumps(obj))
+        with open(updates_path, "w") as fh:
+            fh.write("\n".join(rewritten) + "\n")
+        second = grok.sync(con, root=tmp)
+        self.assertEqual(second["responses_inserted"], 0)
+        kept = con.execute(
+            "SELECT model, input_tokens, output_tokens, total_tokens"
+            " FROM responses WHERE response_id=?",
+            (f"{key}:p-bmu",)).fetchone()
+        self.assertEqual(kept["model"], "grok-4.7-valid")
+        self.assertEqual(
+            (kept["input_tokens"], kept["output_tokens"],
+             kept["total_tokens"]), (10, 2, 12))
+        self.assertEqual(
+            con.execute("SELECT COUNT(*) n FROM responses"
+                        " WHERE response_id=?",
+                        (f"{key}:p-bmu",)).fetchone()["n"], 1)
+        third = grok.sync(con, root=tmp)
+        self.assertEqual(third["responses_inserted"], 0)
+        again = con.execute(
+            "SELECT model, input_tokens, output_tokens, total_tokens"
+            " FROM responses WHERE response_id=?",
+            (f"{key}:p-bmu",)).fetchone()
+        self.assertEqual(again["model"], "grok-4.7-valid")
+        self.assertEqual(
+            (again["input_tokens"], again["output_tokens"],
+             again["total_tokens"]), (10, 2, 12))
+        self.assertEqual(
+            con.execute("SELECT COUNT(*) n FROM responses"
+                        " WHERE response_id=?",
+                        (f"{key}:p-bmu",)).fetchone()["n"], 1)
+        con.close()
+
+    def test_chat_missing_and_invalid_content_not_genuine(self):
+        # P2: a type=user chat record with prompt_index proves authorship
+        # only with valid content text. Missing and invalid shapes leave the
+        # prompt non-genuine with no excerpt; a valid record stays genuine.
+        tmp = os.path.join(self.tmp.name, "badchatcontent")
+        group = os.path.join(tmp, "%2Fbadchatcontent")
+        sid = "09badchatcontent-cccc-4b5c-8d6e-000000000011"
+        os.makedirs(os.path.join(group, sid), exist_ok=True)
+        sdir = os.path.join(group, sid)
+        with open(os.path.join(sdir, "summary.json"), "w") as fh:
+            fh.write(json.dumps({
+                "info": {"id": sid, "cwd": "/redacted/repo"},
+                "created_at": "2026-09-01T19:00:00Z",
+                "current_model_id": "grok-4.6"}))
+        updates = []
+        for idx, pid in enumerate(["p-cc0", "p-cc1", "p-cc2"]):
+            updates.append({
+                "timestamp": 1788811000 + idx,
+                "method": "session/update",
+                "params": {"sessionId": sid,
+                           "update": {"sessionUpdate": "user_message_chunk",
+                                      "content": {"type": "text",
+                                                  "text": f"Human probe {idx}"},
+                                      "_meta": {"promptIndex": idx}},
+                           "_meta": {"eventId": f"cc-{idx}",
+                                     "promptId": pid}}})
+        for idx, pid in enumerate(["p-cc0", "p-cc1", "p-cc2"]):
+            updates.append({
+                "timestamp": 1788811100 + idx,
+                "method": "_x.ai/session/update",
+                "params": {"sessionId": sid,
+                           "update": {"sessionUpdate": "turn_completed",
+                                      "prompt_id": pid,
+                                      "stop_reason": "end_turn",
+                                      "usage": {"inputTokens": 10,
+                                                "outputTokens": 1,
+                                                "totalTokens": 11}}},
+                "_meta": {"eventId": f"cc-c-{idx}"}})
+        with open(os.path.join(sdir, "updates.jsonl"), "w") as fh:
+            for obj in updates:
+                fh.write(json.dumps(obj) + "\n")
+        with open(os.path.join(sdir, "events.jsonl"), "w") as fh:
+            fh.write(json.dumps({
+                "ts": "2026-09-01T19:00:01Z", "type": "turn_ended",
+                "outcome": "completed"}) + "\n")
+        with open(os.path.join(sdir, "chat_history.jsonl"), "w") as fh:
+            # Missing content: no proof.
+            fh.write(json.dumps({
+                "type": "user", "prompt_index": 0}) + "\n")
+            # Invalid shape: no valid text.
+            fh.write(json.dumps({
+                "type": "user", "content": 12345,
+                "prompt_index": 1}) + "\n")
+            # Valid positive case.
+            fh.write(json.dumps({
+                "type": "user",
+                "content": [{"type": "text",
+                             "text": "Human valid probe"}],
+                "prompt_index": 2}) + "\n")
+        con = self._isolated_con("badchatcontent")
+        grok.sync(con, root=tmp)
+        key = f"grok:{sid}"
+        rows = {r["native_id"]: r for r in con.execute(
+            "SELECT native_id, kind, is_genuine, text_excerpt FROM submissions"
+            " WHERE session_key=?", (key,))}
+        self.assertEqual(
+            set(rows), {f"{key}:prompt:0", f"{key}:prompt:1",
+                        f"{key}:prompt:2"})
+        for idx in ("0", "1"):
+            row = rows[f"{key}:prompt:{idx}"]
+            self.assertEqual(row["is_genuine"], 0)
+            self.assertEqual(row["text_excerpt"], "")
+            self.assertIn(row["kind"], ("unknown", "synthetic"))
+        valid = rows[f"{key}:prompt:2"]
+        self.assertEqual(valid["kind"], "genuine")
+        self.assertEqual(valid["is_genuine"], 1)
+        # The excerpt comes from the updates text; chat only proves
+        # authorship.
+        self.assertEqual(valid["text_excerpt"], "Human probe 2")
+        con.close()
+
+    def test_malformed_session_dir_is_quarantined(self):
+        # P2: the native session id comes only from a validated
+        # summary.info.id or a validated basename. With neither valid, the
+        # session is quarantined under a fixed category and no session,
+        # response, submission or event key holds the malformed name.
+        tmp = os.path.join(self.tmp.name, "badsessionid")
+        group = os.path.join(tmp, "%2Fbadsessionid")
+        os.makedirs(group, exist_ok=True)
+        bad_names = ["bad session id!", "evil session\tnames"]
+        for i, bad in enumerate(bad_names):
+            sdir = os.path.join(group, bad)
+            os.makedirs(sdir, exist_ok=True)
+            if i == 0:
+                summary = {"created_at": "2026-09-01T20:00:00Z",
+                           "current_model_id": "grok-4.6"}
+            else:
+                summary = {"info": {"id": "also bad id!",
+                                    "cwd": "/redacted/repo"},
+                           "created_at": "2026-09-01T20:00:00Z",
+                           "current_model_id": "grok-4.6"}
+            with open(os.path.join(sdir, "summary.json"), "w") as fh:
+                fh.write(json.dumps(summary))
+            with open(os.path.join(sdir, "updates.jsonl"), "w") as fh:
+                fh.write(json.dumps({
+                    "timestamp": 1788812000 + i,
+                    "method": "session/update",
+                    "params": {"sessionId": bad,
+                               "update": {"sessionUpdate":
+                                          "user_message_chunk",
+                                          "content": {"type": "text",
+                                                      "text": "probe"},
+                                          "_meta": {"promptIndex": 0}},
+                               "_meta": {"eventId": f"bs-{i}",
+                                         "promptId": f"p-bs{i}"}}}) + "\n")
+                fh.write(json.dumps({
+                    "timestamp": 1788812001 + i,
+                    "method": "_x.ai/session/update",
+                    "params": {"sessionId": bad,
+                               "update": {"sessionUpdate": "turn_completed",
+                                          "prompt_id": f"p-bs{i}",
+                                          "stop_reason": "end_turn",
+                                          "usage": {"inputTokens": 5,
+                                                    "outputTokens": 1,
+                                                    "totalTokens": 6}},
+                               "_meta": {"eventId": f"bs-c-{i}"}}}) + "\n")
+            with open(os.path.join(sdir, "events.jsonl"), "w") as fh:
+                fh.write(json.dumps({
+                    "ts": "2026-09-01T20:00:01Z", "type": "turn_ended",
+                    "outcome": "completed"}) + "\n")
+            with open(os.path.join(sdir, "chat_history.jsonl"), "w") as fh:
+                fh.write(json.dumps({
+                    "type": "user",
+                    "content": [{"type": "text", "text": "probe"}],
+                    "prompt_index": 0}) + "\n")
+        con = self._isolated_con("badsessionid")
+        stats = grok.sync(con, root=tmp)
+        self.assertGreaterEqual(stats.get("malformed", 0), 2)
+        errors = list(con.execute(
+            "SELECT error, line_excerpt FROM import_errors"))
+        self.assertEqual(len(errors), 2)
+        allowed = set(privacy.ERROR_CATEGORIES) | {privacy.ERROR_FALLBACK}
+        for row in errors:
+            self.assertIn(row["error"], allowed)
+            self.assertEqual(row["error"], "missing_id")
+            self.assertEqual(row["line_excerpt"], "")
+            self.assertNotIn("bad session", row["error"] or "")
+            self.assertNotIn("bad session", row["line_excerpt"] or "")
+            self.assertNotIn("evil session", row["error"] or "")
+            self.assertNotIn("evil session", row["line_excerpt"] or "")
+        # No unsafe persisted identifiers in ledger keys.
+        for table, col in (("sessions", "session_key"),
+                           ("sessions", "native_id"),
+                           ("responses", "response_id"),
+                           ("responses", "session_key"),
+                           ("submissions", "native_id"),
+                           ("submissions", "session_key"),
+                           ("events", "session_key")):
+            vals = [r[0] for r in con.execute(
+                f'SELECT "{col}" FROM "{table}"')]
+            for val in vals:
+                self.assertNotIn("bad session", val or "")
+                self.assertNotIn("evil session", val or "")
+        self.assertEqual(
+            con.execute("SELECT COUNT(*) n FROM sessions").fetchone()["n"], 0)
+        self.assertEqual(
+            con.execute("SELECT COUNT(*) n FROM responses").fetchone()["n"], 0)
+        self.assertEqual(
+            con.execute("SELECT COUNT(*) n FROM submissions").fetchone()["n"],
+            0)
+        self.assertEqual(
+            con.execute("SELECT COUNT(*) n FROM events").fetchone()["n"], 0)
+        # Idempotent: a second sync adds no duplicate quarantine.
+        grok.sync(con, root=tmp)
+        self.assertEqual(
+            con.execute(
+                "SELECT COUNT(*) n FROM import_errors").fetchone()["n"], 2)
+        con.close()

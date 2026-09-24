@@ -698,6 +698,99 @@ def _model_ranks(model, turn_m, usage_models, summary_m, chunk_m) -> int:
     return -1
 
 
+_PROVENANCE_TABLE = "grok_response_provenance"
+
+
+def _ensure_provenance_table(con: sqlite3.Connection) -> None:
+    """Adapter-owned evidence provenance: stored model/effort ranks.
+
+    Without stored ranks, a rewritten file that drops the old usage model
+    makes the old value rank -1 under current evidence, letting the summary
+    fallback win. Stored ranks let stronger validated turn/usage evidence
+    beat later fallback evidence across syncs.
+    """
+    try:
+        con.execute(
+            f"CREATE TABLE IF NOT EXISTS {_PROVENANCE_TABLE}"
+            "(response_id TEXT PRIMARY KEY,"
+            " model_rank INTEGER, effort_rank INTEGER)")
+    except sqlite3.DatabaseError:
+        pass
+
+
+def _read_provenance(con: sqlite3.Connection, response_id: str):
+    """(model_rank, effort_rank) or (None, None) when absent/unreadable."""
+    try:
+        row = con.execute(
+            f"SELECT model_rank, effort_rank FROM {_PROVENANCE_TABLE}"
+            " WHERE response_id=?", (response_id,)).fetchone()
+    except sqlite3.DatabaseError:
+        return None, None
+    if row is None:
+        return None, None
+    try:
+        return row["model_rank"], row["effort_rank"]
+    except (KeyError, TypeError, IndexError):
+        return None, None
+
+
+def _write_provenance(con: sqlite3.Connection, response_id: str,
+                      model_rank=None, effort_rank=None) -> None:
+    """Insert or converge stored ranks without touching ledger counters."""
+    _ensure_provenance_table(con)
+    try:
+        cur = con.execute(
+            f"INSERT OR IGNORE INTO {_PROVENANCE_TABLE}"
+            "(response_id, model_rank, effort_rank) VALUES(?,?,?)",
+            (response_id, model_rank, effort_rank))
+    except sqlite3.DatabaseError:
+        return
+    if cur.rowcount:
+        return
+    sets: list[str] = []
+    args: list = []
+    if model_rank is not None:
+        sets.append("model_rank=?")
+        args.append(model_rank)
+    if effort_rank is not None:
+        sets.append("effort_rank=?")
+        args.append(effort_rank)
+    if not sets:
+        return
+    args.append(response_id)
+    try:
+        con.execute(
+            f"UPDATE {_PROVENANCE_TABLE} SET {', '.join(sets)}"
+            " WHERE response_id=?", args)
+    except sqlite3.DatabaseError:
+        pass
+
+
+def _has_unproven_model_usage(update: dict) -> bool:
+    """Whether a valid-counters update carries present-but-invalid modelUsage.
+
+    A modelUsage key that is present with a non-empty, non-None value that
+    fails validation (wrong shape, unsafe name, multi-key, non-dict) is
+    unproven evidence: the current model falls back to summary, but that
+    fallback must not downgrade a previously recorded valid usage model.
+    Missing keys and empty-dict/None values are clean absent evidence (the
+    existing empty-modelUsage contract) and return False.
+    """
+    try:
+        _validated_usage_counters(update)
+    except _AdapterError:
+        return False
+    usage = update.get("usage")
+    if not isinstance(usage, dict):
+        return False
+    if "modelUsage" not in usage:
+        return False
+    mu = usage.get("modelUsage")
+    if mu is None or (isinstance(mu, dict) and len(mu) == 0):
+        return False
+    return _validated_usage_model(update) is None
+
+
 def _reconcile_response_metadata(con: sqlite3.Connection, r: _Reader,
                                  session_dir: str, model_fallback,
                                  summary_effort, chat_effort=None) -> int:
@@ -709,10 +802,14 @@ def _reconcile_response_metadata(con: sqlite3.Connection, r: _Reader,
     Reuses the replay duplicate-selection logic so a later valid modelUsage
     wins over fallback evidence, validates usage before accepting its
     metadata, and never lets weaker evidence downgrade a valid stronger
-    model or effort already recorded. Only a new valid value differing
-    from the stored one updates the row; a missing new value never clears
-    a known one. Never inserts or duplicates rows; counters and
-    usage_conflict behavior are untouched. Returns rows changed.
+    model or effort already recorded. Stored evidence provenance
+    (grok_response_provenance) decides stronger-wins across syncs; a
+    malformed present usage, counters conflicting with the stored row, or
+    present-but-invalid modelUsage preserve the recorded model (effort
+    still applies). Only a new valid value differing from the stored one
+    updates the row; a missing new value never clears a known one. Never
+    inserts or duplicates rows; counters and usage_conflict behavior are
+    untouched. Returns rows changed.
     """
     updates_path = os.path.join(session_dir, "updates.jsonl")
     if not os.path.isfile(updates_path):
@@ -754,12 +851,25 @@ def _reconcile_response_metadata(con: sqlite3.Connection, r: _Reader,
         response_id = f"{HARNESS}:{r.native_sid}:{pid}"
         try:
             existing = con.execute(
-                "SELECT model, effort FROM responses WHERE response_id=?",
+                "SELECT model, effort, input_tokens, cached_input_tokens,"
+                " cache_write_input_tokens, output_tokens,"
+                " reasoning_output_tokens, total_tokens"
+                " FROM responses WHERE response_id=?",
                 (response_id,)).fetchone()
         except sqlite3.DatabaseError:
             continue
         if existing is None:
             continue
+        # Fail closed on current usage: a malformed present usage never
+        # yields metadata, and counters conflicting with the stored row
+        # never downgrade a recorded model to the fallback. Both preserve
+        # the existing model; effort (summary/chat evidence) still applies.
+        try:
+            cur_counters = _validated_usage_counters(update)
+            cur_malformed = False
+        except _AdapterError:
+            cur_malformed = True
+            cur_counters = None
         chunk_model = _valid_model(pid_to_model.get(pid))
         usage_model = _validated_usage_model(update)
         summary_model = _valid_model(model_fallback)
@@ -782,29 +892,60 @@ def _reconcile_response_metadata(con: sqlite3.Connection, r: _Reader,
         except (KeyError, TypeError, IndexError):
             old_effort = None
         if new_model is not None and old_model != new_model:
-            new_rank = _model_ranks(new_model, turn_m, usage_set,
-                                    summary_model, chunk_model)
-            old_rank = _model_ranks(old_model, turn_m, usage_set,
-                                    summary_model, chunk_model)
-            # Stronger wins; weaker never downgrades. Unknown stale
-            # evidence (-1) yields to the current best.
-            if old_model is None or old_rank == -1 or new_rank >= old_rank:
-                sets.append("model=?")
-                args.append(new_model)
+            preserve_model = cur_malformed or _has_unproven_model_usage(update)
+            if not preserve_model and cur_counters is not None:
+                try:
+                    stored_counters = {
+                        key: existing[key]
+                        for key, _ in _GROK_USAGE_MAP}
+                except (KeyError, TypeError, IndexError):
+                    stored_counters = None
+                if stored_counters is not None and not _counters_compatible(
+                        stored_counters, cur_counters):
+                    preserve_model = True
+            if not preserve_model:
+                new_rank = _model_ranks(new_model, turn_m, usage_set,
+                                        summary_model, chunk_model)
+                stored_model_rank, stored_effort_rank = _read_provenance(
+                    con, response_id)
+                if stored_model_rank is not None:
+                    # Stored provenance wins over recomputation: a recorded
+                    # usage/turn model (2/3) beats a later fallback (1/0).
+                    # Equal ranks allow a changed summary fallback to update
+                    # a prior summary-only model.
+                    if old_model is None or new_rank >= stored_model_rank:
+                        sets.append("model=?")
+                        args.append(new_model)
+                else:
+                    old_rank = _model_ranks(old_model, turn_m, usage_set,
+                                            summary_model, chunk_model)
+                    # Stronger wins; weaker never downgrades. Unknown stale
+                    # evidence (-1) yields to the current best only when the
+                    # current usage is valid, compatible and proven.
+                    if old_model is None or old_rank == -1 \
+                            or new_rank >= old_rank:
+                        sets.append("model=?")
+                        args.append(new_model)
         if valid_effort is not None and old_effort != valid_effort:
             if old_effort is None:
                 sets.append("effort=?")
                 args.append(valid_effort)
             else:
-                if old_effort == valid_summary_effort:
-                    old_erank = 1
-                elif old_effort == valid_chat_effort:
-                    old_erank = 0
+                _, _stored_erank = _read_provenance(con, response_id)
+                if _stored_erank is not None:
+                    if new_effort_rank >= _stored_erank:
+                        sets.append("effort=?")
+                        args.append(valid_effort)
                 else:
-                    old_erank = -1
-                if old_erank == -1 or new_effort_rank >= old_erank:
-                    sets.append("effort=?")
-                    args.append(valid_effort)
+                    if old_effort == valid_summary_effort:
+                        old_erank = 1
+                    elif old_effort == valid_chat_effort:
+                        old_erank = 0
+                    else:
+                        old_erank = -1
+                    if old_erank == -1 or new_effort_rank >= old_erank:
+                        sets.append("effort=?")
+                        args.append(valid_effort)
         if sets:
             args.append(response_id)
             try:
@@ -813,6 +954,15 @@ def _reconcile_response_metadata(con: sqlite3.Connection, r: _Reader,
                     " WHERE response_id=?", args)
             except sqlite3.DatabaseError:
                 continue
+            _m_rank_to_store = None
+            _e_rank_to_store = None
+            if "model=?" in sets:
+                _m_rank_to_store = _model_ranks(
+                    new_model, turn_m, usage_set, summary_model, chunk_model)
+            if "effort=?" in sets:
+                _e_rank_to_store = new_effort_rank
+            _write_provenance(con, response_id, _m_rank_to_store,
+                              _e_rank_to_store)
             changed += 1
     return changed
 
@@ -825,15 +975,37 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
              "events_duplicate": 0, "compactions": 0, "malformed": 0}
     updates_path = os.path.join(session_dir, "updates.jsonl")
     events_path = os.path.join(session_dir, "events.jsonl")
-    r = _Reader(con, f"{HARNESS}:{os.path.basename(session_dir.rstrip(os.sep))}",
-                os.path.basename(session_dir.rstrip(os.sep)), stats)
-
     summary = _read_json(os.path.join(session_dir, "summary.json")) or {}
     info = summary.get("info") if isinstance(summary.get("info"), dict) else {}
-    if isinstance(info.get("id"), str) and info.get("id"):
-        if _safe_token(info["id"]) is not None:
-            r.native_sid = info["id"]
-            r.session_key = f"{HARNESS}:{r.native_sid}"
+    # Fail closed on unsafe identifiers: the native session id comes only
+    # from a validated summary.info.id or a validated directory basename.
+    # Anything else never reaches session keys, response ids, submission
+    # ids or event keys.
+    basename = os.path.basename(session_dir.rstrip(os.sep))
+    safe_basename = _valid_native_id(basename)
+    raw_info_id = info.get("id")
+    valid_info_id = _valid_native_id(raw_info_id) \
+        if isinstance(raw_info_id, str) and raw_info_id else None
+    native_sid = valid_info_id or safe_basename
+    if native_sid is None:
+        # No safe native id: quarantine under the fixed missing_id
+        # category with no record values. The source_path locates the
+        # directory; error and excerpt never carry the raw name.
+        category = privacy.error_category("missing_id")
+        existing = con.execute(
+            "SELECT 1 FROM import_errors WHERE harness=? AND source_path=?"
+            " AND ordinal_num=? AND error=?",
+            (HARNESS, session_dir, 0, category)).fetchone()
+        if existing is None:
+            con.execute(
+                "INSERT INTO import_errors(harness, source_path, ordinal_num,"
+                " error, line_excerpt, created_at) VALUES(?,?,?,?,?,?)",
+                (HARNESS, session_dir, 0, category,
+                 privacy.line_excerpt(""), db.now()))
+            stats["malformed"] = stats.get("malformed", 0) + 1
+            con.commit()
+        return stats
+    r = _Reader(con, f"{HARNESS}:{native_sid}", native_sid, stats)
     group_name = os.path.basename(os.path.dirname(session_dir.rstrip(os.sep)))
     fallback_dir = urllib.parse.unquote(group_name)
     project_dir = (summary.get("git_root_dir") if isinstance(
@@ -983,6 +1155,8 @@ def _read_chat(session_dir: str, r: _Reader) -> dict:
     identity, never the ledger, and only the prompt_index marks survive.
     Missing, malformed or unterminated files leave reliable=False so prompts
     stay provisional (unknown, empty excerpt) until complete metadata arrives.
+    A type=user record proves human authorship only when its content yields
+    valid text; missing or invalid content never adds the prompt to seen.
     """
     chat = {"synthetic": set(), "seen": set(), "effort": None,
             "reliable": True}
@@ -1025,6 +1199,12 @@ def _read_chat(session_dir: str, r: _Reader) -> dict:
                 idx = _valid_prompt_index(obj.get("prompt_index"))
                 if idx is None:
                     chat["reliable"] = False
+                    continue
+                # Fail closed on unproven authorship: only valid chat
+                # content counts as human-authorship proof. Missing or
+                # invalid shapes yield no text and never mark the prompt
+                # seen (synthetic marks need the same proof).
+                if not text:
                     continue
                 chat["seen"].add(idx)
                 if obj.get("synthetic_reason"):
@@ -1365,6 +1545,22 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
          SEMANTICS))
     if cur.rowcount:
         r.stats["responses_inserted"] += 1
+        # Persist evidence provenance for later stronger-wins comparison.
+        _turn_m = None
+        for _started, _name in safe_turns:
+            if ts is not None and _started <= ts:
+                _turn_m = _name
+        if all_usage_models is None:
+            _uset = {usage_model} if usage_model is not None else set()
+        else:
+            _uset = set(all_usage_models)
+            if usage_model is not None:
+                _uset.add(usage_model)
+        _write_provenance(
+            con, response_id,
+            _model_ranks(model, _turn_m, _uset, summary_model, chunk_model),
+            (1 if valid_effort == valid_summary_effort else 0)
+            if valid_effort is not None else -1)
         return
     existing = con.execute(
         "SELECT input_tokens, cached_input_tokens, cache_write_input_tokens,"
@@ -1420,18 +1616,33 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
         old_effort = existing["effort"]
     except (KeyError, TypeError, IndexError):
         old_effort = None
+    stored_model_rank, stored_effort_rank = _read_provenance(con, response_id)
+    new_model_rank = _model_ranks(model, turn_m, usage_set,
+                                  summary_model, chunk_model)
+    new_erank = (1 if valid_effort == valid_summary_effort else 0) \
+        if valid_effort is not None else -1
     if model is not None and old_model != model:
-        new_rank = _model_ranks(model, turn_m, usage_set,
-                                summary_model, chunk_model)
-        old_rank = _model_ranks(old_model, turn_m, usage_set,
-                                summary_model, chunk_model)
-        if old_model is None or old_rank == -1 or new_rank >= old_rank:
-            meta_sets.append("model=?")
-            meta_args.append(model)
+        if stored_model_rank is not None:
+            if old_model is None or new_model_rank >= stored_model_rank:
+                meta_sets.append("model=?")
+                meta_args.append(model)
+        elif _has_unproven_model_usage(update):
+            pass
+        else:
+            new_rank = new_model_rank
+            old_rank = _model_ranks(old_model, turn_m, usage_set,
+                                    summary_model, chunk_model)
+            if old_model is None or old_rank == -1 or new_rank >= old_rank:
+                meta_sets.append("model=?")
+                meta_args.append(model)
     if valid_effort is not None and old_effort != valid_effort:
         if old_effort is None:
             meta_sets.append("effort=?")
             meta_args.append(valid_effort)
+        elif stored_effort_rank is not None:
+            if new_erank >= stored_effort_rank:
+                meta_sets.append("effort=?")
+                meta_args.append(valid_effort)
         else:
             if old_effort == valid_summary_effort:
                 old_erank = 1
@@ -1439,7 +1650,6 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
                 old_erank = 0
             else:
                 old_erank = -1
-            new_erank = 1 if valid_effort == valid_summary_effort else 0
             if old_erank == -1 or new_erank >= old_erank:
                 meta_sets.append("effort=?")
                 meta_args.append(valid_effort)
@@ -1448,6 +1658,15 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
         con.execute(
             f"UPDATE responses SET {', '.join(meta_sets)} WHERE response_id=?",
             meta_args)
+        # Converge stored ranks only for fields that actually changed.
+        _model_rank_to_store = None
+        _effort_rank_to_store = None
+        if "model=?" in meta_sets:
+            _model_rank_to_store = new_model_rank
+        if "effort=?" in meta_sets:
+            _effort_rank_to_store = new_erank
+        _write_provenance(con, response_id, _model_rank_to_store,
+                          _effort_rank_to_store)
     r.stats["responses_duplicate"] += 1
 
 
