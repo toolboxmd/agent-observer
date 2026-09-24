@@ -13,6 +13,5 @@
 {"mode":"synthetic-mode","sessionId":"sess-meta","type":"mode"}
 {"permissionMode":"synthetic-permission","sessionId":"sess-meta","type":"permission-mode"}
 {"prNumber":0,"prRepository":"synthetic/repo","prUrl":"synthetic-url","sessionId":"sess-meta","timestamp":"2026-09-14T10:00:05Z","type":"pr-link"}
-{"content":"synthetic queue content","operation":"synthetic-operation","sessionId":"sess-meta","timestamp":"2026-09-14T10:00:06Z","type":"queue-operation"}
 {"cwd":"/redacted/repo","durationMs":10,"entrypoint":"cli","gitBranch":"main","isMeta":false,"isSidechain":false,"messageCount":1,"parentUuid":"u-meta-1","sessionId":"sess-meta","subtype":"turn_duration","timestamp":"2026-09-14T10:00:07Z","type":"system","userType":"external","uuid":"sys-meta-1","version":"2.1.280"}
 {"sessionId":"sess-meta","timestamp":"2026-09-14T10:00:08Z","type":"future-synthetic-type","uuid":"x-meta-1"}

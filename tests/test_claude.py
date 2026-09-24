@@ -106,8 +106,7 @@ class ClaudeMetadataTest(LedgerCase):
             self.con, fixture("claude-metadata.jsonl"))
         self.assertEqual(stats["responses_inserted"], 1)
         # cost-state plus the genuinely unknown future type quarantine;
-        # every other metadata record (including queue-operation with a
-        # non-enqueue operation) is recognized and ignored.
+        # every other metadata record is recognized and ignored.
         self.assertEqual(stats["malformed"], 2)
         errors = self.query(
             "SELECT error, line_excerpt FROM import_errors ORDER BY id")
@@ -150,8 +149,8 @@ class ClaudeMetadataTest(LedgerCase):
             r["error"] or ""
             for r in self.query("SELECT error FROM import_errors"))
         for sentinel in ("synthetic-bridge", "synthetic-leaf",
-                          "synthetic-operation", "Synthetic title probe",
-                          "synthetic-permission", "synthetic queue content"):
+                          "Synthetic title probe",
+                          "synthetic-permission"):
             self.assertNotIn(sentinel, blob)
 
 
@@ -211,43 +210,28 @@ class ClaudeContradictoryMarkersTest(LedgerCase):
 
 
 class ClaudeQueueOperationTest(LedgerCase):
-    """Mid-turn typed prompts: an enqueue record's prompt text is a genuine
-    human submission, deduplicated against the user record it later
-    becomes so each prompt counts once. dequeue, remove and every other
-    operation store nothing and never error."""
+    """Queue-operation handling is descoped for release 0.2.0: every
+    queue-operation record falls through to unsupported_schema
+    quarantine, stores nothing and creates no submission, until a
+    follow-up implements correct queued-prompt handling."""
 
-    MAIN_TEXT = ("Please summarize the quarterly status in plain words"
-                 " for the review")
-
-    def test_enqueue_and_matching_user_count_once(self):
-        stats = claude.import_claude_file(
-            self.con, fixture("claude-queue.jsonl"))
-        self.assertEqual(stats["malformed"], 0)
+    def test_queue_operation_is_quarantined_with_nothing_stored(self):
+        dst = os.path.join(self.tmp.name, "sess-queue.jsonl")
+        _write(dst, [
+            '{"sessionId": "sess-queue", "cwd": "/redacted/repo",'
+            ' "version": "2.1.280", "isSidechain": false,'
+            ' "type": "queue-operation", "operation": "enqueue",'
+            ' "content": "Please summarize SECRET-QUEUE-aaa111",'
+            ' "timestamp": "2026-09-14T10:00:01Z"}\n',
+        ])
+        stats = claude.import_claude_file(self.con, dst)
+        self.assertEqual(stats["malformed"], 1)
+        errors = self.query(
+            "SELECT error, line_excerpt FROM import_errors")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["error"], "unsupported_schema")
         self.assertEqual(
-            self.query("SELECT COUNT(*) n FROM import_errors")[0]["n"], 0)
-        # Three prompts: queued-then-submitted, queue-only, direct.
-        rows = {r["native_id"]: r for r in self.query(
-            "SELECT native_id, alias_id, kind, text_excerpt, text_hash,"
-            " turn_id, session_key FROM submissions")}
-        self.assertEqual(
-            sorted(rows),
-            ["claude:queue:sess-queue:3", "claude:u-q-1", "claude:u-q-2"])
-        merged = rows["claude:u-q-1"]
-        self.assertEqual(merged["alias_id"], "claude:queue:sess-queue:0")
-        self.assertEqual(merged["kind"], "genuine")
-        self.assertEqual(merged["text_excerpt"], self.MAIN_TEXT)
-        self.assertEqual(merged["turn_id"], "claude:p-q-1")
-        self.assertEqual(merged["session_key"], "claude:sess-queue")
-        self.assertEqual(stats["submissions_inserted"], 3)
-        self.assertEqual(stats.get("submissions_dedup"), 1)
-
-    def test_queue_only_submission_truncates_at_markers(self):
-        claude.import_claude_file(self.con, fixture("claude-queue.jsonl"))
-        row = self.query(
-            "SELECT kind, text_excerpt FROM submissions"
-            " WHERE native_id='claude:queue:sess-queue:3'")[0]
-        self.assertEqual(row["kind"], "genuine")
-        self.assertEqual(row["text_excerpt"], "Check the other file")
+            self.query("SELECT COUNT(*) n FROM submissions")[0]["n"], 0)
         blob = "".join(r["text_excerpt"] or "" for r in self.query(
             "SELECT text_excerpt FROM submissions"))
         blob += "".join(r["detail_json"] or "" for r in self.query(
@@ -257,78 +241,4 @@ class ClaudeQueueOperationTest(LedgerCase):
         blob += "".join(
             (r["error"] or "") + (r["line_excerpt"] or "")
             for r in self.query("SELECT error, line_excerpt FROM import_errors"))
-        self.assertNotIn("SECRET-QUEUE-TAIL-zzz999", blob)
-        self.assertNotIn("A removed queued prompt is never stored", blob)
-        self.assertNotIn("An unknown queue operation is never stored", blob)
-
-    def test_noop_operations_store_nothing_and_never_error(self):
-        stats = claude.import_claude_file(
-            self.con, fixture("claude-queue.jsonl"))
-        self.assertEqual(stats["malformed"], 0)
-        self.assertEqual(
-            self.query("SELECT COUNT(*) n FROM submissions")[0]["n"], 3)
-        self.assertEqual(
-            self.query("SELECT COUNT(*) n FROM import_errors")[0]["n"], 0)
-
-    def test_full_reimport_adds_no_second_row(self):
-        claude.import_claude_file(self.con, fixture("claude-queue.jsonl"))
-        again = claude.import_claude_file(
-            self.con, fixture("claude-queue.jsonl"), full=True)
-        self.assertEqual(again["submissions_inserted"], 0)
-        self.assertEqual(again.get("submissions_dedup", 0), 0)
-        self.assertEqual(again["malformed"], 0)
-        rows = {r["native_id"]: r for r in self.query(
-            "SELECT native_id, alias_id FROM submissions")}
-        self.assertEqual(
-            sorted(rows),
-            ["claude:queue:sess-queue:3", "claude:u-q-1", "claude:u-q-2"])
-        self.assertEqual(rows["claude:u-q-1"]["alias_id"],
-                         "claude:queue:sess-queue:0")
-
-    def test_reverse_order_user_then_enqueue_merges(self):
-        dst = os.path.join(self.tmp.name, "sess-rev.jsonl")
-        _write(dst, [
-            '{"sessionId": "sess-rev", "cwd": "/redacted/repo",'
-            ' "version": "2.1.280", "isSidechain": false, "type": "user",'
-            ' "uuid": "u-rev-1", "promptId": "p-rev-1",'
-            ' "origin": {"kind": "human"}, "promptSource": "typed",'
-            ' "timestamp": "2026-09-14T10:00:01Z",'
-            ' "message": {"role": "user",'
-            ' "content": "A prompt queued after it was submitted"}}\n',
-            '{"sessionId": "sess-rev", "cwd": "/redacted/repo",'
-            ' "version": "2.1.280", "isSidechain": false,'
-            ' "type": "queue-operation", "operation": "enqueue",'
-            ' "content": "A prompt queued after it was submitted",'
-            ' "timestamp": "2026-09-14T10:00:02Z"}\n',
-        ])
-        stats = claude.import_claude_file(self.con, dst)
-        self.assertEqual(stats["malformed"], 0)
-        rows = self.query("SELECT native_id, alias_id FROM submissions")
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["native_id"], "claude:u-rev-1")
-        self.assertEqual(rows[0]["alias_id"], "claude:queue:sess-rev:1")
-
-    def test_subagent_enqueue_keeps_no_excerpt(self):
-        dst = os.path.join(self.tmp.name, "sess-subq.jsonl")
-        _write(dst, [
-            '{"sessionId": "sess-subq", "cwd": "/redacted/repo",'
-            ' "version": "2.1.280", "isSidechain": true,'
-            ' "agentId": "ag-9", "type": "user", "uuid": "u-sub-1",'
-            ' "timestamp": "2026-09-14T10:00:01Z",'
-            ' "message": {"role": "user",'
-            ' "content": "Child work item SECRET-SUBQ-aaa111"}}\n',
-            '{"sessionId": "sess-subq", "cwd": "/redacted/repo",'
-            ' "version": "2.1.280", "type": "queue-operation",'
-            ' "operation": "enqueue",'
-            ' "content": "Subagent queued SECRET-SUBQ-bbb222",'
-            ' "timestamp": "2026-09-14T10:00:02Z"}\n',
-        ])
-        claude.import_claude_file(self.con, dst)
-        rows = {r["native_id"]: r for r in self.query(
-            "SELECT native_id, kind, text_excerpt FROM submissions")}
-        queued = rows["claude:queue:sess-subq:1"]
-        self.assertEqual(queued["kind"], "genuine")
-        self.assertEqual(queued["text_excerpt"], "")
-        blob = "".join(r["text_excerpt"] or "" for r in self.query(
-            "SELECT text_excerpt FROM submissions"))
-        self.assertNotIn("SECRET-SUBQ-bbb222", blob)
+        self.assertNotIn("SECRET-QUEUE-aaa111", blob)
