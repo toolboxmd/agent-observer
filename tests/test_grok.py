@@ -124,9 +124,17 @@ class GrokAdapterTest(LedgerCase):
         # tool_completed duration enriches the update-stream result in place.
         self.assertEqual(results["call-read-1"]["status"], "ok")
         self.assertEqual(results["call-read-1"]["duration_ms"], 12)
-        self.assertEqual(by["skill_read"][0]["target"],
-                         "/redacted/repo/skills/ops/SKILL.md")
+        # Planner ruling: skill_read target holds only the validated
+        # skill identifier, never the installed path. The path lives only
+        # in detail skill_path.
+        self.assertEqual(by["skill_read"][0]["target"], "ops")
         self.assertEqual(by["skill_read"][0]["name"], "ops")
+        import json as _json
+        detail = _json.loads(by["skill_read"][0]["detail_json"] or "{}")
+        self.assertEqual(detail.get("skill"), "ops")
+        self.assertEqual(detail.get("skill_path"),
+                         "/redacted/repo/skills/ops/SKILL.md")
+        self.assertNotIn("/", by["skill_read"][0]["target"] or "")
         self.assertNotIn("read", by)
 
     def test_permission_decision_and_skipped_noise(self):

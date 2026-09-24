@@ -355,7 +355,7 @@ def _upsert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
         raise ValueError(f"{family} event missing native identity")
     safe_name = privacy.filter_event_name(family, name)
     safe_status = privacy.filter_event_status(family, status)
-    safe_target = privacy.filter_target(target) or None
+    safe_target = privacy.filter_target(target, family) or None
     filtered = privacy.filter_detail(family, detail)
     try:
         detail_json = json.dumps(filtered, sort_keys=True) \
@@ -528,6 +528,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
         fields["parent_session_key"] = f"{HARNESS}:{sess['parent_id']}"
         fields["role"] = "subagent"
     db.upsert_session(con, session_key, HARNESS, sess_id, source_id,
+                      replace_identity=privacy_stale,
                       **fields)
     if privacy_stale:
         # Rule 7: native free-text titles are never stored; a version
@@ -872,15 +873,30 @@ def _ingest_tool(con, stats, identity, src_path, source_id, session_key,
         _oops(con, stats, src_path, ordinal, "schema_error", line)
     if tool == "read" and status == "completed" and target:
         identity.observe_path(target)
-        skill = skill_from_path(target)
-        family = "skill_read" if skill else "read"
-        _upsert_event(con, stats, source_id=source_id,
-                      session_key=session_key, family=family,
-                      native_id=call_id, ordinal=ordinal, ts=ts,
-                      name=os.path.basename(target)[:200], target=target,
-                      status="ok", size_bytes=_output_size(output),
-                      fingerprint=fingerprint(target),
-                      detail={"skill": skill} if skill else None)
+        raw_skill = skill_from_path(target)
+        safe_skill = privacy.filter_target(raw_skill, family="skill_read") \
+            if raw_skill else None
+        looks_like_skill = target.endswith("SKILL.md") or "/skills/" in target
+        family = "skill_read" if (safe_skill or looks_like_skill) else "read"
+        if family == "skill_read":
+            # Rule 6: skill_read target holds only the validated skill
+            # identifier, never the installed path. The file path lives
+            # only in detail skill_path.
+            _upsert_event(con, stats, source_id=source_id,
+                          session_key=session_key, family=family,
+                          native_id=call_id, ordinal=ordinal, ts=ts,
+                          name=os.path.basename(target)[:200], target=safe_skill,
+                          status="ok", size_bytes=_output_size(output),
+                          fingerprint=fingerprint(target),
+                          detail={"skill": raw_skill, "skill_path": target})
+        else:
+            _upsert_event(con, stats, source_id=source_id,
+                          session_key=session_key, family=family,
+                          native_id=call_id, ordinal=ordinal, ts=ts,
+                          name=os.path.basename(target)[:200], target=target,
+                          status="ok", size_bytes=_output_size(output),
+                          fingerprint=fingerprint(target),
+                          detail=None)
     if tool == "skill":
         raw_name = tool_input.get("name")
         if isinstance(raw_name, str) and raw_name:
@@ -897,17 +913,18 @@ def _ingest_tool(con, stats, identity, src_path, source_id, session_key,
         metadata = state.get("metadata") if isinstance(
             state.get("metadata"), dict) else {}
         skill_dir = metadata.get("dir")
+        skill_path = None
         if isinstance(skill_dir, str) and skill_dir:
-            identity.observe_path(
-                os.path.join(skill_dir, "SKILL.md"))
-        # Rule 6: the skill_invoke family keeps no detail; the validated
-        # skill name survives in the name and target columns, or neither
-        # when the native value is free text.
+            skill_path = os.path.join(skill_dir, "SKILL.md")
+            identity.observe_path(skill_path)
+        # Rule 6: skill_invoke target holds only the validated skill
+        # identifier; the installed SKILL.md path lives only in detail
+        # skill_path when the native invocation supplies a directory.
         _upsert_event(con, stats, source_id=source_id,
                       session_key=session_key, family="skill_invoke",
                       native_id=call_id, ordinal=ordinal, ts=ts,
                       name=safe_skill, target=safe_skill,
-                      detail=None)
+                      detail={"skill_path": skill_path} if skill_path else None)
     if tool in ("edit", "write", "patch") and target:
         _upsert_event(con, stats, source_id=source_id,
                       session_key=session_key, family="file_change",

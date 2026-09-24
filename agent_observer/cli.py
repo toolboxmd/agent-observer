@@ -60,6 +60,21 @@ def _fmt_section_total(section: dict) -> str:
     return "unknown"
 
 
+def _fmt_session_total(session: dict) -> str:
+    """One session row total that never mixes counter semantics.
+
+    Sessions spanning more than one semantics expose no combined total;
+    the text view names that instead of inventing a sum. Homogeneous
+    sessions keep the historical total rendering.
+    """
+    if "total_tokens" in session:
+        return _fmt_tokens(session.get("total_tokens"),
+                            session.get("unknown_tokens") or 0)
+    if "by_semantics" in session:
+        return "mixed semantics (see --json)"
+    return "unknown"
+
+
 def _text(payload) -> str:
     if isinstance(payload, dict) and payload.get("_view") == "sync":
         lines = []
@@ -85,7 +100,7 @@ def _text(payload) -> str:
                 f"{r['session_key']}  {r.get('project_dir') or '?'}  "
                 f"agentsmd={r.get('agentsmd_version') or 'unknown'}  "
                 f"responses={r.get('responses', 0)} "
-                f"total={_fmt_tokens(r.get('total_tokens'), r.get('unknown_tokens') or 0)}")
+                f"total={_fmt_session_total(r)}")
         return "\n".join(lines) or "no sessions"
     if isinstance(payload, dict) and payload.get("_view") == "task":
         r = payload
@@ -503,10 +518,13 @@ def _analyze(con, ns) -> int:
     for g in payload["groups"]:
         tokens = g["tokens_per_session"]
         prompts = g["genuine_prompts_per_session"]
-        median = tokens.get("median", "-")
-        median = "-" if median is None else f"{median:,}" if isinstance(median, (int, float)) else median
-        if g.get("unknown_token_responses"):
-            median = f">={median} (lower bound)" if median != "-" else "unknown"
+        if "by_semantics" in tokens:
+            median = "mixed semantics (see --json)"
+        else:
+            median = tokens.get("median", "-")
+            median = "-" if median is None else f"{median:,}" if isinstance(median, (int, float)) else median
+            if g.get("unknown_token_responses"):
+                median = f">={median} (lower bound)" if median != "-" else "unknown"
         line = (f"{g['group']}: {g['sessions']} sessions, {g['projects']} projects, "
                 f"median tokens {median}, "
                 f"prompts/session {prompts.get('median', '-')} (n={prompts['n']}), "
@@ -573,13 +591,7 @@ def _sessions(con, ns) -> int:
             " GROUP BY kind", (ns.session,))}
         _emit(payload, True)
         return 0
-    q = ("SELECT s.*, COUNT(r.response_id) responses,"
-         " SUM(CASE WHEN r.is_overlap=0 THEN r.total_tokens END)"
-         " total_tokens,"
-         " SUM(CASE WHEN r.is_overlap=0 AND r.total_tokens IS NULL"
-         " THEN 1 ELSE 0 END) unknown_tokens"
-         " FROM sessions s LEFT JOIN responses r"
-         " ON r.session_key=s.session_key WHERE 1=1")
+    q = ("SELECT s.* FROM sessions s WHERE 1=1")
     args: list = []
     if ns.harness:
         q += " AND s.harness=?"
@@ -593,11 +605,24 @@ def _sessions(con, ns) -> int:
             else float(ns.since)
         q += " AND COALESCE(s.ended_at, s.started_at, 0) >= ?"
         args.append(since or 0)
-    q += " GROUP BY s.session_key ORDER BY COALESCE(s.ended_at, s.started_at) DESC LIMIT ?"
+    q += " ORDER BY COALESCE(s.ended_at, s.started_at) DESC LIMIT ?"
     args.append(ns.limit)
     rows = [dict(r) for r in con.execute(q, args)]
     for r in rows:
         r.pop("identity_json", None)
+        usage = _report.scope_totals(con, {r["session_key"]})
+        r["responses"] = usage.get("responses", 0)
+        if "total_tokens" in usage:
+            r["total_tokens"] = usage.get("total_tokens")
+            r["unknown_tokens"] = (usage.get("unknown_counts") or {}).get(
+                "total_tokens", 0)
+        elif "by_semantics" in usage:
+            # Mixed counter semantics: no combined total exists.
+            r.pop("total_tokens", None)
+            r.pop("unknown_tokens", None)
+            r["by_semantics"] = usage["by_semantics"]
+        else:
+            r["total_tokens"] = usage.get("total_tokens")
     _emit({"_view": "sessions", "sessions": rows}, ns.as_json)
     return 0
 

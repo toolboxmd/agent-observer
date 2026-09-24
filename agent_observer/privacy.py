@@ -23,7 +23,7 @@ import re
 
 # Rule 3: bump when any rule in this module changes meaning. A stored source
 # version that differs forces a full re-import with in-place correction.
-PRIVACY_VERSION = 4
+PRIVACY_VERSION = 5
 
 SUBMISSION_EXCERPT_CHARS = 300
 ASSISTANT_EXCERPT_CHARS = 400
@@ -35,6 +35,7 @@ DETAIL_JSON_CHARS = 4000
 # '<' before whitespace, digits, punctuation or the end of text is kept,
 # as is a bare '<<'.
 _WS_RE = re.compile(r"\s+")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def _marker_at(text: str, index: int) -> bool:
@@ -168,8 +169,11 @@ def line_excerpt(line: object) -> str:
 # - file_change.paths: analysis._changed_paths (target plus detail paths)
 # - tool_result.exit_code/exitCode: analysis._failed
 # - read.start_line/num_lines/cmd: analysis._repeated_reads grouping key
-# - skill_read.start_line/num_lines/cmd/skill: repeated reads plus
-#   analysis._repeated_skills skill identity
+# - skill_read.start_line/num_lines/cmd/skill/skill_path: repeated reads
+#   plus analysis._repeated_skills skill identity (identifier in skill,
+#   installed file path in skill_path, never in target)
+# - skill_invoke.skill_path: installed SKILL.md path when the native
+#   invocation supplies a directory, otherwise omitted
 # - assistant_message.excerpt: analysis._permission_seeking
 # Every other family keeps no detail. Values may be numbers, booleans,
 # fixed-length hex hashes, native identifiers of the expected type, file
@@ -181,10 +185,10 @@ EVENT_DETAIL_ALLOWLIST: dict[str, dict[str, str]] = {
     "tool_result": {"exit_code": "int", "exitCode": "int"},
     "read": {"start_line": "int", "num_lines": "int", "cmd": "command"},
     "skill_read": {"start_line": "int", "num_lines": "int", "cmd": "command",
-                   "skill": "identifier"},
+                   "skill": "identifier", "skill_path": "path"},
     "assistant_message": {"excerpt": "excerpt"},
     "tool_call": {},
-    "skill_invoke": {},
+    "skill_invoke": {"skill_path": "path"},
     "compaction": {},
     "lifecycle": {},
     "permission": {},
@@ -256,6 +260,26 @@ def _valid_command(value: object) -> str | None:
     return None
 
 
+def _valid_path_detail(value: object) -> str | None:
+    """Rule 6 skill file path detail: fail closed and marker/type safe.
+
+    Only a non-empty string without tag-like markers or control
+    characters survives, bounded to _TARGET_CHARS. Relative and absolute
+    spellings both survive so edit-reset logic sees every spelling;
+    wrong types, empty values, markers and control characters fail
+    closed to None and never persist.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    if len(value) > _TARGET_CHARS:
+        return None
+    if _CONTROL_RE.search(value) is not None:
+        return None
+    if _marker_pos(value) is not None:
+        return None
+    return value
+
+
 def _valid_excerpt(value: object) -> str | None:
     """Rule 2, enforced here as well as in assistant_excerpt.
 
@@ -311,6 +335,10 @@ def filter_detail(family: str, detail: object) -> dict:
                 out[key] = kept
         elif kind == "paths":
             kept = _valid_paths(value)
+            if kept is not None:
+                out[key] = kept
+        elif kind == "path":
+            kept = _valid_path_detail(value)
             if kept is not None:
                 out[key] = kept
     return out

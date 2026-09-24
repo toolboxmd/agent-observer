@@ -337,7 +337,8 @@ def import_claude_file(con: sqlite3.Connection, path: str,
             fields["parent_session_key"] = f"{HARNESS}:{r.native_session}"
             fields["role"] = "subagent"
         db.upsert_session(con, r.session_key, HARNESS,
-                          r.session_key.split(":", 1)[1], src.source_id, **fields)
+                          r.session_key.split(":", 1)[1], src.source_id,
+                          replace_identity=src.privacy_stale, **fields)
         if src.privacy_stale:
             # Rule 7: native free-text titles are never stored; a version
             # change clears any title an older import kept.
@@ -628,12 +629,15 @@ def _user(r: _Reader, obj: dict, ordinal: int, ts) -> None:
         # identifier survives in name, target and detail. The installed
         # directory path itself is never a target.
         base = text[len(SKILL_BASE_PREFIX):].splitlines()[0].strip()
-        r.identity.observe_path(base.rstrip("/") + "/SKILL.md")
-        skill = privacy.filter_target(skill_from_path(base + "/"),
+        skill_file = base.rstrip("/") + "/SKILL.md"
+        r.identity.observe_path(skill_file)
+        raw_skill = skill_from_path(base + "/")
+        skill = privacy.filter_target(raw_skill,
                                       family="skill_read")
         r.event("skill_read", obj.get("uuid") or f"ordinal:{ordinal}", ordinal, ts,
                 name=skill, target=skill, size_bytes=len(text),
-                detail={"skill": skill} if skill else None)
+                detail={"skill": raw_skill, "skill_path": skill_file}
+                if (raw_skill or skill_file) else None)
     kind = _user_kind(r, obj, text)
     native = obj.get("uuid") or f"ordinal:{ordinal}"
     if kind == "genuine":
@@ -666,19 +670,27 @@ def _tool_result(r: _Reader, obj: dict, result: dict, ordinal: int, ts) -> None:
     if name in READ_TOOLS and path and status == "ok":
         r.identity.observe_path(path)
         raw_skill = skill_from_path(path)
-        family = "skill_read" if raw_skill else "read"
+        safe_skill = privacy.filter_target(raw_skill, family="skill_read") \
+            if raw_skill else None
+        looks_like_skill = path.endswith("SKILL.md") or "/skills/" in path
+        family = "skill_read" if (safe_skill or looks_like_skill) else "read"
         # Rule 6 via agent_observer/privacy.py: a skill_read target holds
         # only the validated native skill identifier, never the path.
-        # A plain read keeps the observed path as its target.
-        skill = privacy.filter_target(raw_skill, family="skill_read") \
-            if raw_skill else None
+        # The file path lives only in detail skill_path. A plain read
+        # keeps the observed path as its target.
         start = (file_info or {}).get("startLine")
         lines = (file_info or {}).get("numLines")
-        r.event(family, f"{call_id}:read", ordinal, ts, name=os.path.basename(path),
-                target=skill if family == "skill_read" else path, size_bytes=size,
-                fingerprint=fingerprint(path, start, lines),
-                detail={"start_line": start, "num_lines": lines,
-                        "skill": skill})
+        if family == "skill_read":
+            r.event(family, f"{call_id}:read", ordinal, ts, name=os.path.basename(path),
+                    target=safe_skill, size_bytes=size,
+                    fingerprint=fingerprint(path, start, lines),
+                    detail={"start_line": start, "num_lines": lines,
+                            "skill": raw_skill, "skill_path": path})
+        else:
+            r.event(family, f"{call_id}:read", ordinal, ts, name=os.path.basename(path),
+                    target=path, size_bytes=size,
+                    fingerprint=fingerprint(path, start, lines),
+                    detail={"start_line": start, "num_lines": lines})
 
 
 def _attachment(r: _Reader, obj: dict, ordinal: int, ts) -> None:

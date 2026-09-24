@@ -45,7 +45,10 @@ class TimelineTest(LedgerCase):
         self.assertEqual([e["target"] for e in reads], ["AGENTS.md"])
         self.assertEqual([e["name"] for e in reads], ["AGENTS.md"])
         skills = report.timeline(self.con, family="skill_read")["events"]
-        self.assertEqual([e["target"] for e in skills],
+        # Planner ruling: skill_read target holds only the validated skill
+        # identifier; the installed path lives only in detail skill_path.
+        self.assertEqual([e["target"] for e in skills], ["wayfinder"])
+        self.assertEqual([e["detail"]["skill_path"] for e in skills],
                          ["skills/wayfinder/SKILL.md"])
         # Prose that mentions SKILL.md creates no skill event.
         self.assertEqual(report.timeline(self.con,

@@ -83,8 +83,15 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
    and `skill_invoke` targets hold only a validated native skill
    identifier under the same complete identifier rule as names, so a
    free-text skill title or an installed directory path never persists
-   as a target. Never titles, messages, error text, outputs,
-   content, arguments or other free text.
+   as a target. The installed skill file path lives only in detail
+   `skill_path` (`skill_read` and `skill_invoke`), marker- and
+   type-checked; `skill_invoke` keeps it only when the native invocation
+   supplies a directory. Never titles, messages, error text, outputs,
+   content, arguments or other free text. A privacy-version change also
+   replaces source-owned session identity (`identity_json`,
+   `agentsmd_version`, `instructions_sha256`, `preferences_sha256`,
+   `direction_status`): omitted or invalid values clear to NULL instead
+   of COALESCE-keeping old content.
 7. Tables not named above store no free text from native records beyond
    identifiers, model and provider names, paths and commands. Native
    free-text titles are discarded.
@@ -105,8 +112,8 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
 | `tool_call` | Model requested a tool | name, argument fingerprint, `target` (file path or command when present) |
 | `tool_result` | Tool returned | status (`ok`, `error`, `denied`), size, truncation, duration, exit code in detail |
 | `read` | Observed file read | `target` path; content identity when recorded |
-| `skill_read` | Read under an installed Skill directory | validated skill name (never a title or directory path); skill name and AgentsMD version from the path |
-| `skill_invoke` | Explicit Skill invocation (for example Claude's `Skill` tool) | validated skill name |
+| `skill_read` | Read under an installed Skill directory | validated skill identifier in `target` (never a title or directory path); installed file path only in detail `skill_path`; skill name and AgentsMD version from the path |
+| `skill_invoke` | Explicit Skill invocation (for example Claude's `Skill` tool) | validated skill identifier in `target`; installed `SKILL.md` path only in detail `skill_path` when the native record supplies a directory |
 | `file_change` | Edit or write by the agent | path, change kind, content size and hash |
 | `compaction` | Context compaction boundary | trigger, before and after sizes when recorded |
 | `lifecycle` | Turn start, completion, abort, subagent activity, stop reasons | duration, reason |
@@ -122,8 +129,9 @@ guessed into a join.
 `instructions_sha256`, `preferences_sha256` and `direction_status` from the
 `AGENTSMD_PROJECT_DIRECTION_V1` hook block, and `agentsmd_version` from the
 most-read versioned plugin path (`.../agentsmd/<x.y.z>/...`). The block is
-sanitized centrally in `identity.py`, fail closed: statuses must belong to
-the closed set the AgentsMD loader emits, SHA-256 fields must be exactly
+sanitized centrally in `identity.py`, fail closed: `direction_status` must
+belong to exactly `ready`, `missing`, `stale`, `potentially_stale`,
+`invalid`, `uninitialized`, `not_in_repository`, SHA-256 fields must be exactly
 64 lowercase hex characters, the git head must be the fixed-length
 lowercase hex Git digest, paths must be absolute and marker-free, direction
 files are limited to the approved `VISION.md`, `MISSION.md`, `OBJECTIVE.md`
@@ -179,9 +187,15 @@ semantics, omits the top-level raw buckets (`input_tokens`,
 `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`,
 `reasoning_output_tokens`, `total_tokens`) and reports complete
 per-semantics totals under `by_semantics` instead; response and overlap
-counts are preserved. This holds for scope totals and for every
+counts are preserved. This holds for scope totals, for every
 `task_report` counter section (attributed, shared joint, unassigned in
-scope, nested scope).
+scope, nested scope), for publish model rows (grouped by
+harness, model, effort and semantics) and summaries (mixed shared scope
+exposes `shared_by_semantics` with no combined total), for `sessions
+list`/`show` (mixed sessions expose `by_semantics` with no combined
+total; text renders `mixed semantics (see --json)`), and for `compare`
+per-session and group token cells (mixed groups expose `by_semantics`
+with no median, mean or total).
 
 Reconciliation: attributed plus shared plus unassigned equals the scope
 total. Responses must partition exactly; token sums are compared per

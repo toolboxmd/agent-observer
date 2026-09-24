@@ -25,21 +25,19 @@ BLOCK_RE = re.compile(
     r"<<<AGENTSMD_PROJECT_DIRECTION_V1>>>\s*(\{.*?\})\s*<<<END_AGENTSMD_PROJECT_DIRECTION_V1>>>",
     re.S)
 VERSION_PATH_RE = re.compile(r"/agentsmd/(\d+\.\d+\.\d+)/")
-SKILL_PATH_RE = re.compile(r"/skills/([A-Za-z0-9_.-]+)/")
+SKILL_PATH_RE = re.compile(r"(?:/|^)skills/([A-Za-z0-9_.-]+)/")
 
 # Direction-block identity is sanitized centrally here, fail closed: only
 # validated values survive, and identity_json carries only an approved
 # allowlist of fields. Marker-shaped native text can never store free
 # text through identity.
 #
-# Statuses: the closed set the AgentsMD loader actually emits for
-# direction and preference state. Anything else is omitted, never copied.
+# Statuses: exactly the closed set the canonical AgentsMD Project
+# Direction loader emits for direction state (confirmed read-only
+# against bin/project-direction). Anything else is omitted, never copied.
 DIRECTION_STATUSES = frozenset({
-    "ready", "absent", "unreadable", "oversized", "missing",
-    "cache-bound-target", "cache-bound-link", "non-symlink",
-    "broken-link", "invalid-link-target", "valid-stable-link",
-    "divergent-link", "source-unavailable", "source-ambiguous",
-    "read_required", "unparsed",
+    "ready", "missing", "stale", "potentially_stale", "invalid",
+    "uninitialized", "not_in_repository",
 })
 PREFERENCES_STATUSES = frozenset({
     "ready", "absent", "unreadable", "oversized", "missing",
@@ -183,8 +181,12 @@ def version_from_path(path: str) -> str | None:
 
 
 def skill_from_path(path: str) -> str | None:
-    """Skill directory name for a file read under an installed Skill."""
-    if not path or "/skills/" not in path:
+    """Skill directory name for a file read under an installed Skill.
+
+    Absolute and relative spellings both resolve (adapters store both);
+    anything else fails closed to None.
+    """
+    if not path or "skills/" not in path:
         return None
     match = SKILL_PATH_RE.search(path)
     return match.group(1) if match else None
@@ -341,12 +343,14 @@ class SessionIdentity:
             # already-sanitized fields: validated direction status,
             # hashes, paths and git head. The raw parsed block, arbitrary
             # keys, contents, marker-shaped text, titles and free text
-            # are never serialized.
+            # are never serialized. Direction status survives only when
+            # it belongs to the canonical closed set.
             fields["instructions_sha256"] = self.block.get("instructions_sha256")
             fields["preferences_sha256"] = self.block.get("preferences_sha256")
-            fields["direction_status"] = self.block.get("status")
+            status = self.block.get("status")
+            if isinstance(status, str) and status in DIRECTION_STATUSES:
+                fields["direction_status"] = status
             for key, alias in (
-                    ("status", "direction_status"),
                     ("instructions_sha256", "instructions_sha256"),
                     ("preferences_sha256", "preferences_sha256"),
                     ("preferences_status", "preferences_status"),
@@ -356,6 +360,8 @@ class SessionIdentity:
                     ("git_head", "git_head")):
                 if self.block.get(key) is not None:
                     evidence[alias] = self.block[key]
+            if "direction_status" in fields:
+                evidence["direction_status"] = fields["direction_status"]
         if self.loaded_hashes and not self.block and con is not None:
             for digest in self.loaded_hashes:
                 if con.execute("SELECT 1 FROM agentsmd_versions WHERE sha256=?",

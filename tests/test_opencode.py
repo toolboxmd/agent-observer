@@ -388,11 +388,22 @@ class OpencodeAdapterTest(unittest.TestCase):
         self.assertIn(("skill_read", "call_read2"), fams)
         skill_read = self.q("SELECT * FROM events WHERE family='skill_read'"
                             " AND native_id=?", ("call_read2",))[0]
-        self.assertEqual(skill_read["target"],
+        # Planner ruling: skill_read target holds only the validated skill
+        # identifier, never the installed path. The path lives only in
+        # detail skill_path.
+        self.assertEqual(skill_read["target"], "my-skill")
+        detail = json.loads(skill_read["detail_json"] or "{}")
+        self.assertEqual(detail.get("skill"), "my-skill")
+        self.assertEqual(detail.get("skill_path"),
                          "/tmp/skills/my-skill/doc.md")
+        self.assertNotIn("/", skill_read["target"] or "")
         invoke = self.q("SELECT * FROM events WHERE family='skill_invoke'"
                         " AND native_id=?", ("call_skill1",))[0]
         self.assertEqual(invoke["name"], "my-skill")
+        self.assertEqual(invoke["target"], "my-skill")
+        invoke_detail = json.loads(invoke["detail_json"] or "{}")
+        self.assertEqual(invoke_detail.get("skill_path"),
+                         "/tmp/skills/my-skill/SKILL.md")
         changes = {(r["name"], r["native_id"]) for r in self.q(
             "SELECT name, native_id FROM events WHERE family='file_change'")}
         self.assertIn(("edit", "call_edit1"), changes)
@@ -1509,11 +1520,17 @@ class OpencodeAdapterTest(unittest.TestCase):
             self.assertNotIn("SECRET_SKILL_TITLE_zzz_qqq", blob)
             self.assertNotIn("My Cool Tool", blob)
             # The skill title carries a space so it cannot be an
-            # identifier: it must not survive in name, target or detail.
+            # identifier: it must not survive in name, target or the
+            # skill identifier detail. The installed SKILL.md path from
+            # the native directory still survives in detail skill_path.
             if native_id == "call_skillfree1":
                 self.assertIsNone(row["name"])
                 self.assertIsNone(row["target"])
-                self.assertIsNone(row["detail_json"])
+                detail = json.loads(row["detail_json"] or "{}")
+                self.assertNotIn("skill", detail)
+                self.assertEqual(detail.get("skill_path"),
+                                 "/tmp/skills/my-skill/SKILL.md")
+                self.assertNotIn("skill title", json.dumps(detail))
             else:
                 self.assertIsNone(row["name"])
         # The free-text tool produced no read/skill/file rows either.

@@ -293,7 +293,7 @@ def insert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
         raise MissingNativeId(f"{family} event missing native identity")
     safe_name = privacy.filter_event_name(family, name)
     safe_status = privacy.filter_event_status(family, status)
-    safe_target = privacy.filter_target(target)
+    safe_target = privacy.filter_target(target, family)
     filtered = privacy.filter_detail(family, detail)
     # The size bound applies before serialization: shrinking list values
     # (only paths can grow large) keeps detail_json always valid JSON.

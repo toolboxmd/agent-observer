@@ -41,6 +41,38 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(parsed["status"], "ready")
         self.assertNotIn("private", json.dumps(parsed))
 
+    def test_direction_status_closed_set_matches_canonical_loader(self):
+        # Planner ruling: the direction status closed set is exactly the
+        # statuses the canonical AgentsMD Project Direction loader emits.
+        # Confirmed read-only against bin/project-direction.
+        self.assertEqual(identity.DIRECTION_STATUSES,
+                         {"ready", "missing", "stale", "potentially_stale",
+                          "invalid", "uninitialized", "not_in_repository"})
+        for status in ("ready", "missing", "stale", "potentially_stale",
+                       "invalid", "uninitialized", "not_in_repository"):
+            parsed = identity.parse_direction_block(block({"status": status}))
+            self.assertEqual(parsed.get("status"), status, status)
+            ident = identity.SessionIdentity()
+            ident.observe_text(block({"status": status}))
+            self.assertEqual(ident.fields().get("direction_status"),
+                             status, status)
+            payload = json.loads(ident.fields()["identity_json"])
+            self.assertEqual(payload.get("direction_status"), status, status)
+        # Instruction-link and preference-only statuses never survive as
+        # direction status.
+        for bad in ("absent", "unreadable", "oversized",
+                    "cache-bound-target", "cache-bound-link", "non-symlink",
+                    "broken-link", "invalid-link-target", "valid-stable-link",
+                    "divergent-link", "source-unavailable", "source-ambiguous",
+                    "read_required", "unparsed", "definitely-ready", "",
+                    None, 42):
+            parsed = identity.parse_direction_block(block({"status": bad}))
+            self.assertNotIn("status", parsed, repr(bad))
+            ident = identity.SessionIdentity()
+            ident.observe_text(block({"status": bad}))
+            self.assertNotIn("direction_status", ident.fields(),
+                             repr(bad))
+
     def test_invalid_statuses_hashes_paths_heads_and_names_are_dropped(self):
         parsed = identity.parse_direction_block(block({
             "status": "definitely-ready",

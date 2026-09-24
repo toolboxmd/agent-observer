@@ -410,11 +410,17 @@ def now() -> float:
 
 def upsert_session(con: sqlite3.Connection, session_key: str, harness: str,
                    native_id: str, source_id: int | None = None,
+                   replace_identity: bool = False,
                    **fields) -> None:
     """Create a session row or fill its unknown fields.
 
     Known values are never overwritten by unknown ones; a later snapshot may
     extend ended_at and fill fields the earlier snapshot lacked.
+
+    On a privacy-version stale re-import (replace_identity True) the
+    source-owned identity fields are replaced, never COALESCE-kept:
+    omitted or invalid values clear to NULL so pre-sanitization content
+    cannot survive. Normal imports keep fill-unknown behavior.
     """
     allowed = {"parent_session_key", "role", "project_dir", "git_branch",
                "client_version", "entrypoint", "title", "started_at",
@@ -427,7 +433,18 @@ def upsert_session(con: sqlite3.Connection, session_key: str, harness: str,
         "INSERT OR IGNORE INTO sessions(session_key, harness, native_id,"
         " source_id, updated_at) VALUES(?,?,?,?,?)",
         (session_key, harness, native_id, source_id, now()))
+    identity_fields = {"agentsmd_version", "instructions_sha256",
+                       "preferences_sha256", "direction_status",
+                       "identity_json"}
+    if replace_identity:
+        for key in sorted(identity_fields):
+            value = fields.get(key)
+            con.execute(
+                f"UPDATE sessions SET {key}=? WHERE session_key=?",
+                (value, session_key))
     for key, value in fields.items():
+        if replace_identity and key in identity_fields:
+            continue
         if value is None:
             continue
         if key == "started_at":

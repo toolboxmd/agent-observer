@@ -1739,7 +1739,8 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     db.upsert_session(con, r.session_key, HARNESS, r.native_sid,
                       updates_src.source_id if updates_src is not None
                       else (events_src.source_id if events_src is not None
-                            else None), **fields)
+                            else None),
+                      replace_identity=privacy_stale, **fields)
     _store_meta(con, r.session_key, summary_fp, chat_fp_current, chat)
     if updates_src is not None:
         stats.update(updates_src.finish(session_id=r.native_sid))
@@ -2564,25 +2565,42 @@ def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
         if paths:
             for path in paths:
                 r.identity.observe_path(path)
-            skill = skill_from_path(paths[0])
+            raw_skill = skill_from_path(paths[0])
+            skill_path = paths[0]
             # A second location in the same call may name the Skill while the
             # first does not; the Skill read is the identity evidence.
-            if skill is None:
+            if raw_skill is None:
                 for path in paths[1:]:
-                    skill = skill_from_path(path)
-                    if skill is not None:
+                    raw_skill = skill_from_path(path)
+                    if raw_skill is not None:
+                        skill_path = path
                         break
-            if skill is not None and _safe_token(skill) is None:
-                skill = None
-            # Read events keep no detail under privacy.py rule 6; the first
-            # validated path is the target. A skill_read keeps only the
-            # validated skill name as detail.
-            r.event(src, "skill_read" if skill else "read", call_id,
-                    ordinal, ts, turn_id=turn_id,
-                    name=skill or os.path.basename(paths[0]),
-                    target=paths[0],
-                    fingerprint=fingerprint(call_id, paths),
-                    detail={"skill": skill} if skill else None)
+            if raw_skill is not None and _safe_token(raw_skill) is None:
+                raw_skill = None
+            safe_skill = privacy.filter_target(raw_skill, family="skill_read") \
+                if raw_skill else None
+            looks_like_skill = any(
+                p.endswith("SKILL.md") or "/skills/" in p for p in paths)
+            family = "skill_read" if (safe_skill or looks_like_skill) else "read"
+            if family == "skill_read":
+                # Rule 6: skill_read target holds only the validated skill
+                # identifier, never the installed path. The file path lives
+                # only in detail skill_path.
+                r.event(src, family, call_id,
+                        ordinal, ts, turn_id=turn_id,
+                        name=safe_skill or os.path.basename(paths[0]),
+                        target=safe_skill,
+                        fingerprint=fingerprint(call_id, paths),
+                        detail={"skill": raw_skill, "skill_path": skill_path})
+            else:
+                # Read events keep no detail under privacy.py rule 6; the
+                # first validated path is the target.
+                r.event(src, family, call_id,
+                        ordinal, ts, turn_id=turn_id,
+                        name=os.path.basename(paths[0]),
+                        target=paths[0],
+                        fingerprint=fingerprint(call_id, paths),
+                        detail=None)
     status = update.get("status")
     if isinstance(status, str) and status in TERMINAL_TOOL_STATUS:
         # Tool results keep no detail under privacy.py rule 6; the mapped

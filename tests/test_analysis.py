@@ -88,11 +88,19 @@ class TestEditAfterFailureTest(AnalysisCase):
 
 
 class RepeatedSkillTest(AnalysisCase):
-    def load(self, key, skill="wayfinder", target="skills/wayfinder/SKILL.md",
+    def load(self, key, skill="wayfinder",
+             target="skills/wayfinder/SKILL.md",
              family="skill_read"):
-        detail = {"skill": skill} if family == "skill_read" else None
-        self.event(key, family, name=skill, target=target if family == "skill_read" else skill,
-                   detail=detail)
+        # Planner ruling: skill_read target holds only the validated skill
+        # identifier, never the installed path. The path lives only in
+        # detail skill_path.
+        if family == "skill_read":
+            detail = {"skill": skill, "skill_path": target}
+            self.event(key, family, name=skill, target=skill,
+                       detail=detail)
+        else:
+            self.event(key, family, name=skill, target=skill,
+                       detail=None)
 
     def test_second_load_without_change_is_a_candidate(self):
         self.session("claude:sk1")

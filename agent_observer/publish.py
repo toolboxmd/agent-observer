@@ -39,10 +39,12 @@ def summarize(con, session_keys: set, label: str, task_id: str | None = None) ->
     keys = sorted(session_keys)
     usage = report.scope_totals(con, set(keys))
     models = [dict(r) for r in con.execute(
-        f"SELECT harness, model, effort, COUNT(*) responses, SUM(total_tokens) tokens,"
+        f"SELECT harness, model, effort, COALESCE(semantics, 'unknown') semantics,"
+        f" COUNT(*) responses, SUM(total_tokens) tokens,"
         f" SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END) unknown_tokens"
         f" FROM responses WHERE is_overlap=0 AND session_key IN ({','.join('?' * len(keys))})"
-        f" GROUP BY harness, model, effort ORDER BY tokens DESC", keys)] if keys else []
+        f" GROUP BY harness, model, effort, semantics ORDER BY tokens DESC",
+        keys)] if keys else []
     sessions = [dict(r) for r in con.execute(
         f"SELECT session_key, harness, started_at, ended_at, agentsmd_version FROM sessions"
         f" WHERE session_key IN ({','.join('?' * len(keys))})", keys)] if keys else []
@@ -56,14 +58,19 @@ def summarize(con, session_keys: set, label: str, task_id: str | None = None) ->
             counts[incident["detector"]] = counts.get(incident["detector"], 0) + 1
     shared = None
     shared_unknown = 0
+    shared_by_semantics = None
     if task_id:
         rep = report.task_report(con, task_id)
         shared = rep["shared_joint"].get("total_tokens")
         unknown_counts = rep["shared_joint"].get("unknown_counts") or {}
         shared_unknown = unknown_counts.get("total_tokens", 0)
-        for sem_totals in (rep["shared_joint"].get("by_semantics") or {}).values():
-            shared_unknown += (sem_totals.get("unknown_counts") or {}).get(
-                "total_tokens", 0)
+        if "by_semantics" in rep["shared_joint"]:
+            shared_by_semantics = rep["shared_joint"]["by_semantics"]
+            # Mixed shared scope has no combined total; unknown counts add.
+            shared = None
+            for sem_totals in shared_by_semantics.values():
+                shared_unknown += (sem_totals.get("unknown_counts") or {}).get(
+                    "total_tokens", 0)
     return {"label": label, "sessions": len(sessions),
             "harnesses": sorted({s["harness"] for s in sessions}),
             "agentsmd_versions": sorted({s["agentsmd_version"] for s in sessions
@@ -72,6 +79,7 @@ def summarize(con, session_keys: set, label: str, task_id: str | None = None) ->
             "span_s": (max(ends) - min(starts)) if starts and ends else None,
             "incidents": counts, "shared_tokens": shared,
             "shared_tokens_unknown": shared_unknown,
+            "shared_by_semantics": shared_by_semantics,
             "unknown_usage_sessions": sum(1 for s in sessions if not any(
                 m for m in models if m["harness"] == s["harness"]))}
 
@@ -82,11 +90,23 @@ def render(summary: dict) -> str:
              f"{summary['sessions']} session{'s' if summary['sessions'] != 1 else ''} on "
              f"{', '.join(summary['harnesses']) or 'no harness'}; "
              f"AgentsMD {', '.join(summary['agentsmd_versions']) or 'unknown'}; "
-             f"span {_fmt(summary['span_s'])} s.", "",
-             "| Harness | Model | Effort | Responses | Tokens |", "| --- | --- | --- | ---: | ---: |"]
-    for m in summary["models"]:
-        lines.append(f"| {m['harness']} | {m['model'] or 'unknown'} | {m['effort'] or 'unknown'} "
-                     f"| {m['responses']} | {_fmt_tokens(m['tokens'], m.get('unknown_tokens') or 0)} |")
+             f"span {_fmt(summary['span_s'])} s.", ""]
+    sems = {m.get("semantics") for m in summary["models"]}
+    if len(sems) > 1:
+        lines += ["| Harness | Model | Effort | Semantics | Responses | Tokens |",
+                  "| --- | --- | --- | --- | ---: | ---: |"]
+        for m in summary["models"]:
+            lines.append(
+                f"| {m['harness']} | {m['model'] or 'unknown'} | {m['effort'] or 'unknown'} "
+                f"| {m.get('semantics') or 'unknown'} "
+                f"| {m['responses']} | {_fmt_tokens(m['tokens'], m.get('unknown_tokens') or 0)} |")
+    else:
+        lines += ["| Harness | Model | Effort | Responses | Tokens |",
+                  "| --- | --- | --- | ---: | ---: |"]
+        for m in summary["models"]:
+            lines.append(
+                f"| {m['harness']} | {m['model'] or 'unknown'} | {m['effort'] or 'unknown'} "
+                f"| {m['responses']} | {_fmt_tokens(m['tokens'], m.get('unknown_tokens') or 0)} |")
     if "total_tokens" in u:
         lines += ["", f"Total tokens {_fmt_tokens(u['total_tokens'], (u.get('unknown_counts') or {}).get('total_tokens', 0))} over {u['responses']} responses "
                   f"(each harness's own total; cache and reasoning buckets are not added across "
@@ -98,7 +118,12 @@ def render(summary: dict) -> str:
                  for sem, b in sorted((u.get("by_semantics") or {}).items())]
         lines += ["", f"Tokens by counter semantics over {u['responses']} responses "
                   f"(never added across semantics): {'; '.join(parts) or 'unknown'}."]
-    if summary["shared_tokens"] or summary.get("shared_tokens_unknown"):
+    if summary.get("shared_by_semantics"):
+        parts = [f"{sem} {_fmt_tokens(b.get('total_tokens'), (b.get('unknown_counts') or {}).get('total_tokens', 0))}"
+                 for sem, b in sorted(summary["shared_by_semantics"].items())]
+        lines.append("Shared with other tasks and not divided"
+                     f" (by semantics, never added): {'; '.join(parts) or 'unknown'}.")
+    elif summary["shared_tokens"] or summary.get("shared_tokens_unknown"):
         lines.append(f"Shared with other tasks and not divided: {_fmt_tokens(summary['shared_tokens'], summary.get('shared_tokens_unknown') or 0)} tokens.")
     if summary["incidents"]:
         lines += ["", "Diagnostics (candidates, not verdicts): " + ", ".join(

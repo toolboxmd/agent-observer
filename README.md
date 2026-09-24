@@ -155,12 +155,18 @@ native free-text session titles are not stored. Skill event targets are
 family-specific: `skill_read` and `skill_invoke` targets hold only a
 validated native skill identifier (the same identifier rule as names),
 so a free-text skill title or an installed directory path never
-persists as a target. Instruction identity is sanitized centrally:
-direction statuses come from a closed set, hashes must be fixed-length
-hex digests, paths must be absolute and marker-free, and only an
-approved allowlist of fields is ever serialized. When these rules change,
-the next sync fully re-imports affected sources, corrects older rows in
-place, and replaces that source's prior import errors.
+persists as a target; the installed skill file path lives only in
+detail `skill_path`. Instruction identity is sanitized centrally:
+direction statuses are exactly `ready`, `missing`, `stale`,
+`potentially_stale`, `invalid`, `uninitialized`, `not_in_repository`,
+hashes must be fixed-length hex digests, paths must be absolute and
+marker-free, and only an approved allowlist of fields is ever
+serialized. When these rules change, the next sync fully re-imports
+affected sources, corrects older rows in place (including replacing
+source-owned session identity and clearing omitted or invalid fields),
+and replaces that source's prior import errors. Reports never add
+counters across different semantics: mixed scopes expose `by_semantics`
+with no combined total.
 
 ## Development
 

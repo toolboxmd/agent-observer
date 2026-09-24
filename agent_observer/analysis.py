@@ -179,20 +179,34 @@ def _repeated_reads(session, events) -> list:
     return out
 
 
+def _skill_path_of(event) -> str | None:
+    """Installed skill file path for a skill event, from detail only.
+
+    Targets hold only validated skill identifiers, never paths, so the
+    reset logic reads the path from detail skill_path where adapters
+    retain it. Missing, mistyped or marker-bearing detail yields None.
+    """
+    detail = _detail(event)
+    path = detail.get("skill_path")
+    if isinstance(path, str) and path:
+        return path
+    return None
+
+
 def _skill_key_touched(key, path: str) -> bool:
     """Whether a file change to path resets one skill's seen state.
 
-    key is (family, name, target). A change resets the skill when it
+    key is (family, name, skill_path). A change resets the skill when it
     touches the skill's loaded file (exact or suffix match either way,
     since adapters store relative and absolute spellings) or a file
     under the skill's installed directory.
     """
-    family, name, target = key
+    family, name, skill_path = key
     changed = (path or "").lower().replace("\\", "/")
     if not changed:
         return False
-    if target:
-        loaded = str(target).lower().replace("\\", "/")
+    if skill_path:
+        loaded = str(skill_path).lower().replace("\\", "/")
         if changed == loaded or changed.endswith("/" + loaded) \
                 or loaded.endswith("/" + changed):
             return True
@@ -226,7 +240,14 @@ def _repeated_skills(session, events) -> list:
         name = (e["name"] or e["target"] or "").lower()
         if e["family"] == "skill_read":
             name = (_detail(e).get("skill") or name).lower()
-        key = (e["family"], name, e["target"] if e["family"] == "skill_read" else None)
+        skill_path = _skill_path_of(e) if e["family"] == "skill_read" else None
+        if e["family"] == "skill_invoke":
+            # skill_invoke detail holds the installed SKILL.md path when
+            # the native invocation supplied a directory.
+            detail_path = _detail(e).get("skill_path")
+            if isinstance(detail_path, str) and detail_path:
+                skill_path = detail_path
+        key = (e["family"], name, skill_path)
         prev = seen.get(key)
         ts = e["ts"] or 0
         if prev is not None and not any((prev["ts"] or 0) < c <= ts for c in compactions):
@@ -384,18 +405,80 @@ def diagnose(con, detectors=None, limit=200, **filters) -> dict:
             "note": "Candidates with evidence, not verdicts. Heuristic detectors are marked."}
 
 
+def _semantics_of(value) -> str:
+    """Counter semantics group; missing stays an explicit unknown group."""
+    return value if value else "unknown"
+
+
+def _session_token_groups(con, session_key: str) -> dict:
+    """Per-semantics token sums for one session, live responses only.
+
+    Never sums across semantics. Missing semantics is the explicit
+    unknown group. Each group holds known total_tokens sum (None when
+    all unknown), unknown count and live response count.
+    """
+    groups: dict = {}
+    for row in con.execute(
+            "SELECT COALESCE(semantics, 'unknown') sem,"
+            " SUM(total_tokens) t,"
+            " SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END) u,"
+            " COUNT(*) n FROM responses"
+            " WHERE session_key=? AND is_overlap=0 GROUP BY sem",
+            (session_key,)):
+        groups[row["sem"]] = {"tokens": row["t"],
+                              "tokens_unknown": row["u"] or 0,
+                              "responses": row["n"] or 0}
+    return groups
+
+
+def _group_token_groups(con, session_keys: list) -> dict:
+    """Per-semantics token sums over sessions, live responses only."""
+    if not session_keys:
+        return {}
+    keys = sorted(session_keys)
+    groups: dict = {}
+    for row in con.execute(
+            f"SELECT COALESCE(semantics, 'unknown') sem,"
+            " SUM(total_tokens) t,"
+            " SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END) u,"
+            " COUNT(*) n FROM responses"
+            f" WHERE session_key IN ({','.join('?' * len(keys))})"
+            " AND is_overlap=0 GROUP BY sem", keys):
+        groups[row["sem"]] = {"tokens": row["t"],
+                              "tokens_unknown": row["u"] or 0,
+                              "responses": row["n"] or 0}
+    return groups
+
+
 def _session_metrics(con, s) -> dict:
     key = s["session_key"]
-    usage = con.execute(
-        "SELECT COUNT(*) n, SUM(total_tokens) t,"
-        " SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END) u,"
-        " MAX(input_tokens) mi FROM responses"
-        " WHERE session_key=? AND is_overlap=0", (key,)).fetchone()
+    groups = _session_token_groups(con, key)
+    if len(groups) > 1:
+        # Mixed counter semantics: no combined total exists and none is
+        # invented. Unknown counts add (they are counts, not counters).
+        total_unknown = sum(g["tokens_unknown"] for g in groups.values())
+        total_responses = sum(g["responses"] for g in groups.values())
+        usage_n = total_responses
+        usage_t = None
+        usage_u = total_unknown
+        by_semantics = groups
+    else:
+        usage = con.execute(
+            "SELECT COUNT(*) n, SUM(total_tokens) t,"
+            " SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END) u,"
+            " MAX(input_tokens) mi FROM responses"
+            " WHERE session_key=? AND is_overlap=0", (key,)).fetchone()
+        usage_n = usage["n"] or 0
+        usage_t = usage["t"]
+        usage_u = usage["u"] or 0
+        by_semantics = None
     subs = {r["kind"]: r["n"] for r in con.execute(
         "SELECT kind, COUNT(*) n FROM submissions WHERE session_key=? GROUP BY kind", (key,))}
     reading = con.execute(
         "SELECT COUNT(*) n, COALESCE(SUM(size_bytes), 0) b FROM events WHERE session_key=?"
-        " AND family IN ('read', 'skill_read') AND target LIKE ?", (key, f"%{AGENTSMD_PATH}%")
+        " AND family IN ('read', 'skill_read')"
+        " AND (target LIKE ? OR detail_json LIKE ?)",
+        (key, f"%{AGENTSMD_PATH}%", f"%{AGENTSMD_PATH}%")
     ).fetchone()
     incidents = detect_session(con, s)
     per = defaultdict(int)
@@ -405,12 +488,16 @@ def _session_metrics(con, s) -> dict:
     if s["started_at"] and s["ended_at"]:
         elapsed = max(0.0, s["ended_at"] - s["started_at"])
     # Contract rule 5: an unknown total stays None, never zero; the count
-    # of responses without totals marks the lower bound.
-    return {"responses": usage["n"] or 0, "tokens": usage["t"],
-            "tokens_unknown": usage["u"] or 0,
-            "genuine_prompts": subs.get("genuine", 0), "interrupts": subs.get("interrupt", 0),
-            "agentsmd_reads": reading["n"] or 0, "agentsmd_read_bytes": reading["b"] or 0,
-            "elapsed_s": elapsed, "incidents": dict(per)}
+    # of responses without totals marks the lower bound. A mixed-semantics
+    # session exposes no combined total, only per-semantics groups.
+    out = {"responses": usage_n, "tokens": usage_t,
+           "tokens_unknown": usage_u,
+           "genuine_prompts": subs.get("genuine", 0), "interrupts": subs.get("interrupt", 0),
+           "agentsmd_reads": reading["n"] or 0, "agentsmd_read_bytes": reading["b"] or 0,
+           "elapsed_s": elapsed, "incidents": dict(per)}
+    if by_semantics is not None:
+        out["by_semantics"] = by_semantics
+    return out
 
 
 def _turn_models(con, session_key: str) -> dict:
@@ -485,20 +572,28 @@ def _model_session_tokens(con, session_key: str, model: str) -> tuple:
 
     Live responses only. The "unknown" group holds responses with no
     model; every other group holds live responses for that exact model.
+    Totals aggregate only within one counter semantics: a (session,
+    model) mixing semantics returns None for the combined sum so no
+    false total is ever exposed. Missing semantics is the explicit
+    unknown group.
     """
     if model == "unknown":
-        row = con.execute(
-            "SELECT SUM(total_tokens) t,"
-            " SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END) u"
-            " FROM responses WHERE session_key=? AND model IS NULL AND is_overlap=0",
-            (session_key,)).fetchone()
+        filt = "model IS NULL"
+        args: tuple = (session_key,)
     else:
-        row = con.execute(
-            "SELECT SUM(total_tokens) t,"
-            " SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END) u"
-            " FROM responses WHERE session_key=? AND model=? AND is_overlap=0",
-            (session_key, model)).fetchone()
-    return row["t"], row["u"] or 0
+        filt = "model=?"
+        args = (session_key, model)
+    groups = list(con.execute(
+        f"SELECT COALESCE(semantics, 'unknown') sem, SUM(total_tokens) t,"
+        f" SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END) u"
+        f" FROM responses WHERE session_key=? AND {filt} AND is_overlap=0"
+        f" GROUP BY sem", args).fetchall())
+    if len(groups) > 1:
+        unknown = sum((r["u"] or 0) for r in groups)
+        return None, unknown
+    if not groups:
+        return None, 0
+    return groups[0]["t"], groups[0]["u"] or 0
 
 
 def _stats(values) -> dict:
@@ -507,6 +602,49 @@ def _stats(values) -> dict:
         return {"n": 0}
     return {"n": len(values), "median": statistics.median(values),
             "mean": round(statistics.fmean(values), 2), "total": round(sum(values), 2)}
+
+
+def _semantic_tokens_per_session(con, members, metrics) -> dict:
+    """Semantic-safe per-session token stats for a compare group.
+
+    Totals aggregate only within one exact counter semantics. When the
+    group's live responses span more than one semantics (including the
+    explicit unknown group), no combined median/mean/total is exposed;
+    complete per-semantics sums appear under by_semantics instead.
+    """
+    keys = [s["session_key"] for s in members]
+    groups = _group_token_groups(con, keys)
+    if len(groups) > 1:
+        return {"n": len(members), "by_semantics": groups}
+    return _stats([m["tokens"] for m in metrics])
+
+
+def _model_group_semantics(con, model_sessions, model: str) -> dict:
+    """Per-semantics sums for one model group, live responses only."""
+    keys = sorted(s["session_key"] for s in model_sessions)
+    if not keys:
+        return {}
+    if model == "unknown":
+        filt = "model IS NULL"
+        args = tuple(keys)
+        q = (f"SELECT COALESCE(semantics, 'unknown') sem, SUM(total_tokens) t,"
+             " SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END) u,"
+             " COUNT(*) n FROM responses"
+             f" WHERE session_key IN ({','.join('?' * len(keys))})"
+             f" AND {filt} AND is_overlap=0 GROUP BY sem")
+    else:
+        args = tuple(keys) + (model,)
+        q = (f"SELECT COALESCE(semantics, 'unknown') sem, SUM(total_tokens) t,"
+             " SUM(CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END) u,"
+             " COUNT(*) n FROM responses"
+             f" WHERE session_key IN ({','.join('?' * len(keys))})"
+             " AND model=? AND is_overlap=0 GROUP BY sem")
+    groups: dict = {}
+    for row in con.execute(q, args):
+        groups[row["sem"]] = {"tokens": row["t"],
+                              "tokens_unknown": row["u"] or 0,
+                              "responses": row["n"] or 0}
+    return groups
 
 
 def compare(con, by: str = "agentsmd", **filters) -> dict:
@@ -525,7 +663,8 @@ def compare(con, by: str = "agentsmd", **filters) -> dict:
         row = {"group": label, "sessions": len(members),
                "projects": len({s["project_dir"] for s in members}),
                "sessions_with_human_prompts": len(human),
-               "tokens_per_session": _stats([m["tokens"] for m in metrics]),
+               "tokens_per_session": _semantic_tokens_per_session(
+                   con, members, metrics),
                "unknown_token_responses": sum(m["tokens_unknown"] for m in metrics),
                "elapsed_s_per_session": _stats([m["elapsed_s"] for m in metrics]),
                "genuine_prompts_per_session": _stats([m["genuine_prompts"] for m in human]),
@@ -595,10 +734,16 @@ def _compare_by_model(con, **filters) -> dict:
                        for s in model_sessions]
         unknown = sum(model_tokens[(s["session_key"], model)][1]
                       for s in model_sessions)
+        sem_groups = _model_group_semantics(con, model_sessions, model)
+        if len(sem_groups) > 1:
+            tokens_cell: dict = {"n": len(model_sessions),
+                                 "by_semantics": sem_groups}
+        else:
+            tokens_cell = _stats(per_session)
         row = {"group": model, "sessions": len(model_sessions),
                "projects": len({s["project_dir"] for s in model_sessions}),
                "sessions_with_human_prompts": len(human),
-               "tokens_per_session": _stats(per_session),
+               "tokens_per_session": tokens_cell,
                "unknown_token_responses": unknown,
                "elapsed_s_per_session": _stats([m["elapsed_s"] for m in metrics]),
                "genuine_prompts_per_session": _stats([m["genuine_prompts"] for m in human]),

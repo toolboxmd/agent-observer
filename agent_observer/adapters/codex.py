@@ -17,7 +17,7 @@ import os
 import sqlite3
 
 from .. import db, privacy
-from ..identity import SessionIdentity
+from ..identity import SessionIdentity, skill_from_path
 from ..ingest import (JsonlSource, MissingNativeId, fingerprint, insert_event,
                       iso_ts, text_hash)
 
@@ -511,6 +511,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
               **reader.meta, **reader.identity.fields(con)}
     db.upsert_session(con, reader.session_key, HARNESS,
                       reader.session_key.split(":", 1)[1], src.source_id,
+                      replace_identity=src.privacy_stale,
                       **fields)
     stats.update(src.finish(session_id=reader.session_id,
                             thread_id=reader.thread_id,
@@ -1148,14 +1149,30 @@ def _ingest_command(r: _Reader, obj: dict, item: dict, turn_id) -> None:
             if not isinstance(target, str) or not target:
                 continue
             r.identity.observe_path(target)
-            fam = "skill_read" if (target.endswith("SKILL.md")
-                                   or "/skills/" in target) else "read"
-            r.event(obj, fam, f"{item.get('id')}:{target}", turn_id=turn_id,
-                    name=os.path.basename(target), target=target,
-                    status=item.get("status"),
-                    duration_ms=_duration(item), size_bytes=size,
-                    fingerprint=fingerprint(target),
-                    detail={"cmd": entry.get("cmd")})
+            raw_skill = skill_from_path(target)
+            safe_skill = privacy.filter_target(raw_skill, family="skill_read") \
+                if raw_skill else None
+            looks_like_skill = target.endswith("SKILL.md") \
+                or "/skills/" in target
+            fam = "skill_read" if (safe_skill or looks_like_skill) else "read"
+            if fam == "skill_read":
+                # Rule 6: skill_read target holds only the validated skill
+                # identifier, never the installed path. The file path lives
+                # only in detail skill_path.
+                r.event(obj, fam, f"{item.get('id')}:{target}", turn_id=turn_id,
+                        name=os.path.basename(target), target=safe_skill,
+                        status=item.get("status"),
+                        duration_ms=_duration(item), size_bytes=size,
+                        fingerprint=fingerprint(target),
+                        detail={"cmd": entry.get("cmd"), "skill": raw_skill,
+                                "skill_path": target})
+            else:
+                r.event(obj, fam, f"{item.get('id')}:{target}", turn_id=turn_id,
+                        name=os.path.basename(target), target=target,
+                        status=item.get("status"),
+                        duration_ms=_duration(item), size_bytes=size,
+                        fingerprint=fingerprint(target),
+                        detail={"cmd": entry.get("cmd")})
 
 
 def _ingest_compacted(r: _Reader, obj: dict) -> None:

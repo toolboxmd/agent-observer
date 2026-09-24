@@ -900,6 +900,91 @@ class PrivacyVersionTest(LedgerCase):
         self.assertEqual(after_errors, before_errors)
 
 
+class IdentityMigrationTest(LedgerCase):
+    """Finding 2: a privacy-version re-import replaces source-owned
+    identity fields, clearing omitted or invalid values instead of
+    COALESCE-keeping them."""
+
+    def test_stale_reimport_clears_old_identity_content(self):
+        import json as _json
+        from agent_observer import db as _db
+        # End-to-end: import a real rollout, poison its session with
+        # pre-sanitization identity, mark the source stale, then re-sync
+        # data whose sanitized identity omits those values.
+        import_codex_file(self.con, fixture("codex-mini.jsonl"))
+        key = self.query(
+            "SELECT session_key FROM sessions"
+            " WHERE session_key LIKE 'codex:%' LIMIT 1")[0]["session_key"]
+        old_inst = "a" * 64
+        self.con.execute(
+            "UPDATE sessions SET agentsmd_version='99.9.9',"
+            " instructions_sha256=?, preferences_sha256=?,"
+            " direction_status='ready', identity_json=? WHERE session_key=?",
+            (old_inst, "b" * 64,
+             _json.dumps({"direction_status": "ready",
+                          "instructions_sha256": old_inst,
+                          "instructions_path": "/old/AGENTS.md",
+                          "repository_root": "/old/repo",
+                          "git_head": "c" * 40}), key))
+        self.con.execute(
+            "UPDATE sources SET privacy_version=0 WHERE harness='codex'")
+        self.con.commit()
+        errors_before = self.query(
+            "SELECT COUNT(*) n FROM import_errors")[0]["n"]
+        import_codex_file(self.con, fixture("codex-mini.jsonl"), full=True)
+        row = self.query(
+            "SELECT agentsmd_version, instructions_sha256,"
+            " preferences_sha256, direction_status, identity_json"
+            " FROM sessions WHERE session_key=?", (key,))[0]
+        # Every old identity value is removed; the sanitized re-import
+        # omits them (the fixture carries no direction block and no
+        # versioned plugin path), and no old hash/path/status survives.
+        self.assertNotEqual(row["agentsmd_version"], "99.9.9")
+        self.assertIsNone(row["instructions_sha256"])
+        self.assertIsNone(row["preferences_sha256"])
+        self.assertIsNone(row["direction_status"])
+        blob = row["identity_json"] or ""
+        self.assertNotIn("/old/AGENTS.md", blob)
+        self.assertNotIn("/old/repo", blob)
+        self.assertNotIn(old_inst, blob)
+        self.assertNotIn("b" * 64, blob)
+        # Import errors are replaced rather than duplicated.
+        errors_after = self.query(
+            "SELECT COUNT(*) n FROM import_errors")[0]["n"]
+        self.assertLessEqual(errors_after, errors_before + 5)
+        # Direct seam: omitted identity fields clear on stale, fill on
+        # normal imports.
+        self.con.execute(
+            "INSERT INTO sources(harness, path, sha256, imported_at,"
+            " privacy_version) VALUES('codex','mig-path','x',0,0)")
+        source_id = self.con.execute(
+            "SELECT id FROM sources WHERE harness='codex'"
+            " AND path='mig-path'").fetchone()["id"]
+        _db.upsert_session(self.con, "codex:mig1", "codex", "mig1",
+                           source_id, replace_identity=True)
+        _db.upsert_session(self.con, "codex:mig1", "codex", "mig1",
+                           source_id, agentsmd_version="12.1.0")
+        kept = self.query(
+            "SELECT agentsmd_version FROM sessions"
+            " WHERE session_key='codex:mig1'")[0]
+        self.assertEqual(kept["agentsmd_version"], "12.1.0")
+
+    def test_normal_import_keeps_fill_unknown(self):
+        from agent_observer import db as _db
+        _db.upsert_session(self.con, "codex:keep1", "codex", "keep1", None,
+                           agentsmd_version="12.1.0",
+                           instructions_sha256="d" * 64)
+        _db.upsert_session(self.con, "codex:keep1", "codex", "keep1", None,
+                           preferences_sha256="e" * 64)
+        row = self.query(
+            "SELECT agentsmd_version, instructions_sha256,"
+            " preferences_sha256 FROM sessions"
+            " WHERE session_key='codex:keep1'")[0]
+        self.assertEqual(row["agentsmd_version"], "12.1.0")
+        self.assertEqual(row["instructions_sha256"], "d" * 64)
+        self.assertEqual(row["preferences_sha256"], "e" * 64)
+
+
 class PrivacyUnitTest(unittest.TestCase):
     def test_submission_excerpt_needs_genuine_main_session(self):
         self.assertEqual(
@@ -1235,6 +1320,143 @@ class SkillTargetTest(LedgerCase):
         for row in rows:
             self.assertEqual(row["name"], "operations")
             self.assertEqual(row["target"], "operations")
-            self.assertEqual(_json.loads(row["detail_json"]),
-                             {"skill": "operations"})
+            detail = _json.loads(row["detail_json"])
+            self.assertEqual(detail.get("skill"), "operations")
+            # The installed path lives only in detail skill_path, never
+            # in the target.
+            self.assertIn("skill_path", detail)
+            self.assertIn("/skills/operations/SKILL.md",
+                          detail["skill_path"])
             self.assertNotIn("/", row["target"] or "")
+
+
+class CodexSkillTargetTest(LedgerCase):
+    """Finding 1 through the Codex adapter: skill_read target holds only
+    the validated skill identifier derived from the Skill directory name;
+    the installed path lives only in detail skill_path."""
+
+    def _write_rollout(self, path_value):
+        import json as _json
+        import os
+        lines = [
+            {"ordinal": 0,
+             "payload": {"session_id": "sess-codex-skill",
+                         "thread_source": "user",
+                         "cli_version": "0.155.0"},
+             "timestamp": "2026-09-15T14:00:00.000Z",
+             "type": "session_meta"},
+            {"ordinal": 1,
+             "payload": {"item": {
+                 "command": ["/bin/zsh", "-lc", f"cat {path_value}"],
+                 "cwd": "file:///redacted/workspace",
+                 "exit_code": 0,
+                 "id": "exec-skill-001",
+                 "parsed_cmd": [{"cmd": f"cat {path_value}",
+                                 "name": "SKILL.md",
+                                 "path": path_value,
+                                 "type": "read"}],
+                 "source": "unified_exec_startup",
+                 "status": "completed",
+                 "stdout": "skill body",
+                 "type": "CommandExecution"},
+                 "type": "item_completed"},
+             "timestamp": "2026-09-15T14:00:01.000Z",
+             "type": "event_msg"},
+        ]
+        path = os.path.join(self.tmp.name, "codex-skill.jsonl")
+        with open(path, "w") as fh:
+            for obj in lines:
+                fh.write(_json.dumps(obj) + "\n")
+        return path
+
+    def test_skill_read_target_is_identifier_path_only_in_detail(self):
+        path = self._write_rollout("skills/wayfinder/SKILL.md")
+        import_codex_file(self.con, path)
+        rows = self.query(
+            "SELECT family, name, target, detail_json FROM events"
+            " WHERE family='skill_read'")
+        self.assertEqual(len(rows), 1)
+        import json as _json
+        row = rows[0]
+        self.assertEqual(row["target"], "wayfinder")
+        detail = _json.loads(row["detail_json"] or "{}")
+        self.assertEqual(detail.get("skill"), "wayfinder")
+        self.assertEqual(detail.get("skill_path"),
+                         "skills/wayfinder/SKILL.md")
+        self.assertNotIn("/", row["target"] or "")
+
+    def test_invalid_skill_path_drops_identifier_keeps_safe_path(self):
+        # A free-text title cannot become a skill identifier; the target
+        # stays None while the raw path still survives only in detail
+        # when it is marker-safe, and markers fail closed.
+        import json as _json
+        path = self._write_rollout("/tmp/skills/evil title/SKILL.md")
+        import_codex_file(self.con, path)
+        rows = self.query(
+            "SELECT target, detail_json FROM events"
+            " WHERE family='skill_read'")
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["target"])
+        detail = _json.loads(rows[0]["detail_json"] or "{}")
+        # No validated identifier survives.
+        self.assertNotIn("skill", detail)
+        # The marker-safe path still survives in detail; free-text titles
+        # never reach name/target.
+        self.assertEqual(detail.get("skill_path"),
+                         "/tmp/skills/evil title/SKILL.md")
+
+    def test_stale_reimport_corrects_skill_target_in_place(self):
+        path = self._write_rollout("skills/wayfinder/SKILL.md")
+        import_codex_file(self.con, path)
+        before = self.query("SELECT COUNT(*) n FROM events")[0]["n"]
+        self.assertGreater(before, 0)
+        # Poison the row the way a pre-fix import kept the installed path
+        # as the target with no detail path.
+        self.con.execute(
+            "UPDATE events SET target='skills/wayfinder/SKILL.md',"
+            " detail_json='{\"cmd\": \"cat\"}'"
+            " WHERE family='skill_read'")
+        self.con.execute(
+            "UPDATE sources SET privacy_version=0 WHERE harness='codex'")
+        self.con.commit()
+        stats = import_codex_file(self.con, path, full=True)
+        self.assertGreaterEqual(stats.get("events_updated", 0), 1)
+        import json as _json
+        row = self.query(
+            "SELECT target, detail_json FROM events"
+            " WHERE family='skill_read'")[0]
+        self.assertEqual(row["target"], "wayfinder")
+        detail = _json.loads(row["detail_json"] or "{}")
+        self.assertEqual(detail.get("skill_path"),
+                         "skills/wayfinder/SKILL.md")
+        self.assertEqual(
+            self.query("SELECT COUNT(*) n FROM events")[0]["n"], before)
+
+
+class SkillPathDetailTest(unittest.TestCase):
+    """Finding 1 privacy unit: skill file paths survive only in detail
+    skill_path, fail closed on markers, types and bounds."""
+
+    def test_skill_path_keeps_marker_free_paths_only(self):
+        self.assertEqual(
+            privacy.filter_detail(
+                "skill_read",
+                {"skill": "wayfinder",
+                 "skill_path": "/tmp/skills/wayfinder/SKILL.md"}),
+            {"skill": "wayfinder",
+             "skill_path": "/tmp/skills/wayfinder/SKILL.md"})
+        self.assertEqual(
+            privacy.filter_detail(
+                "skill_invoke",
+                {"skill_path": "/tmp/skills/my-skill/SKILL.md"}),
+            {"skill_path": "/tmp/skills/my-skill/SKILL.md"})
+        for bad in ("", None, 42, True, ["x"], {"x": 1},
+                    "/p/<b>SKILL.md", "/p/<<<SKILL.md", "x" * 501):
+            self.assertNotIn(
+                "skill_path",
+                privacy.filter_detail("skill_read", {"skill_path": bad}),
+                repr(bad))
+            self.assertNotIn(
+                "skill_path",
+                privacy.filter_detail("skill_invoke", {"skill_path": bad}),
+                repr(bad))
