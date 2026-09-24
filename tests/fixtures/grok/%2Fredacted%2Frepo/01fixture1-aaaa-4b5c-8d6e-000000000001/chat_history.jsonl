@@ -1,0 +1,7 @@
+{"type": "system", "content": "You are Grok, an autonomous agent. No secrets here beyond redaction."}
+{"type": "user", "content": [{"type": "text", "text": "<user_query>\nImplement the widget\n</user_query>"}], "prompt_index": 0}
+{"type": "user", "content": [{"type": "text", "text": "<<<AGENTSMD_PROJECT_DIRECTION_V1>>>\n{\"status\": \"ready\", \"instructions\": {\"sha256\": \"56cb2f7d0ea20f2fef04e6dc8d4cdedc443aa7fc2c79496842e5eb0af593a4dc\"}, \"preferences\": {\"sha256\": \"3e4d25b9f705be734ba08f985d7a407071962894b0b327028e68b9c8aae4ca80\"}}\n<<<END_AGENTSMD_PROJECT_DIRECTION_V1>>>"}], "synthetic_reason": "system_reminder"}
+{"type": "user", "content": [{"type": "text", "text": "<user_query>\nNow the second prompt\n</user_query>"}], "prompt_index": 1}
+{"type": "user", "content": [{"type": "text", "text": "scheduled check ping"}], "prompt_index": 2, "synthetic_reason": "system_reminder"}
+{"type": "user", "content": [{"type": "text", "text": "<user_query>\nOpen follow-up\n</user_query>"}], "prompt_index": 3}
+{"type": "user", "content": [{"type": "text", "text": "<user_query>\nStill open\n</user_query>"}], "prompt_index": 4}

@@ -1,0 +1,10 @@
+{"ts": "2026-09-01T10:00:01Z", "type": "turn_started", "session_id": "01fixture1-aaaa-4b5c-8d6e-000000000001", "turn_number": 0, "model_id": "grok-4.6", "session_relationship": "primary"}
+{"ts": "2026-09-01T10:00:02Z", "type": "tool_started", "tool_name": "read_file"}
+{"ts": "2026-09-01T10:00:02Z", "type": "permission_requested", "tool_name": "read_file"}
+{"ts": "2026-09-01T10:00:03Z", "type": "permission_resolved", "tool_name": "read_file", "decision": "allow", "wait_ms": 0}
+{"ts": "2026-09-01T10:00:04Z", "type": "tool_completed", "tool_name": "read_file", "duration_ms": 12, "outcome": "success", "tool_call_id": "call-read-1"}
+{"ts": "2026-09-01T10:00:04Z", "type": "phase_changed", "phase": "waiting_for_model"}
+{"ts": "2026-09-01T10:00:05Z", "type": "phase_changed", "phase": "running_tools"}
+{"ts": "2026-09-01T10:00:06Z", "type": "turn_ended", "outcome": "completed"}
+{"ts": "2026-09-01T10:00:07Z", "type": "turn_started", "session_id": "01fixture1-aaaa-4b5c-8d6e-000000000001", "turn_number": 1, "model_id": "grok-4.6", "session_relationship": "primary"}
+{"ts": "2026-09-01T10:00:08Z", "type": "turn_ended", "outcome": "completed"}
