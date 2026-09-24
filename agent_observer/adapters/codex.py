@@ -390,9 +390,13 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         "events_duplicate": 0, "compactions": 0, "malformed": 0,
     }
     src = JsonlSource(con, HARNESS, path, full=full)
-    if src.unchanged:
-        # Unchanged fast path: same source bytes, same privacy version,
-        # not full, no new complete records. Skip every per-source SQL
+    if src.unchanged and src.recheck_unchanged():
+        # Unchanged fast path: same size, mtime, inode and tail bytes at
+        # the recorded offset, same privacy version, not full, no new
+        # complete records. The recheck re-stats immediately before
+        # returning so an append (or same-size rewrite) racing the first
+        # check falls through to the import path below with the corrected
+        # offset instead of skipping new bytes. Skip every per-source SQL
         # beyond JsonlSource's stat/tail check: no cumulative table, no
         # reader, no prescan, no prior-event query, no JSON parsing, no
         # token flush, no fallback reconciliation, no submission or

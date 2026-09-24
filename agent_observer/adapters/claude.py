@@ -243,8 +243,12 @@ def import_claude_file(con: sqlite3.Connection, path: str,
              "submissions_inserted": 0, "events_inserted": 0,
              "events_duplicate": 0, "compactions": 0, "malformed": 0}
     src = JsonlSource(con, HARNESS, path, full=full)
-    if src.unchanged:
-        # Unchanged fast path: same bytes, same privacy version, not full.
+    if src.unchanged and src.recheck_unchanged():
+        # Unchanged fast path: same size, mtime, inode and tail bytes,
+        # same privacy version, not full. The recheck re-stats immediately
+        # before returning so an append (or same-size rewrite) racing the
+        # first check falls through to the import path below with the
+        # corrected offset instead of skipping new bytes.
         # Skip the global finality scan, the turn-resume query, JSON
         # parsing and session writes. The stored fingerprint is the sha256
         # contract; stale/full imports never take this path because

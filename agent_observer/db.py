@@ -26,7 +26,10 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 -- One row per native source unit: a session file, or one session inside a
 -- harness database (locator 'opencode.db#<id>'). The fingerprint identifies
 -- the imported snapshot; read_offset and tail_sha256 let append-only logs
--- resume where the previous import stopped.
+-- resume where the previous import stopped. size_bytes, mtime_ns and ino
+-- (all nullable for ledgers written before they were recorded) join the
+-- tail hash in the cheap unchanged check: a same-size rewrite changes the
+-- mtime, a replaced file changes the inode, and a shrink changes the size.
 CREATE TABLE IF NOT EXISTS sources (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   harness TEXT NOT NULL,
@@ -35,6 +38,8 @@ CREATE TABLE IF NOT EXISTS sources (
   size_bytes INTEGER NOT NULL DEFAULT 0,
   read_offset INTEGER NOT NULL DEFAULT 0,
   tail_sha256 TEXT,
+  mtime_ns INTEGER,
+  ino INTEGER,
   cli_version TEXT,
   session_id TEXT,
   thread_id TEXT,
@@ -377,6 +382,10 @@ def init_db(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE sources ADD COLUMN privacy_version INTEGER")
     if "thread_source" not in columns:
         con.execute("ALTER TABLE sources ADD COLUMN thread_source TEXT")
+    if "mtime_ns" not in columns:
+        con.execute("ALTER TABLE sources ADD COLUMN mtime_ns INTEGER")
+    if "ino" not in columns:
+        con.execute("ALTER TABLE sources ADD COLUMN ino INTEGER")
     con.execute(
         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES "
         "('schema_version', ?), ('event_contract_version', ?), "

@@ -630,11 +630,16 @@ def _sibling_updates_unchanged(con: sqlite3.Connection,
 
     A cheap stat plus tail read, never a full parse. Unchanged siblings
     already contributed their spawns to persisted session links on their
-    own import, so the tree index can skip reparsing them.
+    own import, so the tree index can skip reparsing them. The stored
+    size, mtime_ns and inode must all agree with the current file (rows
+    written before they were recorded fail closed to changed), and the
+    size/mtime are rechecked after the tail read so an append racing the
+    check is not reported unchanged.
     """
     try:
         row = con.execute(
-            "SELECT read_offset, tail_sha256, privacy_version FROM sources"
+            "SELECT read_offset, size_bytes, tail_sha256, mtime_ns, ino,"
+            " privacy_version FROM sources"
             " WHERE harness=? AND path=?", (HARNESS, updates_path)).fetchone()
     except sqlite3.DatabaseError:
         return False
@@ -648,16 +653,39 @@ def _sibling_updates_unchanged(con: sqlite3.Connection,
         return False
     if stored_version != privacy.PRIVACY_VERSION:
         return False
-    if not isinstance(offset, int) or not tail:
+    try:
+        keys = row.keys()
+        stored_size = row["size_bytes"] if "size_bytes" in keys else None
+        stored_mtime = row["mtime_ns"] if "mtime_ns" in keys else None
+        stored_ino = row["ino"] if "ino" in keys else None
+    except (TypeError, IndexError):
+        return False
+    if (not isinstance(offset, int) or not tail
+            or not isinstance(stored_size, int)
+            or stored_mtime is None or stored_ino is None):
+        # Pre-metadata rows fail closed until a fresh import records them.
         return False
     try:
-        size = os.path.getsize(updates_path)
+        st = os.stat(updates_path)
     except OSError:
         return False
-    if offset != size:
+    if st.st_ino != stored_ino or st.st_size != stored_size:
+        return False
+    try:
+        if st.st_mtime_ns != stored_mtime:
+            return False
+    except AttributeError:
+        return False
+    if offset != st.st_size:
         return False
     if offset <= 0:
-        return True
+        try:
+            st2 = os.stat(updates_path)
+        except OSError:
+            return False
+        return (st2.st_size == st.st_size
+                and st2.st_mtime_ns == st.st_mtime_ns
+                and st2.st_ino == st.st_ino)
     try:
         with open(updates_path, "rb") as fh:
             start = max(0, offset - 4096)
@@ -665,7 +693,15 @@ def _sibling_updates_unchanged(con: sqlite3.Connection,
             digest = hashlib.sha256(fh.read(offset - start)).hexdigest()
     except OSError:
         return False
-    return digest == tail
+    if digest != tail:
+        return False
+    try:
+        st2 = os.stat(updates_path)
+    except OSError:
+        return False
+    return (st2.st_size == st.st_size
+            and st2.st_mtime_ns == st.st_mtime_ns
+            and st2.st_ino == st.st_ino)
 
 
 def _build_source_tree_index(con: sqlite3.Connection, ctx,
@@ -1297,11 +1333,14 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     """Import one Grok session directory. Idempotent; growing logs resume.
 
     Change detection runs before any updates.jsonl/events.jsonl parse: the
-    JsonlSource tail check decides unchanged without reading the whole file,
-    and an unchanged known session with unchanged summary/chat metadata and
-    no new parent link returns without parsing either file. The caller
-    supplies the operation parent index (sync() builds it once per
-    operation); per-session code never scans sibling files.
+    JsonlSource size/mtime/inode plus tail check decides unchanged without
+    reading the whole file, and an unchanged known session with unchanged
+    summary/chat metadata and no new parent link returns without parsing
+    either file. Both JsonlSource decisions are refreshed after
+    construction and rechecked immediately before the fully unchanged
+    return, so a file that grows in between still parses on this sync.
+    The caller supplies the operation parent index (sync() builds it once
+    per operation); per-session code never scans sibling files.
     """
     stats = {"lines": 0, "responses_inserted": 0, "responses_duplicate": 0,
              "submissions_inserted": 0, "events_inserted": 0,
@@ -1400,6 +1439,13 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     known_row = con.execute("SELECT 1 FROM sessions WHERE session_key=?",
                             (r.session_key,)).fetchone()
     known = known_row is not None
+    # Refresh the initial JsonlSource decisions before judging: a file
+    # appended between the two constructions must not be judged by a stale
+    # flag. Recheck is stat/tail only, no SQL and no parse.
+    if updates_src is not None and updates_src.unchanged:
+        updates_src.recheck_unchanged()
+    if events_src is not None and events_src.unchanged:
+        events_src.recheck_unchanged()
     updates_new = full or updates_src is None or not updates_src.unchanged
     events_new = full or events_src is None or not events_src.unchanged
     privacy_stale = bool(
@@ -1476,35 +1522,60 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             # session/meta rows already match, so no session, meta or
             # source writes happen here. The late parent/role branch below
             # keeps its convergence writes.
-            stats["unchanged"] = True
-            stats["session_key"] = r.session_key
-            return stats
-        if not meta_changed and stored_marks is not None \
+            # Final safety recheck immediately before returning: an append
+            # (or same-size rewrite) racing the earlier checks falls
+            # through to parsing below instead of being skipped.
+            if updates_src is not None and updates_src.unchanged:
+                updates_src.recheck_unchanged()
+            if events_src is not None and events_src.unchanged:
+                events_src.recheck_unchanged()
+            updates_new = (full or updates_src is None
+                           or not updates_src.unchanged)
+            events_new = (full or events_src is None
+                          or not events_src.unchanged)
+            if not updates_new and not events_new:
+                stats["unchanged"] = True
+                stats["session_key"] = r.session_key
+                return stats
+        elif not meta_changed and stored_marks is not None \
                 and (new_parent_via_index or new_role_via_evidence):
             # Late parent or role with no JSONL or chat-bytes growth:
             # converge without parsing updates/events and without JSON
             # parsing chat. The prebuilt operation index (or persisted link)
             # already supplied the parent; force existing submissions to
             # synthetic/empty in place and record the session link/role.
-            chat = stored_marks
-            _force_child_synthetic(con, stats, r.session_key)
-            late_fields = {"started_at": r.first_ts, "ended_at": r.last_ts,
-                           **r.meta, **r.identity.fields(con)}
-            if r.parent_key:
-                late_fields["parent_session_key"] = r.parent_key
-            db.upsert_session(
-                con, r.session_key, HARNESS, r.native_sid,
-                updates_src.source_id if updates_src is not None
-                else (events_src.source_id if events_src is not None else None),
-                **late_fields)
-            # Reclassify without records is covered by the force above
-            # (no parse, no duplicates).
-            _store_meta(con, r.session_key, summary_fp, chat_fp_current,
-                        chat)
-            con.commit()
-            stats["unchanged"] = False
-            stats["session_key"] = r.session_key
-            return stats
+            # Recheck first: a raced JSONL growth must parse below instead
+            # of converging without it.
+            if updates_src is not None and updates_src.unchanged:
+                updates_src.recheck_unchanged()
+            if events_src is not None and events_src.unchanged:
+                events_src.recheck_unchanged()
+            updates_new = (full or updates_src is None
+                           or not updates_src.unchanged)
+            events_new = (full or events_src is None
+                          or not events_src.unchanged)
+            if not updates_new and not events_new:
+                chat = stored_marks
+                _force_child_synthetic(con, stats, r.session_key)
+                late_fields = {"started_at": r.first_ts, "ended_at": r.last_ts,
+                               **r.meta, **r.identity.fields(con)}
+                if r.parent_key:
+                    late_fields["parent_session_key"] = r.parent_key
+                db.upsert_session(
+                    con, r.session_key, HARNESS, r.native_sid,
+                    updates_src.source_id if updates_src is not None
+                    else (events_src.source_id if events_src is not None else None),
+                    **late_fields)
+                # Reclassify without records is covered by the force above
+                # (no parse, no duplicates).
+                _store_meta(con, r.session_key, summary_fp, chat_fp_current,
+                            chat)
+                con.commit()
+                stats["unchanged"] = False
+                stats["session_key"] = r.session_key
+                return stats
+            # A raced JSONL growth invalidated the no-parse shortcut: fall
+            # through so the new records parse and reconcile below.
         # Else metadata changed (or first sync after the mark migration):
         # fall through so late chat/summary evidence reclassifies and
         # reconciles in place. Chat is resolved lazily below: reused
