@@ -534,13 +534,209 @@ class CodexFallbackConflictTest(LedgerCase):
         self.assertEqual(
             self.query("SELECT COUNT(*) n FROM responses WHERE response_id=?",
                        (f"{LEGACY}:tc:2110",))[0]["n"], 1)
-        errors = self.query("SELECT error FROM import_errors")
+        errors = self.query(
+            "SELECT error, line_excerpt FROM import_errors")
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["error"], "usage_conflict")
         self.assertNotIn("450", errors[0]["error"])
+        # Deferred fallback errors keep structure only: the sorted
+        # top-level key names of the record, never values.
+        self.assertEqual(errors[0]["line_excerpt"],
+                         "ordinal,payload,timestamp,type")
         totals = report.scope_totals(self.con)
         self.assertEqual(totals["total_tokens"], 450 + 670 + 990)
         self.assertEqual(totals["responses"], 3)
+
+    def test_conflict_fixture_standalone_contains_one_same_total_conflict(self):
+        # The fixture is self-contained: importing it alone quarantines
+        # exactly one same-total accounting conflict, so the genuine-conflict
+        # requirement does not depend on cross-file import order.
+        stats = self.sync("codex-legacy-conflict.jsonl")
+        self.assertEqual(stats["malformed"], 1)
+        self.assertEqual(stats["responses_inserted"], 2)
+        errors = self.query("SELECT error FROM import_errors")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["error"], "usage_conflict")
+
+
+class CodexPostCompactionFallbackTest(LedgerCase):
+    """Post-compaction repeats of a cumulative checkpoint are duplicate
+    evidence when only last-token metadata changed; genuine accounting
+    changes still quarantine."""
+
+    DUP = "codex:sess-fixture-comp-01"
+    CONFLICT = "codex:sess-fixture-comp-02"
+
+    def test_post_compaction_same_total_changed_last_is_ignored(self):
+        stats = self.sync("codex-compaction-dup.jsonl")
+        self.assertEqual(stats["malformed"], 0)
+        self.assertEqual(stats["responses_inserted"], 3)
+        rows = {r["response_id"]: r for r in self.query(
+            "SELECT response_id, input_tokens, total_tokens,"
+            " thread_total_tokens FROM responses")}
+        # No extra response for the repeated checkpoint, and the stored row
+        # keeps the first checkpoint's counters: nothing counted twice.
+        self.assertEqual(
+            sorted(rows),
+            [f"{self.DUP}:tc:1120", f"{self.DUP}:tc:2110",
+             f"{self.DUP}:tc:450"])
+        self.assertEqual(rows[f"{self.DUP}:tc:1120"]["input_tokens"], 600)
+        self.assertEqual(rows[f"{self.DUP}:tc:1120"]["total_tokens"], 670)
+        self.assertEqual(
+            self.query("SELECT COUNT(*) n FROM import_errors")[0]["n"], 0)
+        totals = report.scope_totals(self.con)
+        self.assertEqual(totals["total_tokens"], 450 + 670 + 990)
+        self.assertEqual(totals["responses"], 3)
+
+    def test_post_compaction_ignore_is_idempotent(self):
+        self.sync("codex-compaction-dup.jsonl")
+        again = import_codex_file(
+            self.con, fixture("codex-compaction-dup.jsonl"), full=True)
+        self.assertEqual(again["responses_inserted"], 0)
+        self.assertEqual(again["malformed"], 0)
+        self.assertEqual(
+            self.query("SELECT COUNT(*) n FROM import_errors")[0]["n"], 0)
+        totals = report.scope_totals(self.con)
+        self.assertEqual(totals["total_tokens"], 450 + 670 + 990)
+        self.assertEqual(totals["responses"], 3)
+
+    def test_post_compaction_changed_cumulative_bucket_stays_quarantined(self):
+        stats = self.sync("codex-compaction-conflict.jsonl")
+        # Same cumulative identity after a compaction boundary, but the
+        # cumulative bucket itself changed: a genuine usage conflict, even
+        # though the repeat arrived after compaction.
+        self.assertEqual(stats["malformed"], 1)
+        self.assertEqual(stats["responses_inserted"], 3)
+        errors = self.query("SELECT error FROM import_errors")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["error"], "usage_conflict")
+        row = self.query(
+            "SELECT input_tokens, total_tokens FROM responses"
+            " WHERE response_id=?",
+            (f"{self.CONFLICT}:tc:1120",))[0]
+        self.assertEqual(row["input_tokens"], 600)
+        self.assertEqual(row["total_tokens"], 670)
+        totals = report.scope_totals(self.con)
+        self.assertEqual(totals["total_tokens"], 450 + 670 + 990)
+        self.assertEqual(totals["responses"], 3)
+
+    def test_pre_compaction_conflict_before_later_compaction_stays_quarantined(self):
+        # The changed same-total repeat arrives before the compaction
+        # boundary in the same file: a genuine pre-compaction conflict. The
+        # later compaction must not suppress it.
+        stats = self.sync("codex-precompaction-conflict.jsonl")
+        self.assertEqual(stats["malformed"], 1)
+        self.assertEqual(stats["responses_inserted"], 2)
+        errors = self.query("SELECT error FROM import_errors")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["error"], "usage_conflict")
+        row = self.query(
+            "SELECT input_tokens, total_tokens FROM responses"
+            " WHERE response_id='codex:sess-fixture-comp-03:tc:450'")[0]
+        self.assertEqual(row["input_tokens"], 400)
+        self.assertEqual(row["total_tokens"], 450)
+        totals = report.scope_totals(self.con)
+        self.assertEqual(totals["total_tokens"], 450 + 990)
+        self.assertEqual(totals["responses"], 2)
+
+    def test_incremental_later_compaction_does_not_rewrite_conflict(self):        # Same file imported as a growing log: the pre-compaction conflict
+        # quarantines in the first prefix, and the later compaction plus the
+        # rising checkpoint in the appended prefix change nothing about it.
+        with open(fixture("codex-precompaction-conflict.jsonl")) as fh:
+            lines = fh.readlines()
+        dst = os.path.join(self.tmp.name, "preconf-grow.jsonl")
+        _write_lines(dst, lines[0:4])
+        first = import_codex_file(self.con, dst)
+        self.assertEqual(first["malformed"], 1)
+        self.assertEqual(first["responses_inserted"], 1)
+        _append_lines(dst, lines[4:])
+        second = import_codex_file(self.con, dst)
+        self.assertFalse(second["unchanged"])
+        self.assertEqual(second["malformed"], 0)
+        self.assertEqual(second["responses_inserted"], 1)
+        errors = self.query("SELECT error FROM import_errors")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["error"], "usage_conflict")
+        row = self.query(
+            "SELECT input_tokens, total_tokens FROM responses"
+            " WHERE response_id LIKE '%:tc:450'")[0]
+        self.assertEqual(row["input_tokens"], 400)
+        self.assertEqual(row["total_tokens"], 450)
+        totals = report.scope_totals(self.con)
+        self.assertEqual(totals["total_tokens"], 450 + 990)
+        self.assertEqual(totals["responses"], 2)
+
+
+    def test_split_import_suffix_starting_with_post_compaction_repeat(self):
+        # The first import ends before the post-compaction repeat and the
+        # second starts with it. The persisted cumulative signature makes
+        # the suffix behave exactly like a full import: the repeat is
+        # duplicate evidence across all cumulative counters, not a
+        # usage_conflict, and only the rising checkpoint inserts.
+        with open(fixture("codex-compaction-dup.jsonl")) as fh:
+            lines = fh.readlines()
+        dst = os.path.join(self.tmp.name, "split-grow.jsonl")
+        _write_lines(dst, lines[0:5])
+        first = import_codex_file(self.con, dst)
+        self.assertEqual(first["responses_inserted"], 2)
+        self.assertEqual(first["malformed"], 0)
+        _append_lines(dst, lines[5:])
+        second = import_codex_file(self.con, dst)
+        self.assertFalse(second["unchanged"])
+        self.assertEqual(second["malformed"], 0)
+        self.assertEqual(second["responses_inserted"], 1)
+        self.assertEqual(
+            self.query("SELECT COUNT(*) n FROM import_errors")[0]["n"], 0)
+        rows = {r["response_id"]: r for r in self.query(
+            "SELECT response_id, input_tokens, total_tokens,"
+            " thread_total_tokens FROM responses")}
+        self.assertEqual(
+            sorted(rows),
+            [f"{self.DUP}:tc:1120", f"{self.DUP}:tc:2110",
+             f"{self.DUP}:tc:450"])
+        # The repeated checkpoint kept the first import's counters.
+        self.assertEqual(rows[f"{self.DUP}:tc:1120"]["input_tokens"], 600)
+        self.assertEqual(rows[f"{self.DUP}:tc:1120"]["total_tokens"], 670)
+        totals = report.scope_totals(self.con)
+        self.assertEqual(totals["total_tokens"], 450 + 670 + 990)
+        self.assertEqual(totals["responses"], 3)
+        # All six cumulative counters persisted per total, not only the
+        # total or the last-token metadata.
+        sigs = {r["thread_total"]: r for r in self.query(
+            "SELECT thread_total, input_tokens, cached_input_tokens,"
+            " cache_write_input_tokens, output_tokens,"
+            " reasoning_output_tokens, total_tokens"
+            " FROM codex_fallback_cumulative"
+            " WHERE session_key=?", (self.DUP,))}
+        self.assertEqual(sorted(sigs), [450, 1120, 2110])
+        self.assertEqual(
+            {k: sigs[1120][k] for k in (
+                "input_tokens", "cached_input_tokens",
+                "cache_write_input_tokens", "output_tokens",
+                "reasoning_output_tokens", "total_tokens")},
+            {"input_tokens": 1000, "cached_input_tokens": 100,
+             "cache_write_input_tokens": 0, "output_tokens": 120,
+             "reasoning_output_tokens": 12, "total_tokens": 1120})
+
+    def test_split_import_changed_cumulative_bucket_stays_quarantined(self):
+        # Same split shape, but the suffix repeat changes the cumulative
+        # bucket: the persisted signature proves a genuine accounting
+        # change and the repeat quarantines as usage_conflict.
+        with open(fixture("codex-compaction-conflict.jsonl")) as fh:
+            lines = fh.readlines()
+        dst = os.path.join(self.tmp.name, "split-conflict.jsonl")
+        _write_lines(dst, lines[0:5])
+        first = import_codex_file(self.con, dst)
+        self.assertEqual(first["malformed"], 0)
+        _append_lines(dst, lines[5:])
+        second = import_codex_file(self.con, dst)
+        self.assertEqual(second["malformed"], 1)
+        errors = self.query(
+            "SELECT error, line_excerpt FROM import_errors")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["error"], "usage_conflict")
+        self.assertEqual(errors[0]["line_excerpt"],
+                         "ordinal,payload,timestamp,type")
 
 
 class ClaudeServiceTierTest(LedgerCase):

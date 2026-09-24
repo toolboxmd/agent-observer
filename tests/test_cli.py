@@ -153,3 +153,79 @@ class UnknownCountersCliTest(unittest.TestCase):
         self.assertEqual(
             groups["gpt-6-fixture"]["tokens_per_session"]["total"], 100)
         self.assertEqual(groups["gpt-6-fixture"]["unknown_token_responses"], 2)
+
+
+class JsonFlagPositionTest(unittest.TestCase):
+    """--json works before and after the subcommand for every subparser."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.mini = os.path.join(REPO, "tests", "fixtures", "codex-mini.jsonl")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _db(self, name):
+        return os.path.join(self.tmp.name, name)
+
+    def test_json_before_and_after_sync_parses(self):
+        cases = (("before.db", ["--json", "sync", "--source", self.mini]),
+                 ("after.db", ["sync", "--source", self.mini, "--json"]))
+        for name, args in cases:
+            with self.subTest(args=args):
+                r = run(self._db(name), *args)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                payload = json.loads(r.stdout)
+                self.assertEqual(payload["_view"], "sync")
+                self.assertEqual(
+                    payload["harnesses"][0]["responses_inserted"], 3)
+
+    def test_json_before_and_after_read_views_parse(self):
+        run(self._db("views.db"), "sync", "--source", self.mini)
+        for args in (["--json", "sessions", "list"],
+                     ["sessions", "list", "--json"]):
+            with self.subTest(args=args):
+                r = run(self._db("views.db"), *args)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("sessions", json.loads(r.stdout))
+
+    def test_json_before_and_after_capture_create_task(self):
+        db = self._db("capture.db")
+        cases = (
+            ["--json", "capture", "create-task", "--task", "T-CAP-BEFORE",
+             "--title", "before"],
+            ["capture", "create-task", "--task", "T-CAP-AFTER",
+             "--title", "after", "--json"],
+            ["capture", "--json", "create-task", "--task", "T-CAP-MIDDLE",
+             "--title", "middle"],
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                r = run(db, *args)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                payload = json.loads(r.stdout)
+                self.assertTrue(payload["ok"])
+        r = run(db, "task", "list", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        tasks = {t["task_id"] for t in json.loads(r.stdout)["tasks"]}
+        self.assertEqual(tasks, {"T-CAP-BEFORE", "T-CAP-AFTER", "T-CAP-MIDDLE"})
+
+    def test_json_after_capture_assign_attempt_outcome(self):
+        db = self._db("capture-leaves.db")
+        r = run(db, "sync", "--source", self.mini)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = run(db, "capture", "create-task", "--task", "T-LEAF")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        cases = (
+            ["capture", "assign", "--submission", "msg-mini-sub-01",
+             "--task", "T-LEAF", "--json"],
+            ["capture", "attempt", "--task", "T-LEAF", "--turn",
+             "codex:turn-mini-01", "--role", "parent", "--json"],
+            ["capture", "outcome", "--task", "T-LEAF", "--state", "active",
+             "--json"],
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                r = run(db, *args)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertTrue(json.loads(r.stdout)["ok"])

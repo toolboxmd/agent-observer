@@ -1,0 +1,17 @@
+{"cwd":"/redacted/repo","entrypoint":"cli","gitBranch":"main","isSidechain":false,"message":{"content":"Synthetic metadata probe request","role":"user"},"origin":{"kind":"human"},"promptId":"p-meta-1","promptSource":"typed","sessionId":"sess-meta","timestamp":"2026-09-14T10:00:01Z","type":"user","userType":"external","uuid":"u-meta-1","version":"2.1.280"}
+{"cwd":"/redacted/repo","entrypoint":"cli","gitBranch":"main","isSidechain":false,"message":{"content":[{"text":"Synthetic metadata probe reply.","type":"text"}],"id":"msg-meta-1","model":"claude-fable-5-1","stop_reason":"end_turn","usage":{"cache_creation_input_tokens":100,"cache_read_input_tokens":1000,"input_tokens":10,"output_tokens":50,"output_tokens_details":{"thinking_tokens":20}}},"requestId":"req-meta","sessionId":"sess-meta","timestamp":"2026-09-14T10:00:02Z","type":"assistant","userType":"external","uuid":"as-meta-1","version":"2.1.280"}
+{"agentName":"synthetic-agent","sessionId":"sess-meta","type":"agent-name"}
+{"aiTitle":"Synthetic title probe","sessionId":"sess-meta","type":"ai-title"}
+{"atis":{"synthetic":true},"sessionId":"sess-meta","type":"atis-latch"}
+{"attachment":{"synthetic":true,"type":"synthetic-probe"},"cwd":"/redacted/repo","entrypoint":"cli","gitBranch":"main","isSidechain":false,"parentUuid":"u-meta-1","rendered":false,"sessionId":"sess-meta","timestamp":"2026-09-14T10:00:03Z","type":"attachment","userType":"external","uuid":"at-meta-1","version":"2.1.280"}
+{"bridgeSessionId":"synthetic-bridge","lastSequenceNum":1,"ownerAccountUuid":"synthetic-owner","ownerOrganizationUuid":"synthetic-org","sessionId":"sess-meta","type":"bridge-session"}
+{"hasUnknownModelCost":false,"modelUsage":{"claude-opus-5-5":{"cacheCreationInputTokens":46843,"cacheReadInputTokens":703577,"costUSD":1.0082185,"inputTokens":26343,"outputTokens":7496,"thinkingTokens":2671,"webSearchRequests":0}},"sessionId":"sess-meta","startTime":"2026-09-14T10:00:00Z","totalAPIDuration":1,"totalAPIDurationWithoutRetries":1,"totalCostUSD":0,"totalDuration":1,"totalLinesAdded":0,"totalLinesRemoved":0,"totalToolDuration":0,"type":"cost-state"}
+{"customTitle":"Synthetic custom title","sessionId":"sess-meta","type":"custom-title"}
+{"backup":false,"messageId":"synthetic-message","snapshotMessageId":"synthetic-snapshot","timestamp":"2026-09-14T10:00:04Z","trackingPath":"/redacted/file","type":"file-history-delta"}
+{"isSnapshotUpdate":false,"messageId":"synthetic-message","snapshot":{},"type":"file-history-snapshot"}
+{"lastPrompt":"synthetic last prompt","leafUuid":"synthetic-leaf","sessionId":"sess-meta","type":"last-prompt"}
+{"mode":"synthetic-mode","sessionId":"sess-meta","type":"mode"}
+{"permissionMode":"synthetic-permission","sessionId":"sess-meta","type":"permission-mode"}
+{"prNumber":0,"prRepository":"synthetic/repo","prUrl":"synthetic-url","sessionId":"sess-meta","timestamp":"2026-09-14T10:00:05Z","type":"pr-link"}
+{"cwd":"/redacted/repo","durationMs":10,"entrypoint":"cli","gitBranch":"main","isMeta":false,"isSidechain":false,"messageCount":1,"parentUuid":"u-meta-1","sessionId":"sess-meta","subtype":"turn_duration","timestamp":"2026-09-14T10:00:07Z","type":"system","userType":"external","uuid":"sys-meta-1","version":"2.1.280"}
+{"sessionId":"sess-meta","timestamp":"2026-09-14T10:00:08Z","type":"future-synthetic-type","uuid":"x-meta-1"}

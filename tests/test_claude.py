@@ -8,6 +8,11 @@ from agent_observer.adapters import claude
 from tests.helpers import FIXTURES, LedgerCase, fixture
 
 ROOT = os.path.join(FIXTURES, "claude")
+
+
+def _write(path, lines):
+    with open(path, "w") as fh:
+        fh.writelines(lines)
 MAIN = "claude:sess-main"
 SUB = "claude:sess-main:agent:ag-1"
 
@@ -89,6 +94,66 @@ class ClaudeAdapterTest(LedgerCase):
         self.assertEqual(report.scope_totals(self.con)["responses"], 3)
 
 
+class ClaudeMetadataTest(LedgerCase):
+    """Known benign metadata records are recognized and ignored: no rows,
+    no stored contents, no import errors. cost-state is not benign: it
+    carries per-model counters pending reconciliation, so it stays
+    quarantined as unsupported_schema with nothing stored. Genuinely
+    unknown types stay quarantined as unsupported_schema."""
+
+    def test_cost_state_is_quarantined_with_nothing_stored(self):
+        stats = claude.import_claude_file(
+            self.con, fixture("claude-metadata.jsonl"))
+        self.assertEqual(stats["responses_inserted"], 1)
+        # cost-state plus the genuinely unknown future type quarantine;
+        # every other metadata record is recognized and ignored.
+        self.assertEqual(stats["malformed"], 2)
+        errors = self.query(
+            "SELECT error, line_excerpt FROM import_errors ORDER BY id")
+        self.assertEqual(len(errors), 2)
+        cost, future = errors
+        self.assertEqual(cost["error"], "unsupported_schema")
+        self.assertEqual(future["error"], "unsupported_schema")
+        self.assertEqual(future["line_excerpt"],
+                         "sessionId,timestamp,type,uuid")
+        # Privacy rule 5: structure only, key names never values. The
+        # cost-state keys appear in sorted order...
+        keys = cost["line_excerpt"].split(",")
+        self.assertIn("modelUsage", keys)
+        self.assertEqual(keys, sorted(keys))
+        # ...and no per-model counter value persists anywhere.
+        blob = "".join(r["line_excerpt"] or "" for r in errors)
+        blob += "".join(r["text_excerpt"] or "" for r in self.query(
+            "SELECT text_excerpt FROM submissions"))
+        blob += "".join(r["detail_json"] or "" for r in self.query(
+            "SELECT detail_json FROM events"))
+        for value in ("26343", "703577", "1.0082185", "46843"):
+            self.assertNotIn(value, blob)
+        # The quarantined snapshot creates no usage row: only the genuine
+        # assistant message counts.
+        self.assertEqual(
+            self.query("SELECT COUNT(*) n FROM responses")[0]["n"], 1)
+        self.assertEqual(
+            self.query("SELECT total_tokens t FROM responses"
+                       " WHERE response_id='claude:msg-meta-1'")[0]["t"],
+            10 + 100 + 1000 + 50)
+        # Existing behavior is intact: the genuine submission still imports.
+        self.assertEqual(
+            self.query("SELECT kind FROM submissions"
+                       " WHERE native_id='claude:u-meta-1'")[0]["kind"],
+            "genuine")
+        # No metadata contents persist anywhere in the ledger.
+        blob += "".join(r["identity_json"] or "" for r in self.query(
+            "SELECT identity_json FROM sessions"))
+        blob += "".join(
+            r["error"] or ""
+            for r in self.query("SELECT error FROM import_errors"))
+        for sentinel in ("synthetic-bridge", "synthetic-leaf",
+                          "Synthetic title probe",
+                          "synthetic-permission"):
+            self.assertNotIn(sentinel, blob)
+
+
 class ClaudeContradictoryMarkersTest(LedgerCase):
     """Human-origin metadata never makes a known marker genuine."""
 
@@ -142,3 +207,38 @@ class ClaudeContradictoryMarkersTest(LedgerCase):
             for r in self.query("SELECT error, line_excerpt FROM import_errors"))
         for sentinel in self.SENTINELS:
             self.assertNotIn(sentinel, blob)
+
+
+class ClaudeQueueOperationTest(LedgerCase):
+    """Queue-operation handling is descoped for release 0.2.0: every
+    queue-operation record falls through to unsupported_schema
+    quarantine, stores nothing and creates no submission, until a
+    follow-up implements correct queued-prompt handling."""
+
+    def test_queue_operation_is_quarantined_with_nothing_stored(self):
+        dst = os.path.join(self.tmp.name, "sess-queue.jsonl")
+        _write(dst, [
+            '{"sessionId": "sess-queue", "cwd": "/redacted/repo",'
+            ' "version": "2.1.280", "isSidechain": false,'
+            ' "type": "queue-operation", "operation": "enqueue",'
+            ' "content": "Please summarize SECRET-QUEUE-aaa111",'
+            ' "timestamp": "2026-09-14T10:00:01Z"}\n',
+        ])
+        stats = claude.import_claude_file(self.con, dst)
+        self.assertEqual(stats["malformed"], 1)
+        errors = self.query(
+            "SELECT error, line_excerpt FROM import_errors")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["error"], "unsupported_schema")
+        self.assertEqual(
+            self.query("SELECT COUNT(*) n FROM submissions")[0]["n"], 0)
+        blob = "".join(r["text_excerpt"] or "" for r in self.query(
+            "SELECT text_excerpt FROM submissions"))
+        blob += "".join(r["detail_json"] or "" for r in self.query(
+            "SELECT detail_json FROM events"))
+        blob += "".join(r["identity_json"] or "" for r in self.query(
+            "SELECT identity_json FROM sessions"))
+        blob += "".join(
+            (r["error"] or "") + (r["line_excerpt"] or "")
+            for r in self.query("SELECT error, line_excerpt FROM import_errors"))
+        self.assertNotIn("SECRET-QUEUE-aaa111", blob)

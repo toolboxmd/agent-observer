@@ -49,6 +49,38 @@ CAPABILITIES = [
     ("subagents", True, "subagent transcripts as child sessions of their parent"),
 ]
 
+# Benign native metadata records: recognized as known and ignored. Their
+# contents are never stored; only the session/timing fields read before
+# dispatch (identifiers, never free text) are kept. Anything not listed
+# here still raises _UnsupportedSchema, so arbitrary future record types
+# stay quarantined instead of being silently dropped.
+#
+# last-prompt stays here deliberately: it is known duplicate state that
+# repeats the latest human prompt already carried by user records, which
+# are the canonical prompt evidence. It stores nothing.
+#
+# cost-state is NOT ignored: it carries per-model token counters whose
+# reconciliation with assistant usage is an open follow-up, so it stays
+# quarantined as unsupported_schema (nothing stored) instead of being
+# silently dropped.
+#
+# queue-operation is NOT ignored either: queued-prompt handling is
+# descoped for release 0.2.0, so every queue-operation record falls
+# through to unsupported_schema quarantine (nothing stored, no
+# submission) until a follow-up implements it correctly.
+IGNORED_METADATA_TYPES = frozenset({
+    "agent-name",
+    "atis-latch",
+    "bridge-session",
+    "custom-title",
+    "file-history-delta",
+    "file-history-snapshot",
+    "last-prompt",
+    "mode",
+    "permission-mode",
+    "pr-link",
+})
+
 
 class _MalformedUsage(ValueError):
     """A usage bucket that is not NULL or a real integer counter."""
@@ -299,6 +331,9 @@ def _ingest(r: _Reader, obj: dict, ordinal: int) -> None:
         _system(r, obj, ordinal, ts)
     elif kind == "ai-title":
         # Rule 7: native free-text titles are discarded, never stored.
+        return
+    elif kind in IGNORED_METADATA_TYPES:
+        # Known benign metadata: recognized, never stored, never an error.
         return
     else:
         raise _UnsupportedSchema(f"unsupported record type: {kind!r}")
