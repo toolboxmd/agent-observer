@@ -122,11 +122,32 @@ the process, directory and fix.
 
 ## Privacy
 
-The ledger is private and local. It stores counters, identities, paths,
-hashes and short excerpts (300 characters of a prompt, the last 400 of an
-assistant message) needed for the detectors; it never stores file contents,
-tool outputs or AgentsMD preference contents. Only sanitized fixtures are
-committed to this repository.
+The ledger is private and local: its directory is created or hardened to
+mode 0700, and the database plus SQLite sidecars to mode 0600. It stores
+counters, identities, paths, hashes and short excerpts needed for the
+detectors; it never stores file contents, tool outputs or AgentsMD
+preference contents. Only sanitized fixtures are committed to this
+repository.
+
+Prompt excerpts are kept only for genuine human prompts in the main
+session: the human's own text up to the first tag-like marker (`<`
+followed by a letter, `/` or `!`, or the first `<<<`),
+whitespace-collapsed, at most 300 characters. Pasted blocks, injected
+instructions and preference contents after such a marker are therefore
+never kept. An assistant excerpt is the last 400 characters of each
+assistant text block, kept only when that span contains no such
+marker: Claude Code emits one assistant_message event per nonempty
+assistant text block, so a message streamed as several blocks keeps
+one excerpt per block. Codex instead concatenates the text items of
+an assistant message and keeps one excerpt for the combined message.
+No other adapter emits assistant_message excerpts. Error records keep only a fixed category and the sorted
+top-level key names of the record, never its values. Event details keep
+only allowlisted, correctly typed metadata (identifiers, paths,
+commands, numbers, closed status and kind values), never titles,
+messages, error text, outputs, content, arguments or other free text;
+native free-text session titles are not stored. When these rules change,
+the next sync fully re-imports affected sources, corrects older rows in
+place, and replaces that source's prior import errors.
 
 ## Development
 

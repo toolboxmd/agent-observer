@@ -62,8 +62,14 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
    human submission of the main session; then the human text up to the
    first tag-like marker (`<` followed by a letter, `/` or `!`, or the
    first `<<<`), whitespace-collapsed, at most 300 characters. Assistant
-   excerpts keep the last 400 characters only when that span holds no
-   marker. Every source records the privacy rules version; a version
+   excerpts keep the last 400 characters of each assistant text block
+   only when that span holds no marker: the Claude Code adapter calls
+   the helper once per nonempty assistant text block and emits one
+   assistant_message event per text block, so a message with several
+   blocks keeps one excerpt per block; the Codex adapter concatenates
+   the text items of an assistant message and keeps one excerpt for
+   the combined message. No other adapter emits assistant_message
+   excerpts. Every source records the privacy rules version; a version
    change fully re-imports the source, updating rows in place and
    replacing that source's `import_errors`. `import_errors.error` is
    exactly one closed category (`malformed_json`, `unknown_record`,
@@ -100,7 +106,7 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
 | `file_change` | Edit or write by the agent | path, change kind, content size and hash |
 | `compaction` | Context compaction boundary | trigger, before and after sizes when recorded |
 | `lifecycle` | Turn start, completion, abort, subagent activity, stop reasons | duration, reason |
-| `assistant_message` | Final assistant text of a turn | last 400 characters |
+| `assistant_message` | Final assistant text of a turn | last 400 characters per Claude assistant text block; one combined-message excerpt on Codex |
 | `permission` | Permission request or denial | tool, outcome |
 
 A tool call joins its result only on an equal native call id. Nothing is
