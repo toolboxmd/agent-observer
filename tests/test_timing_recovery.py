@@ -340,10 +340,13 @@ class RecoveryTest(LedgerCase):
     def test_failure_to_next_start_and_first_progress_at_end(self):
         _task(self.con, "T-R", "active", 0.0)
         _attempt(self.con, "T-R", "router:A", state="failed", terminal="failed",
+                 stage="implementation",
                  started=0.0, ended=100.0, elapsed=100.0)
         _attempt(self.con, "T-R", "router:B", state="failed", terminal="timeout",
+                 stage="implementation",
                  started=110.0, ended=120.0, elapsed=10.0)
         _attempt(self.con, "T-R", "router:C", state="complete", terminal="completed",
+                 stage="implementation",
                  started=130.0, ended=140.0, elapsed=10.0)
         for turn, s, e in (("router:A", 0.0, 100.0), ("router:B", 110.0, 120.0),
                            ("router:C", 130.0, 140.0)):
@@ -354,6 +357,8 @@ class RecoveryTest(LedgerCase):
         # Failure to next start uses the next compatible start.
         self.assertEqual(rec["router:A"]["failure_to_next_start_s"], 10.0)
         self.assertEqual(rec["router:A"]["first_progress_turn"], "router:C")
+        self.assertEqual(rec["router:A"]["first_progress_stage"], "implementation")
+        self.assertEqual(rec["router:A"]["failed_stage"], "implementation")
         # First progress is measured at completion end, not candidate start.
         self.assertEqual(rec["router:A"]["time_to_first_progress_s"], 40.0)
         self.assertEqual(rec["router:A"]["compat_scope"], "request req-R")
@@ -361,14 +366,17 @@ class RecoveryTest(LedgerCase):
         self.assertEqual(rec["router:A"]["later_failed_attempts"], 1)
         self.assertEqual(rec["router:B"]["failure_to_next_start_s"], 10.0)
         self.assertEqual(rec["router:B"]["first_progress_turn"], "router:C")
+        self.assertEqual(rec["router:B"]["first_progress_stage"], "implementation")
         self.assertEqual(rec["router:B"]["time_to_first_progress_s"], 20.0)
         self.assertIn("recovered", rec["router:B"]["recovery_outcome"])
 
     def test_start_alone_is_not_recovery_and_unresolved_stays(self):
         _task(self.con, "T-U", "active", 0.0)
         _attempt(self.con, "T-U", "router:D", state="failed", terminal="failed",
+                 stage="implementation",
                  started=0.0, ended=50.0, elapsed=50.0)
         _attempt(self.con, "T-U", "router:E", state="active", terminal=None,
+                 stage="implementation",
                  started=60.0, ended=None, elapsed=None)
         _link_router(self.con, "router:D", "req-U", started=0.0, ended=50.0)
         _link_router(self.con, "router:E", "req-U", started=60.0, ended=None)
@@ -406,9 +414,11 @@ class RecoveryTest(LedgerCase):
     def test_quota_exhaustion_recovers_in_compatible_request(self):
         _task(self.con, "T-Q", "active", 0.0)
         _attempt(self.con, "T-Q", "router:q1", state="quota_blocked", terminal="quota",
-                 reason="initial", started=0.0, ended=10.0, elapsed=10.0)
+                 reason="initial", stage="implementation",
+                 started=0.0, ended=10.0, elapsed=10.0)
         _attempt(self.con, "T-Q", "router:q2", state="complete", terminal="completed",
-                 reason="pool_move", started=11.0, ended=20.0, elapsed=9.0)
+                 reason="pool_move", stage="implementation",
+                 started=11.0, ended=20.0, elapsed=9.0)
         _link_router(self.con, "router:q1", "req-Q", terminal="quota",
                      started=0.0, ended=10.0, elapsed=10.0)
         _link_router(self.con, "router:q2", "req-Q", terminal="completed",
@@ -418,6 +428,8 @@ class RecoveryTest(LedgerCase):
         self.assertEqual(rec["router:q1"]["failed_class"], "provider")
         self.assertEqual(rec["router:q1"]["failure_to_next_start_s"], 1.0)
         self.assertEqual(rec["router:q1"]["first_progress_turn"], "router:q2")
+        self.assertEqual(rec["router:q1"]["first_progress_stage"], "implementation")
+        self.assertEqual(rec["router:q1"]["failed_stage"], "implementation")
         # Progress measured at the completed end (20) minus failed end (10).
         self.assertEqual(rec["router:q1"]["time_to_first_progress_s"], 10.0)
         self.assertIn("recovered", rec["router:q1"]["recovery_outcome"])
@@ -447,19 +459,20 @@ class RecoveryTest(LedgerCase):
     def test_compatible_serial_recovery_with_real_gaps(self):
         _task(self.con, "T-T3", "active", 0.0)
         _attempt(self.con, "T-T3", "router:d1", role="codex_dispatch",
-                 state="failed", terminal="stalled",
+                 state="failed", terminal="stalled", stage="dispatch",
                  started=0.0, ended=578.674, elapsed=578.674,
                  session="codex:w1", route="luna/max")
         _attempt(self.con, "T-T3", "router:c1", role="opencode_control",
-                 state="complete", terminal="completed",
+                 state="complete", terminal="completed", stage="dispatch",
                  started=578.944, ended=621.342, elapsed=42.399,
                  session="opencode:w1")
         _attempt(self.con, "T-T3", "router:f1", role="opencode_control",
-                 state="failed", terminal="failed",
+                 state="failed", terminal="failed", stage="implementation",
                  started=621.572, ended=1874.382, elapsed=1252.81,
                  session="opencode:w1")
         _attempt(self.con, "T-T3", "router:r1", role="opencode_control",
                  state="complete", terminal="completed", reason="pool_move",
+                 stage="implementation",
                  started=1875.812, ended=3663.207, elapsed=1787.395,
                  session="opencode:w2")
         # Compatible pairs share a request: dispatch retries in one
@@ -476,9 +489,75 @@ class RecoveryTest(LedgerCase):
         # f1 recovers to r1 inside req-r with exact gaps.
         self.assertAlmostEqual(rec["router:f1"]["failure_to_next_start_s"], 1.43, places=2)
         self.assertEqual(rec["router:f1"]["first_progress_turn"], "router:r1")
+        self.assertEqual(rec["router:f1"]["first_progress_stage"], "implementation")
+        self.assertEqual(rec["router:f1"]["failed_stage"], "implementation")
+        self.assertEqual(rec["router:f1"]["same_stage_progress_turn"], "router:r1")
         self.assertAlmostEqual(rec["router:f1"]["time_to_first_progress_s"],
                                3663.207 - 1874.382, places=2)
         self.assertIn("recovered", rec["router:f1"]["recovery_outcome"])
+
+    def test_dispatcher_completion_is_not_implementation_recovery(self):
+        # Faithful Router shape: implementation failure, then a
+        # completed dispatch step, then a failed implementation retry,
+        # all inside one compatible Router request.
+        _task(self.con, "T-STAGE", "active", 0.0)
+        _attempt(self.con, "T-STAGE", "router:f1", role="worker",
+                 state="failed", terminal="failed", stage="implementation",
+                 started=0.0, ended=100.0, elapsed=100.0,
+                 session="codex:s1")
+        _attempt(self.con, "T-STAGE", "router:d2", role="codex_dispatch",
+                 state="complete", terminal="completed", stage="dispatch",
+                 started=110.0, ended=120.0, elapsed=10.0,
+                 session="codex:s1")
+        _attempt(self.con, "T-STAGE", "router:f3", role="worker",
+                 state="failed", terminal="failed", stage="implementation",
+                 started=130.0, ended=140.0, elapsed=10.0,
+                 session="codex:s1")
+        for turn, s, e in (("router:f1", 0.0, 100.0),
+                           ("router:d2", 110.0, 120.0),
+                           ("router:f3", 130.0, 140.0)):
+            _link_router(self.con, turn, "req-stage", started=s, ended=e)
+        rep = report.task_report(self.con, "T-STAGE")
+        rec = {r["failed_turn"]: r for r in rep["recovery"]}
+        # Failure to next start still uses the compatible identity.
+        self.assertEqual(rec["router:f1"]["failure_to_next_start_s"], 10.0)
+        # The dispatcher completion stays visible as first progress.
+        self.assertEqual(rec["router:f1"]["first_progress_turn"], "router:d2")
+        self.assertEqual(rec["router:f1"]["first_progress_stage"], "dispatch")
+        self.assertEqual(rec["router:f1"]["failed_stage"], "implementation")
+        # First progress timing is measured at the dispatcher end.
+        self.assertEqual(rec["router:f1"]["time_to_first_progress_s"], 20.0)
+        # A dispatcher completion never recovers implementation work.
+        self.assertNotIn("recovered", rec["router:f1"]["recovery_outcome"])
+        self.assertIn("repeated failed recovery",
+                      rec["router:f1"]["recovery_outcome"])
+        # Only the later implementation failure counts as repeated.
+        self.assertEqual(rec["router:f1"]["later_failed_attempts"], 1)
+
+    def test_unknown_stage_never_recovers(self):
+        _task(self.con, "T-UNK", "active", 0.0)
+        _attempt(self.con, "T-UNK", "router:u1", role="worker",
+                 state="failed", terminal="failed", stage=None,
+                 started=0.0, ended=10.0, elapsed=10.0,
+                 session="codex:s1")
+        _attempt(self.con, "T-UNK", "router:u2", role="worker",
+                 state="complete", terminal="completed",
+                 stage="implementation",
+                 started=11.0, ended=20.0, elapsed=9.0,
+                 session="codex:s1")
+        _link_router(self.con, "router:u1", "req-unk",
+                     started=0.0, ended=10.0)
+        _link_router(self.con, "router:u2", "req-unk",
+                     started=11.0, ended=20.0)
+        rep = report.task_report(self.con, "T-UNK")
+        rec = {r["failed_turn"]: r for r in rep["recovery"]}
+        self.assertEqual(rec["router:u1"]["first_progress_turn"], "router:u2")
+        self.assertEqual(rec["router:u1"]["first_progress_stage"],
+                         "implementation")
+        self.assertIsNone(rec["router:u1"]["failed_stage"])
+        self.assertNotIn("recovered", rec["router:u1"]["recovery_outcome"])
+        self.assertIn("unknown", rec["router:u1"]["recovery_outcome"])
+        self.assertEqual(rec["router:u1"]["later_failed_attempts"], 0)
 
 
 class ReconcileDuplicateTest(LedgerCase):
@@ -739,14 +818,16 @@ class CliParityTest(unittest.TestCase):
         con = sqlite3.connect(self.db)
         con.row_factory = sqlite3.Row
         con.execute(
-            "INSERT INTO attempts(task_id, turn_id, role, harness, session_key,"
+            "INSERT INTO attempts(task_id, turn_id, role, harness, session_key, stage,"
             " started_at, ended_at, elapsed_s, state, terminal_class, reason)"
-            " VALUES('T-CLI','router:q1','worker','router','codex:s1',0.0,10.0,10.0,"
+            " VALUES('T-CLI','router:q1','worker','router','codex:s1','implementation',"
+            " 0.0,10.0,10.0,"
             " 'quota_blocked','quota','initial')")
         con.execute(
-            "INSERT INTO attempts(task_id, turn_id, role, harness, session_key,"
+            "INSERT INTO attempts(task_id, turn_id, role, harness, session_key, stage,"
             " started_at, ended_at, elapsed_s, state, terminal_class, reason)"
-            " VALUES('T-CLI','router:q2','worker','router','codex:s1',11.0,20.0,9.0,"
+            " VALUES('T-CLI','router:q2','worker','router','codex:s1','implementation',"
+            " 11.0,20.0,9.0,"
             " 'complete','completed','pool_move')")
         con.execute(
             "INSERT INTO attempts(task_id, turn_id, role, harness, session_key,"
@@ -771,10 +852,13 @@ class CliParityTest(unittest.TestCase):
         rec = {r["failed_turn"]: r for r in payload["recovery"]}
         self.assertEqual(rec["router:q1"]["failure_to_next_start_s"], 1.0)
         self.assertEqual(rec["router:q1"]["time_to_first_progress_s"], 10.0)
+        self.assertEqual(rec["router:q1"]["first_progress_stage"], "implementation")
+        self.assertEqual(rec["router:q1"]["failed_stage"], "implementation")
         self.assertIn("recovered", rec["router:q1"]["recovery_outcome"])
         # Human text carries the same measurements and evidence links.
         self.assertIn("failed/production", text.stdout)
         self.assertIn("failure_to_next_start=1.0", text.stdout)
+        self.assertIn("stage=implementation", text.stdout)
         self.assertIn("unknown_intent=1", text.stdout)
         self.assertIn("union_span", text.stdout)
         self.assertIn("usage source coverage", text.stdout)

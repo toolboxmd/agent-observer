@@ -44,9 +44,13 @@ Meanings (also in GLOSSARY.md and docs/contracts.md):
   request_id resolved through router_invocations, or the same known
   non-shared native session/ownership. Another request, another
   session, sort order alone or shared context never pairs. Next start
-  must be at or after failed end. First progress is measured at the
-  completed attempt end, not its start. Another attempt starting alone
-  is not successful recovery.
+  must be at or after failed end. First subsequent progress is the
+  first compatible completion at any stage, labelled with its stage
+  and measured at its end, not its start. Recovery outcome, recovered
+  status, active status and repeated counts are stage specific: failed
+  and candidate stages must both be known and equal, with unknown
+  never matching. Another attempt starting alone is not successful
+  recovery.
 """
 
 from __future__ import annotations
@@ -835,6 +839,23 @@ def _compat_key(attempt: dict, request_id: str | None,
     return None
 
 
+def _known_stage(value) -> str | None:
+    """Explicit attempt stage, or None when missing or unknown.
+
+    Stage compatibility uses only the explicit attempt stage.
+    Role, model, route, reason, launch reason and task order never
+    infer a stage. Unknown never matches unknown.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.lower() == "unknown":
+            return None
+        return text
+    return None
+
+
 def recovery_summary(attempts_rows: list[dict], con: sqlite3.Connection | None = None,
                      whole_shared: set | None = None,
                      whole_conflicts: set | None = None) -> list[dict]:
@@ -845,9 +866,15 @@ def recovery_summary(attempts_rows: list[dict], con: sqlite3.Connection | None =
     non-shared session/ownership for native attempts. Attempts from
     another request never pair merely because they share a task, sort
     order or session context. Next start must be at or after failed
-    end. First progress is measured at the completed attempt end, not
-    its start. A new attempt starting alone is never successful
-    recovery. Unresolved recovery stays active or unknown. quota_blocked
+    end. First subsequent progress is the first compatible completed
+    attempt by timestamp at any stage, labelled with its stage, and
+    measured at its end, not its start. Recovery outcome, recovered
+    status, active status and repeated counts are stage specific:
+    the failed stage and the candidate stage must both be known and
+    equal. A dispatcher or other different-stage completion never
+    recovers implementation work, and unknown stage never matches.
+    A new attempt starting alone is never successful recovery.
+    Unresolved recovery stays active or unknown. quota_blocked
     provider exhaustion participates when compatible.
     """
     shared = set(whole_shared or set())
@@ -927,14 +954,17 @@ def recovery_summary(attempts_rows: list[dict], con: sqlite3.Connection | None =
                     gap_missing.append("negative failure-to-next-start")
                 else:
                     gap = diff
+        failed_stage = _known_stage(failed.get("stage"))
         first_progress = None
         first_progress_end = None
+        first_progress_stage: str | None = None
         time_to_progress = None
         progress_missing: list[str] = []
         for cand in later:
             if cand.get("state") == "complete":
                 first_progress = cand.get("turn_id")
                 first_progress_end = cand.get("ended_at")
+                first_progress_stage = _known_stage(cand.get("stage"))
                 if _is_num(failed_end) and _is_num(first_progress_end):
                     diff = float(first_progress_end) - float(failed_end)
                     if diff < 0:
@@ -945,24 +975,87 @@ def recovery_summary(attempts_rows: list[dict], con: sqlite3.Connection | None =
                     if not _is_num(first_progress_end):
                         progress_missing.append("progress ended_at")
                 break
-        if first_progress is not None:
-            outcome = "recovered (later completed attempt observed)"
-        elif next_row is not None and next_row.get("state") in FAILURE_STATES:
-            outcome = "repeated failed recovery (next attempt also failed)"
-        elif next_row is not None and next_row.get("state") == "active":
-            outcome = "active (recovery in progress, no completed progress yet)"
-        elif next_row is not None:
-            outcome = "unknown (next attempt started but no completed progress observed)"
-        elif failed_key is None:
+        # Stage-specific recovery chain: only candidates whose
+        # explicit stage equals the failed explicit stage count.
+        same_progress_turn = None
+        same_progress_end = None
+        time_to_same_progress = None
+        if failed_stage is not None:
+            for cand in later:
+                if cand.get("state") == "complete" \
+                        and _known_stage(cand.get("stage")) == failed_stage:
+                    same_progress_turn = cand.get("turn_id")
+                    same_progress_end = cand.get("ended_at")
+                    if _is_num(failed_end) and _is_num(same_progress_end):
+                        diff = float(same_progress_end) - float(failed_end)
+                        if diff >= 0:
+                            time_to_same_progress = diff
+                    break
+        same_failed_turns = [
+            cand.get("turn_id") for cand in later
+            if cand.get("state") in FAILURE_STATES
+            and failed_stage is not None
+            and _known_stage(cand.get("stage")) == failed_stage
+        ]
+        repeated = len(same_failed_turns)
+        same_active_turn = None
+        if failed_stage is not None and same_progress_turn is None \
+                and not same_failed_turns:
+            for cand in later:
+                if cand.get("state") == "active" \
+                        and _known_stage(cand.get("stage")) == failed_stage:
+                    same_active_turn = cand.get("turn_id")
+                    break
+        first_label = first_progress_stage if first_progress_stage else "unknown"
+        if failed_key is None:
             outcome = ("unknown (no compatible retry identity; attempts from "
                        "another request or shared/unknown session never pair)")
+        elif failed_stage is None:
+            if first_progress is not None:
+                outcome = (f"unknown (failed stage unknown; first subsequent progress "
+                           f"{first_progress} at {first_label} observed but stage "
+                           f"cannot be matched)")
+            else:
+                outcome = ("unknown (failed stage unknown; no stage-specific "
+                           "recovery assessed)")
+        elif same_progress_turn is not None:
+            if first_progress == same_progress_turn:
+                outcome = (f"recovered (later completed {failed_stage} "
+                           f"attempt observed)")
+            else:
+                outcome = (f"recovered (later completed {failed_stage} attempt "
+                           f"{same_progress_turn} observed; first subsequent progress "
+                           f"was {first_label} at {first_progress})")
+        elif same_failed_turns:
+            if first_progress is not None:
+                outcome = (f"repeated failed recovery (first subsequent progress at "
+                           f"{first_label} {first_progress}; later {failed_stage} "
+                           f"failure observed)")
+            else:
+                outcome = (f"repeated failed recovery (later {failed_stage} "
+                           f"attempt also failed)")
+        elif same_active_turn is not None:
+            if first_progress is not None:
+                outcome = (f"active (same-stage {failed_stage} recovery in progress, "
+                           f"no completed {failed_stage} progress yet; first subsequent "
+                           f"progress was {first_label} at {first_progress})")
+            else:
+                outcome = (f"active (same-stage {failed_stage} recovery in progress, "
+                           f"no completed progress yet)")
+        elif first_progress is not None:
+            outcome = (f"unknown (first subsequent progress at {first_label} "
+                       f"{first_progress}; no completed {failed_stage} "
+                       f"progress observed)")
+        elif next_row is not None:
+            outcome = (f"unknown (next attempt started but no completed "
+                       f"{failed_stage} progress observed)")
         else:
             outcome = "unknown (no later attempt observed)"
-        repeated = sum(1 for cand in later if cand.get("state") in FAILURE_STATES)
         entry: dict = {
             "failed_turn": failed.get("turn_id"),
             "failed_ended_at": failed_end if _is_num(failed_end) else None,
             "failed_class": failure_class(failed),
+            "failed_stage": failed_stage,
             "failed_request_id": failed_req,
             "failed_session": failed.get("session_key"),
             "compat_scope": f"{failed_key[0]} {failed_key[1]}" if failed_key else None,
@@ -973,15 +1066,23 @@ def recovery_summary(attempts_rows: list[dict], con: sqlite3.Connection | None =
             if first_progress is None and time_to_progress is None and next_row is not None
             else sorted(set(gap_missing)),
             "first_progress_turn": first_progress,
+            "first_progress_stage": first_progress_stage,
             "first_progress_ended_at": first_progress_end if _is_num(first_progress_end) else None,
             "time_to_first_progress_s": time_to_progress,
+            "same_stage_progress_turn": same_progress_turn,
+            "same_stage_progress_ended_at": same_progress_end if _is_num(same_progress_end) else None,
+            "time_to_same_stage_progress_s": time_to_same_progress,
             "recovery_outcome": outcome,
             "later_failed_attempts": repeated,
             "evidence": {
                 "failed_turn": failed.get("turn_id"),
+                "failed_stage": failed_stage,
                 "failed_request_id": failed_req,
                 "next_turn": next_row.get("turn_id") if next_row else None,
                 "progress_turn": first_progress,
+                "progress_stage": first_progress_stage,
+                "same_stage_progress_turn": same_progress_turn,
+                "same_stage_failed_turns": sorted(same_failed_turns),
             },
         }
         out.append(entry)

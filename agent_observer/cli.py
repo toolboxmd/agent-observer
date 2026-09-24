@@ -209,14 +209,18 @@ def _text(payload) -> str:
                 f"(job outcome is separate from attempt failure counts)")
         for rec in r.get("recovery", []):
             scope = rec.get("compat_scope")
+            failed_stage = rec.get("failed_stage") or "unknown"
+            progress_stage = rec.get("first_progress_stage") or "unknown"
             lines.append(
                 f"  recovery {rec.get('failed_turn')} -> {rec.get('next_attempt_turn') or 'none'}: "
                 f"failure_to_next_start={rec.get('failure_to_next_start_s')} s; "
                 f"first_progress={rec.get('first_progress_turn') or 'none'} "
+                f"(stage={progress_stage}) "
                 f"in {rec.get('time_to_first_progress_s')} s; "
                 f"{rec.get('recovery_outcome')}"
                 + (f" scope={scope}" if scope else "")
-                + (f" class={rec.get('failed_class')}" if rec.get("failed_class") else ""))
+                + (f" class={rec.get('failed_class')}" if rec.get("failed_class") else "")
+                + f" failed_stage={failed_stage}")
             if rec.get("gap_missing"):
                 lines.append(f"    recovery missing: {rec['gap_missing']}")
         coverage_u = r.get("usage_coverage") or {}

@@ -302,9 +302,14 @@ arithmetic.
 - `recovery` holds, per failed execution, the failure-to-next-attempt-start
   duration inside the same compatible identity (same Router request_id
   resolved through router_invocations, or same known non-shared
-  session), the first subsequent completed progress measured at its
-  end when observable with repeated failed counts in that chain only,
-  and the recovery outcome. A new attempt
+  session), the first subsequent completed progress at any stage with
+  its `first_progress_stage` label measured at its end when observable,
+  the same-stage progress turn and timing when a known equal stage
+  exists, with repeated failed counts in that stage chain only,
+  and the recovery outcome. Recovered, active and repeated counts need
+  the failed stage and the candidate stage both known and equal; a
+  dispatcher or other different-stage completion never recovers
+  implementation work and unknown stage never matches. A new attempt
   starting alone is not successful recovery; unresolved recovery stays
   active or unknown; attempts from another request or shared/unknown
   sessions never pair; next start must be at or after failed end.

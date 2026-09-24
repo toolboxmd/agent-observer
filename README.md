@@ -128,7 +128,9 @@ for the same known session or Router request only, failures by class
 from explicit terminal and stage with production denominators
 including quota provider exhaustion and cancellation intent unknown
 unless explicit, separate job outcomes,
-per-failure recovery inside compatible identities, and attributable
+per-failure stage-specific recovery inside compatible identities
+(first progress at any stage with its stage label; recovered, active
+and repeated counts only at the same known stage), and attributable
 Router usage source coverage. Parallel attempt
 durations never become task elapsed time; Router and native rows for one
 execution merge only on explicit turn/session/time evidence and count once.

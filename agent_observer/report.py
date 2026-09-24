@@ -547,10 +547,15 @@ def task_report(con: sqlite3.Connection, task_id: str,
              g.get("is_duplicate_group")] for g in (
                 attempt_time.get("reconciliation_groups") or [])),
         "recovery_inputs": sorted(
-            [r.get("failed_turn"), r.get("compat_scope"),
+            [r.get("failed_turn"), r.get("failed_stage"),
+             r.get("compat_scope"),
              r.get("next_attempt_turn"), r.get("first_progress_turn"),
+             r.get("first_progress_stage"),
+             r.get("same_stage_progress_turn"),
              r.get("failure_to_next_start_s"),
              r.get("time_to_first_progress_s"),
+             r.get("time_to_same_stage_progress_s"),
+             r.get("later_failed_attempts"),
              r.get("recovery_outcome")] for r in recovery),
         "usage_attribution": sorted(
             [u.get("turn_id"), u.get("session_key"),
