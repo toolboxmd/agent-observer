@@ -243,6 +243,41 @@ def import_claude_file(con: sqlite3.Connection, path: str,
              "submissions_inserted": 0, "events_inserted": 0,
              "events_duplicate": 0, "compactions": 0, "malformed": 0}
     src = JsonlSource(con, HARNESS, path, full=full)
+    if src.unchanged and src.recheck_unchanged():
+        # Unchanged fast path: same size, mtime, inode and tail bytes,
+        # same privacy version, not full. The recheck re-stats immediately
+        # before returning so an append (or same-size rewrite) racing the
+        # first check falls through to the import path below with the
+        # corrected offset instead of skipping new bytes.
+        # Skip the global finality scan, the turn-resume query, JSON
+        # parsing and session writes. The stored fingerprint is the sha256
+        # contract; stale/full imports never take this path because
+        # JsonlSource leaves unchanged False for them.
+        try:
+            stored_sha = src.row["sha256"]
+            stored_ordinal = src.row["ordinal_max"]
+            native_session = src.row["session_id"]
+            agent_id = src.row["thread_id"]
+        except (KeyError, TypeError, IndexError):
+            stored_sha = ""
+            stored_ordinal = -1
+            native_session = None
+            agent_id = None
+        if not native_session:
+            session_key = f"{HARNESS}:file:{os.path.basename(path)}"
+        elif agent_id:
+            session_key = f"{HARNESS}:{native_session}:agent:{agent_id}"
+        else:
+            session_key = f"{HARNESS}:{native_session}"
+        stats.update({
+            "source_id": src.source_id,
+            "sha256": stored_sha,
+            "ordinal_max": stored_ordinal,
+            "incremental": src.incremental,
+            "unchanged": True,
+            "session_key": session_key,
+        })
+        return stats
     r = _Reader(con, src, stats)
     _ensure_finality_table(con)
     # Durable per-response finality is authoritative for accepted final

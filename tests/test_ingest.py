@@ -5,7 +5,7 @@ import shutil
 
 from agent_observer import privacy, report
 from agent_observer.adapters.codex import import_codex_file
-from agent_observer.ingest import JsonlSource
+from agent_observer.ingest import TAIL_BYTES, JsonlSource
 from tests.helpers import LedgerCase, fixture
 
 
@@ -65,6 +65,136 @@ class IncrementalTest(LedgerCase):
         self.assertTrue(later["incremental"])
         self.assertEqual(later["responses_inserted"], 1)
         self.assertEqual(report.scope_totals(self.con)["total_tokens"], 3350)
+
+
+class UnchangedInvalidationTest(LedgerCase):
+    """Size/mtime/inode invalidation for the append-only fast path."""
+
+    def live_copy(self, name):
+        path = os.path.join(self.tmp.name, "rollout-live.jsonl")
+        shutil.copy(fixture(name), path)
+        return path
+
+    def test_same_size_prefix_rewrite_forces_full_reread(self):
+        path = self.live_copy("codex-mini.jsonl")
+        first = import_codex_file(self.con, path)
+        self.assertEqual(first["responses_inserted"], 3)
+        before_totals = report.scope_totals(self.con)
+        self.assertEqual(before_totals["total_tokens"], 5500)
+        with open(path, "rb") as fh:
+            body = fh.read()
+        self.assertGreater(len(body), TAIL_BYTES)
+        # Rewrite one authoritative usage counter in the prefix: the usage
+        # bucket is compared against the stored row, so a re-read meets it
+        # again as a usage conflict, while a skipped prefix would stay
+        # silent. (Sibling checkpoint buckets are never compared.)
+        old = (b'"usage":{"cache_write_input_tokens":0,'
+               b'"cached_input_tokens":0,"input_tokens":1000')
+        new = (b'"usage":{"cache_write_input_tokens":0,'
+               b'"cached_input_tokens":0,"input_tokens":1001')
+        at = body.find(old)
+        # The changed byte sits in the prefix, outside the recorded tail,
+        # so a size-plus-tail check alone would call this file unchanged.
+        self.assertGreaterEqual(at, 0)
+        self.assertLess(at, len(body) - TAIL_BYTES)
+        rewritten = body[:at] + new + body[at + len(old):]
+        self.assertEqual(len(rewritten), len(body))
+        self.assertEqual(rewritten[len(body) - TAIL_BYTES:],
+                         body[len(body) - TAIL_BYTES:])
+        st_before = os.stat(path)
+        with open(path, "wb") as fh:
+            fh.write(rewritten)
+        if os.stat(path).st_mtime_ns == st_before.st_mtime_ns:
+            # A real rewrite always moves mtime; pin the precondition
+            # deterministically on coarse filesystems.
+            os.utime(path, ns=(st_before.st_atime_ns,
+                               st_before.st_mtime_ns + 5_000_000))
+        again = import_codex_file(self.con, path)
+        # Not unchanged and not incremental: the file was read again whole.
+        self.assertFalse(again.get("unchanged"))
+        self.assertFalse(again.get("incremental"))
+        self.assertEqual(again["responses_inserted"], 0)
+        # The rewritten prefix was not skipped: the changed counter meets
+        # its stored row again and is quarantined as a usage conflict.
+        self.assertEqual(again["malformed"], 1)
+        # Accounting stays idempotent: conflicts never overwrite stored rows.
+        self.assertEqual(report.scope_totals(self.con), before_totals)
+
+    def test_append_racing_the_unchanged_check_is_imported_same_sync(self):
+        path = self.live_copy("codex-growing-a.jsonl")
+        first = import_codex_file(self.con, path)
+        self.assertEqual(first["responses_inserted"], 1)
+        with open(fixture("codex-growing-b.jsonl")) as fh:
+            grown_lines = fh.read().splitlines(keepends=True)
+        with open(fixture("codex-growing-a.jsonl")) as fh:
+            known = set(fh.read().splitlines())
+        appended = "".join(line for line in grown_lines
+                           if line.rstrip("\n") not in known)
+        self.assertTrue(appended)
+        self.assertTrue(appended.endswith("\n"))
+        orig_recheck = JsonlSource.recheck_unchanged
+
+        def raced(self):
+            # Deterministic seam: one valid record lands after the initial
+            # check but before the fast-path return. An implementation that
+            # only checks once at JsonlSource construction misses it.
+            with open(self.path, "a") as fh:
+                fh.write(appended)
+            return orig_recheck(self)
+
+        JsonlSource.recheck_unchanged = raced
+        try:
+            second = import_codex_file(self.con, path)
+        finally:
+            JsonlSource.recheck_unchanged = orig_recheck
+        self.assertFalse(second.get("unchanged"))
+        self.assertEqual(second["responses_inserted"], 1)
+        self.assertEqual(report.scope_totals(self.con)["total_tokens"], 3350)
+        # finish() persisted the raced file's metadata, not the stale check.
+        st = os.stat(path)
+        row = self.con.execute(
+            "SELECT size_bytes, read_offset, mtime_ns, ino FROM sources"
+            " WHERE harness='codex' AND path=?", (path,)).fetchone()
+        self.assertEqual(row["size_bytes"], st.st_size)
+        self.assertEqual(row["read_offset"], st.st_size)
+        self.assertEqual(row["mtime_ns"], st.st_mtime_ns)
+        self.assertEqual(row["ino"], st.st_ino)
+
+
+class SourceMetadataMigrationTest(LedgerCase):
+    """The new size/mtime/inode columns are additive and fail closed."""
+
+    def test_pre_metadata_rows_reread_once_then_resume(self):
+        path = os.path.join(self.tmp.name, "rollout-live.jsonl")
+        shutil.copy(fixture("codex-mini.jsonl"), path)
+        first = import_codex_file(self.con, path)
+        self.assertEqual(first["responses_inserted"], 3)
+        cols = {row["name"]
+                for row in self.con.execute("PRAGMA table_info(sources)")}
+        self.assertTrue({"mtime_ns", "ino"} <= cols)
+        # Ledgers written before the columns existed keep working: an
+        # explicit INSERT naming only the old columns still succeeds.
+        self.con.execute(
+            "INSERT INTO sources(harness, path, sha256, imported_at)"
+            " VALUES(?,?,?,?)", ("codex", "dummy-legacy-path", "", 0))
+        self.con.execute(
+            "DELETE FROM sources WHERE path='dummy-legacy-path'")
+        # Simulate a pre-metadata row: no mtime/inode on record.
+        self.con.execute(
+            "UPDATE sources SET mtime_ns=NULL, ino=NULL"
+            " WHERE harness='codex' AND path=?", (path,))
+        self.con.commit()
+        before_totals = report.scope_totals(self.con)
+        second = import_codex_file(self.con, path)
+        # Fail closed: no unsafe fast path before metadata is refreshed.
+        self.assertFalse(second.get("unchanged"))
+        self.assertFalse(second.get("incremental"))
+        self.assertEqual(second["responses_inserted"], 0)
+        self.assertEqual(report.scope_totals(self.con), before_totals)
+        # The re-read refreshed the metadata, so the next sync is cheap.
+        third = import_codex_file(self.con, path)
+        self.assertTrue(third.get("unchanged"))
+        self.assertEqual(report.scope_totals(self.con), before_totals)
 
 
 SECRET = "SECRET-QUARANTINE-9f8e7d6c"

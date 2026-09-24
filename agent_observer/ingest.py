@@ -5,6 +5,15 @@ the bytes just before that offset are unchanged; otherwise the whole file is
 read again. Either way every row lands under its natural key, so re-reading
 never adds usage twice. A trailing line without a newline is left for the
 next import because a live harness may still be writing it.
+
+Change detection is cheap on purpose: the stored file size, mtime_ns and
+inode plus the hash of the final 4 KiB before the recorded offset decide
+whether the prefix is intact. A same-size prefix rewrite changes the mtime,
+an inode replacement changes the inode, and a shrink changes the size, so
+each forces a full re-read from offset zero instead of skipping rewritten
+bytes. Adapters recheck size and mtime (plus inode) immediately before any
+unchanged fast-path return so an append racing the first check is imported
+on that sync instead of skipped.
 """
 
 from __future__ import annotations
@@ -39,7 +48,11 @@ class JsonlSource:
         self.con = con
         self.harness = harness
         self.path = path
-        self.size = os.path.getsize(path)
+        st = os.stat(path)
+        self.size = st.st_size
+        self.mtime_ns = st.st_mtime_ns
+        self.ino = st.st_ino
+        self.full = full
         self.started = time.monotonic()
         row = con.execute(
             "SELECT * FROM sources WHERE harness=? AND path=?",
@@ -59,12 +72,8 @@ class JsonlSource:
                 "DELETE FROM import_errors WHERE harness=? AND source_path=?",
                 (harness, path))
         if row is not None and not full and not self.privacy_stale:
-            offset = row["read_offset"] or 0
-            if 0 < offset <= self.size and row["tail_sha256"]:
-                with open(path, "rb") as fh:
-                    if _tail_sha(fh, offset) == row["tail_sha256"]:
-                        self.start_offset = offset
-                        self.unchanged = offset == self.size
+            self.start_offset, self.unchanged = self._check_at(
+                row, self.size, self.mtime_ns, self.ino)
         if row is None:
             con.execute(
                 "INSERT INTO sources(harness, path, sha256, imported_at)"
@@ -75,6 +84,97 @@ class JsonlSource:
             self.row = row
         self.source_id = row["id"]
         self.end_offset = self.start_offset
+
+    def _check_at(self, row, size: int, mtime_ns: int,
+                  ino: int) -> tuple[int, bool]:
+        """Decide (start_offset, unchanged) for one stat snapshot.
+
+        Pure comparison helper shared by __init__ and recheck_unchanged so
+        both use the same invalidation rule. Missing stored mtime/inode
+        (ledgers imported before they were recorded) fails closed to a
+        full re-read. Any mismatch forces start_offset 0 except a grown
+        file whose recorded prefix still validates, which resumes
+        incrementally at that offset.
+        """
+        try:
+            offset = row["read_offset"] or 0
+        except (KeyError, TypeError, IndexError):
+            return 0, False
+        try:
+            stored_tail = row["tail_sha256"]
+        except (KeyError, TypeError, IndexError):
+            stored_tail = None
+        try:
+            stored_size = row["size_bytes"]
+        except (KeyError, TypeError, IndexError):
+            stored_size = None
+        try:
+            stored_mtime = (row["mtime_ns"]
+                            if "mtime_ns" in row.keys() else None)
+        except (TypeError, IndexError):
+            stored_mtime = None
+        try:
+            stored_ino = (row["ino"] if "ino" in row.keys() else None)
+        except (TypeError, IndexError):
+            stored_ino = None
+        if (not isinstance(offset, int) or offset <= 0 or not stored_tail
+                or stored_mtime is None or stored_ino is None
+                or not isinstance(stored_size, int)):
+            return 0, False
+        if ino != stored_ino:
+            # Same path, replaced file: never skip bytes.
+            return 0, False
+        if size < offset:
+            # Truncated: the recorded offset is past EOF.
+            return 0, False
+        if size < stored_size:
+            # Shrank since the last import: full re-read.
+            return 0, False
+        if size == stored_size and mtime_ns != stored_mtime:
+            # Same-size rewrite (the changed prefix may sit outside the
+            # recorded tail): full re-read without trusting the old offset.
+            return 0, False
+        with open(self.path, "rb") as fh:
+            if _tail_sha(fh, offset) != stored_tail:
+                return 0, False
+        if size == stored_size and mtime_ns == stored_mtime:
+            return offset, offset == size
+        if size > stored_size and size >= offset:
+            # Grown with an intact prefix: resume incrementally.
+            return offset, False
+        return 0, False
+
+    def recheck_unchanged(self) -> bool:
+        """Re-stat and revalidate immediately before a fast-path return.
+
+        Deterministic seam for the append racing the first check: adapters
+        call this right before returning unchanged, and tests wrap it to
+        append one valid record between the initial check and this one.
+        Refreshes size/mtime/ino and the start decision; a raced append
+        (or same-size rewrite) clears unchanged so the caller falls
+        through to the import path with the corrected offset. No SQL.
+        """
+        if self.full or self.privacy_stale or self.row is None:
+            self.start_offset = 0
+            self.unchanged = False
+            return False
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            self.start_offset = 0
+            self.unchanged = False
+            return False
+        self.size = st.st_size
+        self.mtime_ns = st.st_mtime_ns
+        self.ino = st.st_ino
+        try:
+            self.start_offset, self.unchanged = self._check_at(
+                self.row, self.size, self.mtime_ns, self.ino)
+        except OSError:
+            self.start_offset = 0
+            self.unchanged = False
+            return False
+        return self.unchanged
 
     @property
     def incremental(self) -> bool:
@@ -137,6 +237,17 @@ class JsonlSource:
                thread_id: str | None = None,
                cli_version: str | None = None,
                thread_source: str | None = None) -> dict:
+        # Fresh stat at finish: the file may have grown while records were
+        # parsed, so the persisted size/mtime/ino describe the current file,
+        # not the import-start snapshot. Only offsets and hashes persist;
+        # no file contents reach the ledger.
+        try:
+            st = os.stat(self.path)
+            self.size = st.st_size
+            self.mtime_ns = st.st_mtime_ns
+            self.ino = st.st_ino
+        except OSError:
+            pass
         with open(self.path, "rb") as fh:
             tail = _tail_sha(fh, self.end_offset) if self.end_offset else None
         fingerprint = hashlib.sha256(
@@ -149,12 +260,12 @@ class JsonlSource:
             " thread_id=COALESCE(?, thread_id),"
             " cli_version=COALESCE(?, cli_version),"
             " thread_source=COALESCE(?, thread_source),"
-            " privacy_version=? WHERE id=?",
+            " privacy_version=?, mtime_ns=?, ino=? WHERE id=?",
             (fingerprint, self.size, self.end_offset, tail, self.end_offset,
              ordinal_max, now(),
              int((time.monotonic() - self.started) * 1000),
              session_id, thread_id, cli_version, thread_source,
-             privacy.PRIVACY_VERSION,
+             privacy.PRIVACY_VERSION, self.mtime_ns, self.ino,
              self.source_id))
         return {"source_id": self.source_id, "sha256": fingerprint,
                 "ordinal_max": ordinal_max, "incremental": self.incremental,
