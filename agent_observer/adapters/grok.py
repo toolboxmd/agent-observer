@@ -17,6 +17,7 @@ that would double count.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -229,15 +230,18 @@ def _looks_like_session(path: str) -> bool:
 
 
 class _SyncCtx:
-    """Per-sync shared state: linear parent lookup with no whole-tree rescans.
+    """Per-operation shared state: linear parent lookup with no rescans.
 
-    parent_index maps child native session id -> parent session key, built
-    incrementally in the single sync pass from each session's own
-    subagent_spawned records (plus persisted ledger links consulted in
-    _precompute). A child imported before its parent misses the index but is
-    reclassified in place when the parent later imports via _subagent_link,
-    so the final rows match the old quadratic scan without rescanning
-    sibling files per session.
+    parent_index maps child native session id -> parent session key. For a
+    full-tree sync it accumulates from each imported session's own
+    subagent_spawned records in the single sync pass (plus persisted ledger
+    links). For a source-scoped sync, sync() builds the source's
+    containing-tree index once before importing, so a child whose only
+    parent evidence lives in a sibling file still classifies correctly. A
+    child imported before its parent misses the index but is reclassified
+    in place when the parent later imports via _subagent_link.
+    import_grok_session receives this index from its caller and never scans
+    sibling files itself.
     """
 
     def __init__(self) -> None:
@@ -252,6 +256,13 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
               "responses_inserted": 0, "events_inserted": 0,
               "submissions_inserted": 0, "malformed": 0, "failed": []}
     ctx = _SyncCtx()
+    if source is not None:
+        # Source-scoped operation: build the containing-tree parent index
+        # once before importing, regardless of each session's role. A
+        # child already proven subagent by summary or events can still be
+        # missing its parent link, and the link may live only in a sibling
+        # file outside the sync set.
+        _build_source_tree_index(con, ctx, paths)
     for path in paths:
         try:
             stats = import_grok_session(con, path, full=full, _sync_ctx=ctx)
@@ -425,125 +436,294 @@ def _has_any_counter(counters: dict | None) -> bool:
     return bool(counters) and any(v is not None for v in counters.values())
 
 
-def _scan_updates_file_for_parent(updates_path: str,
-                                  native_sid: str) -> str | None:
-    """Parent session key from subagent_spawned records naming native_sid."""
-    if not updates_path or not os.path.isfile(updates_path):
-        return None
-    try:
-        lines = list(_complete_lines(updates_path))
-    except OSError:
-        return None
-    for _, raw in lines:
-        try:
-            obj = json.loads(raw)
-        except ValueError:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        if obj.get("method") not in METHODS:
-            continue
-        params = obj.get("params") if isinstance(obj.get("params"), dict) \
-            else {}
-        update = params.get("update") if isinstance(params, dict) else {}
-        if not isinstance(update, dict):
-            continue
-        if update.get("sessionUpdate") != "subagent_spawned":
-            continue
-        parent = update.get("parent_session_id")
-        child = update.get("child_session_id") or update.get("subagent_id")
-        if not isinstance(parent, str) or _safe_token(parent) is None:
-            continue
-        if not isinstance(child, str) or _safe_token(child) is None:
-            continue
-        if child == native_sid:
-            return f"{HARNESS}:{parent}"
-    return None
+_GROK_META_TABLE = "grok_session_meta"
 
 
-def _has_subagent_relationship(session_dir: str) -> bool:
-    """Whether events.jsonl proves this session is a subagent.
+def _ensure_grok_meta_table(con: sqlite3.Connection) -> None:
+    """Adapter-owned summary/chat fingerprints for change detection.
 
-    Any complete turn_started line with session_relationship exactly
-    'subagent' marks the session as a child, regardless of summary or
-    parent-link evidence. Other relationship values prove nothing.
+    An unchanged second sync must not fully parse updates.jsonl,
+    events.jsonl, or chat_history.jsonl. The ledger already persists parent
+    links and roles in sessions; this table persists the summary fingerprint
+    plus the chat raw fingerprint and its parsed marks (seen/synthetic
+    prompt indexes, effort, reliability), so a later sync can reuse the
+    marks from the ledger when the raw bytes are unchanged and only
+    JSON-parse the chat file when its bytes actually changed.
     """
-    events_path = os.path.join(session_dir, "events.jsonl")
-    if not os.path.isfile(events_path):
+    try:
+        con.execute(
+            f"CREATE TABLE IF NOT EXISTS {_GROK_META_TABLE}"
+            "(session_key TEXT PRIMARY KEY,"
+            " summary_fp TEXT, chat_fp TEXT)")
+    except sqlite3.DatabaseError:
+        pass
+    for column in ("chat_seen_json", "chat_synthetic_json", "chat_effort",
+                   "chat_reliable"):
+        try:
+            cols = {row["name"] for row in con.execute(
+                f"PRAGMA table_info({_GROK_META_TABLE})")}
+        except sqlite3.DatabaseError:
+            return
+        if column not in cols:
+            try:
+                con.execute(
+                    f"ALTER TABLE {_GROK_META_TABLE} ADD COLUMN {column} TEXT")
+            except sqlite3.DatabaseError:
+                pass
+
+
+def _summary_fingerprint(summary: dict) -> str:
+    try:
+        canonical = json.dumps(summary, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        canonical = repr(sorted(summary.keys()))
+    return hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()
+
+
+def _stored_meta(con: sqlite3.Connection, session_key: str):
+    """Stored chat/summary state or Nones when absent/unreadable.
+
+    Returns (summary_fp, chat_fp, seen_set, synthetic_set, chat_effort,
+    chat_reliable). Mark collections are None when the row or its mark
+    columns are absent, so the caller falls back to parsing the chat file.
+    """
+    try:
+        row = con.execute(
+            f"SELECT summary_fp, chat_fp, chat_seen_json,"
+            f" chat_synthetic_json, chat_effort, chat_reliable"
+            f" FROM {_GROK_META_TABLE}"
+            " WHERE session_key=?", (session_key,)).fetchone()
+    except sqlite3.DatabaseError:
+        return None, None, None, None, None, None
+    if row is None:
+        return None, None, None, None, None, None
+    try:
+        summary_fp = row["summary_fp"]
+        chat_fp = row["chat_fp"]
+    except (KeyError, TypeError, IndexError):
+        return None, None, None, None, None, None
+    try:
+        seen_raw = row["chat_seen_json"]
+        synth_raw = row["chat_synthetic_json"]
+        chat_effort = row["chat_effort"]
+        reliable_raw = row["chat_reliable"]
+    except (KeyError, TypeError, IndexError):
+        return summary_fp, chat_fp, None, None, None, None
+    try:
+        seen = set(json.loads(seen_raw)) if seen_raw else set()
+        synthetic = set(json.loads(synth_raw)) if synth_raw else set()
+    except (TypeError, ValueError):
+        return summary_fp, chat_fp, None, None, None, None
+    if reliable_raw is None:
+        reliable = None
+    elif isinstance(reliable_raw, int):
+        reliable = bool(reliable_raw)
+    elif isinstance(reliable_raw, str):
+        reliable = reliable_raw == "1"
+    else:
+        reliable = None
+    return summary_fp, chat_fp, seen, synthetic, chat_effort, reliable
+
+
+def _store_meta(con: sqlite3.Connection, session_key: str,
+                summary_fp: str | None, chat_fp: str | None,
+                chat: dict | None = None) -> None:
+    """Persist fingerprints plus parsed chat marks for the fast path."""
+    _ensure_grok_meta_table(con)
+    if chat is None:
+        seen_json = synth_json = None
+        chat_effort = None
+        chat_reliable = None
+    else:
+        try:
+            seen_json = json.dumps(sorted(chat.get("seen") or set()))
+            synth_json = json.dumps(sorted(chat.get("synthetic") or set()))
+        except (TypeError, ValueError):
+            seen_json = synth_json = None
+        chat_effort = chat.get("effort")
+        reliable = chat.get("reliable")
+        chat_reliable = None if reliable is None else (
+            "1" if reliable else "0")
+    try:
+        con.execute(
+            f"INSERT OR REPLACE INTO {_GROK_META_TABLE}"
+            "(session_key, summary_fp, chat_fp, chat_seen_json,"
+            " chat_synthetic_json, chat_effort, chat_reliable)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (session_key, summary_fp, chat_fp, seen_json, synth_json,
+             chat_effort, chat_reliable))
+    except sqlite3.DatabaseError:
+        pass
+
+
+def _chat_fingerprint(session_dir: str) -> str:
+    """Raw-byte hash of chat_history.jsonl without any JSON parsing.
+
+    A small raw read every sync is the only per-sync chat I/O on the fast
+    path; the JSON parse below runs only when these bytes changed. Missing
+    files fingerprint as "missing" so a late-arriving chat file still
+    counts as changed.
+    """
+    path = os.path.join(session_dir, "chat_history.jsonl")
+    try:
+        with open(path, "rb") as bfh:
+            raw_bytes = bfh.read()
+    except OSError:
+        return "missing"
+    try:
+        return hashlib.sha256(raw_bytes).hexdigest()
+    except (TypeError, ValueError):
+        return "unhashable"
+
+
+def _chat_from_stored(chat_fp: str | None, seen, synthetic,
+                      chat_effort, chat_reliable) -> dict | None:
+    """Rebuild the chat marks dict from persisted ledger state.
+
+    Returns None when any mark is missing so the caller parses the file
+    instead. No file I/O and no JSON parsing of chat records happens here.
+    """
+    if seen is None or synthetic is None or chat_reliable is None:
+        return None
+    return {"synthetic": set(synthetic), "seen": set(seen),
+            "effort": chat_effort, "reliable": bool(chat_reliable),
+            "fp": chat_fp}
+
+
+
+def _sibling_updates_unchanged(con: sqlite3.Connection,
+                               updates_path: str) -> bool:
+    """Whether a sibling updates.jsonl is already imported and unchanged.
+
+    A cheap stat plus tail read, never a full parse. Unchanged siblings
+    already contributed their spawns to persisted session links on their
+    own import, so the tree index can skip reparsing them.
+    """
+    try:
+        row = con.execute(
+            "SELECT read_offset, tail_sha256, privacy_version FROM sources"
+            " WHERE harness=? AND path=?", (HARNESS, updates_path)).fetchone()
+    except sqlite3.DatabaseError:
+        return False
+    if row is None:
         return False
     try:
-        lines = list(_complete_lines(events_path))
+        stored_version = row["privacy_version"]
+        offset = row["read_offset"]
+        tail = row["tail_sha256"]
+    except (KeyError, TypeError, IndexError):
+        return False
+    if stored_version != privacy.PRIVACY_VERSION:
+        return False
+    if not isinstance(offset, int) or not tail:
+        return False
+    try:
+        size = os.path.getsize(updates_path)
     except OSError:
         return False
-    for _, raw in lines:
-        try:
-            obj = json.loads(raw)
-        except ValueError:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        if obj.get("type") != "turn_started":
-            continue
-        if obj.get("session_relationship") == "subagent":
-            return True
-    return False
-
-
-def _find_parent_via_dispatches(session_dir: str,
-                                native_sid: str) -> str | None:
-    """Parent key from own or any sibling session's spawn records on disk.
-
-    Covers the import-order case: the child may be imported before its
-    parent session, but the parent's updates.jsonl already exists on disk.
-    Only subagent_spawned shapes are read; prompt text is never touched.
-    """
-    own = _scan_updates_file_for_parent(
-        os.path.join(session_dir, "updates.jsonl"), native_sid)
-    if own is not None:
-        return own
-    group_dir = os.path.dirname(os.path.abspath(session_dir.rstrip(os.sep)))
-    root = os.path.dirname(group_dir.rstrip(os.sep))
-    candidates: list[str] = []
+    if offset != size:
+        return False
+    if offset <= 0:
+        return True
     try:
-        if root and os.path.isdir(root):
-            for sess_dir in discover(root):
-                if os.path.abspath(sess_dir) == os.path.abspath(session_dir):
-                    continue
-                candidates.append(sess_dir)
-        elif os.path.isdir(group_dir):
-            for child in sorted(os.listdir(group_dir)):
-                path = os.path.join(group_dir, child)
-                if os.path.abspath(path) == os.path.abspath(session_dir):
-                    continue
-                if os.path.isdir(path) and _looks_like_session(path):
-                    candidates.append(path)
+        with open(updates_path, "rb") as fh:
+            start = max(0, offset - 4096)
+            fh.seek(start)
+            digest = hashlib.sha256(fh.read(offset - start)).hexdigest()
     except OSError:
-        return None
-    for sess_dir in candidates:
-        found = _scan_updates_file_for_parent(
-            os.path.join(sess_dir, "updates.jsonl"), native_sid)
-        if found is not None:
-            return found
-    return None
+        return False
+    return digest == tail
+
+
+def _build_source_tree_index(con: sqlite3.Connection, ctx,
+                             paths: list[str]) -> None:
+    """Build the containing-tree parent index once per source-scoped op.
+
+    Called by sync() before any import, never by import_grok_session.
+    Scans each sibling updates.jsonl in the sync set's containing groups at
+    most once for subagent_spawned records and merges them into
+    ctx.parent_index, persisting child links so later syncs can consult the
+    ledger instead of reparsing. Siblings already imported and unchanged are
+    skipped via a stat/tail check without parsing; their spawns already
+    reached persisted session links on their own import. Siblings in the
+    sync set itself are skipped here because their own import parse will
+    contribute their spawns to the shared index.
+    """
+    if ctx is None:
+        return
+    try:
+        in_set = {os.path.abspath(p) for p in paths}
+    except OSError:
+        in_set = set()
+    groups: list[str] = []
+    seen_groups: set[str] = set()
+    for path in paths:
+        try:
+            group = os.path.dirname(os.path.abspath(path.rstrip(os.sep)))
+        except OSError:
+            continue
+        if group not in seen_groups:
+            seen_groups.add(group)
+            groups.append(group)
+    for group in groups:
+        try:
+            children = sorted(os.listdir(group))
+        except OSError:
+            continue
+        for child in children:
+            sibling = os.path.join(group, child)
+            try:
+                if os.path.abspath(sibling) in in_set:
+                    continue
+            except OSError:
+                continue
+            try:
+                if not (os.path.isdir(sibling)
+                        and _looks_like_session(sibling)):
+                    continue
+            except OSError:
+                continue
+            updates_path = os.path.join(sibling, "updates.jsonl")
+            if not os.path.isfile(updates_path):
+                continue
+            if _sibling_updates_unchanged(con, updates_path):
+                continue
+            try:
+                records = _load_jsonl_records(updates_path)
+            except OSError:
+                continue
+            try:
+                spawns = _extract_spawns_from_records(records)
+            except (AttributeError, TypeError):
+                continue
+            for child_sid, pkey in spawns.items():
+                try:
+                    ctx.parent_index.setdefault(child_sid, pkey)
+                except (AttributeError, TypeError):
+                    pass
+                child_key = f"{HARNESS}:{child_sid}"
+                try:
+                    db.upsert_session(con, child_key, HARNESS, child_sid, None,
+                                      parent_session_key=pkey, role="subagent")
+                except (sqlite3.DatabaseError, ValueError):
+                    pass
+                _force_child_synthetic(con, None, child_key)
 
 
 def _precompute_child_status(con: sqlite3.Connection, r: _Reader,
-                             session_dir: str,
                              updates_records: list | None = None,
-                             events_records: list | None = None) -> None:
+                             events_records: list | None = None,
+                             parent_index: dict | None = None) -> None:
     """Set parent link and subagent role before any replay.
 
     Order: summary role (already in r.meta), persisted
-    sessions.parent_session_key/role, per-sync parent index plus this
-    session's own spawn records (sync path, linear), and events
-    turn_started session_relationship='subagent'. A proven child is
-    non-genuine with an empty excerpt via privacy.py rule 1.
-
-    Direct single-session imports (no per-sync context) keep the old
-    own-plus-sibling disk scan so a child imported alone still finds a
-    parent that exists on disk but not yet in the ledger. Sync imports
-    never scan siblings: earlier parents are in the ledger or the sync
-    index, later parents reclassify the child in place via _subagent_link.
+    sessions.parent_session_key/role, the operation parent index plus this
+    session's own spawn records, and events turn_started
+    session_relationship='subagent' from cached records. A proven child is
+    non-genuine with an empty excerpt via privacy.py rule 1. A spawn-proven
+    parent link also marks the subagent role, so a child whose only evidence
+    is a sibling's dispatch still carries the role. Per-session code never
+    scans sibling files: the caller supplies the index.
     """
     try:
         row = con.execute(
@@ -564,51 +744,19 @@ def _precompute_child_status(con: sqlite3.Connection, r: _Reader,
             r.parent_key = persisted_parent
         if persisted_role == "subagent" and r.meta.get("role") != "subagent":
             r.meta["role"] = "subagent"
-    sync_ctx = getattr(r, "sync_ctx", None)
-    if sync_ctx is not None:
-        if r.parent_key is None:
-            indexed = sync_ctx.parent_index.get(r.native_sid)
-            if indexed is not None:
-                r.parent_key = indexed
-        if r.parent_key is None and updates_records is not None:
-            found = _find_parent_in_records(updates_records, r.native_sid)
-            if found is not None:
-                r.parent_key = found
-        if r.meta.get("role") != "subagent":
-            if events_records is not None:
-                if _has_subagent_in_records(events_records):
-                    r.meta["role"] = "subagent"
-            else:
-                if _has_subagent_relationship(session_dir):
-                    r.meta["role"] = "subagent"
-        return
-    if r.parent_key is None and r.meta.get("role") != "subagent":
-        if updates_records is not None:
-            found = _find_parent_in_records(updates_records, r.native_sid)
-            if found is None:
-                found = _find_parent_via_dispatches(session_dir, r.native_sid)
-        else:
-            found = _find_parent_via_dispatches(session_dir, r.native_sid)
+    if parent_index is not None and r.parent_key is None:
+        indexed = parent_index.get(r.native_sid)
+        if indexed is not None:
+            r.parent_key = indexed
+    if r.parent_key is None and updates_records is not None:
+        found = _find_parent_in_records(updates_records, r.native_sid)
         if found is not None:
             r.parent_key = found
-    elif r.parent_key is None:
-        # Already proven via summary/persisted role, but a parent link may
-        # still exist on disk; record it for the session row.
-        if updates_records is not None:
-            found = _find_parent_in_records(updates_records, r.native_sid)
-            if found is None:
-                found = _find_parent_via_dispatches(session_dir, r.native_sid)
-        else:
-            found = _find_parent_via_dispatches(session_dir, r.native_sid)
-        if found is not None:
-            r.parent_key = found
-    if r.meta.get("role") != "subagent":
-        if events_records is not None:
-            if _has_subagent_in_records(events_records):
-                r.meta["role"] = "subagent"
-        else:
-            if _has_subagent_relationship(session_dir):
-                r.meta["role"] = "subagent"
+    if r.meta.get("role") != "subagent" and events_records is not None:
+        if _has_subagent_in_records(events_records):
+            r.meta["role"] = "subagent"
+    if r.parent_key is not None and r.meta.get("role") != "subagent":
+        r.meta["role"] = "subagent"
 
 
 def _force_child_synthetic(con: sqlite3.Connection, stats: dict | None,
@@ -873,27 +1021,20 @@ def _reconcile_response_metadata(con: sqlite3.Connection, r: _Reader,
     updates the row; a missing new value never clears a known one. Never
     inserts or duplicates rows; counters and usage_conflict behavior are
     untouched. Returns rows changed.
+
+    Both record sets must be supplied by the caller from its single cached
+    parse; a missing set means the file was deliberately not loaded (known
+    and unchanged with no metadata change) and there is nothing to
+    reconcile, so this returns 0 without opening any file.
     """
     if precomputed is not None:
         prompts, order, completions_ordered, turn_models = precomputed
-    elif updates_records is not None:
-        if not updates_records and not os.path.isfile(
-                os.path.join(session_dir, "updates.jsonl")):
-            return 0
+    elif updates_records is not None and events_records is not None:
         prompts, order, completions_ordered = _collect_prompts_from_records(
             updates_records, record_error=None)
-        if events_records is not None:
-            turn_models = _turn_models_from_records(events_records)
-        else:
-            turn_models = _turn_models(
-                os.path.join(session_dir, "events.jsonl"))
+        turn_models = _turn_models_from_records(events_records)
     else:
-        updates_path = os.path.join(session_dir, "updates.jsonl")
-        if not os.path.isfile(updates_path):
-            return 0
-        prompts, order, completions_ordered = _collect_prompts(
-            updates_path, record_error=None)
-        turn_models = _turn_models(os.path.join(session_dir, "events.jsonl"))
+        return 0
     pid_to_model: dict = {}
     for key in order:
         pid = prompts[key].get("prompt_id")
@@ -1118,9 +1259,17 @@ def _delta_records(records: list, src) -> list:
 
 
 def import_grok_session(con: sqlite3.Connection, session_dir: str,
-                        full: bool = False,
+                        full: bool = False, parent_index=None,
                         _sync_ctx=None) -> dict:
-    """Import one Grok session directory. Idempotent; growing logs resume."""
+    """Import one Grok session directory. Idempotent; growing logs resume.
+
+    Change detection runs before any updates.jsonl/events.jsonl parse: the
+    JsonlSource tail check decides unchanged without reading the whole file,
+    and an unchanged known session with unchanged summary/chat metadata and
+    no new parent link returns without parsing either file. The caller
+    supplies the operation parent index (sync() builds it once per
+    operation); per-session code never scans sibling files.
+    """
     stats = {"lines": 0, "responses_inserted": 0, "responses_duplicate": 0,
              "submissions_inserted": 0, "events_inserted": 0,
              "events_duplicate": 0, "compactions": 0, "malformed": 0}
@@ -1156,8 +1305,31 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             stats["malformed"] = stats.get("malformed", 0) + 1
             con.commit()
         return stats
+    # Resolve the shared operation index. sync() passes _sync_ctx with the
+    # operation parent index (source-scoped tree index prebuilt there);
+    # direct callers may pass a parent_index dict built once for their
+    # operation, or nothing for a lone session relying on its own records
+    # plus persisted ledger links. Per-session code never scans siblings.
+    ctx = _sync_ctx
+    if ctx is not None:
+        try:
+            effective_index = ctx.parent_index
+        except AttributeError:
+            effective_index = {}
+            try:
+                ctx.parent_index = effective_index
+            except (AttributeError, TypeError):
+                pass
+    elif isinstance(parent_index, dict):
+        effective_index = parent_index
+        ctx = _SyncCtx()
+        ctx.parent_index = effective_index
+    else:
+        effective_index = {}
+        ctx = _SyncCtx()
+        ctx.parent_index = effective_index
     r = _Reader(con, f"{HARNESS}:{native_sid}", native_sid, stats,
-                sync_ctx=_sync_ctx)
+                sync_ctx=ctx)
     group_name = os.path.basename(os.path.dirname(session_dir.rstrip(os.sep)))
     fallback_dir = urllib.parse.unquote(group_name)
     project_dir = (summary.get("git_root_dir") if isinstance(
@@ -1184,90 +1356,217 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         if ts is not None:
             r.note_ts(ts)
 
-    # Single parse per file per session: every downstream path reuses these
-    # cached records instead of reopening and reparsing updates.jsonl and
-    # events.jsonl for parent indexing, prompt collection, replay, normal
-    # ingestion, reclassification and reconciliation.
-    updates_records = _load_jsonl_records(updates_path)
-    events_records = _load_jsonl_records(events_path)
-    if _sync_ctx is not None:
-        try:
-            _spawns = _extract_spawns_from_records(updates_records)
-        except (AttributeError, TypeError):
-            _spawns = {}
-        for _child, _pkey in _spawns.items():
-            try:
-                _sync_ctx.parent_index.setdefault(_child, _pkey)
-            except (AttributeError, TypeError):
-                pass
-            # Persist immediately from the same cached parse (no extra scan
-            # or reparse): a newly appearing child that sorts before this
-            # parent must converge even when this parent is unchanged and
-            # takes the early return below without reaching _subagent_link.
-            # Upsert only fills unknowns and the synthetic force only touches
-            # non-synthetic rows, so repeats stay idempotent.
-            _child_key = f"{HARNESS}:{_child}"
-            try:
-                db.upsert_session(con, _child_key, HARNESS, _child, None,
-                                  parent_session_key=_pkey)
-            except (sqlite3.DatabaseError, ValueError):
-                pass
-            if _child_key != r.session_key:
-                _force_child_synthetic(con, stats, _child_key)
-
-    # Child status is available before any replay: summary role is already
-    # in r.meta; persisted links, the per-sync parent index plus this
-    # session's own dispatches, and the turn_started subagent relationship
-    # complete it here. Sync imports never scan sibling files.
-    _precompute_child_status(con, r, session_dir, updates_records,
-                             events_records)
-
+    # Change state before any full parse. JsonlSource does a stat plus a
+    # small tail read, never a full parse.
     updates_src = (JsonlSource(con, HARNESS, updates_path, full=full)
                    if os.path.isfile(updates_path) else None)
     events_src = (JsonlSource(con, HARNESS, events_path, full=full)
                   if os.path.isfile(events_path) else None)
     r.updates_src = updates_src
     r.events_src = events_src
-    known = con.execute("SELECT 1 FROM sessions WHERE session_key=?",
-                        (r.session_key,)).fetchone()
+    known_row = con.execute("SELECT 1 FROM sessions WHERE session_key=?",
+                            (r.session_key,)).fetchone()
+    known = known_row is not None
     updates_new = full or updates_src is None or not updates_src.unchanged
     events_new = full or events_src is None or not events_src.unchanged
-    chat = _read_chat(session_dir, r)
-    if known and not updates_new and not events_new:
-        reclassified = _reclassify_existing(con, r, session_dir, chat,
-                                            updates_records)
-        reconciled = _reconcile_response_metadata(
-            con, r, session_dir, model_fallback,
-            effort, chat.get("effort"), updates_records, events_records)
-        # Persist late identity even when no JSONL bytes changed.
-        late_fields = {"started_at": r.first_ts, "ended_at": r.last_ts,
-                       **r.meta, **r.identity.fields(con)}
-        if r.parent_key:
-            late_fields["parent_session_key"] = r.parent_key
-        db.upsert_session(
-            con, r.session_key, HARNESS, r.native_sid,
-            updates_src.source_id if updates_src is not None
-            else (events_src.source_id if events_src is not None else None),
-            **late_fields)
-        con.commit()
-        stats["unchanged"] = not bool(reclassified or reconciled)
-        if reconciled:
-            stats["responses_updated"] = \
-                stats.get("responses_updated", 0) + reconciled
-        stats["session_key"] = r.session_key
-        return stats
+    privacy_stale = bool(
+        (updates_src is not None and updates_src.privacy_stale)
+        or (events_src is not None and events_src.privacy_stale))
+    try:
+        stored_parent_row = con.execute(
+            "SELECT parent_session_key, role FROM sessions WHERE session_key=?",
+            (r.session_key,)).fetchone()
+    except sqlite3.DatabaseError:
+        stored_parent_row = None
+    try:
+        stored_parent = stored_parent_row["parent_session_key"] \
+            if stored_parent_row is not None else None
+    except (KeyError, TypeError, IndexError):
+        stored_parent = None
+    try:
+        stored_role = stored_parent_row["role"] \
+            if stored_parent_row is not None else None
+    except (KeyError, TypeError, IndexError):
+        stored_role = None
+    summary_fp = _summary_fingerprint(summary)
+    chat_fp_current = _chat_fingerprint(session_dir)
+    _ensure_grok_meta_table(con)
+    (stored_summary_fp, stored_chat_fp, stored_seen, stored_synthetic,
+     stored_chat_effort, stored_chat_reliable) = _stored_meta(con,
+                                                              r.session_key)
+    stored_marks = _chat_from_stored(stored_chat_fp, stored_seen,
+                                     stored_synthetic, stored_chat_effort,
+                                     stored_chat_reliable)
+
+    # Preliminary child status from summary, persisted links and the shared
+    # operation index only (no record parse and no sibling scan). The index
+    # already holds the containing-tree spawns for source-scoped operations
+    # (built once in sync()), so this finds a sibling-spawned parent even
+    # when the child role is already subagent via summary or events.
+    _precompute_child_status(con, r, None, None, effective_index)
+    new_parent_via_index = (
+        r.parent_key is not None and r.parent_key != stored_parent)
+    new_role_via_evidence = (
+        r.meta.get("role") == "subagent" and stored_role != "subagent")
+    meta_changed = (stored_summary_fp != summary_fp
+                    or stored_chat_fp != chat_fp_current)
+
+    chat = None
+
+    def _get_chat() -> dict:
+        """Parsed chat marks, reusing persisted marks when bytes match.
+
+        JSON-parses chat_history.jsonl only when its raw bytes changed (or
+        no usable marks are stored). The fast path never calls this, so an
+        unchanged second sync performs no chat JSON parsing at all.
+        """
+        nonlocal chat
+        if chat is not None:
+            return chat
+        if not meta_changed and stored_marks is not None:
+            chat = _chat_from_stored(stored_chat_fp, stored_seen,
+                                     stored_synthetic, stored_chat_effort,
+                                     stored_chat_reliable)
+            if chat is not None:
+                return chat
+        chat = _read_chat(session_dir, r)
+        return chat
+
+    if known and not updates_new and not events_new and not privacy_stale \
+            and not full:
+        if not meta_changed and stored_marks is not None \
+                and not new_parent_via_index and not new_role_via_evidence:
+            # Fully unchanged: no parse of updates/events and no JSON parse
+            # of chat. Per-sync I/O is summary.json, one raw chat read for
+            # the fingerprint, and stat/tail checks. Persisted links, roles
+            # and chat marks already cover classification.
+            chat = stored_marks
+            late_fields = {"started_at": r.first_ts, "ended_at": r.last_ts,
+                           **r.meta, **r.identity.fields(con)}
+            if r.parent_key:
+                late_fields["parent_session_key"] = r.parent_key
+            db.upsert_session(
+                con, r.session_key, HARNESS, r.native_sid,
+                updates_src.source_id if updates_src is not None
+                else (events_src.source_id if events_src is not None else None),
+                **late_fields)
+            _store_meta(con, r.session_key, summary_fp, chat_fp_current,
+                        chat)
+            con.commit()
+            stats["unchanged"] = True
+            stats["session_key"] = r.session_key
+            return stats
+        if not meta_changed and stored_marks is not None \
+                and (new_parent_via_index or new_role_via_evidence):
+            # Late parent or role with no JSONL or chat-bytes growth:
+            # converge without parsing updates/events and without JSON
+            # parsing chat. The prebuilt operation index (or persisted link)
+            # already supplied the parent; force existing submissions to
+            # synthetic/empty in place and record the session link/role.
+            chat = stored_marks
+            _force_child_synthetic(con, stats, r.session_key)
+            late_fields = {"started_at": r.first_ts, "ended_at": r.last_ts,
+                           **r.meta, **r.identity.fields(con)}
+            if r.parent_key:
+                late_fields["parent_session_key"] = r.parent_key
+            db.upsert_session(
+                con, r.session_key, HARNESS, r.native_sid,
+                updates_src.source_id if updates_src is not None
+                else (events_src.source_id if events_src is not None else None),
+                **late_fields)
+            # Reclassify without records is covered by the force above
+            # (no parse, no duplicates).
+            _store_meta(con, r.session_key, summary_fp, chat_fp_current,
+                        chat)
+            con.commit()
+            stats["unchanged"] = False
+            stats["session_key"] = r.session_key
+            return stats
+        # Else metadata changed (or first sync after the mark migration):
+        # fall through so late chat/summary evidence reclassifies and
+        # reconciles in place. Chat is resolved lazily below: reused
+        # without parsing when its bytes match, parsed when they changed.
+        chat = _get_chat()
+
+    # Changed, new, or metadata-changed session: parse only what the sync
+    # strictly requires, reusing one cached parse per loaded file.
+    # - updates is required for new/full/stale/grown updates, or when
+    #   summary/chat bytes changed (reclassify needs prompts, reconcile
+    #   needs completions).
+    # - events is additionally required when updates will replay (turn
+    #   models decide response models), for new/full/stale/grown events,
+    #   or when summary/chat bytes changed (reconcile needs turn models).
+    # An unchanged updates file is therefore NOT reparsed merely because
+    # events grew: that case loads events only, unless the events parse
+    # itself proves a new subagent role, in which case updates is loaded
+    # in a second stage strictly for the reclassification.
+    if chat is None:
+        chat = _get_chat()
+    updates_will_replay = updates_src is not None and (updates_new or not known)
+    load_updates = ((not known) or full or privacy_stale or updates_new
+                    or meta_changed)
+    load_events = ((not known) or full or privacy_stale or events_new
+                   or meta_changed or updates_will_replay)
+    updates_records = _load_jsonl_records(updates_path) \
+        if (load_updates and os.path.isfile(updates_path)) else None
+    events_records = _load_jsonl_records(events_path) \
+        if (load_events and os.path.isfile(events_path)) else None
+    if updates_records is None and events_records is not None and known \
+            and not full and not privacy_stale and not meta_changed:
+        # Events-only growth: the events parse may itself prove a new
+        # subagent relationship. Only then is the unchanged updates file
+        # loaded, strictly for reclassifying existing submissions.
+        if stored_role != "subagent" and r.meta.get("role") != "subagent" \
+                and _has_subagent_in_records(events_records):
+            updates_records = _load_jsonl_records(updates_path) \
+                if os.path.isfile(updates_path) else []
+    if updates_records is not None:
+        try:
+            _spawns = _extract_spawns_from_records(updates_records)
+        except (AttributeError, TypeError):
+            _spawns = {}
+    else:
+        # Updates file not loaded (unchanged, known, metadata-unchanged):
+        # its spawns already reached persisted links on an earlier import.
+        _spawns = {}
+    for _child, _pkey in _spawns.items():
+        try:
+            effective_index.setdefault(_child, _pkey)
+        except (AttributeError, TypeError):
+            pass
+        # Persist immediately from the same cached parse (no extra scan
+        # or reparse): a newly appearing child that sorts before this
+        # parent must converge even when this parent is unchanged and
+        # would otherwise take a fast path without reaching _subagent_link.
+        # Upsert only fills unknowns and the synthetic force only touches
+        # non-synthetic rows, so repeats stay idempotent.
+        _child_key = f"{HARNESS}:{_child}"
+        try:
+            db.upsert_session(con, _child_key, HARNESS, _child, None,
+                              parent_session_key=_pkey, role="subagent")
+        except (sqlite3.DatabaseError, ValueError):
+            pass
+        if _child_key != r.session_key:
+            _force_child_synthetic(con, stats, _child_key)
+
+    # Child status with the full evidence: summary, persisted, shared index,
+    # this session's own dispatches and the cached turn_started relationship.
+    _precompute_child_status(con, r, updates_records, events_records,
+                             effective_index)
 
     # A parent link discovered while ingesting this sync's own updates means
     # the replay above computed submissions as a main session; reclassify to
     # correct those rows to non-genuine in place.
     parent_before = r.parent_key
-    if updates_src is not None and (updates_new or not known):
+    if updates_src is not None and (updates_new or not known) \
+            and updates_records is not None:
         def _replay_error(ordinal: int, category: str, line: str = "") -> None:
             _record_error_once(updates_src, stats, ordinal, category, line)
 
         _prompts, _order, _completions = _collect_prompts_from_records(
             updates_records, record_error=_replay_error)
-        _turn_models_cached = _turn_models_from_records(events_records)
+        _turn_models_cached = _turn_models_from_records(
+            events_records if events_records is not None else [])
         _replay_updates(
             con, r, updates_src, chat, model_fallback, effort,
             updates_records, events_records,
@@ -1288,7 +1587,8 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             except (KeyError, TypeError, ValueError, AttributeError):
                 _record_error_once(
                     updates_src, stats, ordinal, "schema_error", line)
-    if events_src is not None and (events_new or not known):
+    if events_src is not None and (events_new or not known) \
+            and events_records is not None:
         _advance_source_to_cached(events_src, events_path, events_records)
         for ordinal, obj, line in _delta_records(
                 events_records, events_src):
@@ -1307,19 +1607,21 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                     events_src, stats, ordinal, "schema_error", line)
     # Late chat metadata reclassifies provisional submissions even when only
     # events.jsonl grew and updates.jsonl did not. Runs silently (no duplicate
-    # import_errors) and never duplicates rows. Child status was already
-    # precomputed before replay, so a parent link in this sync's own bytes
-    # wrote synthetic rows directly; this corrects rows from earlier syncs
-    # when late summary, persisted-link, dispatch or relationship evidence
-    # arrives.
-    if known or (r.parent_key is not None
-                 and r.parent_key != parent_before):
+    # import_errors) and never duplicates rows. Requires the updates records:
+    # without them (events-only growth with no new role evidence) there is
+    # nothing to reclassify, so the unchanged updates file stays unparsed.
+    if updates_records is not None and (
+            known or (r.parent_key is not None
+                      and r.parent_key != parent_before)):
         _reclassify_existing(con, r, session_dir, chat, updates_records)
     replayed_updates = updates_src is not None and (updates_new or not known)
-    if not replayed_updates:
+    if not replayed_updates and updates_records is not None \
+            and events_records is not None:
         # Only events (or only summary/chat) changed: turn_started models,
         # summary model/effort or chat effort may be new. Update existing
         # response rows in place without duplicates or counter changes.
+        # Both record sets are loaded here by construction (metadata change
+        # loads both), so this never triggers a fresh parse itself.
         reconciled = _reconcile_response_metadata(
             con, r, session_dir, model_fallback,
             effort, chat.get("effort"), updates_records, events_records)
@@ -1335,6 +1637,7 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                       updates_src.source_id if updates_src is not None
                       else (events_src.source_id if events_src is not None
                             else None), **fields)
+    _store_meta(con, r.session_key, summary_fp, chat_fp_current, chat)
     if updates_src is not None:
         stats.update(updates_src.finish(session_id=r.native_sid))
     if events_src is not None:
@@ -1356,9 +1659,12 @@ def _read_chat(session_dir: str, r: _Reader) -> dict:
     stay provisional (unknown, empty excerpt) until complete metadata arrives.
     A type=user record proves human authorship only when its content yields
     valid text; missing or invalid content never adds the prompt to seen.
+    The returned dict carries fp, a hash of the raw bytes distinguishing
+    a changed chat file from an unchanged one without parsing updates or
+    events.
     """
     chat = {"synthetic": set(), "seen": set(), "effort": None,
-            "reliable": True}
+            "reliable": True, "fp": "missing"}
     path = os.path.join(session_dir, "chat_history.jsonl")
     try:
         with open(path, "rb") as bfh:
@@ -1366,6 +1672,10 @@ def _read_chat(session_dir: str, r: _Reader) -> dict:
     except OSError:
         chat["reliable"] = False
         return chat
+    try:
+        chat["fp"] = hashlib.sha256(raw_bytes).hexdigest()
+    except (TypeError, ValueError):
+        chat["fp"] = "unhashable"
     if raw_bytes and not raw_bytes.endswith(b"\n"):
         chat["reliable"] = False
     try:
@@ -1753,23 +2063,20 @@ def _reclassify_existing(con, r: _Reader, session_dir: str,
                          updates_records: list | None = None) -> int:
     """Update stored submissions when chat metadata arrives later.
 
-    Runs even when updates.jsonl/events.jsonl are unchanged. Reuses the
-    single cached parse of updates.jsonl when provided (no duplicate
+    Requires the single cached parse of updates.jsonl (no duplicate
     import_errors) and applies evidence-aware kind/excerpt/turn updates in
-    place without duplicates. Returns the number of rows changed.
+    place without duplicates. Returns the number of rows changed. A missing
+    record set means the updates file was deliberately not loaded (known
+    and unchanged with no new role evidence) and there is nothing to
+    reclassify, so this returns 0 without opening any file.
     """
     # The reader's updates source carries the ledger source id; building a
     # second JsonlSource here would repeat its privacy-stale import_errors
     # replacement and wipe the errors this sync just recorded.
-    if updates_records is not None:
-        prompts, order, completions_ordered = _collect_prompts_from_records(
-            updates_records, record_error=None)
-    else:
-        updates_path = os.path.join(session_dir, "updates.jsonl")
-        if not os.path.isfile(updates_path):
-            return 0
-        prompts, order, completions_ordered = _collect_prompts(
-            updates_path, record_error=None)
+    if updates_records is None:
+        return 0
+    prompts, order, completions_ordered = _collect_prompts_from_records(
+        updates_records, record_error=None)
     completions_by_id = _deduplicate_completions(completions_ordered)
     before = con.total_changes
     for key in order:
@@ -2206,7 +2513,8 @@ def _subagent_link(r: _Reader, update: dict) -> None:
         try:
             db.upsert_session(r.con, f"{HARNESS}:{child}", HARNESS,
                               child, None,
-                              parent_session_key=f"{HARNESS}:{parent}")
+                              parent_session_key=f"{HARNESS}:{parent}",
+                              role="subagent")
         except (sqlite3.DatabaseError, ValueError):
             pass
         child_key = f"{HARNESS}:{child}"
