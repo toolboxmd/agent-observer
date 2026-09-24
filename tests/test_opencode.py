@@ -1462,6 +1462,221 @@ class OpencodeAdapterTest(unittest.TestCase):
         self.assertNotIn(secret, sub["text_excerpt"] or "")
         self._assert_no_secret_anywhere((secret,))
 
+    def test_free_text_tool_name_and_skill_title_never_persist(self):
+        # Review P1: every event write passes name/status through the
+        # shared privacy filters. Free-text tool names and skill titles
+        # must never survive in any event column.
+        free_tool = "My Cool Tool!!! With Spaces SECRET_FREE_TOOL_zzz_qqq"
+        skill_title = "skill title SECRET_SKILL_TITLE_zzz_qqq"
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_free", None, "/repo", "Free", "1.2.3", None,
+                        "build", T0 + 1100, T0 + 1100, None))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_free_a", "ses_free", T0 + 1100, T0 + 1100,
+                        _msg("assistant", T0 + 1100, T0 + 1110,
+                             _tokens(2, 2, 0, 0, 0))))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_free_tool", "msg_free_a", "ses_free",
+                        T0 + 1101, T0 + 1101,
+                        _tool(free_tool, "call_free1", "completed",
+                              {"command": "echo hi"}, "ok",
+                              T0 + 1101, T0 + 1111)))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_free_skill", "msg_free_a", "ses_free",
+                        T0 + 1102, T0 + 1102,
+                        _tool("skill", "call_skillfree1", "completed",
+                              {"name": skill_title}, "ok",
+                              T0 + 1102, T0 + 1112,
+                              metadata={"dir": "/tmp/skills/my-skill"})))
+        native.commit()
+        native.close()
+        opencode.sync(self.con, source=self.db_file)
+        self._assert_no_secret_anywhere(
+            ("SECRET_FREE_TOOL_zzz_qqq", "SECRET_SKILL_TITLE_zzz_qqq",
+             "My Cool Tool", "skill title"))
+        for family, native_id in (("tool_call", "call_free1"),
+                                  ("tool_result", "call_free1"),
+                                  ("skill_invoke", "call_skillfree1")):
+            rows = self.q("SELECT * FROM events WHERE family=?"
+                          " AND native_id=?", (family, native_id))
+            self.assertEqual(len(rows), 1, f"{family}/{native_id}")
+            row = rows[0]
+            blob = json.dumps(dict(row), default=str)
+            self.assertNotIn("SECRET_FREE_TOOL_zzz_qqq", blob)
+            self.assertNotIn("SECRET_SKILL_TITLE_zzz_qqq", blob)
+            self.assertNotIn("My Cool Tool", blob)
+            # The skill title carries a space so it cannot be an
+            # identifier: it must not survive in name, target or detail.
+            if native_id == "call_skillfree1":
+                self.assertIsNone(row["name"])
+                self.assertIsNone(row["target"])
+                self.assertIsNone(row["detail_json"])
+            else:
+                self.assertIsNone(row["name"])
+        # The free-text tool produced no read/skill/file rows either.
+        self.assertEqual(self.q("SELECT * FROM events WHERE native_id=?",
+                                ("call_free1",))[0]["name"], None)
+
+    def test_stale_row_with_unsafe_name_and_status_corrected(self):
+        # Review P1: a privacy-stale re-import clears or recomputes name
+        # and status as well as target and detail; valid rows are
+        # repopulated in place rather than left stale or blank.
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_stalename", None, "/repo", "StaleName", "1.2.3",
+                        None, "build", T0 + 1120, T0 + 1120, None))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_stalename_a", "ses_stalename", T0 + 1120,
+                        T0 + 1120,
+                        _msg("assistant", T0 + 1120, T0 + 1130,
+                             _tokens(2, 2, 0, 0, 0))))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_stalename_tool", "msg_stalename_a", "ses_stalename",
+                        T0 + 1121, T0 + 1121,
+                        _tool("bash", "call_stalename1", "completed",
+                              {"command": "echo hi"}, "ok",
+                              T0 + 1121, T0 + 1131)))
+        native.commit()
+        native.close()
+        opencode.sync(self.con, source=self.db_file)
+        call_before = self.q("SELECT * FROM events WHERE family='tool_call'"
+                             " AND native_id=?", ("call_stalename1",))[0]
+        self.assertEqual(call_before["name"], "bash")
+        res_before = self.q("SELECT * FROM events WHERE family='tool_result'"
+                            " AND native_id=?", ("call_stalename1",))[0]
+        self.assertEqual(res_before["name"], "bash")
+        self.assertEqual(res_before["status"], "ok")
+        # Poison rows the way a pre-fix import kept them: unsafe free-text
+        # names and statuses that bypassed shared validation.
+        poison_name = "Evil Free Text Title SECRET_POISON_NAME_zzz_qqq"
+        poison_status = "totally broken SECRET_POISON_STATUS_zzz_qqq"
+        self.con.execute(
+            "UPDATE events SET name=?, status=?, target=?, detail_json=?"
+            " WHERE family='tool_call' AND native_id=?",
+            (poison_name, poison_status, "/tmp/poison",
+             json.dumps({"note": "poison"}), "call_stalename1"))
+        self.con.execute(
+            "UPDATE events SET name=?, status=? WHERE family='tool_result'"
+            " AND native_id=?",
+            (poison_name, poison_status, "call_stalename1"))
+        self.con.execute(
+            "UPDATE sources SET privacy_version=0 WHERE harness='opencode'")
+        self.con.commit()
+        counts_before = {
+            table: self.q(f"SELECT COUNT(*) n FROM {table}")[0]["n"]
+            for table in ("events", "responses", "sources")}
+        stats = opencode.sync(self.con, source=self.db_file)
+        self.assertEqual(stats["unchanged"], 0)
+        for table in counts_before:
+            self.assertEqual(
+                self.q(f"SELECT COUNT(*) n FROM {table}")[0]["n"],
+                counts_before[table], table)
+        call_after = self.q("SELECT * FROM events WHERE family='tool_call'"
+                            " AND native_id=?", ("call_stalename1",))[0]
+        res_after = self.q("SELECT * FROM events WHERE family='tool_result'"
+                           " AND native_id=?", ("call_stalename1",))[0]
+        # Valid identifier rows are repopulated in place, not left blank.
+        self.assertEqual(call_after["name"], "bash")
+        self.assertIsNone(call_after["status"])
+        self.assertEqual(call_after["target"], "echo hi")
+        self.assertIsNone(call_after["detail_json"])
+        self.assertEqual(res_after["name"], "bash")
+        self.assertEqual(res_after["status"], "ok")
+        self.assertIsNone(res_after["detail_json"])
+        self._assert_no_secret_anywhere(
+            ("SECRET_POISON_NAME_zzz_qqq", "SECRET_POISON_STATUS_zzz_qqq",
+             "Evil Free Text Title", "totally broken"))
+
+    def test_list_dict_type_and_status_quarantined_as_schema_error(self):
+        # Review P2: non-string or unhashable type/status values must not
+        # raise TypeError in a set membership test and abort the import.
+        # They are quarantined as schema_error; later records still import.
+        native = sqlite3.connect(self.db_file)
+        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       ("ses_badshape", None, "/repo", "BadShape", "1.2.3",
+                        None, "build", T0 + 1140, T0 + 1140, None))
+        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                       ("msg_badshape_a", "ses_badshape", T0 + 1140,
+                        T0 + 1140,
+                        _msg("assistant", T0 + 1140, T0 + 1150,
+                             _tokens(2, 2, 0, 0, 0))))
+        # List and dict part types: unhashable, must not abort.
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_badtype_list", "msg_badshape_a", "ses_badshape",
+                        T0 + 1141, T0 + 1141,
+                        json.dumps({"type": ["tool"], "tool": "bash",
+                                    "callID": "call_badtype_list",
+                                    "state": {"status": "completed",
+                                              "input": {"command": "echo hi"},
+                                              "output": "ok",
+                                              "time": {"start": T0 + 1141,
+                                                       "end": T0 + 1151}}})))
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_badtype_dict", "msg_badshape_a", "ses_badshape",
+                        T0 + 1142, T0 + 1142,
+                        json.dumps({"type": {"t": "tool"}, "tool": "bash",
+                                    "callID": "call_badtype_dict",
+                                    "state": {"status": "completed",
+                                              "input": {"command": "echo hi"},
+                                              "output": "ok",
+                                              "time": {"start": T0 + 1142,
+                                                       "end": T0 + 1152}}})))
+        # Valid tool names with list/dict statuses.
+        for pid, call, bad_status in (
+                ("p_badstatus_list", "call_badstatus_list", ["completed"]),
+                ("p_badstatus_dict", "call_badstatus_dict",
+                 {"s": "completed"})):
+            native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                           (pid, "msg_badshape_a", "ses_badshape",
+                            T0 + 1143, T0 + 1143,
+                            json.dumps({"type": "tool", "tool": "bash",
+                                        "callID": call,
+                                        "state": {"status": bad_status,
+                                                  "input": {"command":
+                                                            "echo hi"},
+                                                  "output": "ok",
+                                                  "time": {
+                                                      "start": T0 + 1143,
+                                                      "end": T0 + 1153}}})))
+        # A later valid record in the same session must still import.
+        native.execute("INSERT INTO part VALUES(?,?,?,?,?,?)",
+                       ("p_valid_after_shape", "msg_badshape_a",
+                        "ses_badshape", T0 + 1144, T0 + 1144,
+                        _tool("bash", "call_shape_valid", "completed",
+                              {"command": "echo hi"}, "ok",
+                              T0 + 1144, T0 + 1154)))
+        native.commit()
+        native.close()
+        stats = opencode.sync(self.con, source=self.db_file)
+        self.assertGreaterEqual(stats["malformed"], 4)
+        errs = self.q("SELECT * FROM import_errors WHERE error=?",
+                      ("schema_error",))
+        self.assertGreaterEqual(len(errs), 4)
+        for row in errs:
+            self.assertEqual(row["error"], "schema_error")
+            self.assertIn(row["error"], opencode.IMPORT_ERROR_CATEGORIES)
+            self.assertLessEqual(len(row["line_excerpt"] or ""), 200)
+        # Malformed part types produce no events under their call ids.
+        self.assertEqual(self.q("SELECT * FROM events WHERE native_id=?",
+                                ("call_badtype_list",)), [])
+        self.assertEqual(self.q("SELECT * FROM events WHERE native_id=?",
+                                ("call_badtype_dict",)), [])
+        # Malformed statuses produce no tool_result, but never abort the
+        # later valid record.
+        for call in ("call_badstatus_list", "call_badstatus_dict"):
+            self.assertEqual(self.q("SELECT * FROM events WHERE family=?"
+                                    " AND native_id=?",
+                                    ("tool_result", call)), [])
+        valid_call = self.q("SELECT * FROM events WHERE family='tool_call'"
+                            " AND native_id=?", ("call_shape_valid",))
+        self.assertEqual(len(valid_call), 1)
+        self.assertEqual(valid_call[0]["name"], "bash")
+        valid_res = self.q("SELECT * FROM events WHERE family='tool_result'"
+                           " AND native_id=?", ("call_shape_valid",))
+        self.assertEqual(len(valid_res), 1)
+        self.assertEqual(valid_res[0]["status"], "ok")
+
 
 if __name__ == "__main__":
     unittest.main()

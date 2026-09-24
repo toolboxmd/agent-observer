@@ -339,16 +339,22 @@ def _upsert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
                   fingerprint=None, detail=None) -> None:
     """Insert one event under its natural key; mutable rows update in place.
 
-    Rule 6 via agent_observer/privacy.py: targets keep only bounded native
-    strings (anything else is already dropped by the callers, never
-    coerced) and detail keeps only allowlisted keys with correctly typed
-    values. The full-field comparison updates a changed row in place, so
+    Rule 6 via agent_observer/privacy.py for every protected field:
+    native_id via filter_native_id (wrong types raise, quarantined as
+    missing_id by the caller), name via filter_event_name, status via
+    filter_event_status, targets via filter_target and detail via
+    filter_detail, so free-text tool or skill names and skill titles never
+    persist. The full-field comparison updates a changed row in place, so
     same-version mutable OpenCode behavior (pending tools completing,
     tool payloads finalizing) keeps working and a privacy-stale re-import
-    replaces outdated targets and detail instead of leaving them stale.
+    replaces outdated names, statuses, targets and detail instead of
+    leaving them stale.
     """
-    if not isinstance(native_id, str) or not native_id:
+    native = privacy.filter_native_id(family, native_id)
+    if not native:
         raise ValueError(f"{family} event missing native identity")
+    safe_name = privacy.filter_event_name(family, name)
+    safe_status = privacy.filter_event_status(family, status)
     safe_target = privacy.filter_target(target) or None
     filtered = privacy.filter_detail(family, detail)
     try:
@@ -358,22 +364,22 @@ def _upsert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
         detail_json = None
     existing = con.execute(
         "SELECT * FROM events WHERE session_key=? AND family=? AND native_id=?",
-        (session_key, family, native_id)).fetchone()
+        (session_key, family, native)).fetchone()
     if existing is None:
         con.execute(
             "INSERT INTO events(source_id, session_key, ordinal_num, ts,"
             " family, native_id, turn_id, name, target, status, duration_ms,"
             " size_bytes, truncated, fingerprint, detail_json)"
             " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (source_id, session_key, ordinal, ts, family, native_id, turn_id,
-             name, safe_target, status, duration_ms, size_bytes, truncated,
-             fingerprint, detail_json))
+            (source_id, session_key, ordinal, ts, family, native, turn_id,
+             safe_name, safe_target, safe_status, duration_ms, size_bytes,
+             truncated, fingerprint, detail_json))
         stats["events_inserted"] = stats.get("events_inserted", 0) + 1
         return
     new_fields = {
         "source_id": source_id, "ordinal_num": ordinal, "ts": ts,
-        "turn_id": turn_id, "name": name, "target": safe_target,
-        "status": status, "duration_ms": duration_ms,
+        "turn_id": turn_id, "name": safe_name, "target": safe_target,
+        "status": safe_status, "duration_ms": duration_ms,
         "size_bytes": size_bytes, "truncated": truncated,
         "fingerprint": fingerprint, "detail_json": detail_json,
     }
@@ -386,9 +392,9 @@ def _upsert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
         " name=?, target=?, status=?, duration_ms=?, size_bytes=?,"
         " truncated=?, fingerprint=?, detail_json=? WHERE session_key=?"
         " AND family=? AND native_id=?",
-        (source_id, ordinal, ts, turn_id, name, safe_target, status,
-         duration_ms, size_bytes, truncated, fingerprint, detail_json,
-         session_key, family, native_id))
+        (source_id, ordinal, ts, turn_id, safe_name, safe_target,
+         safe_status, duration_ms, size_bytes, truncated, fingerprint,
+         detail_json, session_key, family, native))
     stats["events_inserted"] = stats.get("events_inserted", 0) + 1
 
 
@@ -439,15 +445,16 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     if privacy_stale:
         # Reconcile every row this source owns: clear sensitive fields
         # before reprocessing so a deleted, malformed or invalid native
-        # record cannot leave an old excerpt, target or detail behind.
-        # Valid records recompute/update these fields in place below.
+        # record cannot leave an old excerpt, name, status, target or
+        # detail behind. Valid records recompute/update these fields in
+        # place below.
         con.execute(
             "UPDATE submissions SET text_excerpt=?, text_hash=?, kind=?,"
             " is_genuine=? WHERE source_id=?",
             ("", text_hash(""), "synthetic", 0, source_id))
         con.execute(
-            "UPDATE events SET target=NULL, detail_json=NULL"
-            " WHERE source_id=?",
+            "UPDATE events SET name=NULL, target=NULL, status=NULL,"
+            " detail_json=NULL WHERE source_id=?",
             (source_id,))
     complete = True
     try:
@@ -504,13 +511,14 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     for part in parts:
         ordinal += 1
         _ingest_part(con, stats, identity, src_path, source_id,
-                      session_key, sess, roles, part, ordinal)
+                      session_key, sess, roles, part, ordinal,
+                      privacy_stale=privacy_stale)
     if sess.get("time_compacting") is not None:
         insert_event(con, stats, source_id=source_id,
                      session_key=session_key, family="compaction",
                      native_id="time_compacting", ordinal=ordinal,
                      ts=iso_ts(sess.get("time_compacting")),
-                     name="time_compacting")
+                     name="time_compacting", update=privacy_stale)
     fields = {"project_dir": sess.get("directory"),
               "client_version": sess.get("version"),
               "started_at": iso_ts(sess.get("time_created")),
@@ -725,7 +733,8 @@ def _ingest_submission(con, stats, identity, src_path, source_id,
 
 
 def _ingest_part(con, stats, identity, src_path, source_id, session_key,
-                  sess, roles, part, ordinal) -> None:
+                  sess, roles, part, ordinal,
+                  privacy_stale: bool = False) -> None:
     raw = part.get("data") if isinstance(part, dict) else None
     part_id = part.get("id") if isinstance(part, dict) else None
     if raw is None:
@@ -757,15 +766,23 @@ def _ingest_part(con, stats, identity, src_path, source_id, session_key,
         _ingest_patch(con, stats, source_id, session_key, part, data,
                       ordinal, ts)
     elif ptype == "compaction":
+        # Rule 6 via the core writer: closed name set. update=True lets a
+        # privacy-stale re-import repopulate a cleared row in place.
         insert_event(con, stats, source_id=source_id,
                      session_key=session_key, family="compaction",
                      native_id=part_id, ordinal=ordinal, ts=ts,
-                     name="compaction")
-    elif ptype in _KNOWN_QUIET_PART_TYPES:
+                     name="compaction", update=privacy_stale)
+    elif isinstance(ptype, str) and ptype in _KNOWN_QUIET_PART_TYPES:
         # text, reasoning, step checkpoints and file data URLs carry no
         # ledger event: user text is handled per message, and file data,
         # reasoning bodies and step checkpoints stay out of the ledger.
         return
+    elif not isinstance(ptype, str):
+        # Non-string or unhashable JSON type values never reach a set
+        # membership test (which would raise TypeError and abort the
+        # import); they are quarantined under the fixed category.
+        _oops(con, stats, src_path, ordinal, "schema_error",
+              _record_line(raw, data))
     else:
         _oops(con, stats, src_path, ordinal, "unsupported_schema",
               _record_line(raw, data))
@@ -795,12 +812,15 @@ def _ingest_tool(con, stats, identity, src_path, source_id, session_key,
     except (TypeError, ValueError):
         arg_fp = fingerprint(tool)
     # Rule 6: the tool_call family keeps no detail; the message linkage
-    # some older imports stored is dropped rather than persisted.
+    # some older imports stored is dropped rather than persisted. The name
+    # passes through privacy.filter_event_name inside _upsert_event, so
+    # free-text tool names never persist.
     _upsert_event(con, stats, source_id=source_id, session_key=session_key,
                   family="tool_call", native_id=call_id, ordinal=ordinal,
                   ts=ts, name=tool[:200], target=target,
                   fingerprint=arg_fp, detail=None)
-    if status in _INCOMPLETE_TOOL_STATUSES or status is None:
+    if status is None or (
+            isinstance(status, str) and status in _INCOMPLETE_TOOL_STATUSES):
         # No terminal result yet; a later snapshot must add it.
         pass
     elif status in ("completed", "error"):
@@ -812,8 +832,13 @@ def _ingest_tool(con, stats, identity, src_path, source_id, session_key,
                       status=result_status, duration_ms=_duration_ms(state),
                       size_bytes=_output_size(output),
                       detail=None)
-    else:
+    elif isinstance(status, str):
         _oops(con, stats, src_path, ordinal, "unknown_record", line)
+    else:
+        # A non-string or unhashable status never reaches a set
+        # membership test (which would raise TypeError and abort the
+        # import); it is quarantined under the fixed category.
+        _oops(con, stats, src_path, ordinal, "schema_error", line)
     if tool == "read" and status == "completed" and target:
         identity.observe_path(target)
         skill = skill_from_path(target)
@@ -827,20 +852,30 @@ def _ingest_tool(con, stats, identity, src_path, source_id, session_key,
                       detail={"skill": skill} if skill else None)
     if tool == "skill":
         raw_name = tool_input.get("name")
-        skill_name = raw_name \
-            if isinstance(raw_name, str) and raw_name else "unknown"
+        if isinstance(raw_name, str) and raw_name:
+            # Rule 6/7: identifier-shaped skill names only. A free-text
+            # title such as "skill title" must not survive merely because
+            # filter_target accepts bounded strings, so the name is
+            # validated with the event-name filter and stored as None when
+            # unsafe. The same safe value feeds both name and target.
+            safe_skill = privacy.filter_event_name(
+                "skill_invoke", raw_name)
+        else:
+            safe_skill = privacy.filter_event_name(
+                "skill_invoke", "unknown")
         metadata = state.get("metadata") if isinstance(
             state.get("metadata"), dict) else {}
         skill_dir = metadata.get("dir")
         if isinstance(skill_dir, str) and skill_dir:
             identity.observe_path(
                 os.path.join(skill_dir, "SKILL.md"))
-        # Rule 6: the skill_invoke family keeps no detail; the skill name
-        # survives bounded in the name and target columns.
+        # Rule 6: the skill_invoke family keeps no detail; the validated
+        # skill name survives in the name and target columns, or neither
+        # when the native value is free text.
         _upsert_event(con, stats, source_id=source_id,
                       session_key=session_key, family="skill_invoke",
                       native_id=call_id, ordinal=ordinal, ts=ts,
-                      name=skill_name[:200], target=skill_name,
+                      name=safe_skill, target=safe_skill,
                       detail=None)
     if tool in ("edit", "write", "patch") and target:
         _upsert_event(con, stats, source_id=source_id,
