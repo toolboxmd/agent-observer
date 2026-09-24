@@ -338,12 +338,7 @@ def import_claude_file(con: sqlite3.Connection, path: str,
             fields["role"] = "subagent"
         db.upsert_session(con, r.session_key, HARNESS,
                           r.session_key.split(":", 1)[1], src.source_id,
-                          replace_identity=src.privacy_stale, **fields)
-        if src.privacy_stale:
-            # Rule 7: native free-text titles are never stored; a version
-            # change clears any title an older import kept.
-            con.execute("UPDATE sessions SET title=NULL WHERE session_key=?",
-                        (r.session_key,))
+                          **fields)
     stats.update(src.finish(session_id=r.native_session, thread_id=r.agent_id))
     stats["session_key"] = r.session_key
     con.commit()

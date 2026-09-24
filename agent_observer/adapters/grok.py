@@ -1739,8 +1739,7 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     db.upsert_session(con, r.session_key, HARNESS, r.native_sid,
                       updates_src.source_id if updates_src is not None
                       else (events_src.source_id if events_src is not None
-                            else None),
-                      replace_identity=privacy_stale, **fields)
+                            else None), **fields)
     _store_meta(con, r.session_key, summary_fp, chat_fp_current, chat)
     if updates_src is not None:
         stats.update(updates_src.finish(session_id=r.native_sid))

@@ -528,13 +528,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
         fields["parent_session_key"] = f"{HARNESS}:{sess['parent_id']}"
         fields["role"] = "subagent"
     db.upsert_session(con, session_key, HARNESS, sess_id, source_id,
-                      replace_identity=privacy_stale,
                       **fields)
-    if privacy_stale:
-        # Rule 7: native free-text titles are never stored; a version
-        # change clears any title an older import kept.
-        con.execute("UPDATE sessions SET title=NULL WHERE session_key=?",
-                    (session_key,))
     try:
         size_bytes = os.path.getsize(abs_db_path)
     except OSError:

@@ -511,7 +511,6 @@ def import_codex_file(con: sqlite3.Connection, path: str,
               **reader.meta, **reader.identity.fields(con)}
     db.upsert_session(con, reader.session_key, HARNESS,
                       reader.session_key.split(":", 1)[1], src.source_id,
-                      replace_identity=src.privacy_stale,
                       **fields)
     stats.update(src.finish(session_id=reader.session_id,
                             thread_id=reader.thread_id,

@@ -901,16 +901,40 @@ class PrivacyVersionTest(LedgerCase):
 
 
 class IdentityMigrationTest(LedgerCase):
-    """Finding 2: a privacy-version re-import replaces source-owned
-    identity fields, clearing omitted or invalid values instead of
-    COALESCE-keeping them."""
+    """A privacy-version re-import replaces source-owned identity fields,
+    clearing omitted or invalid values instead of COALESCE-keeping them.
+    Staleness is inferred centrally from the session's source rows, never
+    from an adapter flag."""
+
+    IDENTITY_COLS = ("agentsmd_version", "instructions_sha256",
+                     "preferences_sha256", "direction_status",
+                     "identity_json", "project_dir", "git_branch", "title")
+
+    def _identity_row(self, con, key):
+        return con.execute(
+            "SELECT agentsmd_version, instructions_sha256,"
+            " preferences_sha256, direction_status, identity_json,"
+            " project_dir, git_branch, title FROM sessions"
+            " WHERE session_key=?", (key,)).fetchone()
+
+    def _counts(self):
+        return {
+            table: self.query(f"SELECT COUNT(*) n FROM {table}")[0]["n"]
+            for table in ("sessions", "submissions", "events",
+                          "import_errors", "responses", "sources")}
+
+    def _error_keys(self):
+        return sorted(
+            (r["harness"], r["source_path"], r["ordinal_num"], r["error"],
+             r["line_excerpt"]) for r in self.query(
+                "SELECT harness, source_path, ordinal_num, error,"
+                " line_excerpt FROM import_errors"))
 
     def test_stale_reimport_clears_old_identity_content(self):
         import json as _json
-        from agent_observer import db as _db
-        # End-to-end: import a real rollout, poison its session with
-        # pre-sanitization identity, mark the source stale, then re-sync
-        # data whose sanitized identity omits those values.
+        # End-to-end through the real source/version path: import a real
+        # rollout, poison its session with pre-sanitization identity and a
+        # native title, mark the source stale, then re-sync.
         import_codex_file(self.con, fixture("codex-mini.jsonl"))
         key = self.query(
             "SELECT session_key FROM sessions"
@@ -919,7 +943,9 @@ class IdentityMigrationTest(LedgerCase):
         self.con.execute(
             "UPDATE sessions SET agentsmd_version='99.9.9',"
             " instructions_sha256=?, preferences_sha256=?,"
-            " direction_status='ready', identity_json=? WHERE session_key=?",
+            " direction_status='ready', project_dir='/old/repo',"
+            " title='old native title', identity_json=?"
+            " WHERE session_key=?",
             (old_inst, "b" * 64,
              _json.dumps({"direction_status": "ready",
                           "instructions_sha256": old_inst,
@@ -929,45 +955,131 @@ class IdentityMigrationTest(LedgerCase):
         self.con.execute(
             "UPDATE sources SET privacy_version=0 WHERE harness='codex'")
         self.con.commit()
-        errors_before = self.query(
-            "SELECT COUNT(*) n FROM import_errors")[0]["n"]
+        before = self._counts()
+        errors_before = self._error_keys()
         import_codex_file(self.con, fixture("codex-mini.jsonl"), full=True)
-        row = self.query(
-            "SELECT agentsmd_version, instructions_sha256,"
-            " preferences_sha256, direction_status, identity_json"
-            " FROM sessions WHERE session_key=?", (key,))[0]
-        # Every old identity value is removed; the sanitized re-import
-        # omits them (the fixture carries no direction block and no
-        # versioned plugin path), and no old hash/path/status survives.
-        self.assertNotEqual(row["agentsmd_version"], "99.9.9")
-        self.assertIsNone(row["instructions_sha256"])
-        self.assertIsNone(row["preferences_sha256"])
-        self.assertIsNone(row["direction_status"])
-        blob = row["identity_json"] or ""
-        self.assertNotIn("/old/AGENTS.md", blob)
-        self.assertNotIn("/old/repo", blob)
-        self.assertNotIn(old_inst, blob)
-        self.assertNotIn("b" * 64, blob)
-        # Import errors are replaced rather than duplicated.
-        errors_after = self.query(
-            "SELECT COUNT(*) n FROM import_errors")[0]["n"]
-        self.assertLessEqual(errors_after, errors_before + 5)
-        # Direct seam: omitted identity fields clear on stale, fill on
-        # normal imports.
+        # Rows are corrected in place, never duplicated, and import
+        # errors are replaced rather than duplicated.
+        self.assertEqual(self._counts(), before)
+        self.assertEqual(self._error_keys(), errors_before)
+        row = self._identity_row(self.con, key)
+        # Every old identity value is removed: no old hash, path, status
+        # or title survives, whatever the fixture re-derives.
+        blob = _json.dumps([row["agentsmd_version"],
+                            row["instructions_sha256"],
+                            row["preferences_sha256"],
+                            row["direction_status"],
+                            row["identity_json"], row["project_dir"]])
+        for poison in (old_inst, "b" * 64, "/old/AGENTS.md", "/old/repo",
+                       "c" * 40, "99.9.9", "old native title"):
+            self.assertNotIn(poison, blob)
+        self.assertIsNone(row["title"])
+        # The re-imported row matches a fresh import of the same fixture:
+        # omitted or invalid old values clear instead of persisting.
+        control_path = os.path.join(self.tmp.name, "control.db")
+        control = db.connect(control_path)
+        try:
+            db.init_db(control)
+            import_codex_file(control, fixture("codex-mini.jsonl"))
+            control.commit()
+            fresh = self._identity_row(control, key)
+        finally:
+            control.close()
+        for col in self.IDENTITY_COLS:
+            self.assertEqual(row[col], fresh[col], col)
+        versions = {r["privacy_version"] for r in self.query(
+            "SELECT privacy_version FROM sources")}
+        self.assertEqual(versions, {privacy.PRIVACY_VERSION})
+        # A current-version re-sync is a true no-op through the fast path.
+        again = import_codex_file(self.con, fixture("codex-mini.jsonl"))
+        self.assertTrue(again.get("unchanged"))
+        self.assertEqual(self._counts(), before)
+        self.assertEqual(self._error_keys(), errors_before)
+
+    def test_stale_detected_beyond_the_single_selected_source(self):
+        # Central inference covers every source row behind the session:
+        # staleness in an associated source counts even when the
+        # incoming source_id itself is current.
+        import_codex_file(self.con, fixture("codex-mini.jsonl"))
+        key = self.query(
+            "SELECT session_key FROM sessions"
+            " WHERE session_key LIKE 'codex:%' LIMIT 1")[0]["session_key"]
+        native = key.split(":", 1)[1]
+        current = self.query(
+            "SELECT id FROM sources WHERE harness='codex' LIMIT 1"
+        )[0]["id"]
         self.con.execute(
             "INSERT INTO sources(harness, path, sha256, imported_at,"
-            " privacy_version) VALUES('codex','mig-path','x',0,0)")
-        source_id = self.con.execute(
+            " session_id, privacy_version)"
+            " VALUES('codex','sibling-path','deadbeef',0,?,0)", (native,))
+        sibling = self.con.execute(
             "SELECT id FROM sources WHERE harness='codex'"
-            " AND path='mig-path'").fetchone()["id"]
-        _db.upsert_session(self.con, "codex:mig1", "codex", "mig1",
-                           source_id, replace_identity=True)
-        _db.upsert_session(self.con, "codex:mig1", "codex", "mig1",
-                           source_id, agentsmd_version="12.1.0")
-        kept = self.query(
-            "SELECT agentsmd_version FROM sessions"
-            " WHERE session_key='codex:mig1'")[0]
-        self.assertEqual(kept["agentsmd_version"], "12.1.0")
+            " AND path='sibling-path'").fetchone()["id"]
+        self.assertFalse(db.session_sources_stale(
+            self.con, key, "codex", "unrelated-native", current))
+        self.assertTrue(db.session_sources_stale(
+            self.con, key, "codex", native, current))
+        # The sibling's events associate it with the session even when the
+        # native id lookup is bypassed.
+        self.con.execute(
+            "INSERT INTO events(source_id, session_key, family, native_id)"
+            " VALUES(?,?,?,?)", (sibling, key, "lifecycle", "sibling-evt"))
+        self.assertTrue(db.session_sources_stale(
+            self.con, key, "codex", "unrelated-native", current))
+        # Remove the sibling confounders so the rows below prove their own
+        # association path: each must fail without its table's coverage.
+        self.con.execute(
+            "DELETE FROM events WHERE native_id='sibling-evt'")
+        self.con.execute(
+            "DELETE FROM sources WHERE path='sibling-path'")
+        self.assertFalse(db.session_sources_stale(
+            self.con, key, "codex", "unrelated-native", current))
+        # A stale source linked only through responses or turns counts
+        # too, without relying on sources.session_id or the selected
+        # source_id: responses and turns are source-owned rows of the
+        # session exactly like events and submissions.
+        self.con.execute(
+            "INSERT INTO sources(harness, path, sha256, imported_at,"
+            " privacy_version)"
+            " VALUES('codex','responses-only-path','deadbeef',0,0)")
+        resp_only = self.con.execute(
+            "SELECT id FROM sources WHERE harness='codex'"
+            " AND path='responses-only-path'").fetchone()["id"]
+        self.con.execute(
+            "INSERT INTO responses(response_id, source_id, harness,"
+            " session_key) VALUES(?,?,?,?)",
+            ("codex:resp-only-1", resp_only, "codex", key))
+        self.assertTrue(db.session_sources_stale(
+            self.con, key, "codex", "unrelated-native", current))
+        self.con.execute(
+            "DELETE FROM responses WHERE response_id='codex:resp-only-1'")
+        self.con.execute(
+            "INSERT INTO sources(harness, path, sha256, imported_at,"
+            " privacy_version)"
+            " VALUES('codex','turns-only-path','deadbeef',0,0)")
+        turn_only = self.con.execute(
+            "SELECT id FROM sources WHERE harness='codex'"
+            " AND path='turns-only-path'").fetchone()["id"]
+        self.con.execute(
+            "INSERT INTO turns(turn_id, source_id, session_key)"
+            " VALUES(?,?,?)", ("turn-only-1", turn_only, key))
+        self.assertTrue(db.session_sources_stale(
+            self.con, key, "codex", "unrelated-native", current))
+        self.con.execute("DELETE FROM turns WHERE turn_id='turn-only-1'")
+        # The session row's own stored source_id counts on its own: a
+        # session whose row points at a stale source is stale even with a
+        # current incoming source and no other linked rows.
+        db.upsert_session(self.con, "codex:stored1", "codex", "stored1",
+                          resp_only)
+        self.assertTrue(db.session_sources_stale(
+            self.con, "codex:stored1", "codex", "stored1", current))
+        db.upsert_session(self.con, "codex:stored2", "codex", "stored2",
+                          current)
+        self.assertFalse(db.session_sources_stale(
+            self.con, "codex:stored2", "codex", "stored2", current))
+        # Unknown sessions need no replacement.
+        self.assertFalse(db.session_sources_stale(
+            self.con, "codex:missing", "codex", native, current))
 
     def test_normal_import_keeps_fill_unknown(self):
         from agent_observer import db as _db

@@ -1457,6 +1457,100 @@ class GrokAdapterTest(LedgerCase):
         self.assertGreaterEqual(stats.get("events_updated", 0), 1)
         con.close()
 
+    def test_stale_non_selected_source_replaces_session_identity(self):
+        # Central stale-source detection covers multi-source sessions:
+        # the session identity is replaced even when the stale source is
+        # the events file rather than the adapter-selected updates source.
+        import json as _json
+        tmp = os.path.join(self.tmp.name, "staleevents")
+        shutil.copytree(ROOT, tmp)
+        con = self._isolated_con("staleevents")
+        grok.sync(con, root=tmp)
+        sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
+        session_dir = os.path.join(
+            tmp, "%2Fredacted%2Frepo", sid)
+        updates_path = os.path.join(session_dir, "updates.jsonl")
+        events_path = os.path.join(session_dir, "events.jsonl")
+        session_sources = {
+            r["path"]: r["privacy_version"] for r in con.execute(
+                "SELECT path, privacy_version FROM sources"
+                " WHERE harness='grok' AND (path=? OR path=?)",
+                (updates_path, events_path))}
+        self.assertEqual(
+            session_sources,
+            {updates_path: privacy.PRIVACY_VERSION,
+             events_path: privacy.PRIVACY_VERSION})
+        old_inst = "d" * 64
+        con.execute(
+            "UPDATE sessions SET agentsmd_version='0.0.0-stale',"
+            " instructions_sha256=?, preferences_sha256=?,"
+            " direction_status='stale', project_dir='/old/repo',"
+            " git_branch='old-branch', title='old native title',"
+            " identity_json=? WHERE session_key=?",
+            (old_inst, "e" * 64,
+             _json.dumps({"direction_status": "stale",
+                          "instructions_sha256": old_inst,
+                          "instructions_path": "/old/AGENTS.md",
+                          "repository_root": "/old/repo"}), S1))
+        # Only the events source goes stale; the adapter-selected updates
+        # source stays current.
+        con.execute("UPDATE sources SET privacy_version=0 WHERE path=?",
+                    (events_path,))
+        con.commit()
+        selected = con.execute(
+            "SELECT privacy_version FROM sources WHERE path=?",
+            (updates_path,)).fetchone()["privacy_version"]
+        self.assertEqual(selected, privacy.PRIVACY_VERSION)
+        before = {table: con.execute(
+            f"SELECT COUNT(*) n FROM {table}").fetchone()["n"]
+            for table in ("sessions", "submissions", "events",
+                          "import_errors", "responses", "sources")}
+        errors_before = sorted(
+            (r["harness"], r["source_path"], r["ordinal_num"], r["error"],
+             r["line_excerpt"]) for r in con.execute(
+                "SELECT harness, source_path, ordinal_num, error,"
+                " line_excerpt FROM import_errors"))
+        stats = grok.import_grok_session(con, session_dir)
+        after = {table: con.execute(
+            f"SELECT COUNT(*) n FROM {table}").fetchone()["n"]
+            for table in ("sessions", "submissions", "events",
+                          "import_errors", "responses", "sources")}
+        self.assertEqual(after, before)
+        errors_after = sorted(
+            (r["harness"], r["source_path"], r["ordinal_num"], r["error"],
+             r["line_excerpt"]) for r in con.execute(
+                "SELECT harness, source_path, ordinal_num, error,"
+                " line_excerpt FROM import_errors"))
+        self.assertEqual(errors_after, errors_before)
+        row = con.execute(
+            "SELECT agentsmd_version, instructions_sha256,"
+            " preferences_sha256, direction_status, identity_json,"
+            " project_dir, git_branch, title FROM sessions"
+            " WHERE session_key=?", (S1,)).fetchone()
+        # The stale import replaces the session identity centrally: no old
+        # hash, path, status or title survives. Chat evidence is reused
+        # without reparsing on this path, so chat-derived identity clears
+        # while summary-derived project fields are re-derived in place.
+        self.assertIsNone(row["instructions_sha256"])
+        self.assertIsNone(row["preferences_sha256"])
+        self.assertIsNone(row["direction_status"])
+        self.assertIsNone(row["identity_json"])
+        self.assertIsNone(row["agentsmd_version"])
+        self.assertEqual(row["project_dir"], "/redacted/repo")
+        self.assertEqual(row["git_branch"], "main")
+        self.assertIsNone(row["title"])
+        blob = _json.dumps([row["agentsmd_version"], row["identity_json"],
+                            row["project_dir"], row["git_branch"]])
+        for poison in (old_inst, "e" * 64, "/old/AGENTS.md", "/old/repo",
+                       "0.0.0-stale", "old-branch", "old native title"):
+            self.assertNotIn(poison, blob)
+        versions = {r["privacy_version"] for r in con.execute(
+            "SELECT privacy_version FROM sources WHERE harness='grok'"
+            " AND (path=? OR path=?)", (updates_path, events_path))}
+        self.assertEqual(versions, {privacy.PRIVACY_VERSION})
+        self.assertGreaterEqual(stats.get("events_updated", 0), 1)
+        con.close()
+
     def test_title_never_becomes_event_name(self):
         # Rule 7: native free-text titles are not stored; only a validated
         # native tool name becomes the event name, else safe "unknown".
