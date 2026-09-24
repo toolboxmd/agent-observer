@@ -991,8 +991,17 @@ def recovery_summary(attempts_rows: list[dict], con: sqlite3.Connection | None =
                         if diff >= 0:
                             time_to_same_progress = diff
                     break
+        # A failure after the first same-stage completion starts a
+        # new chain; it is not repeated failed recovery for this
+        # failure. Count only same-stage failures before recovery.
+        chain = later
+        if same_progress_turn is not None:
+            for idx, cand in enumerate(later):
+                if cand.get("turn_id") == same_progress_turn:
+                    chain = later[:idx]
+                    break
         same_failed_turns = [
-            cand.get("turn_id") for cand in later
+            cand.get("turn_id") for cand in chain
             if cand.get("state") in FAILURE_STATES
             and failed_stage is not None
             and _known_stage(cand.get("stage")) == failed_stage

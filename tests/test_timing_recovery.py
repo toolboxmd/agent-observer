@@ -475,18 +475,34 @@ class RecoveryTest(LedgerCase):
                  stage="implementation",
                  started=1875.812, ended=3663.207, elapsed=1787.395,
                  session="opencode:w2")
-        # Compatible pairs share a request: dispatch retries in one
-        # request, the implementation retry chain in another.
-        _link_router(self.con, "router:d1", "req-d", started=0.0, ended=578.674)
-        _link_router(self.con, "router:c1", "req-c", started=578.944, ended=621.342)
-        _link_router(self.con, "router:f1", "req-r", started=621.572, ended=1874.382)
-        _link_router(self.con, "router:r1", "req-r", started=1875.812, ended=3663.207)
+        # All four share the real same-job Router request
+        # t3-fleet-pane-1-complete: dispatch retries then the
+        # implementation retry chain in one compatible identity.
+        _link_router(self.con, "router:d1", "t3-fleet-pane-1-complete",
+                     started=0.0, ended=578.674)
+        _link_router(self.con, "router:c1", "t3-fleet-pane-1-complete",
+                     started=578.944, ended=621.342)
+        _link_router(self.con, "router:f1", "t3-fleet-pane-1-complete",
+                     started=621.572, ended=1874.382)
+        _link_router(self.con, "router:r1", "t3-fleet-pane-1-complete",
+                     started=1875.812, ended=3663.207)
         rep = report.task_report(self.con, "T-T3")
         rec = {r["failed_turn"]: r for r in rep["recovery"]}
-        # d1 has no compatible retry in req-d, so it stays unknown.
-        self.assertIsNone(rec["router:d1"]["first_progress_turn"])
-        self.assertIn("unknown", rec["router:d1"]["recovery_outcome"])
-        # f1 recovers to r1 inside req-r with exact gaps.
+        # d1 recovers to c1 inside the same request with exact gaps.
+        self.assertAlmostEqual(rec["router:d1"]["failure_to_next_start_s"],
+                               578.944 - 578.674, places=2)
+        self.assertEqual(rec["router:d1"]["first_progress_turn"], "router:c1")
+        self.assertEqual(rec["router:d1"]["first_progress_stage"], "dispatch")
+        self.assertEqual(rec["router:d1"]["failed_stage"], "dispatch")
+        self.assertEqual(rec["router:d1"]["same_stage_progress_turn"], "router:c1")
+        self.assertAlmostEqual(rec["router:d1"]["time_to_first_progress_s"],
+                               621.342 - 578.674, places=2)
+        self.assertIn("recovered", rec["router:d1"]["recovery_outcome"])
+        self.assertEqual(rec["router:d1"]["later_failed_attempts"], 0)
+        # f1 recovers to r1 inside the same request with exact gaps.
+        # The pool_move reason on r1 stays an attempt detail; f1 still
+        # classifies as an implementation failure.
+        self.assertEqual(rec["router:f1"]["failed_class"], "implementation")
         self.assertAlmostEqual(rec["router:f1"]["failure_to_next_start_s"], 1.43, places=2)
         self.assertEqual(rec["router:f1"]["first_progress_turn"], "router:r1")
         self.assertEqual(rec["router:f1"]["first_progress_stage"], "implementation")
@@ -533,6 +549,45 @@ class RecoveryTest(LedgerCase):
                       rec["router:f1"]["recovery_outcome"])
         # Only the later implementation failure counts as repeated.
         self.assertEqual(rec["router:f1"]["later_failed_attempts"], 1)
+
+    def test_failure_after_successful_recovery_is_new_failure(self):
+        # f1 fails, r1 completes the same stage, then f5 fails the
+        # same stage again. f5 is a new failure with its own recovery
+        # row, not repeated failed recovery for f1.
+        _task(self.con, "T-REC2", "active", 0.0)
+        _attempt(self.con, "T-REC2", "router:f1", role="worker",
+                 state="failed", terminal="failed", stage="implementation",
+                 started=0.0, ended=100.0, elapsed=100.0,
+                 session="codex:s1")
+        _attempt(self.con, "T-REC2", "router:r1", role="worker",
+                 state="complete", terminal="completed",
+                 stage="implementation",
+                 started=110.0, ended=120.0, elapsed=10.0,
+                 session="codex:s1")
+        _attempt(self.con, "T-REC2", "router:f5", role="worker",
+                 state="failed", terminal="failed", stage="implementation",
+                 started=130.0, ended=140.0, elapsed=10.0,
+                 session="codex:s1")
+        for turn, s, e in (("router:f1", 0.0, 100.0),
+                           ("router:r1", 110.0, 120.0),
+                           ("router:f5", 130.0, 140.0)):
+            _link_router(self.con, turn, "req-rec2", started=s, ended=e)
+        rep = report.task_report(self.con, "T-REC2")
+        rec = {r["failed_turn"]: r for r in rep["recovery"]}
+        self.assertEqual(rec["router:f1"]["failure_to_next_start_s"], 10.0)
+        self.assertEqual(rec["router:f1"]["first_progress_turn"], "router:r1")
+        self.assertEqual(rec["router:f1"]["first_progress_stage"], "implementation")
+        self.assertEqual(rec["router:f1"]["time_to_first_progress_s"], 20.0)
+        self.assertIn("recovered", rec["router:f1"]["recovery_outcome"])
+        self.assertEqual(rec["router:f1"]["same_stage_progress_turn"], "router:r1")
+        self.assertEqual(rec["router:f1"]["later_failed_attempts"], 0)
+        self.assertNotIn("router:f5",
+                         rec["router:f1"]["evidence"]["same_stage_failed_turns"])
+        # f5 stays its own failed row, not folded into f1.
+        self.assertIn("router:f5", rec)
+        self.assertEqual(rec["router:f5"]["failed_stage"], "implementation")
+        self.assertIn("unknown", rec["router:f5"]["recovery_outcome"])
+        self.assertEqual(rec["router:f5"]["later_failed_attempts"], 0)
 
     def test_unknown_stage_never_recovers(self):
         _task(self.con, "T-UNK", "active", 0.0)
