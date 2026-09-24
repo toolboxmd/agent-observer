@@ -250,6 +250,10 @@ def import_claude_file(con: sqlite3.Connection, path: str,
              "submissions_inserted": 0, "events_inserted": 0,
              "events_duplicate": 0, "compactions": 0, "malformed": 0}
     src = JsonlSource(con, HARNESS, path, full=full)
+    if (src.row["claude_usage_version"] != 1
+            or src.row["claude_usage_offset"] != src.row["read_offset"]):
+        src.start_offset = src.end_offset = 0
+        src.unchanged = False
     if src.unchanged and src.recheck_unchanged():
         # Unchanged fast path: same size, mtime, inode and tail bytes,
         # same privacy version, not full. The recheck re-stats immediately
@@ -340,6 +344,8 @@ def import_claude_file(con: sqlite3.Connection, path: str,
                           r.session_key.split(":", 1)[1], src.source_id,
                           **fields)
     stats.update(src.finish(session_id=r.native_session, thread_id=r.agent_id))
+    con.execute("UPDATE sources SET claude_usage_version=1,claude_usage_offset=? WHERE id=?",
+                (src.end_offset, src.source_id))
     stats["session_key"] = r.session_key
     con.commit()
     return stats
@@ -407,11 +413,25 @@ def _usage_values(usage) -> dict:
     if not any(k in usage for k in _CLAUDE_COUNTER_KEYS) and \
             "thinking_tokens" not in details:
         raise _MalformedUsage("malformed usage")
+    ttl = usage.get("cache_creation")
+    if ttl is not None and not isinstance(ttl, dict):
+        raise _MalformedUsage("malformed cache creation details")
+    ttl = ttl or {}
+    five = ttl.get("ephemeral_5m_input_tokens")
+    hour = ttl.get("ephemeral_1h_input_tokens")
+    if not _valid_counter(five) or not _valid_counter(hour):
+        raise _MalformedUsage("malformed cache creation counter")
+    total_write = usage.get("cache_creation_input_tokens")
+    if five is not None and hour is not None and total_write is not None \
+            and five + hour != total_write:
+        raise _MalformedUsage("inconsistent cache creation counters")
     values = [usage.get(k) for k in _CLAUDE_COUNTER_KEYS]
     return {
         "input_tokens": usage.get("input_tokens"),
         "cached_input_tokens": usage.get("cache_read_input_tokens"),
         "cache_write_input_tokens": usage.get("cache_creation_input_tokens"),
+        "cache_write_5m_tokens": five,
+        "cache_write_1h_tokens": hour,
         "output_tokens": usage.get("output_tokens"),
         "reasoning_output_tokens": details.get("thinking_tokens"),
         "total_tokens": sum(values)
@@ -422,7 +442,8 @@ def _usage_values(usage) -> dict:
 def _stored_counters(r: _Reader, rid: str) -> dict:
     row = r.con.execute(
         "SELECT input_tokens, cached_input_tokens, cache_write_input_tokens,"
-        " output_tokens, reasoning_output_tokens, total_tokens"
+        " output_tokens, reasoning_output_tokens, total_tokens,"
+        " cache_write_5m_tokens, cache_write_1h_tokens"
         " FROM responses WHERE response_id=?", (rid,)).fetchone()
     return dict(row) if row is not None else {}
 
@@ -441,22 +462,37 @@ def _ingest_usage_row(r: _Reader, obj: dict, ordinal: int, ts, mid: str,
     if mid in r.finalized or _is_finalized(r.con, rid):
         r.finalized.add(mid)
         seen = _stored_counters(r, rid)
-        if seen != values:
+        ttl_keys = ("cache_write_5m_tokens", "cache_write_1h_tokens")
+        if any(seen.get(k) != v for k, v in values.items() if k not in ttl_keys):
             raise _UsageConflict("usage conflict")
+        if not final:
+            # A replayed provisional block cannot supply final TTL metadata.
+            r.stats["responses_duplicate"] += 1
+            return
+        if any(seen.get(k) is not None and values[k] is not None
+               and seen[k] != values[k] for k in ttl_keys):
+            raise _UsageConflict("usage conflict")
+        # Enrich legacy finalized rows without replacing accepted usage or
+        # losing known TTL metadata when copied records omit it.
+        con = r.con
+        con.execute("UPDATE responses SET cache_write_5m_tokens=COALESCE(cache_write_5m_tokens,?),"
+                    "cache_write_1h_tokens=COALESCE(cache_write_1h_tokens,?) WHERE response_id=?",
+                    (values[ttl_keys[0]], values[ttl_keys[1]], rid))
         r.stats["responses_duplicate"] += 1
         return
     cur = r.con.execute(
         "INSERT OR IGNORE INTO responses(response_id, source_id, harness,"
         " session_key, turn_id, session_id, ordinal_num, ts, model, effort,"
         " input_tokens, cached_input_tokens, cache_write_input_tokens,"
-        " output_tokens, reasoning_output_tokens, total_tokens, semantics)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " output_tokens, reasoning_output_tokens, total_tokens, semantics,"
+        " cache_write_5m_tokens,cache_write_1h_tokens)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (rid, r.src.source_id, HARNESS, r.session_key, r.turn,
          r.native_session, ordinal, ts, model, obj.get("effort"),
          values["input_tokens"], values["cached_input_tokens"],
          values["cache_write_input_tokens"], values["output_tokens"],
          values["reasoning_output_tokens"], values["total_tokens"],
-         SEMANTICS))
+         SEMANTICS, values["cache_write_5m_tokens"], values["cache_write_1h_tokens"]))
     if cur.rowcount:
         r.stats["responses_inserted"] += 1
         if final:
@@ -477,12 +513,14 @@ def _ingest_usage_row(r: _Reader, obj: dict, ordinal: int, ts, mid: str,
         " model=COALESCE(?, model), effort=COALESCE(?, effort),"
         " input_tokens=?, cached_input_tokens=?,"
         " cache_write_input_tokens=?, output_tokens=?,"
-        " reasoning_output_tokens=?, total_tokens=?"
+        " reasoning_output_tokens=?, total_tokens=?,"
+        " cache_write_5m_tokens=?, cache_write_1h_tokens=?"
         " WHERE response_id=?",
         (ordinal, ts, model, obj.get("effort"),
          values["input_tokens"], values["cached_input_tokens"],
          values["cache_write_input_tokens"], values["output_tokens"],
-         values["reasoning_output_tokens"], values["total_tokens"], rid))
+         values["reasoning_output_tokens"], values["total_tokens"],
+         values["cache_write_5m_tokens"], values["cache_write_1h_tokens"], rid))
     r.stats["responses_updated"] += 1
     if final:
         _mark_finalized(r.con, rid)

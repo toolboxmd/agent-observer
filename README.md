@@ -46,7 +46,7 @@ names another.
 | Claude Code | `~/.claude/projects/*/*.jsonl` and subagent transcripts | per message, counted once across streamed blocks |
 | OpenCode | `~/.local/share/opencode/opencode.db` (read-only) | per completed assistant message |
 | Grok Build | `~/.grok/sessions/*/*/` | per prompt completion |
-| Model Router | `~/.local/state/model-router/jobs.db` (read-only) | ownership: jobs become tasks, invocations become attempts |
+| Model Router | `DURABLE_RUNNER_STATE_DIR`, `~/.local/share/durable-runner`, and legacy `~/.local/state/model-router` (read-only, deduplicated) | explicit task ownership, jobs and invocations |
 
 Counter meanings differ by harness (cached input is part of input on Codex
 and Grok, separate on Claude Code and OpenCode). Each response keeps its
@@ -85,8 +85,10 @@ output is a candidate list with evidence, not a verdict.
 
 ## Ownership and tasks
 
-Model Router jobs need no extra work: `sync` binds each job's worker and
-dispatcher sessions to a task through the router's own records. For work
+Put `observer_task_id` in related Router jobs' prepared task JSON to connect
+them to one Observer task. `sync` binds their dedicated worker and dispatcher
+sessions using Router records, preserving captured task metadata and outcomes.
+Without that field, each job retains its legacy `router:<request-id>` task. For work
 outside Model Router, a coordinator records ownership through its existing
 briefs and handoffs:
 
@@ -100,17 +102,97 @@ agent-observer task show --task T-42
 Every genuine prompt in a task's sessions needs a binding; a missing or
 conflicting one is reported (exit 3), never inherited. A prompt serving
 several tasks can be bound with `--shared`; its usage then stays shared and
-is never divided.
+is never divided. `task show` reports the same attributed, shared-joint and
+unassigned partitions that publication uses, with per-model rows carrying
+native input, cache-read, cache-write, output and reasoning buckets plus
+exact counter semantics. Buckets are never added across semantics; a mixed
+scope exposes per-semantics groups with no combined total. The attributed
+headline excludes shared and outside-task usage; shared model rows render
+separately. Missing ownership, conflicting ownership, active attempts,
+crashes, missing native sessions, unbound workers and incomplete coverage stay visible; arithmetic reconciliation
+alone never claims completeness. Acceptance is explicit only: a zero exit
+or successful attempt never implies an accepted outcome.
+
+Task reports carry a stable snapshot identity (`snapshot_id`, a SHA-256
+over the selected task, sessions, response counters, assignments, outcome,
+attempts, dispatches, source cutoff and price schedule) and a measured set (task, sessions
+and attributed/shared/unassigned response ids). Repeated rendering without
+ledger changes keeps the same identity; new evidence changes it. Time and
+diagnostics are task-turn scoped when turn timing exists, otherwise labeled
+unavailable with the whole-session span kept explicitly as session context.
+
+The bundled dated price schedule supplies standard API list-price equivalents
+for supported exact model identities. `task show --prices schedule.json` and
+`publish --task T-42 --prices schedule.json` override it with a sourced offline
+schedule. Each response is priced under its native semantics. Unknown models,
+unsupported semantics, missing counters or rates, cache-write TTL ambiguity and
+unverified long-context tiers remain unpriced. The known subtotal and priced
+response count remain separate from a complete estimate. These estimates do
+not represent subscription spending or an invoice; native reported cost is
+shown separately. Provider source URLs travel with each model's estimate.
+
+Coordinators and dispatchers reuse `task show --task T-42 --json`; no Router
+price table is needed. Task inspection and publication open an existing ledger
+read-only, using one consistent database snapshot. Run `sync` first to create or
+upgrade the ledger; reporting never migrates it. A strict read-only sandbox may
+also prevent SQLite from opening a WAL ledger whose sidecars are absent. In
+that case the coordinator exports the report and hands its saved JSON to the
+dispatcher; do not relax permissions or bypass SQLite locking. Save that JSON
+as valuation evidence. It includes
+the exact selected `price_schedule` and its `price_schedule_id` (SHA-256 of
+JSON with sorted keys and compact separators), alongside the costs, coverage
+and task snapshot. `publish --dry-run --json` carries the same evidence;
+the GitHub body shows the schedule identity and rates for reported models.
+The local JSON retains the supplied schedule, including any custom metadata;
+publication does not render arbitrary metadata or unused model entries.
+Extracting `price_schedule` to a file and passing it to `--prices` reproduces
+the valuation while the underlying task evidence is unchanged. Keep the original
+export when usage or ownership changes; this is not a historical ledger replay.
+Changing the schedule creates a new valuation identity, never an invoice.
+
+The bundled schedule's `as_of` records when its prices were verified. Neither
+that date nor a caller's `effective_date` selects rates by response time:
+reports explicitly value usage using the selected schedule. Verify official
+sources when adding a model/route, after announced changes or promotion expiry,
+or when freshness affects a decision. Verify a promotional price before claiming
+it is currently free. Reports retain the schedule date without implying a live
+check; rendering is offline and no periodic updater runs.
+
+Claude cache-write prices use the native 5-minute/1-hour breakdown, including
+backfill for older imports. Muse Contributor Free uses its verified promotional
+route price of $0; a paid-model proxy is not substituted as actual cost.
+
+Work phase is separate from token type. Record `capture assign --phase review`
+or `capture attempt --phase implementation` for the entire observed turn.
+Reports partition attributed usage by phase and show reasoning versus other
+generated output, plus recorded tool/MCP activity. A long turn spanning phases
+stays `mixed`, and missing phase ownership stays `unclassified`. Tool counts
+are observations, not individual token bills; activity without turn ownership
+remains labeled session context. This supports investigating inefficiency
+without claiming that reasoning, tool use and implementation are disjoint work.
+
+For a provably dedicated session outside Router, `capture assign-session
+--task T-42 --session <key> --exclusive --evidence <dispatch-ref>` binds the
+whole session. It rejects existing ownership conflicts. Do not use it for a
+conversation that has served, or will serve, other tasks. The installed
+Observer Skill owns the complete capture and delivery procedure.
 
 ## GitHub summaries
 
 `publish --task T-42 --repo o/r --pr 7` renders one aggregate comment
-(models, effort, tokens, span, diagnostic counts) and creates or updates the
+(models, effort, token buckets with semantics, sourced cost, snapshot,
+outcome, coverage and task-scoped diagnostics) and creates or updates the
 single Observer-owned comment on that PR or commit (`--commit <sha>`).
 `--dry-run` prints it without posting. `publish --dry-run --json` instead
 prints parseable JSON with the same summary data, the rendered body, and an
 explicit target naming the task or sessions plus any repo, PR or commit.
-Only aggregates leave the machine.
+Only aggregates leave the machine: no transcripts, prompts, excerpts,
+paths or free-form repair/proof text. Candidate and proof render only as
+public GitHub URLs, owner/name identifiers, PR numbers, hex SHAs or fixed
+hashes; anything else renders as withheld. Repo, PR and commit targets are
+validated before posting; session-only summaries name their limited scope
+and never imply a task outcome. Publication is explicit only and offline
+until posted; repeats update the owned comment in place.
 
 ## Launch requirements
 

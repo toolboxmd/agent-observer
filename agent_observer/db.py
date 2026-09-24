@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+from pathlib import Path
 
 from . import CAPTURE_CONTRACT_VERSION, EVENT_CONTRACT_VERSION, SCHEMA_VERSION
 
@@ -44,6 +45,12 @@ CREATE TABLE IF NOT EXISTS sources (
   session_id TEXT,
   thread_id TEXT,
   thread_source TEXT,
+  codex_context_version INTEGER,
+  codex_context_offset INTEGER,
+  codex_model TEXT,
+  codex_effort TEXT,
+  claude_usage_version INTEGER,
+  claude_usage_offset INTEGER,
   ordinal_max INTEGER NOT NULL DEFAULT -1,
   raw_bytes INTEGER NOT NULL DEFAULT 0,
   imported_at REAL NOT NULL,
@@ -106,6 +113,8 @@ CREATE TABLE IF NOT EXISTS responses (
   input_tokens INTEGER,
   cached_input_tokens INTEGER,
   cache_write_input_tokens INTEGER,
+  cache_write_5m_tokens INTEGER,
+  cache_write_1h_tokens INTEGER,
   output_tokens INTEGER,
   reasoning_output_tokens INTEGER,
   total_tokens INTEGER,
@@ -354,6 +363,22 @@ def _harden_path(path: str) -> None:
             pass
 
 
+def connect_read_only(path: str) -> sqlite3.Connection:
+    """Read one consistent existing ledger snapshot without migration or chmod."""
+    con = sqlite3.connect(Path(path).absolute().as_uri() + "?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("BEGIN")
+        row = con.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+        if row is None or row['value'] != str(SCHEMA_VERSION):
+            raise RuntimeError("ledger schema is incompatible; run agent-observer sync with the current version")
+    except Exception:
+        con.close()
+        raise
+    return con
+
+
 def connect(path: str) -> sqlite3.Connection:
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
@@ -386,6 +411,17 @@ def init_db(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE sources ADD COLUMN mtime_ns INTEGER")
     if "ino" not in columns:
         con.execute("ALTER TABLE sources ADD COLUMN ino INTEGER")
+    for name, kind in (("codex_context_version", "INTEGER"),
+                       ("codex_context_offset", "INTEGER"),
+                       ("claude_usage_version", "INTEGER"),
+                       ("claude_usage_offset", "INTEGER"),
+                       ("codex_model", "TEXT"), ("codex_effort", "TEXT")):
+        if name not in columns:
+            con.execute(f"ALTER TABLE sources ADD COLUMN {name} {kind}")
+    response_columns = {row["name"] for row in con.execute("PRAGMA table_info(responses)")}
+    for name in ("cache_write_5m_tokens", "cache_write_1h_tokens"):
+        if name not in response_columns:
+            con.execute(f"ALTER TABLE responses ADD COLUMN {name} INTEGER")
     con.execute(
         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES "
         "('schema_version', ?), ('event_contract_version', ?), "

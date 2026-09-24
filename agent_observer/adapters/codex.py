@@ -257,12 +257,13 @@ class _Reader:
         self.thread_source = src.row["thread_source"]
         self.cli_version = src.row["cli_version"]
         self.identity = SessionIdentity()
-        self.model = None
-        self.effort = None
+        self.model = src.row["codex_model"] if src.start_offset else None
+        self.effort = src.row["codex_effort"] if src.start_offset else None
         self.first_ts = None
         self.last_ts = None
         self.meta: dict = {}
         self.token_counts: list = []
+        self.usage_context_seen: set[str] = set()
         # Compaction context for deferred token_count flushing: token_count
         # checkpoints are collected during ingestion and reconciled only at
         # flush, so each checkpoint captures whether a compaction boundary
@@ -390,6 +391,12 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         "events_duplicate": 0, "compactions": 0, "malformed": 0,
     }
     src = JsonlSource(con, HARNESS, path, full=full)
+    if (src.row["codex_context_version"] != 2
+            or src.row["codex_context_offset"] != src.row["read_offset"]):
+        # One in-place replay repairs metadata lost by older incremental imports.
+        src.start_offset = 0
+        src.end_offset = 0
+        src.unchanged = False
     if src.unchanged and src.recheck_unchanged():
         # Unchanged fast path: same size, mtime, inode and tail bytes at
         # the recorded offset, same privacy version, not full, no new
@@ -516,6 +523,9 @@ def import_codex_file(con: sqlite3.Connection, path: str,
                             thread_id=reader.thread_id,
                             cli_version=reader.cli_version,
                             thread_source=reader.thread_source))
+    con.execute("UPDATE sources SET codex_context_version=2,codex_context_offset=?,"
+                "codex_model=?,codex_effort=? WHERE id=?",
+                (src.end_offset, reader.model, reader.effort, src.source_id))
     stats["session_key"] = reader.session_key
     con.commit()
     return stats
@@ -615,6 +625,23 @@ def _fallback_want(last: dict, total: int) -> dict:
     }
 
 
+def _repair_usage_context(r: _Reader, rid: str, obj: dict, model, effort) -> None:
+    """Only the original record in a full source replay can repair context.
+
+    Repeated counters after a model switch are not new usage. A copied source
+    cannot establish the original record's context either. Exact replay may
+    restore unknown values that an older reader incorrectly inferred.
+    """
+    first = rid not in r.usage_context_seen
+    r.usage_context_seen.add(rid)
+    if first and r.src.start_offset == 0:
+        r.con.execute(
+            "UPDATE responses SET model=?,effort=? WHERE response_id=?"
+            " AND source_id=? AND ordinal_num IS ? AND ts IS ?",
+            (model, effort, rid, r.src.source_id, obj.get("ordinal"),
+             iso_ts(obj.get("timestamp"))))
+
+
 def _flush_token_counts(r: _Reader) -> None:
     """Count token_count checkpoints for rollouts without full usage cover.
 
@@ -679,7 +706,7 @@ def _flush_token_counts(r: _Reader) -> None:
                     prior_compaction = hit is not None
             return prior_compaction
 
-        for struct_ordinal, obj, info, compacted_before in r.token_counts:
+        for struct_ordinal, obj, info, compacted_before, model, effort in r.token_counts:
             ordinal = struct_ordinal
             try:
                 if not isinstance(info, dict):
@@ -728,6 +755,7 @@ def _flush_token_counts(r: _Reader) -> None:
                                 previous = total
                             continue
                         raise _UsageConflict("usage conflict")
+                    _repair_usage_context(r, rid, obj, model, effort)
                     r.stats["responses_duplicate"] += 1
                     if total > previous:
                         previous = total
@@ -743,11 +771,12 @@ def _flush_token_counts(r: _Reader) -> None:
                     " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (rid, r.src.source_id, HARNESS,
                      r.session_key, r.thread_id, obj.get("ordinal"), iso_ts(obj.get("timestamp")),
-                     r.model, r.effort, last_raw.get("input_tokens"), last_raw.get("cached_input_tokens"),
+                     model, effort, last_raw.get("input_tokens"), last_raw.get("cached_input_tokens"),
                      last_raw.get("cache_write_input_tokens"), last_raw.get("output_tokens"),
                      last_raw.get("reasoning_output_tokens"), last_raw.get("total_tokens"), total,
                      TOKEN_COUNT_SEMANTICS))
                 if cur.rowcount:
+                    r.usage_context_seen.add(rid)
                     r.stats["responses_inserted"] += 1
                 else:
                     # Lost a race with an existing row: compare before counting.
@@ -863,8 +892,10 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
                 "thread_total_tokens": th.get("total_tokens")}
         if seen != want:
             raise _UsageConflict("usage conflict")
+        _repair_usage_context(r, rid, obj, r.model, r.effort)
         r.stats["responses_duplicate"] += 1
     else:
+        r.usage_context_seen.add(rid)
         r.stats["responses_inserted"] += 1
     if turn_id:
         r.con.execute(
@@ -1097,7 +1128,7 @@ def _ingest_event_msg(r: _Reader, obj: dict, ordinal: int) -> None:
         # reason: flushing happens after the whole file is read, so each
         # checkpoint must remember whether a compaction boundary already
         # preceded it at collection time.
-        r.token_counts.append((ordinal, obj, info_raw, r.compaction_seen))
+        r.token_counts.append((ordinal, obj, info_raw, r.compaction_seen, r.model, r.effort))
     elif etype == "thread_settings_applied":
         return
     elif etype == "turn_aborted":

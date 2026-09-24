@@ -71,7 +71,8 @@ from . import codex as _codex
 
 HARNESS = "router"
 ROUTER_SCHEMA_VERSION = 2
-DEFAULT_ROOT = os.path.expanduser("~/.local/state/model-router")
+DEFAULT_ROOT = os.path.expanduser("~/.local/share/durable-runner")
+LEGACY_ROOT = os.path.expanduser("~/.local/state/model-router")
 
 CAPABILITIES = [
     ("router_ledger", True, "router jobs, invocations and readings copied read-only; usage stays numeric-only evidence on attempts, never native responses"),
@@ -236,10 +237,17 @@ _CONTENT_HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def discover(root: str | None = None) -> list[str]:
-    db_path, _ = _resolve_paths(root, None)
-    if db_path and os.path.isfile(db_path):
-        return [db_path]
-    return []
+    roots = [root] if root is not None else [
+        os.environ.get("DURABLE_RUNNER_STATE_DIR"), DEFAULT_ROOT, LEGACY_ROOT]
+    paths = []
+    for candidate in roots:
+        if not candidate:
+            continue
+        path, _ = _resolve_paths(os.path.expanduser(candidate), None)
+        canonical = _canonical_source_path(path)
+        if os.path.isfile(canonical) and canonical not in paths:
+            paths.append(canonical)
+    return paths
 
 
 def sync(con: sqlite3.Connection, root: str | None = None,
@@ -249,6 +257,17 @@ def sync(con: sqlite3.Connection, root: str | None = None,
               "submissions_inserted": 0, "malformed": 0, "failed": [],
               "jobs": 0, "invocations": 0, "bindings": 0, "readings": 0,
               "rollouts": 0}
+    if root is None and source is None:
+        paths = discover()
+        if paths:
+            for path in paths:
+                result = sync(con, source=path, full=full)
+                for key, value in result.items():
+                    if key == "failed":
+                        totals[key].extend(value)
+                    elif key != "harness":
+                        totals[key] += value
+            return totals
     db_path, rollout_root = _resolve_paths(root, source)
     if db_path is not None:
         db_path = _canonical_source_path(db_path)
@@ -377,7 +396,7 @@ def _ledger_fingerprint(jobs: list[dict], invocations: list[dict],
     The fingerprint stays inside the sources row; only shape-only excerpts
     ever reach import_errors.
     """
-    parts = []
+    parts = ["observer-task-ownership-v2"]
     for rows in (jobs, invocations, readings, events):
         parts.append(sorted(
             json.dumps(r, sort_keys=True, default=str) for r in rows))
@@ -416,6 +435,15 @@ def _record_source_success(con: sqlite3.Connection, canonical: str,
              HARNESS, canonical))
 
 
+def _job_task_id(job: dict) -> str | None:
+    request_id = _valid_request_id(job.get("request_id"))
+    if request_id is None:
+        return None
+    task = _parse_json_object(job.get("task_json")) or {}
+    explicit = _valid_id_token(task.get("observer_task_id"))
+    return explicit or f"router:{request_id}"
+
+
 def _snapshot_bindings(con: sqlite3.Connection, jobs: list[dict],
                        invocations: list[dict]) -> tuple:
     """Non-mutating binding map from an already-read ledger snapshot.
@@ -426,11 +454,11 @@ def _snapshot_bindings(con: sqlite3.Connection, jobs: list[dict],
     the unchanged fast path so usage reconciliation still sees the bound
     sessions after the router-owned rollouts land.
     """
-    job_ids: set[str] = set()
+    job_ids: dict[str, str] = {}
     for job in jobs:
         request_id = _valid_request_id(job.get("request_id"))
         if request_id is not None:
-            job_ids.add(request_id)
+            job_ids[request_id] = _job_task_id(job)
     bound: dict[str, str] = {}
     bound_pairs: set[tuple[str, str]] = set()
     for inv in invocations:
@@ -444,10 +472,13 @@ def _snapshot_bindings(con: sqlite3.Connection, jobs: list[dict],
         if key is None:
             continue
         if not con.execute("SELECT 1 FROM tasks WHERE task_id=?",
-                           (f"router:{request_id}",)).fetchone():
+                           (job_ids[request_id],)).fetchone():
+            continue
+        if not con.execute("SELECT 1 FROM session_assignments WHERE session_key=? AND task_id=?",
+                           (key, job_ids[request_id])).fetchone():
             continue
         bound[invocation_id] = key
-        bound_pairs.add((key, f"router:{request_id}"))
+        bound_pairs.add((key, job_ids[request_id]))
     return bound, bound_pairs
 
 
@@ -510,21 +541,23 @@ def _sync_ledger(con: sqlite3.Connection, db_path: str, totals: dict,
             bound, bound_pairs = _snapshot_bindings(con, jobs, invocations)
             totals["bindings"] = len(bound_pairs)
             return False, invocations, bound
+        task_ids = {j.get("request_id"): _job_task_id(j) for j in jobs}
         for job in jobs:
             if _import_job(con, db_path, job, totals):
                 changed = True
         bound: dict[str, str] = {}
         bound_pairs: set[tuple[str, str]] = set()
         for inv in invocations:
-            if _import_invocation(con, db_path, inv, totals):
+            if _import_invocation(con, db_path, inv, totals,
+                                  task_ids.get(inv.get("request_id"))):
                 changed = True
-            key = _binding_key(con, inv)
+            key = _binding_key(con, inv, task_ids.get(inv.get("request_id")))
             if key is not None:
                 invocation_id = _valid_id_token(inv.get("invocation_id"))
                 request_id = _valid_request_id(inv.get("request_id"))
                 if invocation_id is not None and request_id is not None:
                     bound[invocation_id] = key
-                    bound_pairs.add((key, f"router:{request_id}"))
+                    bound_pairs.add((key, task_ids[request_id]))
         totals["bindings"] = len(bound_pairs)
         for reading in readings:
             if _import_reading(con, db_path, reading, totals):
@@ -890,17 +923,20 @@ def _import_job(con: sqlite3.Connection, db_path: str, job: dict,
     }
     changed = _upsert_changed(con, "router_jobs",
                               {"request_id": request_id}, values)
+    task_id = _job_task_id(job)
+    explicit = task_id != f"router:{request_id}"
     changed = _upsert_task(
         con, request_id, issue, title, workspace,
-        job.get("created_at")) or changed
-    changed = _upsert_outcome(con, status,
-                              f"router:{request_id}") or changed
+        job.get("created_at"), task_id=task_id, preserve=explicit) or changed
+    # A combined task has several job states; no last-job status is its outcome.
+    changed = _upsert_outcome(con, None if explicit else status, task_id) or changed
     return changed
 
 
 def _upsert_task(con: sqlite3.Connection, request_id: str, issue,
-                 title, workspace, created_at) -> bool:
-    task_id = f"router:{request_id}"
+                 title, workspace, created_at, task_id=None,
+                 preserve=False) -> bool:
+    task_id = task_id or f"router:{request_id}"
     project = _project_from_workspace(workspace)
     row = con.execute(
         "SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
@@ -911,6 +947,8 @@ def _upsert_task(con: sqlite3.Connection, request_id: str, issue,
             (task_id, project, None, title, issue, "router",
              iso_ts(created_at) or db.now()))
         return True
+    if preserve or row["origin"] != "router":
+        return False
     updates = {}
     if project is not None and row["project"] != project:
         updates["project"] = project
@@ -1018,7 +1056,7 @@ def _attempt_state(raw_terminal_class) -> str:
 
 
 def _import_invocation(con: sqlite3.Connection, db_path: str, inv: dict,
-                       totals: dict) -> bool:
+                       totals: dict, task_id: str | None = None) -> bool:
     invocation_id = _valid_id_token(inv.get("invocation_id"))
     if invocation_id is None:
         _record_malformed(
@@ -1090,8 +1128,12 @@ def _import_invocation(con: sqlite3.Connection, db_path: str, inv: dict,
     changed = _upsert_changed(con, "router_invocations",
                               {"invocation_id": invocation_id},
                               values)
-    task_id = f"router:{request_id}"
+    task_id = task_id or f"router:{request_id}"
     turn_id = f"router:{invocation_id}"
+    if task_id != f"router:{request_id}":
+        # Replace this invocation's old adapter-owned projection after upgrade.
+        con.execute("DELETE FROM attempts WHERE task_id=? AND turn_id=?",
+                    (f"router:{request_id}", turn_id))
     attempt = {
         "role": kind or "unknown",
         "harness": HARNESS,
@@ -1173,7 +1215,8 @@ def _session_key_for(inv: dict) -> str | None:
     return candidate
 
 
-def _binding_key(con: sqlite3.Connection, inv: dict) -> str | None:
+def _binding_key(con: sqlite3.Connection, inv: dict,
+                 task_id: str | None = None) -> str | None:
     """Bind the worker session; the shared planner session stays unbound."""
     key = _session_key_for(inv)
     if key is None:
@@ -1182,13 +1225,25 @@ def _binding_key(con: sqlite3.Connection, inv: dict) -> str | None:
     invocation_id = _valid_id_token(inv.get("invocation_id"))
     if request_id is None or invocation_id is None:
         return None
-    task_id = f"router:{request_id}"
+    task_id = task_id or f"router:{request_id}"
     if not con.execute("SELECT 1 FROM tasks WHERE task_id=?",
                        (task_id,)).fetchone():
+        return None
+    if con.execute(
+            "SELECT 1 FROM assignments a JOIN submissions s ON s.native_id=a.submission_native_id"
+            " WHERE s.session_key=? AND a.task_id<>?", (key, task_id)).fetchone():
+        # Explicit submission ownership outranks a purported dedicated worker.
+        # The attempt retains its expected session, exposing the unbound gap.
+        con.execute("DELETE FROM session_assignments WHERE session_key=? AND task_id=? AND evidence=?",
+                    (key, task_id, f"router:{request_id}:{invocation_id}"))
         return None
     evidence = f"router:{request_id}:{invocation_id}"
     if privacy.filter_target(evidence) != evidence:
         return None
+    if task_id != f"router:{request_id}":
+        con.execute("DELETE FROM session_assignments WHERE session_key=?"
+                    " AND task_id=? AND evidence=?",
+                    (key, f"router:{request_id}", evidence))
     row = con.execute(
         "SELECT evidence FROM session_assignments"
         " WHERE session_key=? AND task_id=?",

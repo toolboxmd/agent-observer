@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.0] - 2026-09-24
+
+### Added
+
+- Connect task-scoped model costs, Router ownership and outcome evidence
+
 ## [0.2.0] - 2026-09-24
 
 ### Added
