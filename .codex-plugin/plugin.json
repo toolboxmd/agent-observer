@@ -1,6 +1,6 @@
 {
   "name": "agent-observer",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Measure agent work across Codex, Claude Code, OpenCode and Grok Build from native records, and compare behavior by model and AgentsMD version.",
   "author": {
     "name": "toolboxmd",

@@ -170,6 +170,54 @@ class RouterAdapterTest(LedgerCase):
                 "tasks", "attempts", "outcomes", "session_assignments",
                 "responses", "events")}
 
+    def test_explicit_task_combines_jobs_and_preserves_capture(self):
+        from agent_observer import report
+        self.con.execute("INSERT INTO tasks(task_id, title, project, origin, created_at)"
+                         " VALUES('repair:23','human title','observer','manual',1)")
+        self.con.execute("INSERT INTO outcomes(task_id, acceptance_state, candidate, updated_at)"
+                         " VALUES('repair:23','active','candidate-evidence',1)")
+        # Simulate an already-imported ledger upgrading to explicit mapping.
+        router.sync(self.con, root=self.state)
+        src = sqlite3.connect(self.db_path)
+        src.execute("UPDATE jobs SET task_json=?", (json.dumps({
+            "issue": "toolboxmd/agent-observer#23",
+            "observer_task_id": "repair:23"}),))
+        src.commit(); src.close()
+        router.sync(self.con, root=self.state)
+        rows = self.con.execute("SELECT task_id FROM attempts").fetchall()
+        self.assertEqual({r["task_id"] for r in rows}, {"repair:23"})
+        bindings = self.con.execute("SELECT DISTINCT task_id FROM session_assignments").fetchall()
+        self.assertEqual({r["task_id"] for r in bindings}, {"repair:23"})
+        task = self.con.execute("SELECT * FROM tasks WHERE task_id='repair:23'").fetchone()
+        self.assertEqual((task["title"], task["project"]), ("human title", "observer"))
+        outcome = self.con.execute("SELECT * FROM outcomes WHERE task_id='repair:23'").fetchone()
+        self.assertEqual((outcome["acceptance_state"], outcome["candidate"]),
+                         ("active", "candidate-evidence"))
+        before = report.task_report(self.con, "repair:23")
+        again = router.sync(self.con, root=self.state)
+        self.assertEqual(again["unchanged"], 1)
+        self.assertEqual(report.task_report(self.con, "repair:23")["attributed"],
+                         before["attributed"])
+        self.assertEqual(len(before["attempts"]), 8)
+        self.assertNotIn("claude:plan-sess-1", before["scope_sessions"])
+
+    def test_default_discovery_covers_current_legacy_and_configured_once(self):
+        from unittest.mock import patch
+        other = os.path.join(self.tmp.name, "legacy")
+        os.makedirs(other)
+        shutil.copy(self.db_path, os.path.join(other, "jobs.db"))
+        alias = os.path.join(self.tmp.name, "alias")
+        os.symlink(self.state, alias)
+        with patch.object(router, "DEFAULT_ROOT", self.state), \
+                patch.object(router, "LEGACY_ROOT", other, create=True), \
+                patch.dict(os.environ, {"DURABLE_RUNNER_STATE_DIR": alias}):
+            self.assertEqual(set(router.discover()), {
+                os.path.realpath(self.db_path), os.path.realpath(os.path.join(other, "jobs.db"))})
+            self.assertEqual(router.discover(self.state), [os.path.realpath(self.db_path)])
+            result = router.sync(self.con)
+            self.assertEqual(result["sources"], 2)
+            self.assertEqual(self.con.execute("SELECT count(*) FROM responses").fetchone()[0], 2)
+
     def test_job_to_task_fields_and_unknown_outcome(self):
         stats = router.sync(self.con, root=self.state)
         self.assertEqual(stats["jobs"], 2)

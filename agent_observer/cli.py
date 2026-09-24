@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 
 from . import CAPTURE_CONTRACT_VERSION, EVENT_CONTRACT_VERSION, SCHEMA_VERSION
@@ -116,7 +117,43 @@ def _text(payload) -> str:
             f"  missing assignments: {r['missing_assignments'] or 'none'}",
             f"  conflicting: {r['conflicting_assignments'] or 'none'}",
             f"  crashes counted separately: {r['crashes_counted_separately']}",
+            f"  acceptance: {r.get('acceptance_state') or 'unknown'} "
+            f"(finished processes never imply acceptance)",
+            f"  snapshot: {r.get('snapshot_id') or 'unknown'} "
+            f"cutoff={r.get('source_cutoff')}",
+            f"  task time: {r.get('time', {}).get('task_elapsed_s')} "
+            f"({r.get('time', {}).get('task_elapsed_source')}); "
+            f"session span {r.get('time', {}).get('session_span_s')} "
+            f"({r.get('time', {}).get('session_span_label')})",
         ]
+        est = r.get("estimated_cost") or {}
+        if est.get("schedule_source"):
+            lines.append(
+                f"  estimated cost partial: {est.get('estimated_cost_usd_partial')} "
+                f"over {est.get('priced_responses')}/{est.get('responses')} priced; "
+                f"total={est.get('estimated_cost_usd_total')}")
+        else:
+            lines.append("  estimated cost: unknown (no sourced schedule)")
+        for model in r.get("models", []):
+            buckets = ", ".join(f"{key}={model.get(key)}" for key in _report.BUCKETS)
+            lines.append(f"  {model['harness']}/{model.get('model') or 'unknown'} "
+                         f"effort={model.get('effort') or 'unknown'} "
+                         f"[{model['semantics']}]: {buckets}")
+        for phase in r.get("phases", []):
+            lines.append(f"  phase {phase['phase']}: responses={phase['usage']['responses']} "
+                         f"total={_fmt_section_total(phase['usage'])}; "
+                         f"activity={phase['activity']}")
+            for model in phase['models']:
+                g=model['generation']
+                lines.append(f"    {model['harness']}/{model['model']}: "
+                             f"reasoning={g['reasoning_tokens']}, other_output={g['other_output_tokens']}, "
+                             f"reasoning_share={g['reasoning_share']}, unknown_splits={g['unknown_responses']}")
+        for model in est.get("by_model", []):
+            lines.append(f"  price {model.get('model') or 'unknown'} "
+                         f"effort={model.get('effort') or 'unknown'}: "
+                         f"known subtotal USD {model['estimated_cost_usd_partial']}; "
+                         f"complete estimate={model['estimated_cost_usd']}; "
+                         f"priced {model['priced_responses']}/{model['responses']}")
         return "\n".join(lines)
     if isinstance(payload, dict) and payload.get("_view") == "trace":
         lines = [f"events: {len(payload['events'])}",
@@ -186,6 +223,12 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--evidence", default=None)
     a.add_argument("--shared", action="store_true")
     a.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
+    whole = csub.add_parser("assign-session", help="bind a provably dedicated session")
+    whole.add_argument("--task", required=True)
+    whole.add_argument("--session", required=True)
+    whole.add_argument("--exclusive", action="store_true", required=True)
+    whole.add_argument("--evidence", required=True)
+    whole.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     d = csub.add_parser("dispatch")
     d.add_argument("--submission", required=True)
     d.add_argument("--worker", required=True)
@@ -203,6 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
     at.add_argument("--role", required=True, choices=["parent", "worker"])
     at.add_argument("--model", default=None)
     at.add_argument("--effort", default=None)
+    at.add_argument("--phase", choices=list(_report.PHASES)+["mixed"], default=None)
     at.add_argument("--state", default="active",
                     choices=["complete", "active", "cancelled", "failed",
                              "quota_blocked", "crashed"])
@@ -227,6 +271,8 @@ def build_parser() -> argparse.ArgumentParser:
                                               default=argparse.SUPPRESS)
     sh = ksub.add_parser("show")
     sh.add_argument("--task", required=True)
+    sh.add_argument("--prices", default=None,
+                    help="offline JSON price schedule for list-price estimates")
     sh.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
     def _scope(parser):
@@ -256,6 +302,8 @@ def build_parser() -> argparse.ArgumentParser:
     pb.add_argument("--repo", default=None, help="owner/name")
     pb.add_argument("--pr", type=int, default=None)
     pb.add_argument("--commit", default=None)
+    pb.add_argument("--prices", default=None,
+                    help="offline JSON price schedule for list-price estimates")
     pb.add_argument("--dry-run", action="store_true", help="print the comment, post nothing")
     pb.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
@@ -277,9 +325,13 @@ def main(argv=None) -> int:
     ap = build_parser()
     ns = ap.parse_args(argv)
     try:
-        con = _con(ns.db)
-    except RuntimeError as exc:
+        con = _db.connect_read_only(ns.db) if ns.cmd in ("task", "publish") else _con(ns.db)
+    except (RuntimeError, sqlite3.Error) as exc:
         print(str(exc), file=sys.stderr)
+        if ns.cmd in ("task", "publish"):
+            print("Task reports require an existing ledger; run agent-observer sync first.", file=sys.stderr)
+            if os.path.exists(ns.db):
+                print("If a read-only sandbox prevents access, consume a coordinator-exported task JSON instead.", file=sys.stderr)
         return 2
     try:
         if ns.cmd == "sync":
@@ -324,7 +376,15 @@ def main(argv=None) -> int:
                         print(f"{r['task_id']}: {r.get('title') or ''}")
                 return 0
             try:
-                rep = _report.task_report(con, ns.task)
+                schedule = None
+                if getattr(ns, "prices", None):
+                    from . import pricing as _pricing
+                    try:
+                        schedule = _pricing.load_schedule(ns.prices)
+                    except (OSError, ValueError) as exc:
+                        print(f"invalid price schedule: {exc}", file=sys.stderr)
+                        return 2
+                rep = _report.task_report(con, ns.task, schedule=schedule)
             except KeyError as exc:
                 print(str(exc), file=sys.stderr)
                 return 2
@@ -352,12 +412,39 @@ def main(argv=None) -> int:
             tl["_view"] = "trace"
             _emit(tl, ns.as_json)
             return 0
+    except sqlite3.OperationalError as exc:
+        if ns.cmd not in ("task", "publish"):
+            raise
+        print(f"Cannot read ledger: {exc}. Run agent-observer sync with the current version first.", file=sys.stderr)
+        return 2
     finally:
         con.close()
     return 2
 
 
 def _capture(con, ns) -> int:
+    if ns.op == "assign-session":
+        con.execute("BEGIN IMMEDIATE")
+        if not con.execute("SELECT 1 FROM tasks WHERE task_id=?", (ns.task,)).fetchone():
+            print(f"unknown task: {ns.task}", file=sys.stderr)
+            return 2
+        if not con.execute("SELECT 1 FROM sessions WHERE session_key=?", (ns.session,)).fetchone():
+            print(f"unknown session: {ns.session}", file=sys.stderr)
+            return 2
+        other = con.execute(
+            "SELECT task_id FROM session_assignments WHERE session_key=? AND task_id<>?"
+            " UNION SELECT a.task_id FROM assignments a JOIN submissions s"
+            " ON s.native_id=a.submission_native_id WHERE s.session_key=? AND a.task_id<>?",
+            (ns.session, ns.task, ns.session, ns.task)).fetchone()
+        if other or not ns.evidence.strip():
+            print("ownership conflict or missing evidence for exclusive session", file=sys.stderr)
+            return 2
+        con.execute(
+            "INSERT OR IGNORE INTO session_assignments(session_key,task_id,evidence,created_at)"
+            " VALUES(?,?,?,?)", (ns.session, ns.task, ns.evidence, _db.now()))
+        con.commit()
+        _emit({"ok": True, "session": ns.session, "task": ns.task}, ns.as_json)
+        return 0
     if ns.op == "create-task":
         con.execute(
             "INSERT OR IGNORE INTO tasks(task_id, project, family, title,"
@@ -367,6 +454,7 @@ def _capture(con, ns) -> int:
         _emit({"ok": True, "task": ns.task}, ns.as_json)
         return 0
     if ns.op == "assign":
+        con.execute("BEGIN IMMEDIATE")
         ns.submission = _resolve_submission(con, ns.submission)
         sub = con.execute("SELECT native_id, is_genuine FROM submissions "
                           "WHERE native_id=?", (ns.submission,)).fetchone()
@@ -376,6 +464,12 @@ def _capture(con, ns) -> int:
         if not sub["is_genuine"]:
             print(f"refused: {ns.submission} is not a genuine submission",
                   file=sys.stderr)
+            return 2
+        if con.execute(
+                "SELECT 1 FROM session_assignments w JOIN submissions s"
+                " ON s.session_key=w.session_key WHERE s.native_id=? AND w.task_id<>?",
+                (ns.submission, ns.task)).fetchone():
+            print("ownership conflict: session already bound to another task", file=sys.stderr)
             return 2
         if con.execute("SELECT 1 FROM tasks WHERE task_id=?",
                        (ns.task,)).fetchone() is None:
@@ -416,11 +510,16 @@ def _capture(con, ns) -> int:
             usable = 1
         con.execute(
             "INSERT OR IGNORE INTO attempts(task_id, turn_id, role, harness,"
-            " model_observed, effort_observed, state, usable_output)"
-            " VALUES(?,?,?,?,?,?,?,?)",
+            " model_observed, effort_observed, state, usable_output, stage)"
+            " VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(task_id, turn_id) DO UPDATE SET"
+            " state=excluded.state, role=excluded.role,"
+            " stage=COALESCE(excluded.stage,attempts.stage),"
+            " model_observed=COALESCE(excluded.model_observed,attempts.model_observed),"
+            " effort_observed=COALESCE(excluded.effort_observed,attempts.effort_observed),"
+            " usable_output=COALESCE(excluded.usable_output,attempts.usable_output)",
             (ns.task, ns.turn, ns.role, ns.turn.split(":", 1)[0]
              if ":" in ns.turn else None, ns.model, ns.effort,
-             ns.state, usable))
+             ns.state, usable, ns.phase))
         con.commit()
         _emit({"ok": True, "turn": ns.turn}, ns.as_json)
         return 0
@@ -539,7 +638,11 @@ def _analyze(con, ns) -> int:
 def _publish(con, ns) -> int:
     from . import publish as _publish_mod
     if ns.task:
-        keys = _report.task_sessions(con, ns.task)
+        try:
+            keys = _report.task_sessions(con, ns.task)
+        except KeyError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
         label = f"task {ns.task}"
     else:
         keys = set(ns.session)
@@ -547,7 +650,20 @@ def _publish(con, ns) -> int:
     if not keys:
         print("nothing to publish: no sessions in scope", file=sys.stderr)
         return 2
-    summary = _publish_mod.summarize(con, keys, label, task_id=ns.task)
+    schedule = None
+    if getattr(ns, "prices", None):
+        from . import pricing as _pricing
+        try:
+            schedule = _pricing.load_schedule(ns.prices)
+        except (OSError, ValueError) as exc:
+            print(f"invalid price schedule: {exc}", file=sys.stderr)
+            return 2
+    try:
+        summary = _publish_mod.summarize(con, keys, label, task_id=ns.task,
+                                         schedule=schedule)
+    except KeyError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     body = _publish_mod.render(summary)
     if ns.dry_run:
         if ns.as_json:
