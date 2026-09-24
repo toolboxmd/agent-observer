@@ -155,6 +155,59 @@ class UnknownCountersCliTest(unittest.TestCase):
         self.assertEqual(groups["gpt-6-fixture"]["unknown_token_responses"], 2)
 
 
+class PackageVersionTest(unittest.TestCase):
+    def test_version_matches_the_repository_version_file(self):
+        import agent_observer
+        with open(os.path.join(REPO, "VERSION")) as fh:
+            expected = fh.read().strip()
+        self.assertTrue(expected)
+        self.assertEqual(agent_observer.__version__, expected)
+
+
+class PublishDryRunJsonTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, "publish.db")
+        self.mini = os.path.join(REPO, "tests", "fixtures", "codex-mini.jsonl")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _session(self):
+        r = run(self.db, "sessions", "list", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        sessions = json.loads(r.stdout)["sessions"]
+        self.assertTrue(sessions)
+        return sessions[0]["session_key"]
+
+    def test_dry_run_json_is_parseable_with_summary_and_target(self):
+        r = run(self.db, "sync", "--source", self.mini)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        session = self._session()
+        r = run(self.db, "publish", "--session", session,
+                "--dry-run", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        payload = json.loads(r.stdout)
+        self.assertTrue(payload["dry_run"])
+        self.assertEqual(payload["target"]["sessions"], [session])
+        self.assertIsNone(payload["target"]["task"])
+        self.assertIn("summary", payload)
+        self.assertEqual(payload["summary"]["sessions"], 1)
+        self.assertIn("usage", payload["summary"])
+        self.assertIn("body", payload)
+        self.assertIn("Agent Observer", payload["body"])
+
+    def test_dry_run_without_json_stays_markdown(self):
+        r = run(self.db, "sync", "--source", self.mini)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        session = self._session()
+        r = run(self.db, "publish", "--session", session, "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Agent Observer", r.stdout)
+        with self.assertRaises(ValueError):
+            json.loads(r.stdout)
+
+
 class JsonFlagPositionTest(unittest.TestCase):
     """--json works before and after the subcommand for every subparser."""
 

@@ -46,6 +46,20 @@ def _bucket_unknown(bucket: dict, field: str = "total_tokens") -> int:
     return (bucket.get("unknown_counts") or {}).get(field, 0)
 
 
+def _fmt_section_total(section: dict) -> str:
+    """A task section total that stays honest when semantics are mixed.
+
+    Sections over mixed counter semantics carry no top-level raw total;
+    the text view names that instead of inventing a sum.
+    """
+    if "total_tokens" in section:
+        return _fmt_tokens(section.get("total_tokens"),
+                           _bucket_unknown(section))
+    if "by_semantics" in section:
+        return "mixed semantics (see --json)"
+    return "unknown"
+
+
 def _text(payload) -> str:
     if isinstance(payload, dict) and payload.get("_view") == "sync":
         lines = []
@@ -78,11 +92,11 @@ def _text(payload) -> str:
         lines = [
             f"task {r['task']['task_id']}: {r['task'].get('title') or ''}",
             f"  attributed responses: {r['attributed']['responses']} "
-            f"total={_fmt_tokens(r['attributed']['total_tokens'], _bucket_unknown(r['attributed']))}",
+            f"total={_fmt_section_total(r['attributed'])}",
             f"  shared joint responses: {r['shared_joint']['responses']} "
-            f"total={_fmt_tokens(r['shared_joint']['total_tokens'], _bucket_unknown(r['shared_joint']))}",
+            f"total={_fmt_section_total(r['shared_joint'])}",
             f"  unassigned in scope: {r['unassigned_in_scope']['responses']} "
-            f"total={_fmt_tokens(r['unassigned_in_scope']['total_tokens'], _bucket_unknown(r['unassigned_in_scope']))}",
+            f"total={_fmt_section_total(r['unassigned_in_scope'])}",
             f"  reconciles against scope: {r['reconciles']}",
             f"  missing assignments: {r['missing_assignments'] or 'none'}",
             f"  conflicting: {r['conflicting_assignments'] or 'none'}",
@@ -515,9 +529,20 @@ def _publish(con, ns) -> int:
     if not keys:
         print("nothing to publish: no sessions in scope", file=sys.stderr)
         return 2
-    body = _publish_mod.render(_publish_mod.summarize(con, keys, label, task_id=ns.task))
+    summary = _publish_mod.summarize(con, keys, label, task_id=ns.task)
+    body = _publish_mod.render(summary)
     if ns.dry_run:
-        print(body)
+        if ns.as_json:
+            # Structured dry run: the same summary data plus an explicit
+            # target and the rendered body, as parseable JSON.
+            _emit({"dry_run": True,
+                   "target": {"task": ns.task,
+                              "sessions": sorted(keys),
+                              "repo": ns.repo, "pr": ns.pr,
+                              "commit": ns.commit},
+                   "summary": summary, "body": body}, True)
+        else:
+            print(body)
         return 0
     if not ns.repo or (ns.pr is None) == (ns.commit is None):
         print("publish needs --repo and exactly one of --pr or --commit", file=sys.stderr)

@@ -23,7 +23,7 @@ import re
 
 # Rule 3: bump when any rule in this module changes meaning. A stored source
 # version that differs forces a full re-import with in-place correction.
-PRIVACY_VERSION = 3
+PRIVACY_VERSION = 4
 
 SUBMISSION_EXCERPT_CHARS = 300
 ASSISTANT_EXCERPT_CHARS = 400
@@ -205,6 +205,12 @@ _IDENTIFIER_FAMILIES = frozenset({
     "permission",
 })
 
+# Rule 6, skill targets: skill_read and skill_invoke targets hold only a
+# validated native skill identifier (the same complete identifier rule as
+# names). A free-text skill title, an installed directory path and any
+# wrong-typed value fail closed to None.
+_SKILL_TARGET_FAMILIES = frozenset({"skill_read", "skill_invoke"})
+
 
 def _valid_native_identifier(value: object) -> str | None:
     """A validated native tool/skill identifier, or None when rejected."""
@@ -215,11 +221,19 @@ def _valid_native_identifier(value: object) -> str | None:
     return value
 
 
-def filter_target(target: object) -> str | None:
+def filter_target(target: object, family: object = None) -> str | None:
     """Rule 6 targets: keep strings (paths, commands, identifiers).
 
     Non-strings are rejected, never coerced; kept strings are bounded.
+    For the skill families (skill_read, skill_invoke) the target holds
+    only a validated native skill identifier under the same complete
+    identifier rule as names: titles, sentences, paths, whitespace,
+    markers and wrong types fail closed to None. Other families keep
+    the historical bounded-string behavior, so existing non-skill
+    callers passing no family are unaffected.
     """
+    if family in _SKILL_TARGET_FAMILIES:
+        return _valid_native_identifier(target)
     if isinstance(target, str):
         return target[:_TARGET_CHARS]
     return None

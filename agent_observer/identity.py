@@ -27,11 +27,93 @@ BLOCK_RE = re.compile(
 VERSION_PATH_RE = re.compile(r"/agentsmd/(\d+\.\d+\.\d+)/")
 SKILL_PATH_RE = re.compile(r"/skills/([A-Za-z0-9_.-]+)/")
 
+# Direction-block identity is sanitized centrally here, fail closed: only
+# validated values survive, and identity_json carries only an approved
+# allowlist of fields. Marker-shaped native text can never store free
+# text through identity.
+#
+# Statuses: the closed set the AgentsMD loader actually emits for
+# direction and preference state. Anything else is omitted, never copied.
+DIRECTION_STATUSES = frozenset({
+    "ready", "absent", "unreadable", "oversized", "missing",
+    "cache-bound-target", "cache-bound-link", "non-symlink",
+    "broken-link", "invalid-link-target", "valid-stable-link",
+    "divergent-link", "source-unavailable", "source-ambiguous",
+    "read_required", "unparsed",
+})
+PREFERENCES_STATUSES = frozenset({
+    "ready", "absent", "unreadable", "oversized", "missing",
+    "cache-bound-target", "cache-bound-link", "non-symlink",
+    "broken-link", "invalid-link-target", "valid-stable-link",
+    "divergent-link", "source-unavailable", "source-ambiguous",
+    "read_required", "unparsed",
+})
+
+# Hashes: SHA-256 fields are exactly 64 lowercase hex characters; the git
+# head is the fixed-length lowercase hex Git digest (40 characters).
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_GIT_HEAD_RE = re.compile(r"[0-9a-f]{40}")
+
+# Direction files: only the approved Project Direction names, never
+# arbitrary basenames copied from native text.
+DIRECTION_FILES = frozenset({"VISION.md", "MISSION.md", "OBJECTIVE.md"})
+
+# Paths: absolute, printable, marker-free. Control characters and
+# tag-like markers ('<' plus letter, '/' or '!', or '<<<') fail closed.
+_PATH_CHARS = 1024
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _valid_sha256(value: object) -> bool:
+    return isinstance(value, str) and _SHA256_RE.fullmatch(value) is not None
+
+
+def _valid_git_head(value: object) -> bool:
+    return isinstance(value, str) and _GIT_HEAD_RE.fullmatch(value) is not None
+
+
+def _marker_at(text: str, index: int) -> bool:
+    if text.startswith("<<<", index):
+        return True
+    nxt = index + 1
+    if nxt >= len(text):
+        return False
+    ch = text[nxt]
+    return ch == "/" or ch == "!" or ch.isalpha()
+
+
+def _has_marker(text: str) -> bool:
+    start = 0
+    while True:
+        idx = text.find("<", start)
+        if idx == -1:
+            return False
+        if _marker_at(text, idx):
+            return True
+        start = idx + 1
+
+
+def _valid_path(value: object) -> bool:
+    """An absolute native path with no control characters or markers."""
+    if not isinstance(value, str) or not value:
+        return False
+    if not value.startswith("/") or len(value) > _PATH_CHARS:
+        return False
+    if _CONTROL_RE.search(value) is not None:
+        return False
+    if _has_marker(value):
+        return False
+    return True
+
 
 def parse_direction_block(text: str) -> dict | None:
-    """Return the identity fields of the first direction block in text.
+    """Return the sanitized identity fields of the first direction block.
 
-    Only hashes, paths and statuses survive; file contents never do.
+    Only validated hashes, paths and closed-set statuses survive; file
+    contents, arbitrary keys, titles and marker-shaped free text never
+    do. Unknown statuses, short or non-hex hashes, wrong-type or
+    malformed paths, invalid git heads and unapproved direction file
+    names are dropped, never copied.
     """
     if not text or "AGENTSMD_PROJECT_DIRECTION_V1" not in text:
         return None
@@ -42,31 +124,54 @@ def parse_direction_block(text: str) -> dict | None:
         block = json.loads(match.group(1))
     except json.JSONDecodeError:
         return {"status": "unparsed"}
-    instructions = block.get("instructions") or {}
-    preferences = block.get("preferences") or {}
-    result = {
-        "status": block.get("status"),
-        "instructions_sha256": instructions.get("sha256")
-        or instructions.get("target_sha256"),
-        "instructions_path": instructions.get("resolved_target")
-        or instructions.get("target"),
-        "preferences_sha256": preferences.get("sha256"),
-        "preferences_status": preferences.get("status"),
-    }
-    direction = {}
-    for entry in block.get("files") or []:
-        if isinstance(entry, dict) and entry.get("sha256"):
-            name = os.path.basename(str(entry.get("path") or entry.get("name") or ""))
-            if name:
+    if not isinstance(block, dict):
+        return {"status": "unparsed"}
+    result: dict = {}
+    status = block.get("status")
+    if isinstance(status, str) and status in DIRECTION_STATUSES:
+        result["status"] = status
+    instructions = block.get("instructions")
+    if isinstance(instructions, dict):
+        for key in ("sha256", "target_sha256"):
+            digest = instructions.get(key)
+            if _valid_sha256(digest):
+                result["instructions_sha256"] = digest
+                break
+        for key in ("resolved_target", "target"):
+            path = instructions.get(key)
+            if _valid_path(path):
+                result["instructions_path"] = path
+                break
+    preferences = block.get("preferences")
+    if isinstance(preferences, dict):
+        digest = preferences.get("sha256")
+        if _valid_sha256(digest):
+            result["preferences_sha256"] = digest
+        pref_status = preferences.get("status")
+        if isinstance(pref_status, str) and pref_status in PREFERENCES_STATUSES:
+            result["preferences_status"] = pref_status
+    files = block.get("files")
+    if isinstance(files, list):
+        direction = {}
+        for entry in files:
+            if not isinstance(entry, dict):
+                continue
+            raw_name = entry.get("path") or entry.get("name")
+            name = os.path.basename(raw_name) \
+                if isinstance(raw_name, str) and raw_name else ""
+            if name in DIRECTION_FILES and _valid_sha256(entry.get("sha256")):
                 direction[name] = entry["sha256"]
-    if direction:
-        result["direction_sha256"] = direction
-    if block.get("repository_root"):
-        result["repository_root"] = block["repository_root"]
-    head = ((block.get("git") or {}).get("head") or {}).get("sha")
-    if head:
-        result["git_head"] = head
-    return {k: v for k, v in result.items() if v is not None}
+        if direction:
+            result["direction_sha256"] = direction
+    repository_root = block.get("repository_root")
+    if _valid_path(repository_root):
+        result["repository_root"] = repository_root
+    git = block.get("git")
+    head = git.get("head") if isinstance(git, dict) else None
+    sha = head.get("sha") if isinstance(head, dict) else None
+    if _valid_git_head(sha):
+        result["git_head"] = sha
+    return result
 
 
 def version_from_path(path: str) -> str | None:
@@ -232,10 +337,25 @@ class SessionIdentity:
         fields = {}
         evidence = {}
         if self.block:
+            # identity_json carries only this approved allowlist of
+            # already-sanitized fields: validated direction status,
+            # hashes, paths and git head. The raw parsed block, arbitrary
+            # keys, contents, marker-shaped text, titles and free text
+            # are never serialized.
             fields["instructions_sha256"] = self.block.get("instructions_sha256")
             fields["preferences_sha256"] = self.block.get("preferences_sha256")
             fields["direction_status"] = self.block.get("status")
-            evidence["direction_block"] = self.block
+            for key, alias in (
+                    ("status", "direction_status"),
+                    ("instructions_sha256", "instructions_sha256"),
+                    ("preferences_sha256", "preferences_sha256"),
+                    ("preferences_status", "preferences_status"),
+                    ("instructions_path", "instructions_path"),
+                    ("direction_sha256", "direction_sha256"),
+                    ("repository_root", "repository_root"),
+                    ("git_head", "git_head")):
+                if self.block.get(key) is not None:
+                    evidence[alias] = self.block[key]
         if self.loaded_hashes and not self.block and con is not None:
             for digest in self.loaded_hashes:
                 if con.execute("SELECT 1 FROM agentsmd_versions WHERE sha256=?",

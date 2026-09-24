@@ -82,10 +82,10 @@ def build_native(path):
                 ("ses_compact", None, "/repo", "Compact", "1.2.3", None,
                  "build", T0 + 2000, T0 + 80000, T0 + 50000))
     block = ("<<<AGENTSMD_PROJECT_DIRECTION_V1>>>"
-             '{"status":"ready","instructions":{"sha256":"abc123"},'
-             '"preferences":{"sha256":"def456"},'
-             '"preferences_text":"SECRET_PREF_zzz"}'
-             "<<<END_AGENTSMD_PROJECT_DIRECTION_V1>>>")
+              '{"status":"ready","instructions":{"sha256":"fbc26e210bdec1f613766d7a7c45a6a8256f2a21c75c94de2c89d12eca5c8e8f"},'
+              '"preferences":{"sha256":"f9eabf1427d0544f70a3cd50d71b17315d4912aea58f053eac8772d2a5239e6e"},'
+              '"preferences_text":"SECRET_PREF_zzz"}'
+              "<<<END_AGENTSMD_PROJECT_DIRECTION_V1>>>")
     # Parent user message with the direction block.
     con.execute("INSERT INTO message VALUES(?,?,?,?,?)",
                 ("msg_u1", "ses_parent", T0 + 10, T0 + 10,
@@ -432,8 +432,10 @@ class OpencodeAdapterTest(unittest.TestCase):
     def test_identity_without_preference_contents(self):
         row = self.q("SELECT * FROM sessions WHERE session_key=?",
                      ("opencode:ses_parent",))[0]
-        self.assertEqual(row["instructions_sha256"], "abc123")
-        self.assertEqual(row["preferences_sha256"], "def456")
+        self.assertEqual(row["instructions_sha256"],
+                         "fbc26e210bdec1f613766d7a7c45a6a8256f2a21c75c94de2c89d12eca5c8e8f")
+        self.assertEqual(row["preferences_sha256"],
+                         "f9eabf1427d0544f70a3cd50d71b17315d4912aea58f053eac8772d2a5239e6e")
         body = json.dumps(dict(row))
         self.assertNotIn("SECRET_PREF_zzz", body)
 

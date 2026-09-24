@@ -175,9 +175,9 @@ class CodexExcerptTest(LedgerCase):
         # The direction block arrived inside a scaffolding skill body whose
         # excerpt stays empty, yet its hashes identify the session.
         self.assertEqual(row["instructions_sha256"],
-                         "codex-secret-instr-sha")
+                         "4da603d140e84bb15f9b4ad76404b1f55c385f19897c025e52236d8ad75b5b6a")
         self.assertEqual(row["preferences_sha256"],
-                         "codex-secret-prefs-sha")
+                         "e04fc09a7a517327ef3f26084f199efcae9ba98552e6590e60e8a3302d51029f")
 
 
 class ClaudeStreamingTest(LedgerCase):
@@ -297,9 +297,9 @@ class ClaudeExcerptTest(LedgerCase):
             "SELECT instructions_sha256, preferences_sha256 FROM sessions"
             " WHERE session_key='claude:sess-secrets'")[0]
         self.assertEqual(row["instructions_sha256"],
-                         "claude-secret-instr-sha")
+                         "f43c159a1b54439c6db873ed19dc016aef9de09bbcbb770b4312ac1962902eaa")
         self.assertEqual(row["preferences_sha256"],
-                         "claude-secret-prefs-sha")
+                         "4ece7d8eb5e77f270aff2ed3912700867a42d20999bb493fa07af5fd19c27e86")
 
 
 def _write_lines(path, lines):
@@ -399,7 +399,20 @@ class CodexMixedTransitionTest(LedgerCase):
             self.assertIn(rid, rows, rid)
             self.assertEqual(rows[rid]["is_overlap"], 0, rid)
         totals = report.scope_totals(self.con)
-        self.assertEqual(totals["total_tokens"], 450 + 670 + 580 + 500 + 300)
+        # Two counter semantics share this scope (usage records beside
+        # legacy token_count checkpoints), so no top-level raw bucket may
+        # sum across them; each semantics keeps its own complete total.
+        for bucket in ("input_tokens", "cached_input_tokens",
+                       "cache_write_input_tokens", "output_tokens",
+                       "reasoning_output_tokens", "total_tokens"):
+            self.assertNotIn(bucket, totals, bucket)
+        by = totals["by_semantics"]
+        self.assertEqual(
+            by["codex:input_includes_cached,output_includes_reasoning"]
+            ["total_tokens"], 500 + 300)
+        self.assertEqual(
+            by["codex:input_includes_cached,output_includes_reasoning"
+               ";source=token_count"]["total_tokens"], 450 + 670 + 580)
         self.assertEqual(totals["responses"], 5)
         self.assertEqual(totals["overlap_responses"], 0)
 

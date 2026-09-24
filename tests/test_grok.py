@@ -66,8 +66,10 @@ class GrokAdapterTest(LedgerCase):
         row = self.query("SELECT * FROM sessions WHERE session_key=?", (S1,))[0]
         self.assertEqual(row["project_dir"], "/redacted/repo")
         self.assertEqual(row["git_branch"], "main")
-        self.assertEqual(row["instructions_sha256"], "fixture-grok-instructions")
-        self.assertEqual(row["preferences_sha256"], "fixture-grok-preferences")
+        self.assertEqual(row["instructions_sha256"],
+                         "56cb2f7d0ea20f2fef04e6dc8d4cdedc443aa7fc2c79496842e5eb0af593a4dc")
+        self.assertEqual(row["preferences_sha256"],
+                         "3e4d25b9f705be734ba08f985d7a407071962894b0b327028e68b9c8aae4ca80")
         self.assertEqual(row["direction_status"], "ready")
         self.assertNotIn("Implement the widget", row["identity_json"])
         # The <user_rule> body resolves through the release map.
@@ -79,7 +81,9 @@ class GrokAdapterTest(LedgerCase):
         self.con.commit()
         grok.sync(self.con, root=ROOT, full=True)
         row = self.query("SELECT * FROM sessions WHERE session_key=?", (S1,))[0]
-        self.assertEqual(row["instructions_sha256"], "fixture-grok-instructions")
+        self.assertEqual(
+            row["instructions_sha256"],
+            "56cb2f7d0ea20f2fef04e6dc8d4cdedc443aa7fc2c79496842e5eb0af593a4dc")
 
     def test_submissions_genuine_synthetic_and_open(self):
         kinds = {r["native_id"]: (r["kind"], r["turn_id"]) for r in self.query(
@@ -793,9 +797,9 @@ class GrokAdapterTest(LedgerCase):
             " direction_status FROM sessions WHERE session_key=?",
             (S1,)).fetchone()
         self.assertEqual(sess["instructions_sha256"],
-                         "fixture-grok-instructions")
+                         "56cb2f7d0ea20f2fef04e6dc8d4cdedc443aa7fc2c79496842e5eb0af593a4dc")
         self.assertEqual(sess["preferences_sha256"],
-                         "fixture-grok-preferences")
+                         "3e4d25b9f705be734ba08f985d7a407071962894b0b327028e68b9c8aae4ca80")
         self.assertEqual(sess["direction_status"], "ready")
         con.close()
 

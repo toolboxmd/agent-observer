@@ -181,14 +181,21 @@ def _text(content) -> str:
 
 
 def _target(name: str, tool_input: dict):
-    """A string target only: paths, commands and skill names.
+    """A string target only: paths, commands and validated skill names.
 
     Non-string native values never stringify into the ledger; the caller
     then stores no target. Search patterns and URLs are free text and are
-    not targets.
+    not targets. A Skill tool input carries only the skill identity: the
+    skill or command value is validated as an identifier before any
+    path or command handling, so a free-text Skill title in either
+    field fails closed to no target on every event (tool_call,
+    skill_invoke and tool_result alike).
     """
     if not isinstance(tool_input, dict):
         return None
+    if name == "Skill":
+        raw_skill = tool_input.get("skill") or tool_input.get("command")
+        return privacy.filter_target(raw_skill, family="skill_invoke")
     for key in ("file_path", "notebook_path", "path"):
         value = tool_input.get(key)
         if isinstance(value, str) and value:
@@ -198,7 +205,7 @@ def _target(name: str, tool_input: dict):
         return command[:500]
     skill = tool_input.get("skill")
     if isinstance(skill, str) and skill:
-        return skill
+        return privacy.filter_target(skill, family="skill_invoke")
     return None
 
 
@@ -517,12 +524,18 @@ def _assistant(r: _Reader, obj: dict, ordinal: int, ts) -> None:
             tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
             target = _target(name, tool_input)
             r.pending[block["id"]] = (name, tool_input)
+            skill = None
+            if name == "Skill":
+                # Rule 6 via agent_observer/privacy.py: only the validated
+                # native skill identifier survives in name and target. A
+                # free-text Skill title fails closed to no name and no
+                # target, never persisting as either.
+                raw_skill = tool_input.get("skill") or tool_input.get("command")
+                skill = privacy.filter_target(raw_skill, family="skill_invoke")
+                target = skill
             r.event("tool_call", block["id"], ordinal, ts, name=name, target=target,
                     fingerprint=fingerprint(name, json.dumps(tool_input, sort_keys=True)[:4000]))
             if name == "Skill":
-                raw_skill = tool_input.get("skill") or tool_input.get("command")
-                skill = raw_skill if isinstance(raw_skill, str) and raw_skill \
-                    else "unknown"
                 r.event("skill_invoke", block["id"], ordinal, ts, name=skill,
                         target=skill)
             if target and name in EDIT_TOOLS:
@@ -610,13 +623,17 @@ def _user(r: _Reader, obj: dict, ordinal: int, ts) -> None:
         return
     if text.startswith(SKILL_BASE_PREFIX):
         # The loaded Skill body arrives as a meta message naming its
-        # installed directory: that is the skill-load evidence.
+        # installed directory: that is the skill-load evidence. Rule 6
+        # via agent_observer/privacy.py: only the validated native skill
+        # identifier survives in name, target and detail. The installed
+        # directory path itself is never a target.
         base = text[len(SKILL_BASE_PREFIX):].splitlines()[0].strip()
         r.identity.observe_path(base.rstrip("/") + "/SKILL.md")
+        skill = privacy.filter_target(skill_from_path(base + "/"),
+                                      family="skill_read")
         r.event("skill_read", obj.get("uuid") or f"ordinal:{ordinal}", ordinal, ts,
-                name=skill_from_path(base + "/") or os.path.basename(base),
-                target=base, size_bytes=len(text),
-                detail={"skill": skill_from_path(base + "/")})
+                name=skill, target=skill, size_bytes=len(text),
+                detail={"skill": skill} if skill else None)
     kind = _user_kind(r, obj, text)
     native = obj.get("uuid") or f"ordinal:{ordinal}"
     if kind == "genuine":
@@ -648,14 +665,20 @@ def _tool_result(r: _Reader, obj: dict, result: dict, ordinal: int, ts) -> None:
         path = None
     if name in READ_TOOLS and path and status == "ok":
         r.identity.observe_path(path)
-        family = "skill_read" if skill_from_path(path) else "read"
+        raw_skill = skill_from_path(path)
+        family = "skill_read" if raw_skill else "read"
+        # Rule 6 via agent_observer/privacy.py: a skill_read target holds
+        # only the validated native skill identifier, never the path.
+        # A plain read keeps the observed path as its target.
+        skill = privacy.filter_target(raw_skill, family="skill_read") \
+            if raw_skill else None
         start = (file_info or {}).get("startLine")
         lines = (file_info or {}).get("numLines")
         r.event(family, f"{call_id}:read", ordinal, ts, name=os.path.basename(path),
-                target=path, size_bytes=size,
+                target=skill if family == "skill_read" else path, size_bytes=size,
                 fingerprint=fingerprint(path, start, lines),
                 detail={"start_line": start, "num_lines": lines,
-                        "skill": skill_from_path(path)})
+                        "skill": skill})
 
 
 def _attachment(r: _Reader, obj: dict, ordinal: int, ts) -> None:

@@ -51,7 +51,10 @@ names another.
 Counter meanings differ by harness (cached input is part of input on Codex
 and Grok, separate on Claude Code and OpenCode). Each response keeps its
 native counters and its harness's own total; reports never add cache or
-reasoning buckets across harnesses. Unknown values stay unknown.
+reasoning buckets across harnesses. A scope mixing counter semantics
+exposes no top-level raw bucket totals: usage appears only under
+per-semantics groups (`by_semantics`), and task reconciliation compares
+response partitions and per-semantics sums. Unknown values stay unknown.
 
 Each session also records which AgentsMD it ran with: the AGENTS.md SHA-256
 from AgentsMD's Project Direction hook, the instruction text a host
@@ -104,7 +107,10 @@ is never divided.
 `publish --task T-42 --repo o/r --pr 7` renders one aggregate comment
 (models, effort, tokens, span, diagnostic counts) and creates or updates the
 single Observer-owned comment on that PR or commit (`--commit <sha>`).
-`--dry-run` prints it without posting. Only aggregates leave the machine.
+`--dry-run` prints it without posting. `publish --dry-run --json` instead
+prints parseable JSON with the same summary data, the rendered body, and an
+explicit target naming the task or sessions plus any repo, PR or commit.
+Only aggregates leave the machine.
 
 ## Launch requirements
 
@@ -145,7 +151,14 @@ top-level key names of the record, never its values. Event details keep
 only allowlisted, correctly typed metadata (identifiers, paths,
 commands, numbers, closed status and kind values), never titles,
 messages, error text, outputs, content, arguments or other free text;
-native free-text session titles are not stored. When these rules change,
+native free-text session titles are not stored. Skill event targets are
+family-specific: `skill_read` and `skill_invoke` targets hold only a
+validated native skill identifier (the same identifier rule as names),
+so a free-text skill title or an installed directory path never
+persists as a target. Instruction identity is sanitized centrally:
+direction statuses come from a closed set, hashes must be fixed-length
+hex digests, paths must be absolute and marker-free, and only an
+approved allowlist of fields is ever serialized. When these rules change,
 the next sync fully re-imports affected sources, corrects older rows in
 place, and replaces that source's prior import errors.
 

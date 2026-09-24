@@ -79,7 +79,11 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
    max). `events.detail_json` keeps only per-family allowlisted keys with
    correctly typed values (numbers, booleans, fixed-length hashes, native
    identifiers, paths, commands, closed status/kind enums); targets follow
-   the same type rules. Never titles, messages, error text, outputs,
+   the same type rules, and target filtering is family-aware: `skill_read`
+   and `skill_invoke` targets hold only a validated native skill
+   identifier under the same complete identifier rule as names, so a
+   free-text skill title or an installed directory path never persists
+   as a target. Never titles, messages, error text, outputs,
    content, arguments or other free text.
 7. Tables not named above store no free text from native records beyond
    identifiers, model and provider names, paths and commands. Native
@@ -101,8 +105,8 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
 | `tool_call` | Model requested a tool | name, argument fingerprint, `target` (file path or command when present) |
 | `tool_result` | Tool returned | status (`ok`, `error`, `denied`), size, truncation, duration, exit code in detail |
 | `read` | Observed file read | `target` path; content identity when recorded |
-| `skill_read` | Read under an installed Skill directory | `target` path; skill name and AgentsMD version from the path |
-| `skill_invoke` | Explicit Skill invocation (for example Claude's `Skill` tool) | skill name |
+| `skill_read` | Read under an installed Skill directory | validated skill name (never a title or directory path); skill name and AgentsMD version from the path |
+| `skill_invoke` | Explicit Skill invocation (for example Claude's `Skill` tool) | validated skill name |
 | `file_change` | Edit or write by the agent | path, change kind, content size and hash |
 | `compaction` | Context compaction boundary | trigger, before and after sizes when recorded |
 | `lifecycle` | Turn start, completion, abort, subagent activity, stop reasons | duration, reason |
@@ -117,7 +121,14 @@ guessed into a join.
 `identity.SessionIdentity` records, where evidence exists:
 `instructions_sha256`, `preferences_sha256` and `direction_status` from the
 `AGENTSMD_PROJECT_DIRECTION_V1` hook block, and `agentsmd_version` from the
-most-read versioned plugin path (`.../agentsmd/<x.y.z>/...`). `sync`
+most-read versioned plugin path (`.../agentsmd/<x.y.z>/...`). The block is
+sanitized centrally in `identity.py`, fail closed: statuses must belong to
+the closed set the AgentsMD loader emits, SHA-256 fields must be exactly
+64 lowercase hex characters, the git head must be the fixed-length
+lowercase hex Git digest, paths must be absolute and marker-free, direction
+files are limited to the approved `VISION.md`, `MISSION.md`, `OBJECTIVE.md`
+names, and `identity_json` serializes only that approved allowlist of
+fields, never the raw block, titles, contents or free text. `sync`
 rebuilds `agentsmd_versions` from the AgentsMD repository behind the global
 instruction link (or `--agentsmd-repo`) and resolves versions from hashes.
 Unresolved hashes stay unresolved.
@@ -153,12 +164,29 @@ are counted separately and excluded from useful-work comparisons.
 - `task list|show --task ID`: attributed, shared joint, and unassigned token
   buckets over the sessions the task touches; missing and conflicting
   assignments; crash count; outcome; attempts; dispatches. Exit 3 when
-  missing or conflicting ownership exists.
+  missing or conflicting ownership exists. Every command accepts `--json`.
+- `publish --task ID|--session KEY --repo owner/name --pr N|--commit SHA`:
+  render or post the summary comment; `--dry-run` prints the comment
+  without posting, and `--dry-run --json` prints a JSON payload with the
+  same summary data, the rendered body, and an explicit target naming the
+  task or sessions plus any repo, PR or commit.
 - `trace --task ID | --session KEY | --turn ID [--family F]`: ordered events
   with tool join status. `trace --capabilities` prints coverage per harness.
 
+Raw counter buckets are only ever summed within one counter semantics. A
+scope mixing semantics, including a known semantics beside missing
+semantics, omits the top-level raw buckets (`input_tokens`,
+`cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`,
+`reasoning_output_tokens`, `total_tokens`) and reports complete
+per-semantics totals under `by_semantics` instead; response and overlap
+counts are preserved. This holds for scope totals and for every
+`task_report` counter section (attributed, shared joint, unassigned in
+scope, nested scope).
+
 Reconciliation: attributed plus shared plus unassigned equals the scope
-total. A report never claims completeness from arithmetic alone; the
+total. Responses must partition exactly; token sums are compared per
+counter semantics when the scope is mixed, so an absent mixed total is
+never treated as zero. A report never claims completeness from arithmetic alone; the
 `complete` flag requires zero missing and zero conflicting bindings.
 
 ## Verifier separation

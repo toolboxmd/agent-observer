@@ -39,6 +39,36 @@ def _live(rows) -> list:
     return [r for r in rows if not r["is_overlap"]]
 
 
+def _semantics_key(row) -> str:
+    """The counter semantics of one response; missing stays visible."""
+    return row["semantics"] if row["semantics"] else "unknown"
+
+
+def _usage_totals(rows, include_responses: bool = True) -> dict:
+    """Bucket sums that never mix different counter semantics.
+
+    A scope with one semantics (missing semantics throughout counts as
+    one homogeneous group) returns the historical raw bucket keys via
+    _bucket_totals. A scope mixing semantics, including a known
+    semantics beside missing semantics, omits the top-level raw
+    buckets and returns only response counts with complete
+    per-semantics totals under by_semantics, so no cross-semantics
+    arithmetic is ever exposed.
+    """
+    groups: dict[str, list] = {}
+    for row in rows:
+        groups.setdefault(_semantics_key(row), []).append(row)
+    if len(groups) > 1:
+        out: dict = {}
+        if include_responses:
+            out["responses"] = len(rows)
+        out["by_semantics"] = {
+            sem: _bucket_totals(group, include_responses=False)
+            for sem, group in sorted(groups.items())}
+        return out
+    return _bucket_totals(rows, include_responses=include_responses)
+
+
 def _responses(con: sqlite3.Connection, session_keys=None) -> list:
     if session_keys is None:
         return con.execute("SELECT * FROM responses").fetchall()
@@ -51,21 +81,15 @@ def _responses(con: sqlite3.Connection, session_keys=None) -> list:
 
 
 def scope_totals(con: sqlite3.Connection, session_keys=None) -> dict:
-    """Usage over a scope. total_tokens is each harness's own total; the raw
-    buckets are only summed within one counter semantics, listed per
-    semantics when a scope mixes harnesses."""
+    """Usage over a scope. total_tokens is each harness's own total; the
+    raw buckets are only summed within one counter semantics. A scope
+    mixing semantics omits the top-level raw buckets and lists complete
+    per-semantics totals under by_semantics instead."""
     rows = _responses(con, session_keys)
     live = _live(rows)
-    totals = _bucket_totals(live) | {
+    totals = _usage_totals(live) | {
         "overlap_responses": sum(1 for r in rows if r["is_overlap"]),
     }
-    semantics = sorted({r["semantics"] for r in rows if r["semantics"]})
-    if len(semantics) > 1:
-        totals["by_semantics"] = {
-            sem: _bucket_totals(
-                [r for r in live if r["semantics"] == sem],
-                include_responses=False)
-            for sem in semantics}
     return totals
 
 
@@ -152,10 +176,18 @@ def task_report(con: sqlite3.Connection, task_id: str) -> dict:
                 missing_submissions.append(sub)
 
     def total(rows):
-        return _bucket_totals(rows)
+        return _usage_totals(rows)
 
     def _known(value):
         return value if value is not None else 0
+
+    def _sem_known_sums(rows):
+        """Known total_tokens per counter semantics; missing keys are 0."""
+        sums: dict[str, int] = {}
+        for r in rows:
+            sums[_semantics_key(r)] = sums.get(_semantics_key(r), 0) \
+                + _known(r["total_tokens"])
+        return sums
 
     scope = scope_totals(con, scope_keys)
     crashes = con.execute(
@@ -189,17 +221,36 @@ def task_report(con: sqlite3.Connection, task_id: str) -> dict:
             (task_id,))],
     }
     # Reconciliation: attributed + shared + unassigned partition the same
-    # rows as the scope, so known sums still add up exactly when counters
-    # are partial; unknown_counts on any side marks the lower bound.
-    report["reconciles"] = (
+    # rows as the scope, so responses add up exactly and known token sums
+    # agree per counter semantics. A mixed scope has no top-level raw
+    # total; comparing per-semantics sums keeps the check truthful
+    # instead of treating an absent mixed total as zero. Unknown_counts
+    # on any side marks the lower bound.
+    live_scope = [r for r in responses if not r["is_overlap"]]
+    responses_reconcile = (
         report["attributed"]["responses"]
         + report["shared_joint"]["responses"]
         + report["unassigned_in_scope"]["responses"] == scope["responses"]
-        and _known(report["attributed"]["total_tokens"])
-        + _known(report["shared_joint"]["total_tokens"])
-        + _known(report["unassigned_in_scope"]["total_tokens"])
-        == _known(scope["total_tokens"])
     )
+    if "total_tokens" in scope:
+        totals_reconcile = (
+            _known(report["attributed"]["total_tokens"])
+            + _known(report["shared_joint"]["total_tokens"])
+            + _known(report["unassigned_in_scope"]["total_tokens"])
+            == _known(scope["total_tokens"])
+        )
+    else:
+        parts = _sem_known_sums(attributed)
+        for rows in (shared, unassigned):
+            for sem, value in _sem_known_sums(rows).items():
+                parts[sem] = parts.get(sem, 0) + value
+        wholes = _sem_known_sums(live_scope)
+        totals_reconcile = all(
+            parts.get(sem, 0) == value
+            for sem, value in wholes.items()) and all(
+            parts.get(sem, 0) == wholes.get(sem, 0)
+            for sem in parts)
+    report["reconciles"] = responses_reconcile and totals_reconcile
     report["complete"] = (not missing_submissions
                           and not report["conflicting_assignments"])
     return report

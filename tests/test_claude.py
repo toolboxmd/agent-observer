@@ -72,8 +72,10 @@ class ClaudeAdapterTest(LedgerCase):
 
     def test_identity_comes_from_the_clean_hook_block_without_contents(self):
         row = self.query("SELECT * FROM sessions WHERE session_key=?", (MAIN,))[0]
-        self.assertEqual(row["instructions_sha256"], "fixture-instructions-sha")
-        self.assertEqual(row["preferences_sha256"], "fixture-preferences-sha")
+        self.assertEqual(row["instructions_sha256"],
+                         "cda5d15cf67856d4674b05324a77faf7043caca2f8016312644aa8895106e5e4")
+        self.assertEqual(row["preferences_sha256"],
+                         "77cc39dd5fb2a2c9df54d9286cb58123b8d251e640b7278029d101cdd29888c0")
         self.assertEqual(row["direction_status"], "ready")
         self.assertEqual(row["project_dir"], "/redacted/repo")
         self.assertNotIn("secret", row["identity_json"])

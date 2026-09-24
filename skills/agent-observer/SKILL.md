@@ -32,13 +32,18 @@ Run `sync` first; it is incremental and takes seconds after the first run.
 | Record ownership for work outside Model Router | `capture create-task`, `capture assign`, `capture outcome` |
 | Summary comment on a PR or commit | `publish --task <id> --repo owner/name --pr N` (explicit request only) |
 
-Add `--json` to any command for structured output.
+Add `--json` to any command for structured output. `publish --dry-run
+--json` returns a JSON payload with the summary data, the rendered body,
+and an explicit target (task or sessions, plus repo, PR or commit).
 
 ## Reading the results
 
 - Token totals are each harness's own total. Cache and reasoning buckets
   mean different things per harness and are never added across harnesses.
-  Totals are usage, not billing.
+  A scope mixing counter semantics carries no top-level raw totals; read
+  the per-semantics groups instead. Totals are usage, not billing.
+- Skill events name skills by validated identifier only: a free-text
+  skill title never persists as a target, name or detail.
 - `diagnose` returns candidates with event references, not verdicts. A
   reread after a compaction, a different range or an edit is not reported;
   a remaining repeat may still be legitimate. Heuristic detectors say so.

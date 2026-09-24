@@ -1070,3 +1070,171 @@ class PrivacyUnitTest(unittest.TestCase):
         self.assertIsNone(privacy.filter_target(["x"]))
         self.assertIsNone(privacy.filter_target(42))
         self.assertIsNone(privacy.filter_target(None))
+
+    def test_skill_targets_hold_only_validated_identifiers(self):
+        # Finding 1: skill_read and skill_invoke targets accept only a
+        # validated native skill identifier (the same complete rule as
+        # names). Titles, sentences, paths, whitespace, markers and
+        # wrong types fail closed.
+        for family in ("skill_read", "skill_invoke"):
+            for valid in ("agentsmd:operations", "wayfinder", "my-skill",
+                          "mcp__server__tool", "a" * 80,
+                          "skills/ops/SKILL.md"):
+                self.assertEqual(
+                    privacy.filter_target(valid, family=family), valid,
+                    (family, valid))
+            for bad in ("My Helpful Skill Title", "Only Title Here",
+                        "Read `/redacted/repo/skills/ops/SKILL.md`",
+                        "/u/.claude/plugins/cache/skills/operations",
+                        "/abs/path/SKILL.md", "hello world", "a b",
+                        "done <b>x</b>", "a <<< b", "foo\nbar", "",
+                        "a" * 81, None, 42, True, ["a"], {"a": 1}):
+                self.assertIsNone(
+                    privacy.filter_target(bad, family=family), (family, bad))
+
+    def test_non_skill_targets_keep_bounded_string_behavior(self):
+        # Compatibility: existing non-skill callers passing no family,
+        # or another family, keep the historical behavior.
+        self.assertEqual(
+            privacy.filter_target("/p/x.py", family="tool_call"), "/p/x.py")
+        self.assertEqual(
+            privacy.filter_target("cat notes.md", family="tool_result"),
+            "cat notes.md")
+        self.assertIsNone(privacy.filter_target(42, family="read"))
+
+
+class SkillTargetTest(LedgerCase):
+    """Finding 1 through the Claude adapter: a free-text Skill title
+    never persists as target, name, detail or identity; skill_read
+    keeps the validated skill identifier, never the directory path."""
+
+    TITLE = "My Helpful Skill Title"
+
+    def _import_skill_use(self, skill_value):
+        import json as _json
+        import os
+        assistant = {
+            "sessionId": "sess-skill-target", "cwd": "/redacted/repo",
+            "version": "2.1.280", "isSidechain": False, "type": "assistant",
+            "uuid": "as-skill", "timestamp": "2026-09-14T10:00:05Z",
+            "message": {
+                "id": "msg-skill", "model": "claude-fable-5-1",
+                "usage": {"input_tokens": 10, "cache_creation_input_tokens": 0,
+                          "cache_read_input_tokens": 0, "output_tokens": 5},
+                "content": [{"type": "tool_use", "id": "tu-skill-target",
+                             "name": "Skill", "input": {"skill": skill_value}}]},
+        }
+        path = os.path.join(self.tmp.name, "skill-target.jsonl")
+        with open(path, "w") as fh:
+            fh.write(_json.dumps(assistant) + "\n")
+        return claude.import_claude_file(self.con, path)
+
+    def test_free_text_skill_title_persists_nowhere(self):
+        self._import_skill_use(self.TITLE)
+        rows = self.query(
+            "SELECT family, native_id, name, target, detail_json FROM events"
+            " WHERE native_id='tu-skill-target'")
+        self.assertEqual(len(rows), 2)
+        by_family = {r["family"]: r for r in rows}
+        self.assertIn("skill_invoke", by_family)
+        self.assertIn("tool_call", by_family)
+        # The native tool name survives on the tool_call; the free-text
+        # skill value survives nowhere: no skill name, no skill target.
+        self.assertEqual(by_family["tool_call"]["name"], "Skill")
+        self.assertIsNone(by_family["tool_call"]["target"])
+        self.assertIsNone(by_family["skill_invoke"]["name"])
+        self.assertIsNone(by_family["skill_invoke"]["target"])
+        self.assertIsNone(by_family["skill_invoke"]["detail_json"])
+        blob = "".join((r["name"] or "") + (r["target"] or "")
+                       for r in rows)
+        blob += "".join(r["detail_json"] or "" for r in rows)
+        blob += "".join(r["identity_json"] or "" for r in self.query(
+            "SELECT identity_json FROM sessions"))
+        self.assertNotIn(self.TITLE, blob)
+
+    def test_valid_skill_identifier_survives_in_name_and_target(self):
+        self._import_skill_use("agentsmd:operations")
+        row = self.query(
+            "SELECT name, target FROM events WHERE family='skill_invoke'"
+            " AND native_id='tu-skill-target'")[0]
+        self.assertEqual(row["name"], "agentsmd:operations")
+        self.assertEqual(row["target"], "agentsmd:operations")
+        call = self.query(
+            "SELECT target FROM events WHERE family='tool_call'"
+            " AND native_id='tu-skill-target'")[0]
+        self.assertEqual(call["target"], "agentsmd:operations")
+
+    def _import_skill_command_use(self, command_value):
+        import json as _json
+        import os
+        assistant = {
+            "sessionId": "sess-skill-cmd", "cwd": "/redacted/repo",
+            "version": "2.1.280", "isSidechain": False, "type": "assistant",
+            "uuid": "as-skill-cmd", "timestamp": "2026-09-14T10:00:05Z",
+            "message": {
+                "id": "msg-skill-cmd", "model": "claude-fable-5-1",
+                "usage": {"input_tokens": 10, "cache_creation_input_tokens": 0,
+                          "cache_read_input_tokens": 0, "output_tokens": 5},
+                "content": [{"type": "tool_use", "id": "tu-skill-cmd",
+                             "name": "Skill",
+                             "input": {"command": command_value}}]},
+        }
+        result = {
+            "sessionId": "sess-skill-cmd", "cwd": "/redacted/repo",
+            "version": "2.1.280", "isSidechain": False, "type": "user",
+            "uuid": "u-skill-cmd", "timestamp": "2026-09-14T10:00:06Z",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu-skill-cmd",
+                 "content": "Launching skill"}]},
+        }
+        path = os.path.join(self.tmp.name, "skill-cmd.jsonl")
+        with open(path, "w") as fh:
+            fh.write(_json.dumps(assistant) + "\n")
+            fh.write(_json.dumps(result) + "\n")
+        return claude.import_claude_file(self.con, path)
+
+    def test_title_in_command_field_reaches_no_event_target(self):
+        self._import_skill_command_use(self.TITLE)
+        rows = self.query(
+            "SELECT family, native_id, name, target, detail_json FROM events"
+            " WHERE native_id='tu-skill-cmd'")
+        self.assertEqual(len(rows), 3)
+        by_family = {r["family"]: r for r in rows}
+        self.assertIn("skill_invoke", by_family)
+        self.assertIn("tool_call", by_family)
+        self.assertIn("tool_result", by_family)
+        # The command field is validated as a skill identifier before any
+        # path or command handling, so the title fails closed everywhere.
+        self.assertIsNone(by_family["skill_invoke"]["name"])
+        self.assertIsNone(by_family["skill_invoke"]["target"])
+        self.assertIsNone(by_family["tool_call"]["target"])
+        self.assertIsNone(by_family["tool_result"]["target"])
+        blob = "".join((r["name"] or "") + (r["target"] or "")
+                       for r in rows)
+        blob += "".join(r["detail_json"] or "" for r in rows)
+        self.assertNotIn(self.TITLE, blob)
+
+    def test_valid_identifier_in_command_field_stays_intact(self):
+        self._import_skill_command_use("agentsmd:operations")
+        rows = {r["family"]: r for r in self.query(
+            "SELECT family, name, target FROM events"
+            " WHERE native_id='tu-skill-cmd'")}
+        self.assertEqual(rows["skill_invoke"]["name"], "agentsmd:operations")
+        self.assertEqual(rows["skill_invoke"]["target"], "agentsmd:operations")
+        self.assertEqual(rows["tool_call"]["target"], "agentsmd:operations")
+        self.assertEqual(rows["tool_result"]["target"], "agentsmd:operations")
+
+    def test_skill_read_keeps_the_identifier_never_the_directory(self):
+        claude.sync(self.con,
+                    root=os.path.join(FIXTURES, "claude"))
+        rows = self.query(
+            "SELECT name, target, detail_json FROM events"
+            " WHERE family='skill_read'")
+        self.assertTrue(rows)
+        import json as _json
+        for row in rows:
+            self.assertEqual(row["name"], "operations")
+            self.assertEqual(row["target"], "operations")
+            self.assertEqual(_json.loads(row["detail_json"]),
+                             {"skill": "operations"})
+            self.assertNotIn("/", row["target"] or "")
