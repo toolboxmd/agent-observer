@@ -2453,3 +2453,172 @@ class GrokAdapterTest(LedgerCase):
             con.execute(
                 "SELECT COUNT(*) n FROM import_errors").fetchone()["n"], 2)
         con.close()
+
+    def test_provenanceless_row_rewrite_without_modelusage_preserves(self):
+        # P2: an existing response row with no provenance record keeps its
+        # model and effort when a later valid rewrite omits modelUsage.
+        # Summary fallback never overwrites provenance-less values, while a
+        # later valid stronger modelUsage still updates the model.
+        tmp = os.path.join(self.tmp.name, "noprovenance")
+        group = os.path.join(tmp, "%2Fnoprovenance")
+        sid = "10noprovenance-cccc-4b5c-8d6e-000000000013"
+        text = "Provenance-less probe"
+        sdir = self._write_session(
+            group, sid,
+            {"info": {"id": sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-01T21:00:00Z",
+             "current_model_id": "grok-4.6",
+             "reasoning_effort": "medium"},
+            [{"timestamp": 1788813000, "method": "session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text", "text": text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "np-1", "promptId": "p-np"}}},
+             {"timestamp": 1788813001, "method": "_x.ai/session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-np",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 10,
+                                              "outputTokens": 2,
+                                              "totalTokens": 12,
+                                              "modelUsage": {
+                                                  "grok-4.7-valid": {
+                                                      "inputTokens": 10}}}},
+                         "_meta": {"eventId": "np-2"}}}],
+            [{"ts": "2026-09-01T21:00:01Z", "type": "turn_ended",
+              "outcome": "completed"}],
+            [{"type": "user",
+              "content": [{"type": "text", "text": text}],
+              "prompt_index": 0}])
+        con = self._isolated_con("noprovenance")
+        grok.sync(con, root=tmp)
+        key = f"grok:{sid}"
+        first = con.execute(
+            "SELECT model, effort FROM responses WHERE response_id=?",
+            (f"{key}:p-np",)).fetchone()
+        self.assertIsNotNone(first)
+        self.assertEqual(first["model"], "grok-4.7-valid")
+        self.assertEqual(first["effort"], "medium")
+        # Simulate a legacy row from before provenance existed.
+        con.execute(
+            "DELETE FROM grok_response_provenance WHERE response_id=?",
+            (f"{key}:p-np",))
+        con.commit()
+        self.assertIsNone(con.execute(
+            "SELECT 1 FROM grok_response_provenance WHERE response_id=?",
+            (f"{key}:p-np",)).fetchone())
+        # Rewrite without modelUsage and move the summary fallback (model
+        # stays the fallback, effort moves medium -> low).
+        updates_path = os.path.join(sdir, "updates.jsonl")
+        with open(updates_path) as fh:
+            lines = fh.read().splitlines()
+        rewritten = []
+        for line in lines:
+            obj = json.loads(line)
+            params = obj.get("params") if isinstance(
+                obj.get("params"), dict) else {}
+            update = params.get("update") if isinstance(params, dict) \
+                else {}
+            if isinstance(update, dict) and update.get("sessionUpdate") == \
+                    "turn_completed":
+                update["usage"] = {"inputTokens": 10,
+                                   "outputTokens": 2,
+                                   "totalTokens": 12}
+            rewritten.append(json.dumps(obj))
+        with open(updates_path, "w") as fh:
+            fh.write("\n".join(rewritten) + "\n")
+        summary_path = os.path.join(sdir, "summary.json")
+        with open(summary_path) as fh:
+            summary = json.load(fh)
+        summary["reasoning_effort"] = "low"
+        with open(summary_path, "w") as fh:
+            fh.write(json.dumps(summary))
+        grok.sync(con, root=tmp)
+        kept = con.execute(
+            "SELECT model, effort FROM responses WHERE response_id=?",
+            (f"{key}:p-np",)).fetchone()
+        self.assertEqual(kept["model"], "grok-4.7-valid")
+        self.assertEqual(kept["effort"], "medium")
+        # A later valid stronger modelUsage still updates the model.
+        with open(updates_path) as fh:
+            lines = fh.read().splitlines()
+        rewritten = []
+        for line in lines:
+            obj = json.loads(line)
+            params = obj.get("params") if isinstance(
+                obj.get("params"), dict) else {}
+            update = params.get("update") if isinstance(params, dict) \
+                else {}
+            if isinstance(update, dict) and update.get("sessionUpdate") == \
+                    "turn_completed":
+                update["usage"] = {"inputTokens": 10,
+                                   "outputTokens": 2,
+                                   "totalTokens": 12,
+                                   "modelUsage": {"grok-4.7-newer": {
+                                       "inputTokens": 10}}}
+            rewritten.append(json.dumps(obj))
+        with open(updates_path, "w") as fh:
+            fh.write("\n".join(rewritten) + "\n")
+        grok.sync(con, root=tmp)
+        updated = con.execute(
+            "SELECT model, effort FROM responses WHERE response_id=?",
+            (f"{key}:p-np",)).fetchone()
+        self.assertEqual(updated["model"], "grok-4.7-newer")
+        self.assertEqual(updated["effort"], "medium")
+        con.close()
+
+    def test_tool_result_chat_content_proves_nothing(self):
+        # P2: only the native text-content shape (type text with string
+        # text) contributes text. A tool_result shape proves nothing about
+        # human authorship.
+        self.assertEqual(
+            grok._content_text({"type": "text", "text": "hi"}), "hi")
+        self.assertEqual(
+            grok._content_text({"type": "tool_result", "text": "hi"}), "")
+        self.assertEqual(
+            grok._content_text([{"type": "text", "text": "hi"}]), "hi")
+        self.assertEqual(
+            grok._content_text([{"type": "tool_result", "text": "hi"}]),
+            "")
+        tmp = os.path.join(self.tmp.name, "toolresultchat")
+        group = os.path.join(tmp, "%2Ftoolresultchat")
+        sid = "10toolresult-cccc-4b5c-8d6e-000000000014"
+        text = "Human probe 0"
+        self._write_session(
+            group, sid,
+            {"info": {"id": sid, "cwd": "/redacted/repo"},
+             "created_at": "2026-09-01T22:00:00Z",
+             "current_model_id": "grok-4.6"},
+            [{"timestamp": 1788814000, "method": "session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text", "text": text},
+                                    "_meta": {"promptIndex": 0}},
+                         "_meta": {"eventId": "tr-1", "promptId": "p-tr"}}},
+             {"timestamp": 1788814001, "method": "_x.ai/session/update",
+              "params": {"sessionId": sid,
+                         "update": {"sessionUpdate": "turn_completed",
+                                    "prompt_id": "p-tr",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"inputTokens": 10,
+                                              "outputTokens": 1,
+                                              "totalTokens": 11}},
+                         "_meta": {"eventId": "tr-2"}}}],
+            [{"ts": "2026-09-01T22:00:01Z", "type": "turn_ended",
+              "outcome": "completed"}],
+            [{"type": "user",
+              "content": {"type": "tool_result", "text": text},
+              "prompt_index": 0}])
+        con = self._isolated_con("toolresultchat")
+        grok.sync(con, root=tmp)
+        key = f"grok:{sid}"
+        row = con.execute(
+            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            " WHERE native_id=?", (f"{key}:prompt:0",)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["is_genuine"], 0)
+        self.assertEqual(row["text_excerpt"], "")
+        self.assertIn(row["kind"], ("unknown", "synthetic"))
+        con.close()

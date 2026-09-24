@@ -282,6 +282,8 @@ def _content_text(content) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, dict):
+        if content.get("type") != "text":
+            return ""
         text = content.get("text")
         return text if isinstance(text, str) else ""
     if isinstance(content, list):
@@ -917,15 +919,18 @@ def _reconcile_response_metadata(con: sqlite3.Connection, r: _Reader,
                         sets.append("model=?")
                         args.append(new_model)
                 else:
-                    old_rank = _model_ranks(old_model, turn_m, usage_set,
-                                            summary_model, chunk_model)
-                    # Stronger wins; weaker never downgrades. Unknown stale
-                    # evidence (-1) yields to the current best only when the
-                    # current usage is valid, compatible and proven.
-                    if old_model is None or old_rank == -1 \
-                            or new_rank >= old_rank:
+                    if old_model is None:
                         sets.append("model=?")
                         args.append(new_model)
+                    elif new_rank >= 2:
+                        # No provenance: fail safe by keeping the existing
+                        # value unless the rewrite proves a turn (3) or
+                        # usage (2) model. Summary/chunk fallback (1/0)
+                        # never overwrites a provenance-less value.
+                        sets.append("model=?")
+                        args.append(new_model)
+                    # Else preserve the existing model: a provenance-less
+                    # row keeps its value against fallback evidence.
         if valid_effort is not None and old_effort != valid_effort:
             if old_effort is None:
                 sets.append("effort=?")
@@ -937,15 +942,10 @@ def _reconcile_response_metadata(con: sqlite3.Connection, r: _Reader,
                         sets.append("effort=?")
                         args.append(valid_effort)
                 else:
-                    if old_effort == valid_summary_effort:
-                        old_erank = 1
-                    elif old_effort == valid_chat_effort:
-                        old_erank = 0
-                    else:
-                        old_erank = -1
-                    if old_erank == -1 or new_effort_rank >= old_erank:
-                        sets.append("effort=?")
-                        args.append(valid_effort)
+                    # No provenance: preserve the existing effort. Summary
+                    # or chat fallback never overwrites a provenance-less
+                    # value; only a missing value is filled above.
+                    pass
         if sets:
             args.append(response_id)
             try:
@@ -1628,13 +1628,16 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
                 meta_args.append(model)
         elif _has_unproven_model_usage(update):
             pass
-        else:
-            new_rank = new_model_rank
-            old_rank = _model_ranks(old_model, turn_m, usage_set,
-                                    summary_model, chunk_model)
-            if old_model is None or old_rank == -1 or new_rank >= old_rank:
-                meta_sets.append("model=?")
-                meta_args.append(model)
+        elif old_model is None:
+            meta_sets.append("model=?")
+            meta_args.append(model)
+        elif new_model_rank >= 2:
+            # No provenance: fail safe by keeping the existing value
+            # unless the rewrite proves a turn (3) or usage (2) model.
+            # Summary/chunk fallback never overwrites.
+            meta_sets.append("model=?")
+            meta_args.append(model)
+        # Else preserve the existing model against fallback evidence.
     if valid_effort is not None and old_effort != valid_effort:
         if old_effort is None:
             meta_sets.append("effort=?")
@@ -1644,15 +1647,9 @@ def _store_response(con, r: _Reader, src: JsonlSource, ordinal: int,
                 meta_sets.append("effort=?")
                 meta_args.append(valid_effort)
         else:
-            if old_effort == valid_summary_effort:
-                old_erank = 1
-            elif old_effort == valid_chat_effort:
-                old_erank = 0
-            else:
-                old_erank = -1
-            if old_erank == -1 or new_erank >= old_erank:
-                meta_sets.append("effort=?")
-                meta_args.append(valid_effort)
+            # No provenance: preserve the existing effort. Fallback never
+            # overwrites a provenance-less value.
+            pass
     if meta_sets:
         meta_args.append(response_id)
         con.execute(
