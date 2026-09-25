@@ -115,11 +115,36 @@ or successful attempt never implies an accepted outcome.
 
 Task reports carry a stable snapshot identity (`snapshot_id`, a SHA-256
 over the selected task, sessions, response counters, assignments, outcome,
-attempts, dispatches, source cutoff and price schedule) and a measured set (task, sessions
+attempts with timing evidence, submission timestamps, dispatches, source cutoff
+and price schedule) and a measured set (task, sessions
 and attributed/shared/unassigned response ids). Repeated rendering without
 ledger changes keeps the same identity; new evidence changes it. Time and
 diagnostics are task-turn scoped when turn timing exists, otherwise labeled
 unavailable with the whole-session span kept explicitly as session context.
+`task show` also reports submission-to-accepted-completion time only with
+explicit endpoints (active tasks show elapsed-so-far at the named source
+cutoff), observed wall time per attempt/session/role with waiting intervals
+for the same known session or Router request only, failures by class
+from explicit terminal, stage, rc and proof_class with production denominators
+including quota provider exhaustion and cancellation intent unknown
+unless the job carries explicit cancel_requested, separate job outcomes
+with cancel intent,
+per-failure stage-specific recovery inside compatible identities
+(first progress at any stage with its stage label; recovered, active
+and repeated counts only at the same known stage) with linked Router
+recovery projections (decision, next attempt with actual seq, attempt
+result, verification attempt, route switch scope, planner route
+rejection and the recovery-decision question identity), proof attempts
+(kind proof, stage verification; proof timeout stays timeout and proof
+failed stays verification), and attributable
+Router usage source coverage. Parallel attempt
+durations never become task elapsed time; Router and native rows for one
+execution merge only on explicit turn/session/time evidence and count once.
+Router reason never classifies a later failure; context pressure is
+provider, explicit terminal timeout stays timeout including
+historical rc124 rows, and explicit terminal infrastructure is
+infrastructure.
+Union span is merged covered duration with gaps excluded.
 
 The bundled dated price schedule supplies standard API list-price equivalents
 for supported exact model identities. `task show --prices schedule.json` and

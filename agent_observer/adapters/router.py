@@ -99,13 +99,18 @@ CAPABILITIES = [
 # "dispatch_stalled", "dispatch_exhausted" and the preflight reasons;
 # "planner_question"; the ladder's "correction" and "escalation"; the
 # capacity moves "pool_move", "lateral", "larger_context" and
-# "stalled_retry". _switch_route appends "_concurrent" to a move reason
-# when the target was concurrency-full, giving the suffixed variants.
-# "dispatch_fallback rc=N" is a dynamic f-string, never a closed value.
+# "stalled_retry"; the planner-directed "planner_directed" worker move
+# (controller._apply_planner_directed_route via _switch_route, reason
+# persisted as the next worker invocation reason and as the
+# route_switched worker-scope reason). _switch_route appends
+# "_concurrent" to a move reason when the target was concurrency-full,
+# giving the suffixed variants. "dispatch_fallback rc=N" is a dynamic
+# f-string, never a closed value.
 REASONS = frozenset({
     "initial",
     "resume",
     "planner_question",
+    "planner_directed",
     "compact_after_submit",
     "correction",
     "escalation",
@@ -124,6 +129,7 @@ REASONS = frozenset({
     "larger_context_concurrent",
     "correction_concurrent",
     "escalation_concurrent",
+    "planner_directed_concurrent",
     "preflight_exhausted_concurrent",
     "preflight_degraded_concurrent",
     "preflight_one_turn_concurrent",
@@ -147,7 +153,8 @@ JOB_STATUSES = frozenset({
 # Every core.terminal_class_for output: rc/signal mapping (crashed from
 # the crashed flag; quota/overloaded/stalled/context/hard_error from
 # policy.SIGNAL_CLASSES exhausted/overloaded/stalled/context/hard;
-# completed/timeout/cancelled/failed from rc 0/124/143,-15/other).
+# completed/timeout/cancelled/failed from rc 0/124/143,-15/other;
+# infrastructure for a startup failure with an explicit startup marker).
 # Live ledger: completed, failed, stalled.
 TERMINAL_CLASSES = frozenset({
     "completed",
@@ -157,13 +164,16 @@ TERMINAL_CLASSES = frozenset({
     "stalled",
     "context",
     "hard_error",
+    "infrastructure",
     "cancelled",
     "crashed",
     "quota",
 })
 
-# harnesses.INVOCATION_KINDS (live ledger holds all but opencode_serve
-# and grok_control).
+# harnesses.INVOCATION_KINDS plus the durable proof kind
+# (runner/core.record_verification_attempt writes kind proof for an
+# executed verification). Live ledger holds all but opencode_serve
+# and grok_control; proof rows appear only after Router87.
 INVOCATION_KINDS = frozenset({
     "codex_dispatch",
     "codex_resume",
@@ -172,14 +182,18 @@ INVOCATION_KINDS = frozenset({
     "opencode_control",
     "opencode_serve",
     "grok_control",
+    "proof",
 })
 
-# Harness stage_for values (codex dispatch, claude planning, worker
-# implementation); live ledger holds all three.
+# Harness stage_for values plus the durable verification stage
+# (proof invocations carry stage verification). Live ledger holds
+# dispatch, planning and implementation; verification appears only
+# after Router87.
 STAGES = frozenset({
     "dispatch",
     "planning",
     "implementation",
+    "verification",
 })
 
 SESSION_KINDS = frozenset({
@@ -205,10 +219,14 @@ JOB_KINDS = frozenset({
     "replay",
 })
 
-# core.PLANNER_HARNESSES: only claude runs the planner callback
-# (live ledger: claude).
+# core.PLANNER_HARNESSES: the planner callback runs in any of the
+# four supported local harnesses (live ledger may hold any of them).
+# Anything else becomes NULL, never a guess.
 PLANNER_HARNESSES = frozenset({
+    "codex",
     "claude",
+    "opencode",
+    "grok",
 })
 
 # Closed block classes observed in the router ledger. An arbitrary prefix
@@ -226,6 +244,70 @@ DIRECTION_SUPPLIES = frozenset({
     "runner",
     "none",
 })
+
+# Executed proof classes from runner/core.PROOF_CLASSES. A proof
+# invocation row carries its class in reason and in meta_json
+# proof_class; skipped/none never have invocation rows. Anything
+# else becomes NULL (fail closed).
+PROOF_CLASSES = frozenset({
+    "pass",
+    "failed",
+    "timeout",
+    "not_found",
+    "error",
+    "skipped",
+    "none",
+})
+
+# Whitelisted Router ledger event kinds retained as sanitized
+# projections. Every other kind is validated and discarded, never
+# stored. question_posted is retained only for qid recovery-decision;
+# its prompt text is never stored.
+EVENT_KINDS = frozenset({
+    "recovery_decision",
+    "recovery_next_attempt",
+    "recovery_attempt_result",
+    "verification_attempt",
+    "route_switched",
+    "planner_route_rejected",
+    "question_posted",
+})
+
+# Closed route-switch scopes: dispatch moves record why the dispatch
+# moved routes apart from the worker reason; worker moves are ordinary
+# capacity moves. Anything else becomes NULL.
+ROUTE_SCOPES = frozenset({
+    "dispatch",
+    "worker",
+})
+
+# Closed recovery outcomes for recovery_attempt_result.
+RECOVERY_OUTCOMES = frozenset({
+    "ok",
+    "failed",
+})
+
+# Closed ladder rungs for recovery_decision (controller LADDER_RUNGS
+# plus the planner-directed rung).
+RECOVERY_RUNGS = frozenset({
+    "initial",
+    "correction",
+    "correction_fresh",
+    "recovery",
+    "recovery_directed",
+})
+
+# Closed recovery reasons: the ladder's correction/escalation and the
+# planner-directed reason. Anything else becomes NULL.
+RECOVERY_REASONS = frozenset({
+    "correction",
+    "escalation",
+    "planner_directed",
+})
+
+# The only planner question identity retained. Its prompt text is
+# never stored.
+RECOVERY_QUESTION_ID = "recovery-decision"
 
 _ID_TOKEN_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
 _MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._:/-]+$")
@@ -394,9 +476,12 @@ def _ledger_fingerprint(jobs: list[dict], invocations: list[dict],
     """Content fingerprint of the router ledger snapshot, never values out.
 
     The fingerprint stays inside the sources row; only shape-only excerpts
-    ever reach import_errors.
+    ever reach import_errors. v3 covers the Router87 contract additions
+    (proof kind, verification stage, rc/meta_seq/proof_class,
+    cancel_requested and whitelisted recovery events) so existing
+    sources re-import once to pick up the new projections.
     """
-    parts = ["observer-task-ownership-v2"]
+    parts = ["observer-router-contract-v3"]
     for rows in (jobs, invocations, readings, events):
         parts.append(sorted(
             json.dumps(r, sort_keys=True, default=str) for r in rows))
@@ -752,6 +837,87 @@ def _valid_direction_supply(value) -> str | None:
     return None
 
 
+def _valid_proof_class(value) -> str | None:
+    if isinstance(value, str) and value in PROOF_CLASSES:
+        return value
+    return None
+
+
+def _valid_event_kind(value) -> str | None:
+    if isinstance(value, str) and value in EVENT_KINDS:
+        return value
+    return None
+
+
+def _valid_route_scope(value) -> str | None:
+    if isinstance(value, str) and value in ROUTE_SCOPES:
+        return value
+    return None
+
+
+def _valid_recovery_outcome(value) -> str | None:
+    if isinstance(value, str) and value in RECOVERY_OUTCOMES:
+        return value
+    return None
+
+
+def _valid_recovery_rung(value) -> str | None:
+    if isinstance(value, str) and value in RECOVERY_RUNGS:
+        return value
+    return None
+
+
+def _valid_recovery_reason(value) -> str | None:
+    if isinstance(value, str) and value in RECOVERY_REASONS:
+        return value
+    return None
+
+
+def _valid_seq(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _valid_rc(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _valid_cancel_requested(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value in (0, 1, 2):
+        return value
+    return None
+
+
+def _meta_seq(meta_text) -> int | None:
+    """Seq from meta_json for actual joins, else NULL.
+
+    Only the integer seq used to join recovery events to invocations
+    is retained; every other meta member (prompts, routes held for
+    other purposes, direction blocks, runtimes) is never stored.
+    """
+    obj = _parse_json_object(meta_text)
+    if obj is None:
+        return None
+    return _valid_seq(obj.get("seq"))
+
+
+def _meta_proof_class(meta_text) -> str | None:
+    """Proof class from meta_json for proof rows, else NULL."""
+    obj = _parse_json_object(meta_text)
+    if obj is None:
+        return None
+    return _valid_proof_class(obj.get("proof_class"))
+
+
 def _block_class(block_reason) -> str | None:
     """Only a known closed block class; an arbitrary prefix is NULL.
 
@@ -905,6 +1071,13 @@ def _import_job(con: sqlite3.Connection, db_path: str, job: dict,
                        else None)
     base_commit = _valid_commit_sha(job.get("base_commit"))
     head_commit = _valid_commit_sha(job.get("head_commit"))
+    # Explicit cancellation intent lives only on the job's
+    # cancel_requested flag. A missing column (legacy ledger) or a
+    # non-integer stays NULL, which reports as unknown intent, never
+    # intentional. cancel_requested=1 is explicit intent; 0 is no
+    # request; 2 is a timeout drain that finalizes as failed, not an
+    # intentional cancellation.
+    cancel_requested = _valid_cancel_requested(job.get("cancel_requested"))
     values = {
         "status": status,
         "lane": lane,
@@ -920,6 +1093,7 @@ def _import_job(con: sqlite3.Connection, db_path: str, job: dict,
         "block_reason": _block_class(job.get("block_reason")),
         "created_at": iso_ts(job.get("created_at")),
         "updated_at": iso_ts(job.get("updated_at")),
+        "cancel_requested": cancel_requested,
     }
     changed = _upsert_changed(con, "router_jobs",
                               {"request_id": request_id}, values)
@@ -1083,7 +1257,27 @@ def _import_invocation(con: sqlite3.Connection, db_path: str, inv: dict,
     stage = inv.get("stage") if inv.get("stage") in STAGES else None
     requested_route = _valid_model_name(inv.get("requested_route"))
     policy_version = _valid_model_name(inv.get("policy_version"), 64)
-    reason = _valid_reason(inv.get("reason"))
+    # Proof rows carry their proof class in reason and in meta_json;
+    # the launch-reason vocabulary never classifies them. A proof
+    # reason is projected as proof_class with reason NULL, so Router
+    # reason never classifies a later failure.
+    raw_reason = inv.get("reason")
+    meta_seq = _meta_seq(inv.get("meta_json"))
+    meta_proof = _meta_proof_class(inv.get("meta_json"))
+    if kind == "proof":
+        proof_class = _valid_proof_class(raw_reason)
+        if proof_class is None:
+            proof_class = meta_proof
+        reason = None
+    else:
+        reason = _valid_reason(raw_reason)
+        proof_class = meta_proof
+        # Non-proof rows never carry a proof class through reason;
+        # a meta proof_class on a non-proof row is ignored to keep
+        # stage evidence explicit (unknown stays unknown).
+        if kind != "proof":
+            proof_class = None
+    rc = _valid_rc(inv.get("rc"))
     terminal_class = _valid_terminal_class(inv.get("terminal_class"))
     harness_version = _valid_model_name(inv.get("harness_version"), 64)
     observed_model = _valid_model_name(inv.get("observed_model"))
@@ -1124,6 +1318,9 @@ def _import_invocation(con: sqlite3.Connection, db_path: str, inv: dict,
         "skills_json": None,
         "tools_json": None,
         "schema_version": schema_version,
+        "rc": rc,
+        "meta_seq": meta_seq,
+        "proof_class": proof_class,
     }
     changed = _upsert_changed(con, "router_invocations",
                               {"invocation_id": invocation_id},
@@ -1153,6 +1350,9 @@ def _import_invocation(con: sqlite3.Connection, db_path: str, inv: dict,
         "state": _attempt_state(inv.get("terminal_class")),
         "terminal_class": terminal_class,
         "usage_json": usage_projected,
+        "rc": rc,
+        "proof_class": proof_class,
+        "meta_seq": meta_seq,
     }
     row = con.execute(
         "SELECT * FROM attempts WHERE task_id=? AND turn_id=?",
@@ -1300,14 +1500,211 @@ def _import_reading(con: sqlite3.Connection, db_path: str, reading: dict,
     return _upsert_changed(con, "router_readings", key, values)
 
 
+def _project_router_event(event: dict) -> dict | None:
+    """Sanitized whitelisted projection for one Router ledger event.
+
+    Only the closed kinds in EVENT_KINDS are retained, and only their
+    whitelisted numeric/enum/route fields. Raw prompts, tool arguments,
+    question text, secrets and arbitrary payload values never persist:
+    the payload is parsed in memory, validated field by field, and
+    discarded. Returns the projection dict or None when the event
+    carries nothing retainable (unknown kind, legacy value, or a
+    question_posted for another qid).
+    """
+    kind = _valid_event_kind(event.get("kind"))
+    if kind is None:
+        return None
+    payload = _parse_json_object(event.get("payload_json")) or {}
+    # Privacy allowlist still runs, result discarded: no raw payload
+    # value reaches the ledger through another path.
+    _ = privacy.filter_detail(event.get("kind") or "", payload)
+    _ = privacy.filter_target(event.get("kind"))
+    ts = iso_ts(event.get("ts"))
+    if kind == "recovery_decision":
+        failed_seq = _valid_seq(payload.get("failed_seq"))
+        rung = _valid_recovery_rung(payload.get("rung"))
+        target = _valid_model_name(payload.get("target")) if payload.get("target") is not None else None
+        reason = _valid_recovery_reason(payload.get("reason"))
+        failures = payload.get("failures")
+        failures = failures if isinstance(failures, int) and not isinstance(failures, bool) else None
+        if failed_seq is None and rung is None and target is None and reason is None and failures is None:
+            return None
+        return {"kind": kind, "ts": ts, "failed_seq": failed_seq,
+                "next_seq": None, "seq": None, "route": None,
+                "outcome": None, "scope": None, "rung": rung,
+                "target": target, "reason": reason, "requested": None,
+                "qid": None, "failures": failures}
+    if kind == "recovery_next_attempt":
+        failed_seq = _valid_seq(payload.get("failed_seq"))
+        next_seq = _valid_seq(payload.get("next_seq"))
+        route = _valid_model_name(payload.get("route")) if payload.get("route") is not None else None
+        if failed_seq is None and next_seq is None and route is None:
+            return None
+        return {"kind": kind, "ts": ts, "failed_seq": failed_seq,
+                "next_seq": next_seq, "seq": None, "route": route,
+                "outcome": None, "scope": None, "rung": None,
+                "target": None, "reason": None, "requested": None,
+                "qid": None, "failures": None}
+    if kind == "recovery_attempt_result":
+        failed_seq = _valid_seq(payload.get("failed_seq"))
+        next_seq = _valid_seq(payload.get("next_seq"))
+        outcome = _valid_recovery_outcome(payload.get("outcome"))
+        if failed_seq is None and next_seq is None and outcome is None:
+            return None
+        return {"kind": kind, "ts": ts, "failed_seq": failed_seq,
+                "next_seq": next_seq, "seq": None, "route": None,
+                "outcome": outcome, "scope": None, "rung": None,
+                "target": None, "reason": None, "requested": None,
+                "qid": None, "failures": None}
+    if kind == "verification_attempt":
+        seq = _valid_seq(payload.get("seq"))
+        route = _valid_model_name(payload.get("route")) if payload.get("route") is not None else None
+        rc = _valid_rc(payload.get("rc"))
+        proof_class = _valid_proof_class(payload.get("proof_class"))
+        if seq is None and route is None and rc is None and proof_class is None:
+            return None
+        return {"kind": kind, "ts": ts, "failed_seq": None,
+                "next_seq": None, "seq": seq, "route": route,
+                "outcome": None, "scope": None, "rung": None,
+                "target": None, "reason": None, "requested": None,
+                "qid": None, "failures": None,
+                "_rc": rc, "_proof_class": proof_class}
+    if kind == "route_switched":
+        scope = _valid_route_scope(payload.get("scope"))
+        # From/to are validated routes when present; reason stays in
+        # the closed launch vocabulary so a dispatch cause never
+        # disguises a later worker attempt.
+        from_route = _valid_model_name(payload.get("from")) if payload.get("from") is not None else None
+        to_route = _valid_model_name(payload.get("to")) if payload.get("to") is not None else None
+        reason = _valid_reason(payload.get("reason"))
+        if scope is None and from_route is None and to_route is None and reason is None:
+            return None
+        # Scope is the required contract field; a switch without a
+        # known scope stays unretained to avoid mixing dispatch and
+        # worker causes.
+        if scope is None:
+            return None
+        return {"kind": kind, "ts": ts, "failed_seq": None,
+                "next_seq": None, "seq": None, "route": to_route,
+                "outcome": None, "scope": scope, "rung": None,
+                "target": to_route, "reason": reason, "requested": None,
+                "qid": None, "failures": None,
+                "_from": from_route}
+    if kind == "planner_route_rejected":
+        requested = _valid_model_name(payload.get("requested")) if payload.get("requested") is not None else None
+        if requested is None:
+            return None
+        # The free-text reason is never stored; only the validated
+        # requested route persists.
+        return {"kind": kind, "ts": ts, "failed_seq": None,
+                "next_seq": None, "seq": None, "route": None,
+                "outcome": None, "scope": None, "rung": None,
+                "target": None, "reason": None, "requested": requested,
+                "qid": None, "failures": None}
+    if kind == "question_posted":
+        qid = event.get("qid") if isinstance(event.get("qid"), str) else payload.get("qid")
+        if qid != RECOVERY_QUESTION_ID:
+            return None
+        return {"kind": kind, "ts": ts, "failed_seq": None,
+                "next_seq": None, "seq": None, "route": None,
+                "outcome": None, "scope": None, "rung": None,
+                "target": None, "reason": None, "requested": None,
+                "qid": qid, "failures": None}
+    return None
+
+
+def _store_router_event(con: sqlite3.Connection, request_id: str,
+                        event: dict, projection: dict) -> bool:
+    """Insert one sanitized event projection, idempotent on natural key.
+
+    The natural key is (request_id, kind, ts, failed_seq, next_seq,
+    seq): the same ledger event re-imported never duplicates. Extra
+    fields (_rc, _proof_class, _from) are folded into the stored
+    columns where they belong, never as raw values.
+    """
+    # Fold verification extras: rc is not a stored column on events;
+    # the proof outcome lives on the invocation row, so only seq,
+    # route and proof_class-adjacent outcome are kept. The rc itself
+    # is validated but not stored as a separate event field to keep
+    # the projection minimal; the invocation row carries it.
+    kind = projection["kind"]
+    ts = projection.get("ts")
+    failed_seq = projection.get("failed_seq")
+    next_seq = projection.get("next_seq")
+    seq = projection.get("seq")
+    # verification_attempt keeps its proof_class in reason for
+    # inspection without storing raw values.
+    reason = projection.get("reason")
+    if kind == "verification_attempt":
+        reason = projection.get("_proof_class")
+    # route_switched keeps from in requested for inspection? No:
+    # from is a route, but the contract asks for scope; keep target
+    # as route/target and drop from to stay minimal, except when
+    # needed for scope disambiguation (stored as requested is wrong).
+    # Keep minimal: from is discarded, to stays as route/target.
+    values = {
+        "request_id": request_id,
+        "kind": kind,
+        "ts": ts,
+        "failed_seq": failed_seq,
+        "next_seq": next_seq,
+        "seq": seq,
+        "route": projection.get("route"),
+        "outcome": projection.get("outcome"),
+        "scope": projection.get("scope"),
+        "rung": projection.get("rung"),
+        "target": projection.get("target"),
+        "reason": reason,
+        "requested": projection.get("requested"),
+        "qid": projection.get("qid"),
+        "failures": projection.get("failures"),
+    }
+    # Idempotency: the same event never inserts twice. Timestamps
+    # from the ledger are floats via iso_ts; NULLs compare with IS.
+    existing = con.execute(
+        "SELECT id FROM router_events WHERE request_id=? AND kind=?"
+        " AND COALESCE(ts, -1)=COALESCE(?, -1)"
+        " AND COALESCE(failed_seq, -999999)=COALESCE(?, -999999)"
+        " AND COALESCE(next_seq, -999999)=COALESCE(?, -999999)"
+        " AND COALESCE(seq, -999999)=COALESCE(?, -999999)",
+        (request_id, kind, ts, failed_seq, next_seq, seq)).fetchone()
+    if existing is not None:
+        # Fill unknown fields in place without duplicating.
+        row = con.execute(
+            "SELECT * FROM router_events WHERE id=?", (existing["id"],)).fetchone()
+        diff = {c: v for c, v in values.items()
+                if c not in ("request_id", "kind") and row[c] != v and v is not None and row[c] is None}
+        if diff:
+            con.execute(
+                f"UPDATE router_events SET {','.join(f'{c}=?' for c in diff)} WHERE id=?",
+                tuple(diff.values()) + (existing["id"],))
+            return True
+        # Also update when stored NULL should become a new non-NULL
+        # route/outcome/scope on re-import with more evidence.
+        return False
+    con.execute(
+        "INSERT INTO router_events(request_id, kind, ts, failed_seq,"
+        " next_seq, seq, route, outcome, scope, rung, target, reason,"
+        " requested, qid, failures) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (values["request_id"], values["kind"], values["ts"],
+         values["failed_seq"], values["next_seq"], values["seq"],
+         values["route"], values["outcome"], values["scope"],
+         values["rung"], values["target"], values["reason"],
+         values["requested"], values["qid"], values["failures"]))
+    return True
+
+
 def _validate_source_event(con: sqlite3.Connection, db_path: str,
                            event: dict, totals: dict) -> bool:
-    """Fail-closed validation for router ledger event references.
+    """Fail-closed validation with whitelisted recovery projections.
 
-    Router ledger event payloads never enter the ledger: detail and target
-    pass through the shared privacy allowlist and the filtered result is
-    discarded. A missing or dangling request id is quarantined with
-    ``missing_id`` and skipped. Returns False always (nothing stored).
+    A missing or dangling request id is quarantined with ``missing_id``
+    and skipped. Unknown event kinds, legacy values without retainable
+    fields, and question_posted for another qid store nothing and
+    return False. Whitelisted recovery, verification, route-switch,
+    planner-rejection and recovery-decision question events store only
+    their sanitized projection in router_events; raw payloads never
+    enter the ledger.
     """
     request_id = _valid_request_id(event.get("request_id"))
     if request_id is None or not con.execute(
@@ -1316,10 +1713,13 @@ def _validate_source_event(con: sqlite3.Connection, db_path: str,
         _record_malformed(
             con, db_path, "missing_id", _shape_excerpt(event), totals)
         return False
-    payload = _parse_json_object(event.get("payload_json"))
-    _ = privacy.filter_detail(event.get("kind") or "", payload or {})
-    _ = privacy.filter_target(event.get("kind"))
-    return False
+    projection = _project_router_event(event)
+    if projection is None:
+        payload = _parse_json_object(event.get("payload_json"))
+        _ = privacy.filter_detail(event.get("kind") or "", payload or {})
+        _ = privacy.filter_target(event.get("kind"))
+        return False
+    return _store_router_event(con, request_id, event, projection)
 
 
 def _sync_rollouts(con: sqlite3.Connection, rollout_root: str, totals: dict,

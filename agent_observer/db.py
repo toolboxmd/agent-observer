@@ -206,6 +206,9 @@ CREATE TABLE IF NOT EXISTS attempts (
   terminal_class TEXT,
   usable_output INTEGER,
   usage_json TEXT,
+  rc INTEGER,
+  proof_class TEXT,
+  meta_seq INTEGER,
   UNIQUE (task_id, turn_id)
 );
 CREATE TABLE IF NOT EXISTS outcomes (
@@ -257,7 +260,8 @@ CREATE TABLE IF NOT EXISTS router_jobs (
   head_commit TEXT,
   block_reason TEXT,
   created_at REAL,
-  updated_at REAL
+  updated_at REAL,
+  cancel_requested INTEGER
 );
 CREATE TABLE IF NOT EXISTS router_invocations (
   invocation_id TEXT PRIMARY KEY,
@@ -284,7 +288,28 @@ CREATE TABLE IF NOT EXISTS router_invocations (
   direction_hash TEXT,
   skills_json TEXT,
   tools_json TEXT,
-  schema_version INTEGER
+  schema_version INTEGER,
+  rc INTEGER,
+  meta_seq INTEGER,
+  proof_class TEXT
+);
+CREATE TABLE IF NOT EXISTS router_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  ts REAL,
+  failed_seq INTEGER,
+  next_seq INTEGER,
+  seq INTEGER,
+  route TEXT,
+  outcome TEXT,
+  scope TEXT,
+  rung TEXT,
+  target TEXT,
+  reason TEXT,
+  requested TEXT,
+  qid TEXT,
+  failures INTEGER
 );
 CREATE TABLE IF NOT EXISTS router_readings (
   pool TEXT NOT NULL,
@@ -322,6 +347,7 @@ CREATE INDEX IF NOT EXISTS idx_events_family ON events(family);
 CREATE INDEX IF NOT EXISTS idx_submissions_session ON submissions(session_key);
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_dir);
 CREATE INDEX IF NOT EXISTS idx_router_inv_request ON router_invocations(request_id);
+CREATE INDEX IF NOT EXISTS idx_router_events_request ON router_events(request_id, kind);
 """
 
 OUTCOME_STATES = (
@@ -422,6 +448,30 @@ def init_db(con: sqlite3.Connection) -> None:
     for name in ("cache_write_5m_tokens", "cache_write_1h_tokens"):
         if name not in response_columns:
             con.execute(f"ALTER TABLE responses ADD COLUMN {name} INTEGER")
+    # Router87 contract additions, backward compatible: old ledgers gain
+    # nullable columns and the new events table, old rows stay readable.
+    try:
+        job_columns = {row["name"] for row in con.execute("PRAGMA table_info(router_jobs)")}
+        if "cancel_requested" not in job_columns:
+            con.execute("ALTER TABLE router_jobs ADD COLUMN cancel_requested INTEGER")
+    except sqlite3.DatabaseError:
+        pass
+    try:
+        inv_columns = {row["name"] for row in con.execute("PRAGMA table_info(router_invocations)")}
+        for name, kind in (("rc", "INTEGER"), ("meta_seq", "INTEGER"),
+                           ("proof_class", "TEXT")):
+            if name not in inv_columns:
+                con.execute(f"ALTER TABLE router_invocations ADD COLUMN {name} {kind}")
+    except sqlite3.DatabaseError:
+        pass
+    try:
+        attempt_columns = {row["name"] for row in con.execute("PRAGMA table_info(attempts)")}
+        for name, kind in (("rc", "INTEGER"), ("proof_class", "TEXT"),
+                           ("meta_seq", "INTEGER")):
+            if name not in attempt_columns:
+                con.execute(f"ALTER TABLE attempts ADD COLUMN {name} {kind}")
+    except sqlite3.DatabaseError:
+        pass
     con.execute(
         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES "
         "('schema_version', ?), ('event_contract_version', ?), "

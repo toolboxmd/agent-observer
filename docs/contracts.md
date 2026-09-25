@@ -20,7 +20,7 @@ are committed.
 | `submissions` | `native_id` | User-role inputs with `kind` genuine, synthetic, scaffolding or interrupt. |
 | `events` | session_key, family, native_id | Operational events (families below). |
 | `tasks`, `assignments`, `session_assignments`, `dispatches`, `attempts`, `outcomes` | see capture | Workload ownership and outcomes. |
-| `router_jobs`, `router_invocations`, `router_readings` | router ids | Model Router ledger rows, copied read-only. |
+| `router_jobs`, `router_invocations`, `router_readings`, `router_events` | router ids | Model Router ledger rows, copied read-only, plus sanitized recovery projections. |
 | `agentsmd_versions` | AGENTS.md SHA-256 | Release map from the local AgentsMD tags. |
 | `import_errors` | none | Quarantined records; prior valid data is kept. |
 
@@ -160,14 +160,37 @@ Unresolved hashes stay unresolved.
 - `attempt`: observed turn with role parent or worker, model, effort, timing,
   terminal state, and whether output was usable. Re-capture updates state and
   supplied model/effort/usable evidence without erasing omitted observations.
+  A Router-dispatched worker row for its native turn merges with the
+  Router invocation row only on explicit turn/session/time evidence;
+  shared or unknown ownership never auto-merges.
 - `outcome`: explicit acceptance state per task. A zero process exit never
-  implies acceptance.
+  implies acceptance. Re-recording complete to add proof, candidate or
+  metadata never moves the first accepted-completion timestamp.
 - Router reads `observer_task_id` from task JSON, falling back to
   `router:<request-id>` when absent or invalid. Several jobs may map to one
   task. Their attempts and dedicated sessions retain native invocation evidence;
   a shared planner session remains unbound. Reimport preserves explicit capture
   metadata/outcomes and replaces the same invocation's legacy adapter binding.
-  Default discovery covers the configured `DURABLE_RUNNER_STATE_DIR`, current
+  Router invocations accept kind `proof` and stage `verification` for executed
+  task proofs; other kinds and stages outside the closed sets become NULL.
+  Only seq from `meta_json` is retained (as `meta_seq`) for actual joins;
+  prompts, direction blocks, runtimes and other meta members never persist.
+  Proof rows carry their proof class (`pass`, `failed`, `timeout`,
+  `not_found`, `error`) with reason NULL, so launch reason never classifies
+  a   later failure. `rc` is retained as evidence alongside the terminal
+  class; terminal timeout stays timeout regardless of rc; `cancel_requested`
+  on the job carries explicit cancellation intent (1 is intentional; 0, 2,
+  NULL and legacy missing stay unknown). Whitelisted ledger events store
+  only sanitized projections in `router_events`: `recovery_decision`
+  (failed_seq, rung, target, reason, failures), `recovery_next_attempt`
+  (failed_seq, next_seq, route), `recovery_attempt_result` (failed_seq,
+  next_seq, outcome), `verification_attempt` (seq, route, proof_class),
+  `route_switched` (scope dispatch/worker, to route, reason; scope is
+  required), `planner_route_rejected` (requested route only) and
+  `question_posted` only for qid `recovery-decision` (identity only).
+  Raw prompts, tool arguments, question text, secrets and arbitrary
+  payload values never persist. Unknown kinds and legacy values without
+  retainable fields store nothing. Default discovery covers the configured `DURABLE_RUNNER_STATE_DIR`, current
   `~/.local/share/durable-runner` and legacy `~/.local/state/model-router`,
   deduplicated by canonical source path. Explicit `--root`/`--source` stays scoped.
 
@@ -186,7 +209,15 @@ are counted separately and excluded from useful-work comparisons.
   candidate, proof, repairs and corrections; attempts; dispatches; active
   work; snapshot identity with source cutoff and measured set; task-scoped
   diagnostics and time with session context labeled; native cost and
-  sourced estimate with coverage. Exit 3 when
+  sourced estimate with coverage; completion timing
+  (submission-to-accepted-completion or elapsed-so-far at the named
+  cutoff), per attempt/session/role observed wall time with compatible
+  waiting intervals only, failures by class from terminal/stage with
+  production denominators including quota exhaustion and unknown
+  cancellation intent, separate
+  job outcomes, per-failure recovery inside compatible identities, and attributable Router usage source coverage.
+  Human text and `--json` expose the same measurements with attempt and
+  session identity links to existing evidence. Exit 3 when
   missing or conflicting ownership exists. Every command accepts `--json`.
 - `publish --task ID|--session KEY [--prices schedule.json] --repo owner/name --pr N|--commit SHA`:
   render or post the summary comment; `--dry-run` prints the comment
@@ -231,7 +262,14 @@ arithmetic.
 
 - `snapshot_id` is a SHA-256 over the selected task, sorted sessions,
   response counters with semantics and model/effort/turn, assignments,
-  outcome, attempts, dispatches, source cutoff, price schedule and coverage
+  outcome, attempts with full report inputs (timing evidence with
+  started, ended, elapsed and terminal class plus role, harness,
+  session_key, stage, reason, observed model/effort, route, rc,
+  proof_class, meta_seq, cancel intent and usage
+  presence), Router job status, cancel_requested and updated_at, router
+  event projections, reconciliation groups,
+  recovery inputs, usage attribution, submission timestamps,
+  dispatches, source cutoff, price schedule and coverage
   evidence, including ownership that another task records in the same session. `source_cutoff`
   is the max native `imported_at` backing the scope. Repeats without
   ledger changes keep the identity; changed evidence changes it. The
@@ -245,6 +283,76 @@ arithmetic.
   context counts kept explicitly separate. `time` holds task-turn elapsed
   with its source, or unavailable when no task turn timing exists, with
   the whole-session span labeled session context, never a task-only fact.
+- `timing` holds submission-to-accepted-completion elapsed time only
+  when the earliest bound submission timestamp and the first explicit
+  complete outcome timestamp are both present with a non-negative
+  difference. Re-recording complete to add proof or metadata never
+  moves the first timestamp. A known accepted completion without
+  submission timing reports accepted completion known but elapsed
+  unavailable. Negative endpoint differences are rejected and
+  qualified. Active tasks hold elapsed-so-far at the named
+  source cutoff. Failed, cancelled and unaccepted tasks hold no invented
+  accepted completion time. The owned-turn span stays labeled as a
+  partial execution span, never as accepted completion.
+- `attempt_timing` holds observed wall time per attempt, session, role
+  and model with completed and active attempts distinguished and shared
+  or unknown ownership qualified. Session union span is the merged
+  covered duration of explicit attempt windows with gaps excluded.
+  Waiting intervals derive only from explicit timestamps under the
+  same known session or the same Router request with no overlap;
+  parallel overlap produces no waiting row. Parallel attempt durations never become
+  task elapsed time. Router and native attempt rows for one execution
+  merge only on explicit turn/session/time evidence into one execution
+  with its sources and members named; durations and
+  attempt counts are never doubled and shared or unknown ownership
+  never auto-merges.
+- `failures` holds failed/production attempt counts by observed class
+  from explicit terminal and stage only (timeout, stall, provider,
+  infrastructure, implementation,
+  verification, unknown); Router reason never classifies. Context pressure
+  is provider. Explicit terminal timeout stays timeout including
+  historical rc124 rows; explicit terminal infrastructure is
+  infrastructure; legacy rows without rc keep
+  terminal-only behavior. Production attempts are
+  complete plus failed plus quota_blocked provider exhaustion;
+  quota_blocked counts as class provider inside failed/total and stays
+  visible separately. Cancellations report total with intentional
+  (explicit job cancel_requested only) and unknown intent split; intent
+  is job-scoped, so every cancelled attempt in a job with
+  cancel_requested=1 reports intentional without per-attempt timing
+  evidence; bare Router
+  cancelled stays intent unknown outside the
+  denominator. Crashes stay separately counted; active and unknown
+  stay outside. `job_outcomes` holds the separate Router job statuses with
+  status, cancel intent and updated_at. `router_recovery` holds the
+  whitelisted recovery projections with actual seq joins. A
+  provider exhaustion followed by a successful pool move is an attempt
+  failure plus a separate outcome, not a failed accepted task.
+- `recovery` holds, per failed execution, the failure-to-next-attempt-start
+  duration inside the same compatible identity (same Router request_id
+  resolved through router_invocations, or same known non-shared
+  session), the first subsequent completed progress at any stage with
+  its `first_progress_stage` label measured at its end when observable,
+  the same-stage progress turn and timing when a known equal stage
+  exists, with repeated failed counts in that stage chain only,
+  and the recovery outcome. Recovered, active and repeated counts need
+  the failed stage and the candidate stage both known and equal; a
+  dispatcher or other different-stage completion never recovers
+  implementation work and unknown stage never matches. A new attempt
+  starting alone is not successful recovery; unresolved recovery stays
+  active or unknown; attempts from another request or shared/unknown
+  sessions never pair; next start must be at or after failed end.
+  `router_recovery` holds the linked dispatcher evidence (recovery
+  decision, next attempt with actual seq, attempt result, verification
+  attempt, route switch scope, planner route rejection and the
+  recovery-decision question identity) joined by actual seq; another
+  attempt starting alone is not successful recovery.
+- `usage_coverage` holds Router usage source coverage with attributable
+  native responses only (same session plus a turn or time match; turn
+  match required for shared sessions): null usage_json
+  beside attributable native usage is source coverage, never zero usage or
+  complete loss. Measured but unpriced usage is distinct from missing
+  usage.
 
 ## Sourced pricing
 
