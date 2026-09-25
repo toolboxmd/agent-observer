@@ -458,5 +458,191 @@ class RouterContractImportTest(LedgerCase):
         self.assertIn("seq=5", text.stdout)
 
 
+class PlannerDirectedVocabularyTest(LedgerCase):
+    """Router87 planner vocabulary: planner_directed reason and four harnesses.
+
+    Faithful to Router controller/core: controller
+    _apply_planner_directed_route moves the job with reason
+    planner_directed (persisted as the next worker invocation reason
+    and as the worker-scope route_switched reason); core
+    PLANNER_HARNESSES is exactly codex, claude, opencode, grok.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.state = os.path.join(self.tmp.name, "planner-state")
+        os.makedirs(self.state)
+        self.src_path = os.path.join(self.state, "jobs.db")
+        self._build_source()
+
+    def _build_source(self):
+        src = sqlite3.connect(self.src_path)
+        src.execute(
+            "CREATE TABLE jobs (request_id TEXT PRIMARY KEY,"
+            " task_json TEXT, workspace TEXT, status TEXT, lane TEXT,"
+            " job_kind TEXT, planner_harness TEXT, cancel_requested INTEGER,"
+            " created_at TEXT, updated_at TEXT)")
+        src.execute(
+            "CREATE TABLE invocations (invocation_id TEXT UNIQUE,"
+            " request_id TEXT, kind TEXT, stage TEXT, requested_route TEXT,"
+            " policy_version TEXT, reason TEXT, terminal_class TEXT,"
+            " rc INTEGER, session_id TEXT, session_kind TEXT,"
+            " started_at TEXT, ended_at TEXT, elapsed_secs REAL,"
+            " meta_json TEXT, usage_json TEXT, native_ids_json TEXT,"
+            " schema_version INTEGER)")
+        src.execute(
+            "CREATE TABLE readings (pool TEXT, model TEXT, window TEXT,"
+            " used REAL, limit_value REAL, reset_at TEXT, observed_at TEXT,"
+            " source TEXT)")
+        src.execute(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, request_id TEXT,"
+            " ts TEXT, kind TEXT, payload_json TEXT, schema_version INTEGER)")
+        harnesses = ["codex", "claude", "opencode", "grok"]
+        for i, harness in enumerate(harnesses):
+            src.execute(
+                "INSERT INTO jobs(request_id, task_json, workspace, status,"
+                " lane, job_kind, planner_harness, cancel_requested,"
+                " created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (f"req-planner-{harness}",
+                 json.dumps({"issue": "toolboxmd/agent-observer#25",
+                             "observer_task_id": "T-PLANNER"}),
+                 "/tmp/plain-ws", "succeeded", "implementation_default",
+                 "ordinary", harness, 0,
+                 "2026-09-25T01:00:00+00:00", "2026-09-25T01:10:00+00:00"))
+        # Unknown harness stays NULL, never a guess.
+        src.execute(
+            "INSERT INTO jobs(request_id, task_json, workspace, status,"
+            " lane, job_kind, planner_harness, cancel_requested,"
+            " created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("req-planner-bad",
+             json.dumps({"observer_task_id": "T-PLANNER"}),
+             "/tmp/plain-ws", "succeeded", "implementation_default",
+             "ordinary", "cursor", 0,
+             "2026-09-25T01:00:00+00:00", "2026-09-25T01:10:00+00:00"))
+        invocations = [
+            # Planner-directed worker: completed, reason retained.
+            ("wdir", "req-planner-codex", "opencode_control",
+             "implementation", "muse-spark-xhigh-free", "2.7.1",
+             "planner_directed", "completed", 0,
+             "sess-planner-1", "opencode_session_id",
+             "2026-09-25T01:00:00+00:00", "2026-09-25T01:01:40+00:00",
+             100.0, _meta(1, {"prompt": "SECRET-PLANNER-PROMPT",
+                              "route": "muse-spark-xhigh-free",
+                              "stage": "implementation"})),
+            # Planner-directed worker that later failed: reason stays
+            # launch evidence only, classification stays implementation.
+            ("wdir-fail", "req-planner-codex", "opencode_control",
+             "implementation", "muse-spark-xhigh-free", "2.7.1",
+             "planner_directed", "failed", 1,
+             "sess-planner-2", "opencode_session_id",
+             "2026-09-25T01:02:00+00:00", "2026-09-25T01:02:10+00:00",
+             10.0, _meta(2, {"route": "muse-spark-xhigh-free",
+                             "stage": "implementation"})),
+            # Arbitrary launch string still fails closed to NULL.
+            ("wdir-bad", "req-planner-codex", "opencode_control",
+             "implementation", "muse-spark-xhigh-free", "2.7.1",
+             "do it because I said so", "completed", 0,
+             "sess-planner-3", "opencode_session_id",
+             "2026-09-25T01:03:00+00:00", "2026-09-25T01:03:10+00:00",
+             10.0, _meta(3, {"stage": "implementation"})),
+        ]
+        for (iid, req, kind, stage, route, policy, reason, terminal,
+             rc, sid, skind, started, ended, elapsed, meta) in invocations:
+            src.execute(
+                "INSERT INTO invocations(invocation_id, request_id, kind,"
+                " stage, requested_route, policy_version, reason,"
+                " terminal_class, rc, session_id, session_kind,"
+                " started_at, ended_at, elapsed_secs, meta_json,"
+                " usage_json, native_ids_json, schema_version)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (iid, req, kind, stage, route, policy, reason, terminal,
+                 rc, sid, skind, started, ended, elapsed, meta, None,
+                 None, 2))
+        events = [
+            ("req-planner-codex", "2026-09-25T01:00:00+00:00",
+             "route_switched",
+             {"from": "luna/max", "to": "muse-spark-xhigh-free",
+              "reason": "planner_directed", "scope": "worker",
+              "evidence": "dispatcher"}),
+            # Arbitrary route-switch reason fails closed but the scoped
+            # switch itself persists without the reason.
+            ("req-planner-codex", "2026-09-25T01:00:01+00:00",
+             "route_switched",
+             {"from": "luna/max", "to": "luna/max",
+              "reason": "do it because I said so", "scope": "worker",
+              "evidence": "dispatcher",
+              "prompt": "SECRET-EVENT-PROMPT",
+              "token": "SECRET-EVENT-TOKEN"}),
+        ]
+        for req, ts, kind, payload in events:
+            src.execute(
+                "INSERT INTO events(request_id, ts, kind, payload_json,"
+                " schema_version) VALUES(?,?,?,?,?)",
+                (req, ts, kind, json.dumps(payload), 2))
+        src.commit()
+        src.close()
+
+    def test_planner_harnesses_persist_and_unknown_stays_null(self):
+        router.sync(self.con, root=self.state)
+        for harness in ("codex", "claude", "opencode", "grok"):
+            row = self.con.execute(
+                "SELECT planner_harness FROM router_jobs WHERE request_id=?",
+                (f"req-planner-{harness}",)).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["planner_harness"], harness)
+        bad = self.con.execute(
+            "SELECT planner_harness FROM router_jobs WHERE request_id=?",
+            ("req-planner-bad",)).fetchone()
+        self.assertIsNotNone(bad)
+        self.assertIsNone(bad["planner_harness"])
+
+    def test_planner_directed_reason_retained_fail_closed(self):
+        from agent_observer.timing import failure_class
+        router.sync(self.con, root=self.state)
+        kept = self.con.execute(
+            "SELECT reason FROM router_invocations"
+            " WHERE invocation_id='wdir'").fetchone()
+        self.assertEqual(kept["reason"], "planner_directed")
+        attempt = self.con.execute(
+            "SELECT reason FROM attempts WHERE turn_id='router:wdir'"
+            ).fetchone()
+        self.assertEqual(attempt["reason"], "planner_directed")
+        bad = self.con.execute(
+            "SELECT reason FROM router_invocations"
+            " WHERE invocation_id='wdir-bad'").fetchone()
+        self.assertIsNone(bad["reason"])
+        bad_attempt = self.con.execute(
+            "SELECT reason FROM attempts WHERE turn_id='router:wdir-bad'"
+            ).fetchone()
+        self.assertIsNone(bad_attempt["reason"])
+        # Worker-scope route switch keeps the planner-directed cause.
+        switches = self.con.execute(
+            "SELECT reason, scope FROM router_events"
+            " WHERE kind='route_switched' ORDER BY ts").fetchall()
+        self.assertEqual(
+            [(r["reason"], r["scope"]) for r in switches],
+            [("planner_directed", "worker"), (None, "worker")])
+        # Launch reason never classifies: planner-directed plus failed
+        # stays implementation.
+        rep = report.task_report(self.con, "T-PLANNER")
+        by_turn = {a["turn_id"]: a for a in rep["attempt_timing"]["attempts"]}
+        self.assertEqual(
+            by_turn["router:wdir-fail"]["failure_class"], "implementation")
+        self.assertEqual(failure_class(
+            {"state": "failed", "terminal_class": "failed",
+             "reason": "planner_directed", "stage": "implementation"}),
+            "implementation")
+        # Privacy: no raw prompts, tool arguments, question text,
+        # secrets or arbitrary payload values persist.
+        blob = ""
+        for table in ("router_invocations", "router_events", "attempts"):
+            for row in self.con.execute(f"SELECT * FROM {table}"):
+                blob += " ".join(str(row[c] or "") for c in row.keys())
+        self.assertNotIn("SECRET-PLANNER-PROMPT", blob)
+        self.assertNotIn("SECRET-EVENT-PROMPT", blob)
+        self.assertNotIn("SECRET-EVENT-TOKEN", blob)
+        self.assertNotIn("do it because I said so", blob)
+
+
 if __name__ == "__main__":
     unittest.main()

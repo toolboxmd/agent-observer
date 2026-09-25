@@ -906,13 +906,14 @@ class RouterAdapterTest(LedgerCase):
             " created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
             ("wid-invalid",
              json.dumps({"issue": "toolboxmd/agent-observer#1"}),
-             self.ws_plain, "complete", "default", "unknown-kind", "codex",
+             self.ws_plain, "complete", "default", "unknown-kind", "cursor",
              "2026-09-23T18:10:00+00:00", "2026-09-23T18:11:00+00:00"))
         kinds = ["codex_dispatch", "codex_resume", "claude_callback",
                  "claude_compact", "opencode_control", "opencode_serve",
                  "grok_control"]
         stages = ["dispatch", "planning", "implementation"]
         reasons = ["initial", "resume", "planner_question",
+                   "planner_directed",
                    "compact_after_submit", "correction", "escalation",
                    "pool_move", "lateral", "larger_context", "stalled_retry",
                    "dispatch_stalled", "dispatch_exhausted",
@@ -921,6 +922,7 @@ class RouterAdapterTest(LedgerCase):
                    "pool_move_concurrent", "lateral_concurrent",
                    "larger_context_concurrent", "correction_concurrent",
                    "escalation_concurrent",
+                   "planner_directed_concurrent",
                    "preflight_exhausted_concurrent",
                    "preflight_degraded_concurrent",
                    "preflight_one_turn_concurrent"]

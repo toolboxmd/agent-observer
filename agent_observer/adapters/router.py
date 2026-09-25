@@ -99,13 +99,18 @@ CAPABILITIES = [
 # "dispatch_stalled", "dispatch_exhausted" and the preflight reasons;
 # "planner_question"; the ladder's "correction" and "escalation"; the
 # capacity moves "pool_move", "lateral", "larger_context" and
-# "stalled_retry". _switch_route appends "_concurrent" to a move reason
-# when the target was concurrency-full, giving the suffixed variants.
-# "dispatch_fallback rc=N" is a dynamic f-string, never a closed value.
+# "stalled_retry"; the planner-directed "planner_directed" worker move
+# (controller._apply_planner_directed_route via _switch_route, reason
+# persisted as the next worker invocation reason and as the
+# route_switched worker-scope reason). _switch_route appends
+# "_concurrent" to a move reason when the target was concurrency-full,
+# giving the suffixed variants. "dispatch_fallback rc=N" is a dynamic
+# f-string, never a closed value.
 REASONS = frozenset({
     "initial",
     "resume",
     "planner_question",
+    "planner_directed",
     "compact_after_submit",
     "correction",
     "escalation",
@@ -124,6 +129,7 @@ REASONS = frozenset({
     "larger_context_concurrent",
     "correction_concurrent",
     "escalation_concurrent",
+    "planner_directed_concurrent",
     "preflight_exhausted_concurrent",
     "preflight_degraded_concurrent",
     "preflight_one_turn_concurrent",
@@ -213,10 +219,14 @@ JOB_KINDS = frozenset({
     "replay",
 })
 
-# core.PLANNER_HARNESSES: only claude runs the planner callback
-# (live ledger: claude).
+# core.PLANNER_HARNESSES: the planner callback runs in any of the
+# four supported local harnesses (live ledger may hold any of them).
+# Anything else becomes NULL, never a guess.
 PLANNER_HARNESSES = frozenset({
+    "codex",
     "claude",
+    "opencode",
+    "grok",
 })
 
 # Closed block classes observed in the router ledger. An arbitrary prefix
