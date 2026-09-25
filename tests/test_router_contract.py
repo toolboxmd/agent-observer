@@ -450,6 +450,22 @@ class RouterContractImportTest(LedgerCase):
         self.assertIn(text.returncode, (0, 3), text.stderr)
         self.assertEqual(payload["failures"]["by_class"].get("verification"), 1)
         self.assertIn("verification", text.stdout)
+        # Structured per-attempt timing row carries the imported
+        # evidence, not just the top-level attempts list.
+        timed = {a["turn_id"]: a
+                 for a in payload["attempt_timing"]["attempts"]}
+        self.assertEqual(timed["router:p5"]["proof_class"], "failed")
+        self.assertEqual(timed["router:p5"]["rc"], 1)
+        self.assertEqual(timed["router:p5"]["meta_seq"], 5)
+        # The human formatter reads the timing rows, so assert on the
+        # actual attempt line: a separate verification_attempt event
+        # line must not satisfy this check.
+        attempt_lines = [ln for ln in text.stdout.splitlines()
+                         if ln.startswith("  attempt router:p5 ")]
+        self.assertEqual(len(attempt_lines), 1, text.stdout)
+        self.assertIn("proof_class=failed", attempt_lines[0])
+        self.assertIn("rc=1", attempt_lines[0])
+        self.assertIn("seq=5", attempt_lines[0])
         self.assertIn("recovery_decision", text.stdout)
         self.assertIn("recovery_next_attempt", text.stdout)
         self.assertIn("route_switched", text.stdout)
