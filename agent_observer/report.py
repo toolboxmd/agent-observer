@@ -229,6 +229,25 @@ def _router_events_for(con: sqlite3.Connection,
     return events
 
 
+def _job_cancel_evidence(con: sqlite3.Connection, task_id: str) -> list:
+    """Cancel_requested evidence for snapshot, [] on legacy ledgers.
+
+    Old ledgers lack the cancel_requested column until a sync migrates
+    them; reporting stays readable and the snapshot simply carries no
+    cancel evidence rather than refusing the ledger.
+    """
+    try:
+        return sorted(
+            [r["request_id"], r["cancel_requested"]] for r in con.execute(
+                "SELECT request_id, cancel_requested FROM router_jobs"
+                " WHERE request_id IN (SELECT request_id FROM router_invocations"
+                " WHERE invocation_id IN (SELECT SUBSTR(turn_id, 8) FROM attempts"
+                " WHERE task_id=? AND turn_id LIKE 'router:%'))",
+                (task_id,)))
+    except sqlite3.DatabaseError:
+        return []
+
+
 def _turn_submission(con: sqlite3.Connection) -> dict:
     """Map turn_id to the genuine submission that started it.
 
@@ -631,13 +650,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
         "job_evidence": sorted(
             [j.get("request_id"), j.get("status"), j.get("updated_at")]
             for j in jobs),
-        "job_cancel_evidence": sorted(
-            [r["request_id"], r["cancel_requested"]] for r in con.execute(
-                "SELECT request_id, cancel_requested FROM router_jobs"
-                " WHERE request_id IN (SELECT request_id FROM router_invocations"
-                " WHERE invocation_id IN (SELECT SUBSTR(turn_id, 8) FROM attempts"
-                " WHERE task_id=? AND turn_id LIKE 'router:%'))",
-                (task_id,))),
+        "job_cancel_evidence": _job_cancel_evidence(con, task_id),
         "router_event_evidence": sorted(
             [e.get("request_id"), e.get("kind"), e.get("failed_seq"),
              e.get("next_seq"), e.get("seq"), e.get("route"),

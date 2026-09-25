@@ -837,7 +837,33 @@ def job_outcomes(con: sqlite3.Connection, attempts_rows: list[dict]) -> list[dic
                 " created_at, updated_at, cancel_requested FROM router_jobs WHERE request_id=?",
                 (request_id,)).fetchone()
         except sqlite3.DatabaseError:
-            job = None
+            # Legacy ledger without cancel_requested: fall back to the
+            # old column set so reporting stays readable.
+            try:
+                job = con.execute(
+                    "SELECT request_id, status, lane, job_kind, block_reason,"
+                    " created_at, updated_at FROM router_jobs WHERE request_id=?",
+                    (request_id,)).fetchone()
+            except sqlite3.DatabaseError:
+                job = None
+            if job is None:
+                jobs.append({"request_id": request_id, "missing": True})
+                continue
+            jobs.append({
+                "request_id": job["request_id"],
+                "status": job["status"],
+                "lane": job["lane"],
+                "job_kind": job["job_kind"],
+                "block_reason": job["block_reason"],
+                "created_at": job["created_at"],
+                "updated_at": job["updated_at"],
+                "cancel_requested": None,
+                "cancel_intent": "unknown",
+                "note": ("job outcome is separate from attempt failure counts;"
+                         " cancellation is intentional only with explicit"
+                         " cancel_requested evidence"),
+            })
+            continue
         if job is None:
             jobs.append({"request_id": request_id, "missing": True})
             continue
