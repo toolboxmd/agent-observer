@@ -34,9 +34,9 @@ Meanings (also in GLOSSARY.md and docs/contracts.md):
   only. Router reason describes why an invocation was launched and
   never classifies a later failure. Missing terminal evidence stays
   unknown. Context pressure is a provider signal, not infrastructure.
-  A supervisor rc124 with no proof outcome (startup failure) is
-  infrastructure; an executed proof rc124 (proof_class timeout) is a
-  timeout. Legacy rows without rc stay on terminal evidence alone.
+  Explicit terminal timeout stays timeout, including historical
+  Router rows with rc124. Explicit terminal infrastructure is
+  infrastructure. Legacy rows without rc stay on terminal evidence alone.
 - Production attempts are complete plus failed plus quota_blocked
   provider exhaustion. Quota exhaustion is a provider failure attempt
   with separate quota visibility. Intentional cancellation needs
@@ -93,15 +93,16 @@ def failure_class(attempt: dict) -> str | None:
     tests have no explicit marker in the current ledger and stay out of
     scope; they are not counted here.
 
-    Classification uses explicit terminal_class, stage, rc and
-    proof_class only. Router reason (pool_move, lateral,
+    Classification uses explicit terminal_class and stage only.
+    Router reason (pool_move, lateral,
     dispatch_stalled, preflight_* and others) describes why an
     invocation was launched and never classifies a later failure.
     Context pressure (terminal context) is a provider capacity signal,
-    not infrastructure. A supervisor rc124 with no proof outcome is
-    infrastructure (the suite never ran); an executed proof rc124
-    with proof_class timeout stays timeout. Legacy rows without rc
-    keep terminal-only behavior, so old timeout rows stay timeout.
+    not infrastructure. Explicit terminal timeout stays timeout,
+    including historical Router worker and proof rows with rc124.
+    Explicit terminal infrastructure is infrastructure. Legacy rows
+    without rc keep terminal-only behavior, so old timeout rows stay
+    timeout.
     """
     state = attempt.get("state")
     if state == "quota_blocked":
@@ -110,28 +111,16 @@ def failure_class(attempt: dict) -> str | None:
         return None
     terminal = attempt.get("terminal_class")
     stage = attempt.get("stage")
-    rc = attempt.get("rc")
-    proof_class = attempt.get("proof_class")
-    role = attempt.get("role")
-    harness = attempt.get("harness")
     if terminal == "timeout":
-        # Proof timeout stays timeout: an executed proof ran past its
-        # budget (kind proof or proof_class timeout). A supervisor
-        # startup rc124 with no proof outcome is infrastructure (the
-        # suite never ran). Legacy rows without rc keep timeout.
-        is_proof = (role == "proof" or proof_class == "timeout")
-        if is_proof:
-            return "timeout"
-        if rc == 124 and harness == "router" and role != "proof":
-            return "infrastructure"
-        # Native timeouts and legacy Router timeouts without rc stay
-        # timeout.
+        # Explicit terminal timeout stays timeout for ordinary Router
+        # workers, proofs and native rows, including historical Router
+        # rows with rc124. Exit code never reclassifies a timeout.
         return "timeout"
     if terminal == "stalled":
         return "stall"
     if terminal in ("overloaded", "quota"):
         return "provider"
-    if terminal == "hard_error":
+    if terminal in ("hard_error", "infrastructure"):
         return "infrastructure"
     if terminal == "context":
         return "provider"
@@ -803,11 +792,12 @@ def failure_summary(attempts_rows: list[dict]) -> dict:
                              "Cancellations of unknown intent, separately "
                              "counted crashes, active and unknown states "
                              "stay outside failed/total. Failure class uses "
-                             "explicit terminal, stage, rc and proof_class"
+                             "explicit terminal and stage"
                              " only; Router reason never classifies. Context"
-                             " pressure is provider. Startup rc124 without"
-                             " proof outcome is infrastructure; executed"
-                             " proof rc124 stays timeout. A provider"
+                             " pressure is provider. Explicit terminal"
+                             " timeout stays timeout including historical"
+                             " rc124 rows; explicit terminal"
+                             " infrastructure is infrastructure. A provider"
                              " exhaustion followed by a successful pool move"
                              " is an attempt outcome, not a failed accepted"
                              " task."),

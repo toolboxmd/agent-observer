@@ -177,7 +177,8 @@ Unresolved hashes stay unresolved.
   prompts, direction blocks, runtimes and other meta members never persist.
   Proof rows carry their proof class (`pass`, `failed`, `timeout`,
   `not_found`, `error`) with reason NULL, so launch reason never classifies
-  a later failure. `rc` is retained for classification; `cancel_requested`
+  a   later failure. `rc` is retained as evidence alongside the terminal
+  class; terminal timeout stays timeout regardless of rc; `cancel_requested`
   on the job carries explicit cancellation intent (1 is intentional; 0, 2,
   NULL and legacy missing stay unknown). Whitelisted ledger events store
   only sanitized projections in `router_events`: `recovery_decision`
@@ -306,16 +307,20 @@ arithmetic.
   attempt counts are never doubled and shared or unknown ownership
   never auto-merges.
 - `failures` holds failed/production attempt counts by observed class
-  from explicit terminal, stage, rc and proof_class only (timeout, stall, provider,
+  from explicit terminal and stage only (timeout, stall, provider,
   infrastructure, implementation,
   verification, unknown); Router reason never classifies. Context pressure
-  is provider. Startup rc124 without proof outcome is infrastructure;
-  executed proof rc124 stays timeout; legacy rows without rc keep
+  is provider. Explicit terminal timeout stays timeout including
+  historical rc124 rows; explicit terminal infrastructure is
+  infrastructure; legacy rows without rc keep
   terminal-only behavior. Production attempts are
   complete plus failed plus quota_blocked provider exhaustion;
   quota_blocked counts as class provider inside failed/total and stays
   visible separately. Cancellations report total with intentional
-  (explicit job cancel_requested only) and unknown intent split; bare Router
+  (explicit job cancel_requested only) and unknown intent split; intent
+  is job-scoped, so every cancelled attempt in a job with
+  cancel_requested=1 reports intentional without per-attempt timing
+  evidence; bare Router
   cancelled stays intent unknown outside the
   denominator. Crashes stay separately counted; active and unknown
   stay outside. `job_outcomes` holds the separate Router job statuses with

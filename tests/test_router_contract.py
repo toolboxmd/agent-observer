@@ -136,13 +136,14 @@ class RouterContractImportTest(LedgerCase):
              10.0, _meta(6, {"route": "muse-spark-xhigh-free",
                              "stage": "verification",
                              "proof_class": "pass"})),
-            # Startup rc124 without proof outcome: infrastructure.
+            # Historical worker timeout with rc124 and about 1801 s:
+            # explicit terminal timeout stays timeout.
             ("s7", "req-verify-1", "opencode_control", "implementation",
              "muse-spark-xhigh-free", "2.7.1", "initial", "timeout",
              124, "sess-verify-3", "opencode_session_id",
-             "2026-09-25T00:05:00+00:00", "2026-09-25T00:05:10+00:00",
-             10.0, _meta(7, {"route": "muse-spark-xhigh-free",
-                             "stage": "implementation"})),
+             "2026-09-25T00:05:00+00:00", "2026-09-25T00:35:01+00:00",
+             1801.0, _meta(7, {"route": "muse-spark-xhigh-free",
+                               "stage": "implementation"})),
             # Proof rc124 with proof_class timeout: timeout.
             ("p8", "req-verify-1", "proof", "verification",
              "muse-spark-xhigh-free", "2.7.1", "timeout", "timeout",
@@ -165,6 +166,14 @@ class RouterContractImportTest(LedgerCase):
              "2026-09-25T00:07:00+00:00", "2026-09-25T00:07:10+00:00",
              10.0, _meta(10, {"route": "muse-spark-xhigh-free",
                               "stage": "implementation"})),
+            # Explicit Router startup marker: terminal infrastructure
+            # with rc124 imports as failed/infrastructure.
+            ("n11", "req-verify-1", "opencode_control", "implementation",
+             "muse-spark-xhigh-free", "2.7.1", "initial", "infrastructure",
+             124, "sess-verify-6", "opencode_session_id",
+             "2026-09-25T00:36:00+00:00", "2026-09-25T00:36:05+00:00",
+             5.0, _meta(11, {"route": "muse-spark-xhigh-free",
+                             "stage": "implementation"})),
             # Explicit intentional cancellation.
             ("cx1", "req-cancel-1", "opencode_control", "implementation",
              None, None, "initial", "cancelled",
@@ -304,8 +313,39 @@ class RouterContractImportTest(LedgerCase):
         by_turn = {a["turn_id"]: a for a in rep["attempt_timing"]["attempts"]}
         # Context pressure is provider.
         self.assertEqual(by_turn["router:c9"]["failure_class"], "provider")
-        # Startup rc124 without proof outcome is infrastructure.
-        self.assertEqual(by_turn["router:s7"]["failure_class"], "infrastructure")
+        # Historical Router worker timeout with rc124 and about
+        # 1801 s stays timeout, never infrastructure.
+        self.assertEqual(by_turn["router:s7"]["failure_class"], "timeout")
+        self.assertAlmostEqual(by_turn["router:s7"]["wall_time_s"], 1801.0)
+        stored_s7 = self.con.execute(
+            "SELECT terminal_class, rc FROM router_invocations"
+            " WHERE invocation_id='s7'").fetchone()
+        self.assertEqual(stored_s7["terminal_class"], "timeout")
+        attempt_s7 = self.con.execute(
+            "SELECT state, terminal_class, rc FROM attempts"
+            " WHERE turn_id='router:s7'").fetchone()
+        self.assertEqual(attempt_s7["state"], "failed")
+        self.assertEqual(attempt_s7["terminal_class"], "timeout")
+        self.assertEqual(attempt_s7["rc"], 124)
+        # Explicit Router infrastructure terminal imports as
+        # failed/infrastructure.
+        stored_n11 = self.con.execute(
+            "SELECT terminal_class FROM router_invocations"
+            " WHERE invocation_id='n11'").fetchone()
+        self.assertEqual(stored_n11["terminal_class"], "infrastructure")
+        attempt_n11 = self.con.execute(
+            "SELECT state, terminal_class, rc FROM attempts"
+            " WHERE turn_id='router:n11'").fetchone()
+        self.assertEqual(attempt_n11["state"], "failed")
+        self.assertEqual(attempt_n11["terminal_class"], "infrastructure")
+        self.assertEqual(by_turn["router:n11"]["failure_class"], "infrastructure")
+        # Denominators include both rows once: timeout holds the
+        # historical worker plus the proof rc124, infrastructure holds
+        # the explicit row, with no Router/native double count.
+        self.assertEqual(rep["failures"]["by_class"].get("timeout"), 2)
+        self.assertEqual(rep["failures"]["by_class"].get("infrastructure"), 1)
+        self.assertEqual(rep["attempt_timing"]["raw_attempt_count"],
+                         rep["attempt_timing"]["reconciled_execution_count"])
         # Proof rc124 with proof_class timeout stays timeout.
         self.assertEqual(by_turn["router:p8"]["failure_class"], "timeout")
         # Launch reason never classifies: pool_move plus failed stays

@@ -147,7 +147,8 @@ JOB_STATUSES = frozenset({
 # Every core.terminal_class_for output: rc/signal mapping (crashed from
 # the crashed flag; quota/overloaded/stalled/context/hard_error from
 # policy.SIGNAL_CLASSES exhausted/overloaded/stalled/context/hard;
-# completed/timeout/cancelled/failed from rc 0/124/143,-15/other).
+# completed/timeout/cancelled/failed from rc 0/124/143,-15/other;
+# infrastructure for a startup failure with an explicit startup marker).
 # Live ledger: completed, failed, stalled.
 TERMINAL_CLASSES = frozenset({
     "completed",
@@ -157,6 +158,7 @@ TERMINAL_CLASSES = frozenset({
     "stalled",
     "context",
     "hard_error",
+    "infrastructure",
     "cancelled",
     "crashed",
     "quota",

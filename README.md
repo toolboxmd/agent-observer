@@ -141,7 +141,9 @@ Router usage source coverage. Parallel attempt
 durations never become task elapsed time; Router and native rows for one
 execution merge only on explicit turn/session/time evidence and count once.
 Router reason never classifies a later failure; context pressure is
-provider and startup rc124 without proof outcome is infrastructure.
+provider, explicit terminal timeout stays timeout including
+historical rc124 rows, and explicit terminal infrastructure is
+infrastructure.
 Union span is merged covered duration with gaps excluded.
 
 The bundled dated price schedule supplies standard API list-price equivalents
