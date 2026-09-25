@@ -33,7 +33,10 @@ Meanings (also in GLOSSARY.md and docs/contracts.md):
 - Failure class derives from explicit terminal and stage evidence
   only. Router reason describes why an invocation was launched and
   never classifies a later failure. Missing terminal evidence stays
-  unknown.
+  unknown. Context pressure is a provider signal, not infrastructure.
+  A supervisor rc124 with no proof outcome (startup failure) is
+  infrastructure; an executed proof rc124 (proof_class timeout) is a
+  timeout. Legacy rows without rc stay on terminal evidence alone.
 - Production attempts are complete plus failed plus quota_blocked
   provider exhaustion. Quota exhaustion is a provider failure attempt
   with separate quota visibility. Intentional cancellation needs
@@ -90,10 +93,15 @@ def failure_class(attempt: dict) -> str | None:
     tests have no explicit marker in the current ledger and stay out of
     scope; they are not counted here.
 
-    Classification uses explicit terminal_class and stage only. Router
-    reason (pool_move, lateral, dispatch_stalled, preflight_* and
-    others) describes why an invocation was launched and never
-    classifies a later failure.
+    Classification uses explicit terminal_class, stage, rc and
+    proof_class only. Router reason (pool_move, lateral,
+    dispatch_stalled, preflight_* and others) describes why an
+    invocation was launched and never classifies a later failure.
+    Context pressure (terminal context) is a provider capacity signal,
+    not infrastructure. A supervisor rc124 with no proof outcome is
+    infrastructure (the suite never ran); an executed proof rc124
+    with proof_class timeout stays timeout. Legacy rows without rc
+    keep terminal-only behavior, so old timeout rows stay timeout.
     """
     state = attempt.get("state")
     if state == "quota_blocked":
@@ -102,7 +110,22 @@ def failure_class(attempt: dict) -> str | None:
         return None
     terminal = attempt.get("terminal_class")
     stage = attempt.get("stage")
+    rc = attempt.get("rc")
+    proof_class = attempt.get("proof_class")
+    role = attempt.get("role")
+    harness = attempt.get("harness")
     if terminal == "timeout":
+        # Proof timeout stays timeout: an executed proof ran past its
+        # budget (kind proof or proof_class timeout). A supervisor
+        # startup rc124 with no proof outcome is infrastructure (the
+        # suite never ran). Legacy rows without rc keep timeout.
+        is_proof = (role == "proof" or proof_class == "timeout")
+        if is_proof:
+            return "timeout"
+        if rc == 124 and harness == "router" and role != "proof":
+            return "infrastructure"
+        # Native timeouts and legacy Router timeouts without rc stay
+        # timeout.
         return "timeout"
     if terminal == "stalled":
         return "stall"
@@ -111,7 +134,7 @@ def failure_class(attempt: dict) -> str | None:
     if terminal == "hard_error":
         return "infrastructure"
     if terminal == "context":
-        return "infrastructure"
+        return "provider"
     if stage == "verification":
         return "verification"
     if terminal == "failed":
@@ -780,10 +803,14 @@ def failure_summary(attempts_rows: list[dict]) -> dict:
                              "Cancellations of unknown intent, separately "
                              "counted crashes, active and unknown states "
                              "stay outside failed/total. Failure class uses "
-                             "explicit terminal and stage only; Router "
-                             "reason never classifies. A provider exhaustion "
-                             "followed by a successful pool move is an "
-                             "attempt outcome, not a failed accepted task."),
+                             "explicit terminal, stage, rc and proof_class"
+                             " only; Router reason never classifies. Context"
+                             " pressure is provider. Startup rc124 without"
+                             " proof outcome is infrastructure; executed"
+                             " proof rc124 stays timeout. A provider"
+                             " exhaustion followed by a successful pool move"
+                             " is an attempt outcome, not a failed accepted"
+                             " task."),
     }
 
 
@@ -807,13 +834,23 @@ def job_outcomes(con: sqlite3.Connection, attempts_rows: list[dict]) -> list[dic
         try:
             job = con.execute(
                 "SELECT request_id, status, lane, job_kind, block_reason,"
-                " created_at, updated_at FROM router_jobs WHERE request_id=?",
+                " created_at, updated_at, cancel_requested FROM router_jobs WHERE request_id=?",
                 (request_id,)).fetchone()
         except sqlite3.DatabaseError:
             job = None
         if job is None:
             jobs.append({"request_id": request_id, "missing": True})
             continue
+        try:
+            cancel_flag = job["cancel_requested"]
+        except (KeyError, TypeError, IndexError):
+            cancel_flag = None
+        if cancel_flag == 1:
+            cancel_intent = "intentional"
+        else:
+            # 0, 2 (timeout drain), NULL and legacy missing stay
+            # unknown; a bare cancelled never proves intent.
+            cancel_intent = "unknown"
         jobs.append({
             "request_id": job["request_id"],
             "status": job["status"],
@@ -822,7 +859,11 @@ def job_outcomes(con: sqlite3.Connection, attempts_rows: list[dict]) -> list[dic
             "block_reason": job["block_reason"],
             "created_at": job["created_at"],
             "updated_at": job["updated_at"],
-            "note": "job outcome is separate from attempt failure counts",
+            "cancel_requested": cancel_flag,
+            "cancel_intent": cancel_intent,
+            "note": ("job outcome is separate from attempt failure counts;"
+                     " cancellation is intentional only with explicit"
+                     " cancel_requested evidence"),
         })
     return jobs
 

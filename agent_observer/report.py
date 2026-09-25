@@ -157,6 +157,78 @@ def task_sessions(con: sqlite3.Connection, task_id: str) -> set:
     return keys
 
 
+def _cancel_intent_for(con: sqlite3.Connection, attempt: dict) -> str | None:
+    """Explicit cancellation intent for one attempt, or None when unknown.
+
+    Intent lives only on the Router job's cancel_requested flag:
+    1 is explicit intentional cancellation; 0, 2 (timeout drain),
+    NULL and legacy missing columns stay unknown. A bare Router
+    cancelled without job evidence never proves intent.
+    """
+    if attempt.get("harness") != "router":
+        return None
+    turn = attempt.get("turn_id") or ""
+    if not turn.startswith("router:"):
+        return None
+    invocation_id = turn.split("router:", 1)[1]
+    try:
+        row = con.execute(
+            "SELECT j.cancel_requested FROM router_invocations i"
+            " JOIN router_jobs j ON j.request_id=i.request_id"
+            " WHERE i.invocation_id=?", (invocation_id,)).fetchone()
+    except sqlite3.DatabaseError:
+        return None
+    if row is None:
+        return None
+    try:
+        flag = row["cancel_requested"]
+    except (KeyError, TypeError, IndexError):
+        return None
+    if flag == 1:
+        return "intentional"
+    return None
+
+
+def _router_events_for(con: sqlite3.Connection,
+                       attempts_rows: list[dict]) -> list[dict]:
+    """Sanitized Router recovery event projections behind this task.
+
+    Resolves the Router request ids behind the task's attempts through
+    router_invocations, then returns the whitelisted router_events rows
+    for those requests in deterministic order. Each row carries only
+    its closed/enum/route/seq fields; no prompt, question text or
+    secret ever appears.
+    """
+    request_ids: set[str] = set()
+    for attempt in attempts_rows:
+        turn = attempt.get("turn_id") or ""
+        if not turn.startswith("router:"):
+            continue
+        invocation_id = turn.split("router:", 1)[1]
+        try:
+            row = con.execute(
+                "SELECT request_id FROM router_invocations WHERE invocation_id=?",
+                (invocation_id,)).fetchone()
+        except sqlite3.DatabaseError:
+            continue
+        if row is not None and row["request_id"]:
+            request_ids.add(row["request_id"])
+    events: list[dict] = []
+    for request_id in sorted(request_ids):
+        try:
+            rows = con.execute(
+                "SELECT request_id, kind, ts, failed_seq, next_seq, seq,"
+                " route, outcome, scope, rung, target, reason, requested,"
+                " qid, failures FROM router_events WHERE request_id=?"
+                " ORDER BY COALESCE(ts, 0), id",
+                (request_id,)).fetchall()
+        except sqlite3.DatabaseError:
+            continue
+        for r in rows:
+            events.append(dict(r))
+    return events
+
+
 def _turn_submission(con: sqlite3.Connection) -> dict:
     """Map turn_id to the genuine submission that started it.
 
@@ -449,6 +521,13 @@ def task_report(con: sqlite3.Connection, task_id: str,
     attempts_rows = [dict(r) for r in con.execute(
         "SELECT * FROM attempts WHERE task_id=? ORDER BY turn_id",
         (task_id,))]
+    # Explicit cancellation intent from the Router job's
+    # cancel_requested flag. Bare cancelled stays unknown; only
+    # cancel_requested=1 reports intentional.
+    for attempt in attempts_rows:
+        intent = _cancel_intent_for(con, attempt)
+        if intent is not None:
+            attempt["cancel_intent"] = intent
     dispatches_rows = [dict(r) for r in con.execute(
         "SELECT * FROM dispatches WHERE owning_submission IN "
         "(SELECT submission_native_id FROM assignments WHERE task_id=?)",
@@ -491,10 +570,18 @@ def task_report(con: sqlite3.Connection, task_id: str,
     attempt_time = _timing.attempt_timing(
         con, attempts_rows, set(whole_shared), set(whole_conflicts))
     executions = attempt_time.get("executions") or attempts_rows
+    # Executions are representative copies; carry the enriched intent
+    # onto them so failure denominators see explicit intent.
+    intent_by_turn = {a.get("turn_id"): a.get("cancel_intent")
+                      for a in attempts_rows if a.get("cancel_intent")}
+    for rep in executions:
+        if rep.get("turn_id") in intent_by_turn and not rep.get("cancel_intent"):
+            rep["cancel_intent"] = intent_by_turn[rep["turn_id"]]
     failures = _timing.failure_summary(executions)
     jobs = _timing.job_outcomes(con, attempts_rows)
     recovery = _timing.recovery_summary(
         executions, con, set(whole_shared), set(whole_conflicts))
+    router_events = _router_events_for(con, attempts_rows)
 
     def _resp_tuple(r) -> list:
         return [r.get("response_id"), r.get("harness"), r.get("model"),
@@ -538,10 +625,25 @@ def task_report(con: sqlite3.Connection, task_id: str,
              a.get("route_requested"), a.get("state"),
              a.get("terminal_class"), a.get("started_at"),
              a.get("ended_at"), a.get("elapsed_s"),
-             a.get("usage_json") is not None] for a in attempts_rows),
+             a.get("usage_json") is not None,
+             a.get("rc"), a.get("proof_class"), a.get("meta_seq"),
+             a.get("cancel_intent")] for a in attempts_rows),
         "job_evidence": sorted(
             [j.get("request_id"), j.get("status"), j.get("updated_at")]
             for j in jobs),
+        "job_cancel_evidence": sorted(
+            [r["request_id"], r["cancel_requested"]] for r in con.execute(
+                "SELECT request_id, cancel_requested FROM router_jobs"
+                " WHERE request_id IN (SELECT request_id FROM router_invocations"
+                " WHERE invocation_id IN (SELECT SUBSTR(turn_id, 8) FROM attempts"
+                " WHERE task_id=? AND turn_id LIKE 'router:%'))",
+                (task_id,))),
+        "router_event_evidence": sorted(
+            [e.get("request_id"), e.get("kind"), e.get("failed_seq"),
+             e.get("next_seq"), e.get("seq"), e.get("route"),
+             e.get("outcome"), e.get("scope"), e.get("rung"),
+             e.get("target"), e.get("reason"), e.get("requested"),
+             e.get("qid")] for e in router_events),
         "reconciliation_evidence": sorted(
             [g.get("representative"), sorted(g.get("members") or []),
              g.get("is_duplicate_group")] for g in (
@@ -646,6 +748,17 @@ def task_report(con: sqlite3.Connection, task_id: str,
         "failures": failures,
         "job_outcomes": jobs,
         "recovery": recovery,
+        "router_recovery": router_events,
+        "router_recovery_note": ("Whitelisted Router recovery projections"
+                                 " (recovery_decision, recovery_next_attempt,"
+                                 " recovery_attempt_result,"
+                                 " verification_attempt, route_switched"
+                                 " scope, planner_route_rejected and the"
+                                 " recovery-decision question identity) with"
+                                 " actual seq joins; raw prompts, question"
+                                 " text and secrets never persist. Recovery"
+                                 " stays meaningful only inside the same"
+                                 " compatible job/request and stage."),
         "usage_coverage": usage_coverage,
         "native_cost": native_cost,
         "native_cost_shared": _native_cost(shared),

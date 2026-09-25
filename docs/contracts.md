@@ -20,7 +20,7 @@ are committed.
 | `submissions` | `native_id` | User-role inputs with `kind` genuine, synthetic, scaffolding or interrupt. |
 | `events` | session_key, family, native_id | Operational events (families below). |
 | `tasks`, `assignments`, `session_assignments`, `dispatches`, `attempts`, `outcomes` | see capture | Workload ownership and outcomes. |
-| `router_jobs`, `router_invocations`, `router_readings` | router ids | Model Router ledger rows, copied read-only. |
+| `router_jobs`, `router_invocations`, `router_readings`, `router_events` | router ids | Model Router ledger rows, copied read-only, plus sanitized recovery projections. |
 | `agentsmd_versions` | AGENTS.md SHA-256 | Release map from the local AgentsMD tags. |
 | `import_errors` | none | Quarantined records; prior valid data is kept. |
 
@@ -171,7 +171,25 @@ Unresolved hashes stay unresolved.
   task. Their attempts and dedicated sessions retain native invocation evidence;
   a shared planner session remains unbound. Reimport preserves explicit capture
   metadata/outcomes and replaces the same invocation's legacy adapter binding.
-  Default discovery covers the configured `DURABLE_RUNNER_STATE_DIR`, current
+  Router invocations accept kind `proof` and stage `verification` for executed
+  task proofs; other kinds and stages outside the closed sets become NULL.
+  Only seq from `meta_json` is retained (as `meta_seq`) for actual joins;
+  prompts, direction blocks, runtimes and other meta members never persist.
+  Proof rows carry their proof class (`pass`, `failed`, `timeout`,
+  `not_found`, `error`) with reason NULL, so launch reason never classifies
+  a later failure. `rc` is retained for classification; `cancel_requested`
+  on the job carries explicit cancellation intent (1 is intentional; 0, 2,
+  NULL and legacy missing stay unknown). Whitelisted ledger events store
+  only sanitized projections in `router_events`: `recovery_decision`
+  (failed_seq, rung, target, reason, failures), `recovery_next_attempt`
+  (failed_seq, next_seq, route), `recovery_attempt_result` (failed_seq,
+  next_seq, outcome), `verification_attempt` (seq, route, proof_class),
+  `route_switched` (scope dispatch/worker, to route, reason; scope is
+  required), `planner_route_rejected` (requested route only) and
+  `question_posted` only for qid `recovery-decision` (identity only).
+  Raw prompts, tool arguments, question text, secrets and arbitrary
+  payload values never persist. Unknown kinds and legacy values without
+  retainable fields store nothing. Default discovery covers the configured `DURABLE_RUNNER_STATE_DIR`, current
   `~/.local/share/durable-runner` and legacy `~/.local/state/model-router`,
   deduplicated by canonical source path. Explicit `--root`/`--source` stays scoped.
 
@@ -245,8 +263,10 @@ arithmetic.
   response counters with semantics and model/effort/turn, assignments,
   outcome, attempts with full report inputs (timing evidence with
   started, ended, elapsed and terminal class plus role, harness,
-  session_key, stage, reason, observed model/effort, route and usage
-  presence), Router job status and updated_at, reconciliation groups,
+  session_key, stage, reason, observed model/effort, route, rc,
+  proof_class, meta_seq, cancel intent and usage
+  presence), Router job status, cancel_requested and updated_at, router
+  event projections, reconciliation groups,
   recovery inputs, usage attribution, submission timestamps,
   dispatches, source cutoff, price schedule and coverage
   evidence, including ownership that another task records in the same session. `source_cutoff`
@@ -286,17 +306,21 @@ arithmetic.
   attempt counts are never doubled and shared or unknown ownership
   never auto-merges.
 - `failures` holds failed/production attempt counts by observed class
-  from explicit terminal and stage only (timeout, stall, provider,
+  from explicit terminal, stage, rc and proof_class only (timeout, stall, provider,
   infrastructure, implementation,
-  verification, unknown); Router reason never classifies. Production attempts are
+  verification, unknown); Router reason never classifies. Context pressure
+  is provider. Startup rc124 without proof outcome is infrastructure;
+  executed proof rc124 stays timeout; legacy rows without rc keep
+  terminal-only behavior. Production attempts are
   complete plus failed plus quota_blocked provider exhaustion;
   quota_blocked counts as class provider inside failed/total and stays
   visible separately. Cancellations report total with intentional
-  (explicit evidence only) and unknown intent split; bare Router
+  (explicit job cancel_requested only) and unknown intent split; bare Router
   cancelled stays intent unknown outside the
   denominator. Crashes stay separately counted; active and unknown
   stay outside. `job_outcomes` holds the separate Router job statuses with
-  status and updated_at. A
+  status, cancel intent and updated_at. `router_recovery` holds the
+  whitelisted recovery projections with actual seq joins. A
   provider exhaustion followed by a successful pool move is an attempt
   failure plus a separate outcome, not a failed accepted task.
 - `recovery` holds, per failed execution, the failure-to-next-attempt-start
@@ -313,6 +337,11 @@ arithmetic.
   starting alone is not successful recovery; unresolved recovery stays
   active or unknown; attempts from another request or shared/unknown
   sessions never pair; next start must be at or after failed end.
+  `router_recovery` holds the linked dispatcher evidence (recovery
+  decision, next attempt with actual seq, attempt result, verification
+  attempt, route switch scope, planner route rejection and the
+  recovery-decision question identity) joined by actual seq; another
+  attempt starting alone is not successful recovery.
 - `usage_coverage` holds Router usage source coverage with attributable
   native responses only (same session plus a turn or time match; turn
   match required for shared sessions): null usage_json

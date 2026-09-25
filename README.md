@@ -125,15 +125,23 @@ unavailable with the whole-session span kept explicitly as session context.
 explicit endpoints (active tasks show elapsed-so-far at the named source
 cutoff), observed wall time per attempt/session/role with waiting intervals
 for the same known session or Router request only, failures by class
-from explicit terminal and stage with production denominators
+from explicit terminal, stage, rc and proof_class with production denominators
 including quota provider exhaustion and cancellation intent unknown
-unless explicit, separate job outcomes,
+unless the job carries explicit cancel_requested, separate job outcomes
+with cancel intent,
 per-failure stage-specific recovery inside compatible identities
 (first progress at any stage with its stage label; recovered, active
-and repeated counts only at the same known stage), and attributable
+and repeated counts only at the same known stage) with linked Router
+recovery projections (decision, next attempt with actual seq, attempt
+result, verification attempt, route switch scope, planner route
+rejection and the recovery-decision question identity), proof attempts
+(kind proof, stage verification; proof timeout stays timeout and proof
+failed stays verification), and attributable
 Router usage source coverage. Parallel attempt
 durations never become task elapsed time; Router and native rows for one
 execution merge only on explicit turn/session/time evidence and count once.
+Router reason never classifies a later failure; context pressure is
+provider and startup rc124 without proof outcome is infrastructure.
 Union span is merged covered duration with gaps excluded.
 
 The bundled dated price schedule supplies standard API list-price equivalents

@@ -156,6 +156,18 @@ def _text(payload) -> str:
                 + (" [unknown ownership]" if sess.get("unknown_ownership") else "")
                 + (" [router/native duplicate]" if sess.get("duplicate_native") else ""))
         for att in attempt_time.get("attempts", []):
+            extra = ""
+            if att.get("role") == "proof" or att.get("stage") == "verification":
+                extra += f" proof_class={att.get('proof_class') or 'unknown'}"
+                if att.get("rc") is not None:
+                    extra += f" rc={att.get('rc')}"
+                if att.get("meta_seq") is not None:
+                    extra += f" seq={att.get('meta_seq')}"
+            elif att.get("rc") is not None or att.get("meta_seq") is not None:
+                if att.get("rc") is not None:
+                    extra += f" rc={att.get('rc')}"
+                if att.get("meta_seq") is not None:
+                    extra += f" seq={att.get('meta_seq')}"
             lines.append(
                 f"  attempt {att.get('turn_id')} role={att.get('role')} stage={att.get('stage')} "
                 f"session={att.get('session_key') or 'unknown'} state={att.get('state')} "
@@ -163,6 +175,7 @@ def _text(payload) -> str:
                 f"reconciled_wall={att.get('reconciled_wall_time_s')} "
                 f"sources={','.join(att.get('reconciled_sources') or [])}"
                 + (f" failure_class={att.get('failure_class')}" if att.get("failure_class") else "")
+                + extra
                 + (" [shared]" if att.get("shared_session") else "")
                 + (" [unknown ownership]" if att.get("unknown_ownership") else ""))
         for wait in attempt_time.get("waiting_intervals", []):
@@ -204,8 +217,10 @@ def _text(payload) -> str:
         if failures.get("quota_note"):
             lines.append(f"  quota: {failures['quota_note']}")
         for job in r.get("job_outcomes", []):
+            intent = job.get("cancel_intent") or "unknown"
             lines.append(
                 f"  job {job.get('request_id')}: status={job.get('status')} "
+                f"cancel_intent={intent} "
                 f"(job outcome is separate from attempt failure counts)")
         for rec in r.get("recovery", []):
             scope = rec.get("compat_scope")
@@ -223,6 +238,46 @@ def _text(payload) -> str:
                 + f" failed_stage={failed_stage}")
             if rec.get("gap_missing"):
                 lines.append(f"    recovery missing: {rec['gap_missing']}")
+        for ev in r.get("router_recovery", []):
+            kind = ev.get("kind")
+            if kind == "recovery_decision":
+                lines.append(
+                    f"  recovery_decision {ev.get('request_id')}: "
+                    f"failed_seq={ev.get('failed_seq')} rung={ev.get('rung')} "
+                    f"target={ev.get('target') or 'same-route'} "
+                    f"reason={ev.get('reason') or 'unknown'}")
+            elif kind == "recovery_next_attempt":
+                lines.append(
+                    f"  recovery_next_attempt {ev.get('request_id')}: "
+                    f"failed_seq={ev.get('failed_seq')} "
+                    f"next_seq={ev.get('next_seq')} "
+                    f"route={ev.get('route') or 'unknown'}")
+            elif kind == "recovery_attempt_result":
+                lines.append(
+                    f"  recovery_attempt_result {ev.get('request_id')}: "
+                    f"failed_seq={ev.get('failed_seq')} "
+                    f"next_seq={ev.get('next_seq')} "
+                    f"outcome={ev.get('outcome')}")
+            elif kind == "verification_attempt":
+                lines.append(
+                    f"  verification_attempt {ev.get('request_id')}: "
+                    f"seq={ev.get('seq')} route={ev.get('route') or 'unknown'} "
+                    f"proof_class={ev.get('reason') or 'unknown'}")
+            elif kind == "route_switched":
+                lines.append(
+                    f"  route_switched {ev.get('request_id')}: "
+                    f"scope={ev.get('scope')} to={ev.get('route') or 'unknown'} "
+                    f"reason={ev.get('reason') or 'unknown'}")
+            elif kind == "planner_route_rejected":
+                lines.append(
+                    f"  planner_route_rejected {ev.get('request_id')}: "
+                    f"requested={ev.get('requested')}")
+            elif kind == "question_posted":
+                lines.append(
+                    f"  question_posted {ev.get('request_id')}: "
+                    f"qid={ev.get('qid')}")
+        if r.get("router_recovery_note"):
+            lines.append(f"  router recovery: {r['router_recovery_note']}")
         coverage_u = r.get("usage_coverage") or {}
         lines.append(
             f"  usage source coverage: router {coverage_u.get('router_with_usage', 0)}/"
