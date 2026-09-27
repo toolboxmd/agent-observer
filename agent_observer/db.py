@@ -334,7 +334,7 @@ OUTCOME_STATES = (
     "unknown",
 )
 
-HARNESSES = ("codex", "claude", "opencode", "grok", "router")
+HARNESSES = ("t3", "codex", "claude", "opencode", "grok", "router")
 
 
 def default_path() -> str:

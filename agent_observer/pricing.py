@@ -17,7 +17,8 @@ from __future__ import annotations
 import json
 import math
 import os
-from datetime import date
+import sqlite3
+from datetime import date, datetime, timezone
 
 BUCKETS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
            "output_tokens", "reasoning_output_tokens")
@@ -38,8 +39,9 @@ def validate_schedule(data: dict) -> dict:
         if key not in data:
             raise ValueError(f"price schedule missing {key}")
     url = data["source_url"]
-    if not isinstance(url, str) or not url.startswith(("https://", "http://")):
-        raise ValueError("price schedule needs an http(s) source_url")
+    if not isinstance(url, str) or not url.startswith(
+            ("https://", "http://", "file://")):
+        raise ValueError("price schedule needs an http(s) or file source_url")
     as_of = data.get("as_of") or data.get("effective_date")
     try:
         valid_date = isinstance(as_of, str) and date.fromisoformat(as_of).isoformat() == as_of
@@ -112,6 +114,229 @@ def load_schedule(path: str | None = None) -> dict:
     with open(target, encoding="utf-8") as fh:
         data = json.load(fh)
     return validate_schedule(data)
+
+
+def t3_rates_path(home: str | None = None) -> str:
+    """The T3 LiteLLM rate table: $T3CODE_HOME (or home) plus the default."""
+    base = home or os.environ.get("T3CODE_HOME") \
+        or os.path.expanduser("~/.t3")
+    return os.path.join(base, "userdata", "usage-model-rates.json")
+
+
+# Module cache for the multi-megabyte T3 rate table, keyed by identity.
+_T3_CACHE: tuple | None = None
+
+
+def _read_t3_document(path: str) -> tuple[dict, int | None]:
+    """The T3 rate document plus its fetch time, cached by file identity."""
+    global _T3_CACHE
+    try:
+        st = os.stat(path)
+    except OSError:
+        raise ValueError(f"T3 rate table not found at {path}")
+    identity = (os.path.abspath(path), st.st_mtime_ns, st.st_size)
+    if _T3_CACHE is not None and _T3_CACHE[0] == identity:
+        return _T3_CACHE[1], _T3_CACHE[2]
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict) or not isinstance(
+            data.get("document"), dict):
+        raise ValueError("T3 rate table has no document object")
+    _T3_CACHE = (identity, data["document"], data.get("fetchedAtMs"))
+    return data["document"], data.get("fetchedAtMs")
+
+
+_REGION_PREFIXES = ("us.", "eu.", "au.", "jp.", "global.")
+_PRICED_MODES = {"chat": 0, "completion": 1, "responses": 2}
+
+
+def _t3_candidates(document: dict, model: str) -> list:
+    """T3 rate keys that can price one observer model id, best first."""
+    wanted = model.lower()
+    scored = []
+    for key, entry in document.items():
+        if not isinstance(entry, dict):
+            continue
+        mode = entry.get("mode")
+        if mode not in _PRICED_MODES:
+            continue
+        if key == model:
+            rank = 0
+        elif isinstance(key, str) and key.lower() == wanted:
+            rank = 1
+        elif isinstance(key, str):
+            core = key.lower().split("/")[-1].split(".")[-1]
+            if core != wanted:
+                continue
+            rank = 2
+        else:
+            continue
+        region = 1 if key.lower().startswith(_REGION_PREFIXES) else 0
+        scored.append((rank, region, _PRICED_MODES[mode], len(key), key))
+    return [key for _, _, _, _, key in sorted(scored)]
+
+
+def _t3_cost(entry: dict, name: str) -> float | None:
+    value = entry.get(name)
+    return value * 1_000_000.0 if _is_num(value) and value >= 0 else None
+
+
+def _t3_convert(model: str, semantics: set, key: str,
+                entry: dict) -> dict | None:
+    """One observer schedule entry from a T3 LiteLLM rate row.
+
+    Returns None when the row cannot price the model fail-closed
+    (missing input or output cost): the caller then keeps the bundled
+    entry or leaves the model unknown. LiteLLM per-token costs become
+    USD per million; the 1-hour cache-write price feeds the ``1h`` TTL
+    leg and the 200k-token prices feed the long-context tier.
+    """
+    rates: dict = {}
+    base = _t3_cost(entry, "input_cost_per_token")
+    output = _t3_cost(entry, "output_cost_per_token")
+    if base is None or output is None:
+        return None
+    rates["input_tokens"] = base
+    rates["output_tokens"] = output
+    reasoning = _t3_cost(entry, "output_cost_per_reasoning_token")
+    rates["reasoning_output_tokens"] = \
+        reasoning if reasoning is not None else output
+    read = _t3_cost(entry, "cache_read_input_token_cost")
+    if read is not None:
+        rates["cached_input_tokens"] = read
+    write = _t3_cost(entry, "cache_creation_input_token_cost")
+    write_1h = _t3_cost(entry, "cache_creation_input_token_cost_above_1hr")
+    if write is not None:
+        if semantics and all(s.startswith("claude:") for s in semantics):
+            ttl = {"5m": write}
+            if write_1h is not None:
+                ttl["1h"] = write_1h
+            rates["cache_write_input_tokens"] = ttl
+        else:
+            rates["cache_write_input_tokens"] = write
+    converted = {"semantics": sorted(semantics),
+                 "rates": rates,
+                 "t3_key": key,
+                 "basis": "T3 LiteLLM rate table; list-price equivalent,"
+                          " not subscription spend."}
+    long_input = _t3_cost(entry, "input_cost_per_token_above_200k_tokens")
+    long_output = _t3_cost(entry, "output_cost_per_token_above_200k_tokens")
+    if long_input is not None and long_output is not None:
+        long_rates = {"input_tokens": long_input,
+                      "output_tokens": long_output}
+        long_reasoning = _t3_cost(
+            entry, "output_cost_per_reasoning_token_above_200k_tokens")
+        long_rates["reasoning_output_tokens"] = \
+            long_reasoning if long_reasoning is not None else long_output
+        long_read = _t3_cost(
+            entry, "cache_read_input_token_cost_above_200k_tokens")
+        if long_read is not None:
+            long_rates["cached_input_tokens"] = long_read
+        long_write = _t3_cost(
+            entry, "cache_creation_input_token_cost_above_200k_tokens")
+        if long_write is not None:
+            long_rates["cache_write_input_tokens"] = long_write
+        converted["long_context_threshold"] = 200000
+        converted["long_context_rates"] = long_rates
+    return converted
+
+
+def load_t3_schedule(path: str | None = None,
+                     model_semantics: dict | None = None) -> dict | None:
+    """An observer schedule converted from T3's LiteLLM rate table.
+
+    Returns None when the table is absent or unusable, so callers fall
+    back to the bundled schedule. ``model_semantics`` maps observer
+    model ids to the counter semantics observed for them; only listed
+    models convert, and converted entries serve exactly those semantics.
+    """
+    target = path or t3_rates_path()
+    try:
+        document, fetched_ms = _read_t3_document(target)
+    except (OSError, ValueError):
+        return None
+    if not model_semantics:
+        return None
+    try:
+        as_of = datetime.fromtimestamp(
+            fetched_ms / 1000.0, tz=timezone.utc).date().isoformat() \
+            if isinstance(fetched_ms, (int, float)) and math.isfinite(
+                fetched_ms) else None
+    except (OverflowError, OSError, ValueError):
+        as_of = None
+    if as_of is None:
+        try:
+            as_of = date.fromtimestamp(
+                os.stat(target).st_mtime).isoformat()
+        except OSError:
+            return None
+    models = {}
+    for model, semantics in sorted(model_semantics.items()):
+        if not semantics:
+            continue
+        for key in _t3_candidates(document, model):
+            converted = _t3_convert(model, set(semantics), key,
+                                    document[key])
+            if converted is not None:
+                models[model] = converted
+                break
+    schedule = {"source_url": "file://" + os.path.abspath(target),
+                "as_of": as_of,
+                "currency": "USD",
+                "unit": "USD per million tokens",
+                "basis": "T3 LiteLLM rate table when present; bundled"
+                         " schedule covers the rest.",
+                "models": models}
+    try:
+        return validate_schedule(schedule)
+    except ValueError:
+        return None
+
+
+def default_schedule(con=None) -> dict:
+    """The schedule task reports price from: T3 rates over bundled fallback.
+
+    Converted T3 entries win per model; every other bundled entry stays
+    as the offline fallback. The winning source stays labeled on
+    ``source_url`` (T3 file) and ``fallback_source_url`` (bundled file),
+    and per-model rows keep their own source, so a valuation names the
+    table behind every priced response.
+    """
+    try:
+        bundled = load_schedule()
+    except (OSError, ValueError):
+        bundled = {"source_url": DEFAULT_SCHEDULE_PATH,
+                   "models": {}}
+    model_semantics: dict[str, set] = {}
+    for model, entry in (bundled.get("models") or {}).items():
+        model_semantics.setdefault(model, set()).update(
+            entry.get("semantics") or [])
+    if con is not None:
+        try:
+            rows = con.execute(
+                "SELECT DISTINCT model, semantics FROM responses"
+                " WHERE model IS NOT NULL").fetchall()
+        except sqlite3.Error:
+            rows = []
+        for row in rows:
+            try:
+                model, semantics = row["model"], row["semantics"]
+            except (KeyError, TypeError, IndexError):
+                continue
+            if isinstance(model, str) and model:
+                model_semantics.setdefault(model, set())
+                if isinstance(semantics, str) and semantics:
+                    model_semantics[model].add(semantics)
+    converted = load_t3_schedule(model_semantics=model_semantics)
+    if converted is None:
+        return bundled
+    merged = json.loads(json.dumps(bundled))
+    merged["models"].update(converted["models"])
+    merged["fallback_source_url"] = bundled.get("source_url")
+    merged["source_url"] = converted["source_url"]
+    merged["as_of"] = converted["as_of"]
+    merged["basis"] = converted["basis"]
+    return validate_schedule(merged)
 
 
 def _entry_rates(entry: dict, response: dict) -> tuple[dict | None, str | None]:
