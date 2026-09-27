@@ -593,7 +593,7 @@ def _sync(con, ns) -> int:
                 if key == "failed":
                     row["failed"] = list(row.get("failed") or []) + value
                 elif key in ("sources", "unchanged", "threads",
-                             "turns_mapped", "links"):
+                             "turns_mapped", "links", "malformed"):
                     # Mirror sizes, not deltas: the refresh re-reads the
                     # same state, so the larger reading wins.
                     row[key] = max(row.get(key) or 0, value or 0) \

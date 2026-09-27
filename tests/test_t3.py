@@ -348,6 +348,33 @@ class T3SyncTest(LedgerCase):
         self.assertEqual(solo["attributed"]["responses"], 1)
         self.assertEqual(solo["shared_joint"]["responses"], 0)
 
+    def test_changed_link_drops_stale_t3_bindings_only(self):
+        self._opencode_session(OPSESS, "opencode:resp-op")
+        t3_adapter.sync(self.con, source=self.t3_path)
+        self.con.execute(
+            "INSERT INTO tasks(task_id, project, title, created_at)"
+            " VALUES('example/other#1','example/other','manual',"
+            " '2026-09-27T12:00:00Z')")
+        self.con.execute(
+            "INSERT INTO session_assignments(session_key, task_id, evidence,"
+            " created_at) VALUES(?,?,?,?)",
+            ("opencode:" + OPSESS, "example/other#1", "manual",
+             "2026-09-27T12:00:00Z"))
+        native = sqlite3.connect(self.t3_path)
+        native.execute(
+            "UPDATE projection_thread_pull_requests SET number=10, url=?"
+            " WHERE thread_id=?",
+            ("https://github.com/example/alpha/pull/10", T2))
+        native.commit()
+        native.close()
+        t3_adapter.sync(self.con, source=self.t3_path)
+        bound = {(r["session_key"], r["task_id"]) for r in self.query(
+            "SELECT session_key, task_id FROM session_assignments")}
+        self.assertIn(("opencode:" + OPSESS, "example/alpha#10"), bound)
+        self.assertNotIn(("opencode:" + OPSESS, "example/alpha#9"), bound)
+        # Bindings this adapter did not make survive.
+        self.assertIn(("opencode:" + OPSESS, "example/other#1"), bound)
+
     def test_outcomes_follow_pr_snapshots_and_keep_human_rows(self):
         claude.import_claude_file(self.con, self.transcript)
         self._opencode_session(OPSESS, "opencode:resp-op")
@@ -461,6 +488,19 @@ class T3PricingTest(LedgerCase):
         self.assertEqual(entry_b["rates"]["cache_write_input_tokens"],
                          {"5m": 5.0, "1h": 8.0})
         self.assertNotIn("fixture-model-image", schedule["models"])
+
+    def test_mixed_semantics_keep_claude_ttl_split(self):
+        from agent_observer import pricing
+        schedule = pricing.load_t3_schedule(
+            self.rates_file(),
+            {"fixture-model-b": {"claude:input_excludes_cache,"
+                                 "output_includes_thinking",
+                                 "opencode:input_excludes_cache,"
+                                 "reasoning_separate"}})
+        # A flat rate would price Claude 1h cache writes at the 5m rate.
+        self.assertEqual(
+            schedule["models"]["fixture-model-b"]["rates"]
+            ["cache_write_input_tokens"], {"5m": 5.0, "1h": 8.0})
 
     def test_unusable_table_falls_back(self):
         from agent_observer import pricing

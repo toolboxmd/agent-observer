@@ -207,7 +207,10 @@ def _t3_convert(model: str, semantics: set, key: str,
     write = _t3_cost(entry, "cache_creation_input_token_cost")
     write_1h = _t3_cost(entry, "cache_creation_input_token_cost_above_1hr")
     if write is not None:
-        if semantics and all(s.startswith("claude:") for s in semantics):
+        # Claude reports 5m and 1h cache writes separately; a flat rate
+        # would price 1h writes at 5m. Any Claude use needs the split, and
+        # other semantics' nonzero cache writes then stay unknown.
+        if any(s.startswith("claude:") for s in semantics):
             ttl = {"5m": write}
             if write_1h is not None:
                 ttl["1h"] = write_1h

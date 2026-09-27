@@ -638,6 +638,7 @@ def _bind_trees(con: sqlite3.Connection, threads: dict,
     sessions = _tree_sessions(con, threads, roots)
     tasks = 0
     bound = 0
+    wanted: set = set()
     for root, root_links in tree_links.items():
         seen: dict[tuple, dict] = {}
         for link in root_links:
@@ -652,12 +653,28 @@ def _bind_trees(con: sqlite3.Connection, threads: dict,
                  db.now()))
             tasks += cur.rowcount
             for session_key in sorted(sessions.get(root, set())):
+                wanted.add((session_key, task_id))
                 cur = con.execute(
                     "INSERT OR IGNORE INTO session_assignments(session_key,"
                     " task_id, evidence, created_at) VALUES(?,?,?,?)",
                     (session_key, task_id,
                      f"t3:{root}:{link['url']}", db.now()))
                 bound += cur.rowcount
+    # A tree still present in T3 state owns exactly its current links:
+    # drop T3-made bindings its links no longer back (an unlinked or
+    # changed PR). Trees absent from this read keep their history, and
+    # bindings made outside this adapter are never touched.
+    present = {thread_root(t) for t in threads} | set(tree_links)
+    for root in sorted(present):
+        for row in con.execute(
+                "SELECT session_key, task_id FROM session_assignments"
+                " WHERE substr(evidence, 1, ?)=?",
+                (len(f"t3:{root}:"), f"t3:{root}:")).fetchall():
+            if (row["session_key"], row["task_id"]) not in wanted:
+                con.execute(
+                    "DELETE FROM session_assignments"
+                    " WHERE session_key=? AND task_id=?",
+                    (row["session_key"], row["task_id"]))
     return {"tasks": tasks, "sessions_bound": bound}
 
 
