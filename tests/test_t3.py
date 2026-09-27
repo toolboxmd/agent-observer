@@ -33,8 +33,9 @@ CLSESS = "c1aude-5e55-1000-000000000001"
 CXSESS = "c0de8-7e55-1000-000000000002"
 CX2 = "c0de8-7e55-1000-000000000003"
 OPSESS = "ses_fixture00000000000000001"
-U1, U2, U3, U4, U5 = ("u11111111-0000-4000-8000-00000000000%d" % n
-                      for n in (1, 2, 3, 4, 5))
+ROUTER_SESS = "d1a9109-4000-4000-8000-000000000001"
+U1, U2, U3, U4, U5, U6 = ("u11111111-0000-4000-8000-00000000000%d" % n
+                          for n in (1, 2, 3, 4, 5, 6))
 M1, M2, M3 = ("9ead9e99-0000-4000-8000-00000000000%d" % n for n in (1, 2, 3))
 PR7 = "https://github.com/example/alpha/pull/7"
 ISS3 = "https://github.com/example/alpha/issues/3"
@@ -123,9 +124,11 @@ def write_state(path):
     return path
 
 
-def user_line(uuid, text, session=CLSESS, prompt_source="sdk"):
+def user_line(uuid, text, session=CLSESS, prompt_source="sdk",
+              entrypoint="sdk-ts"):
     return json.dumps({
-        "sessionId": session, "cwd": "/redacted/proj", "entrypoint": "sdk-ts",
+        "sessionId": session, "cwd": "/redacted/proj",
+        "entrypoint": entrypoint,
         "version": "9.9.9", "type": "user", "uuid": uuid,
         "timestamp": "2026-09-27T10:00:00Z", "isSidechain": False,
         "promptSource": prompt_source, "promptId": "pp-" + uuid[:4],
@@ -160,6 +163,18 @@ def write_transcript(path):
             + "\n")
         fh.write(user_line(U5, "typed elsewhere", session="other-sess",
                            prompt_source="typed") + "\n")
+    return path
+
+
+def write_router_transcript(path):
+    """A Router `claude -p` worker session: sdk-cli, sdk prompt, no T3 turn.
+
+    Router workers never appear as T3 turn starts, so their uuids stay
+    unlisted and the T3 mirror must never move them.
+    """
+    with open(path, "w") as fh:
+        fh.write(user_line(U6, "worker instruction", session=ROUTER_SESS,
+                           prompt_source="sdk", entrypoint="sdk-cli") + "\n")
     return path
 
 
@@ -204,9 +219,13 @@ class T3SyncTest(LedgerCase):
 
     def test_backfill_reclassifies_sdk_prompts_by_turn_origin(self):
         claude.import_claude_file(self.con, self.transcript)
+        router_transcript = write_router_transcript(
+            os.path.join(self.tmp.name, "router-sess.jsonl"))
+        claude.import_claude_file(self.con, router_transcript)
         before = self.kinds()
         self.assertEqual(before["claude:" + U1][0], "synthetic")
         self.assertEqual(before["claude:" + U2][0], "synthetic")
+        self.assertEqual(before["claude:" + U6][0], "synthetic")
         totals = t3_adapter.sync(self.con, source=self.t3_path)
         self.assertGreaterEqual(totals["submissions_reclassified"], 1)
         kinds = self.kinds()
@@ -220,6 +239,10 @@ class T3SyncTest(LedgerCase):
         self.assertEqual(kinds["claude:" + U4][0], "scaffolding")
         # Router-style typed prompts outside T3 are unaffected.
         self.assertEqual(kinds["claude:" + U5][0], "genuine")
+        # Router sdk-cli workers never appear as T3 turn starts: unlisted
+        # and untouched by the mirror, before and after.
+        self.assertEqual(kinds["claude:" + U6][0], "synthetic")
+        self.assertIsNone(t3_adapter.turn_actor(self.con, U6))
         # Orphaned responses join the reclassified turn by ordinal.
         turns = {r["response_id"]: r["turn_id"] for r in self.query(
             "SELECT response_id, turn_id FROM responses")}
