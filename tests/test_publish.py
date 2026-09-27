@@ -2,7 +2,7 @@
 
 from unittest import mock
 
-from agent_observer import db, publish
+from agent_observer import db, pricing, publish
 from tests.helpers import LedgerCase
 
 ME = "observer-bot"
@@ -180,3 +180,82 @@ class PublishTest(LedgerCase):
             publish.post("o/r", "b")
         with self.assertRaises(ValueError):
             publish.post("o/r", "b", pr=1, commit="abc")
+
+    def test_file_uri_sources_render_with_path_withheld(self):
+        # A representative T3-style file URI with a private-looking home
+        # path must never reach the public body; the source stays labeled.
+        t3_source = ("file:///redacted-home/example-user/.t3/userdata/"
+                     "usage-model-rates.json")
+        other_local = "file:///redacted-home/example-user/schedule.json"
+        summary = publish.summarize(self.con, {"claude:s1"}, "task T")
+        summary["scope_kind"] = "task"
+        summary["estimated_cost"] = {
+            "schedule_source": t3_source,
+            "schedule_as_of": "2026-09-27",
+            "estimated_cost_usd_partial": 0.003,
+            "estimated_cost_usd_total": 0.003,
+            "priced_responses": 2,
+            "responses": 2,
+            "basis": "Standard API list-price equivalent, not subscription spend.",
+            "unpriced_reasons": {},
+            "by_model": [
+                {"model": "claude-fable-5-1", "harness": "claude",
+                 "effort": "unknown", "responses": 1, "priced_responses": 1,
+                 "estimated_cost_usd": 0.001,
+                 "estimated_cost_usd_partial": 0.001,
+                 "source_url": t3_source, "basis": None},
+                {"model": "gpt-6-fixture", "harness": "opencode",
+                 "effort": "high", "responses": 1, "priced_responses": 1,
+                 "estimated_cost_usd": 0.002,
+                 "estimated_cost_usd_partial": 0.002,
+                 "source_url": other_local, "basis": None},
+            ],
+        }
+        body = publish.render(summary)
+        self.assertNotIn("file://", body)
+        self.assertNotIn("redacted-home", body)
+        self.assertNotIn("example-user", body)
+        self.assertIn("T3 local rate table (path withheld)", body)
+        self.assertIn("local schedule (path withheld)", body)
+
+    def test_public_http_source_still_renders(self):
+        summary = publish.summarize(self.con, {"claude:s1"}, "task T")
+        summary["scope_kind"] = "task"
+        summary["estimated_cost"] = {
+            "schedule_source": "https://example.com/pricing",
+            "schedule_as_of": "2026-09-27",
+            "estimated_cost_usd_partial": 0.001,
+            "estimated_cost_usd_total": 0.001,
+            "priced_responses": 1,
+            "responses": 1,
+            "basis": "Standard API list-price equivalent, not subscription spend.",
+            "unpriced_reasons": {},
+            "by_model": [
+                {"model": "claude-fable-5-1", "harness": "claude",
+                 "effort": "unknown", "responses": 1, "priced_responses": 1,
+                 "estimated_cost_usd": 0.001,
+                 "estimated_cost_usd_partial": 0.001,
+                 "source_url": "https://example.com/pricing",
+                 "basis": None},
+            ],
+        }
+        body = publish.render(summary)
+        self.assertIn("https://example.com/pricing", body)
+
+    def test_raw_fallback_schedule_path_is_withheld(self):
+        # Bundled schedule unusable and no T3 rate table: default_schedule
+        # falls back to the raw bundled path, which must not be published.
+        self.con.execute(
+            "INSERT INTO tasks(task_id, project, title, created_at)"
+            " VALUES('T','p','T','2026-09-27')")
+        missing_home = f"{self.tmp.name}/no-t3"
+        with mock.patch.dict("os.environ", {"T3CODE_HOME": missing_home}), \
+                mock.patch.object(pricing, "load_schedule",
+                                  side_effect=ValueError("invalid")):
+            summary = publish.summarize(self.con, set(), "task T", task_id="T")
+        self.assertEqual(summary["estimated_cost"]["schedule_source"],
+                         pricing.DEFAULT_SCHEDULE_PATH)
+        body = publish.render(summary)
+        self.assertNotIn(pricing.DEFAULT_SCHEDULE_PATH, body)
+        self.assertNotIn("prices.json", body)
+        self.assertIn("local schedule (path withheld)", body)

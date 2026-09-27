@@ -616,6 +616,23 @@ def _submission(r: _Reader, native_id, ordinal, ts, kind: str, text: str) -> Non
             r.stats.get("submissions_updated", 0) + 1
 
 
+def _t3_actor(con, uuid: str) -> str | None:
+    """The T3 turn origin for one user-record uuid, if T3 recorded it.
+
+    T3 Code drives Claude through the SDK, so its prompts carry
+    ``promptSource: "sdk"`` with no ``origin`` and used to read as
+    ``synthetic``. A uuid listed as a T3 turn start is human
+    (``client``) or dispatched (``server``); anything unlisted (typed
+    prompts, Router ``sdk-cli`` workers) is untouched by this lookup.
+    A missing T3 mirror table reads as unknown, never as an origin.
+    """
+    try:
+        from . import t3 as _t3
+    except ImportError:
+        return None
+    return _t3.turn_actor(con, uuid)
+
+
 def _user_kind(r: _Reader, obj: dict, text: str) -> str:
     if obj.get("isSidechain") or r.agent_id:
         return "synthetic"
@@ -632,6 +649,18 @@ def _user_kind(r: _Reader, obj: dict, text: str) -> str:
         return "scaffolding"
     if obj.get("isMeta") or stripped.startswith(SCAFFOLD_PREFIXES):
         return "command" if stripped.startswith("<command-name>") else "scaffolding"
+    uuid = obj.get("uuid")
+    if isinstance(uuid, str) and uuid:
+        # T3 turn evidence outranks the generic sdk fallthrough below: a
+        # listed turn start is genuine when a person typed it and
+        # synthetic when a dispatch sent it. Scaffolding and interrupt
+        # verdicts above already failed closed, and unlisted records
+        # (typed prompts, Router sdk-cli workers) fall through unchanged.
+        actor = _t3_actor(r.con, uuid)
+        if actor == "client":
+            return "genuine"
+        if actor == "server":
+            return "synthetic"
     origin = obj.get("origin") if isinstance(obj.get("origin"), dict) else {}
     if origin.get("kind") == "human" or obj.get("promptSource") == "typed":
         return "genuine"

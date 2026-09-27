@@ -20,11 +20,13 @@ are committed.
 | `submissions` | `native_id` | User-role inputs with `kind` genuine, synthetic, scaffolding or interrupt. |
 | `events` | session_key, family, native_id | Operational events (families below). |
 | `tasks`, `assignments`, `session_assignments`, `dispatches`, `attempts`, `outcomes` | see capture | Workload ownership and outcomes. |
+| `t3_turn_origins`, `t3_threads`, `t3_links` | T3 message, thread, link ids | Chromeria turn origins, thread to native-session map, thread-tree links with PR snapshot state, mirrored read-only from T3 state. |
+| `t3_outcome_provenance` (`router_outcome_provenance`) | task id | Last adapter-written outcome snapshot; a row that differs is human-owned and survives re-import. |
 | `router_jobs`, `router_invocations`, `router_readings` | router ids | Model Router ledger rows, copied read-only. |
 | `agentsmd_versions` | AGENTS.md SHA-256 | Release map from the local AgentsMD tags. |
 | `import_errors` | none | Quarantined records; prior valid data is kept. |
 
-Every natural key carries its harness prefix (`codex:`, `claude:`,
+Every natural key carries its harness prefix (`t3:`, `codex:`, `claude:`,
 `opencode:`, `grok:`, `router:`) except event native ids, which are unique
 within their session and family. Rows are keyed by session, not by source
 file, so re-reading a file, a grown log, or a copied file never adds usage
@@ -143,6 +145,9 @@ Unresolved hashes stay unresolved.
 
 ## Capture contract (CLI `capture`)
 
+The Skill is query-only: no agent runs capture commands. The CLI keeps
+them for Router ownership and explicit human use.
+
 - `create-task`: stable task identity with project, family, title, Issue link.
 - `assign`: binds one genuine submission to one task with attempt, phase, and
   evidence. Every genuine submission needs a binding, including followups.
@@ -187,7 +192,10 @@ are counted separately and excluded from useful-work comparisons.
   work; snapshot identity with source cutoff and measured set; task-scoped
   diagnostics and time with session context labeled; native cost and
   sourced estimate with coverage. Exit 3 when
-  missing or conflicting ownership exists. Every command accepts `--json`.
+  missing, conflicting or wholly unbound ownership exists: a task whose
+  sessions hold measured responses but nothing attributed or shared
+  reports those sessions as `unbound_usage` instead of a silent
+  `missing assignments: none`. Every command accepts `--json`.
 - `publish --task ID|--session KEY [--prices schedule.json] --repo owner/name --pr N|--commit SHA`:
   render or post the summary comment; `--dry-run` prints the comment
   without posting, and `--dry-run --json` prints a JSON payload with the
@@ -240,7 +248,12 @@ arithmetic.
   content participates.
 - `acceptance_state` is explicit, defaulting to `unknown` when no outcome
   row exists. Process success, zero exit or a successful attempt never
-  implies acceptance.
+  implies acceptance. The T3 adapter completes `origin='t3'` tasks whose
+  thread tree links a PR snapshot with state `merged` (proof is the PR
+  URL); every other PR state and Issue-only links stay an explicit
+  `unknown`. A T3-owned row advances only while it matches the
+  `t3_outcome_provenance` snapshot; any other pre-existing row is
+  human-owned and survives re-import.
 - `diagnostics` holds task-turn scoped detector counts plus session
   context counts kept explicitly separate. `time` holds task-turn elapsed
   with its source, or unavailable when no task turn timing exists, with
@@ -248,9 +261,19 @@ arithmetic.
 
 ## Sourced pricing
 
+Without `--prices`, task reports price from T3's LiteLLM rate table
+(`$T3CODE_HOME/userdata/usage-model-rates.json`, default `~/.t3`) when it
+names an observed model; the bundled `agent_observer/prices.json` stays as
+the offline fallback per model. Converted entries serve the observed
+counter semantics (TTL-split cache writes for Claude-only models, flat
+otherwise; 200k-token long tier when T3 names it) and carry their T3 key;
+the winning source stays labeled on `source_url` with the bundled URL on
+`fallback_source_url`. An absent or unusable T3 table prices everything
+from the bundle.
+
 `agent_observer/prices.json` supplies dated, sourced standard API list-price
 rates for exact supported model identities. It is an equivalent-cost estimate,
-not a subscription invoice; discounts and service-tier premiums are excluded. A caller schedule is JSON with `source_url` (http(s)),
+not a subscription invoice; discounts and service-tier premiums are excluded. A caller schedule is JSON with `source_url` (http(s) or file),
 `as_of`/`effective_date`, `currency` USD, `unit` per million tokens and
 `models` mapping model ids to `semantics` (exact supported strings) and
 `rates` (USD per million per bucket). Rates must be finite numbers at or
@@ -323,6 +346,31 @@ alone and duplicates are reported.
 ccusage is a pinned development cross-check only. Runtime code never imports
 or executes it. `tests/test_cli.py` asserts that no runtime module imports
 or calls it.
+
+## Chromeria/T3 attribution (`sync --harness t3`)
+
+T3 state is read from a live database copy or snapshot, never written:
+`$T3CODE_HOME/userdata/state.sqlite` (default `~/.t3`) opens read-only,
+and `sync --source` accepts an explicit state file. The mirror is a full
+re-read every sync; workload bindings are durable ledger rows.
+
+- Turn origin: `thread.turn-start-requested` `actor_kind` (`client` human,
+  `server` dispatch) joins the native Claude user-message uuid through
+  `projection_turns`. A listed Claude `sdk` prompt is `genuine` on client
+  turns and `synthetic` on server turns, at import and by backfill
+  (backfilled rows gain their turn but no excerpt). Scaffolding, command
+  and interrupt verdicts fail closed; unlisted records (typed prompts,
+  Router `sdk-cli` workers) never move; unknown stays unknown.
+- Thread trees: `sub.<parent>.<suffix>` ids (nesting allowed) group under
+  their root. Each linked PR or Issue becomes one `repo#N` task
+  (`origin='t3'`); every ledger session in the tree (cursor sessions plus
+  Claude subagent children plus rotated sessions found by turn uuid) binds
+  whole to every tree task. One-link trees attribute exclusively;
+  multi-link trees read shared under the existing joint semantics and are
+  never divided. Branch names are never inferred; Ghostty bodies and
+  unknown cursor shapes are skipped.
+- Outcomes come from the PR snapshot (`merged` completes); exit codes are
+  never read.
 
 ## Codex model context across imports
 

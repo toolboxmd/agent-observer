@@ -363,7 +363,9 @@ def task_report(con: sqlite3.Connection, task_id: str,
                 schedule: dict | None = None) -> dict:
     from . import pricing as _pricing
     if schedule is None:
-        schedule = _pricing.load_schedule()
+        # No explicit override: T3's rate table when present, bundled
+        # fallback otherwise, with the winning source labeled.
+        schedule = _pricing.default_schedule(con)
     # Retain the exact selected schedule with the export. A caller changing
     # its own dictionary later must not alter an already produced valuation.
     schedule = json.loads(json.dumps(schedule))
@@ -424,6 +426,20 @@ def task_report(con: sqlite3.Connection, task_id: str,
             unassigned.append(dict(r))
             if sub not in assigned_anywhere and sub not in missing_submissions:
                 missing_submissions.append(sub)
+
+    # Sessions are known but nothing is bound: the scope holds measured
+    # responses while attributed and shared stay empty (for example every
+    # prompt read synthetic, so per-prompt assignment refused them). This
+    # is a visible coverage gap, never a silent "missing assignments: none".
+    live_scope = [dict(r) for r in responses if not r["is_overlap"]]
+    unbound_usage: list = []
+    if live_scope and not attributed and not shared:
+        responders: dict[str, int] = {}
+        for r in live_scope:
+            if r.get("session_key"):
+                responders[r["session_key"]] = \
+                    responders.get(r["session_key"], 0) + 1
+        unbound_usage = sorted(responders)
 
     def total(rows):
         return _usage_totals(rows)
@@ -593,6 +609,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
                              "and is never posted as spend.",
         "coverage": {
             "no_measured_sessions": not scope_keys,
+            "unbound_usage": list(unbound_usage),
             "conflicting_sessions": sorted(whole_conflicts),
             "missing_sessions": missing_sessions,
             "sessions_without_usage": empty_sessions,
@@ -640,6 +657,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
             parts.get(sem, 0) == wholes.get(sem, 0)
             for sem in parts)
     report["reconciles"] = responses_reconcile and totals_reconcile
+    report["unbound_usage"] = unbound_usage
     report["complete"] = (not missing_submissions
                           and not report["conflicting_assignments"]
                           and not unavailable_usage

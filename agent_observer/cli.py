@@ -115,6 +115,7 @@ def _text(payload) -> str:
             f"total={_fmt_section_total(r['unassigned_in_scope'])}",
             f"  reconciles against scope: {r['reconciles']}",
             f"  missing assignments: {r['missing_assignments'] or 'none'}",
+            f"  unbound usage: {r.get('unbound_usage') or 'none'}",
             f"  conflicting: {r['conflicting_assignments'] or 'none'}",
             f"  crashes counted separately: {r['crashes_counted_separately']}",
             f"  acceptance: {r.get('acceptance_state') or 'unknown'} "
@@ -390,8 +391,9 @@ def main(argv=None) -> int:
                 return 2
             rep["_view"] = "task"
             _emit(rep, ns.as_json)
-            # Missing or conflicting ownership is a visible failure.
-            if rep["missing_assignments"] or rep["conflicting_assignments"]:
+            # Missing, conflicting or wholly unbound ownership is visible.
+            if rep["missing_assignments"] or rep["conflicting_assignments"] \
+                    or rep.get("unbound_usage"):
                 return 3
             return 0
 
@@ -574,6 +576,32 @@ def _sync(con, ns) -> int:
             continue
         results.append(module.sync(con, root=ns.root, full=ns.full,
                                    source=ns.source))
+    if "t3" in wanted and len(wanted) > 1 and "t3" in registry:
+        # T3 attribution reads first so transcript imports classify
+        # prompts as they land, but sessions imported later in this same
+        # run did not exist for that first pass. One idempotent refresh
+        # closes the loop so a single sync converges; its counters fold
+        # into the first T3 row.
+        refresh = registry["t3"].sync(con, root=ns.root, full=ns.full,
+                                      source=ns.source)
+        merged = False
+        for row in results:
+            if row.get("harness") != "t3" or merged:
+                continue
+            merged = True
+            for key, value in refresh.items():
+                if key == "failed":
+                    row["failed"] = list(row.get("failed") or []) + value
+                elif key in ("sources", "unchanged", "threads",
+                             "turns_mapped", "links", "malformed"):
+                    # Mirror sizes, not deltas: the refresh re-reads the
+                    # same state, so the larger reading wins.
+                    row[key] = max(row.get(key) or 0, value or 0) \
+                        if isinstance(value, int) else value
+                elif isinstance(value, int):
+                    row[key] = (row.get(key) or 0) + value
+                elif key not in row:
+                    row[key] = value
     _identity.refresh_session_versions(con)
     con.commit()
     payload = {"_view": "sync", "harnesses": results,
