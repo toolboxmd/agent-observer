@@ -128,8 +128,10 @@ class TaskSemanticsTest(MixedSemanticsCase):
                                     "task T-M")
         self.assertNotIn("total_tokens", summary["usage"])
         body = publish.render(summary)
-        self.assertIn(CODEX_SEM, body)
-        self.assertIn(CLAUDE_SEM, body)
+        # Each semantics keeps its own labeled row, in words.
+        self.assertIn("codex counters: input includes cached, output includes reasoning", body)
+        self.assertIn("claude counters: input excludes cache, output includes thinking", body)
+        self.assertNotIn(CODEX_SEM, body)
         self.assertIn("1,100", body)
         self.assertIn("1,160", body)
         self.assertNotIn("Total tokens", body)
@@ -155,7 +157,7 @@ class PublishSemanticsTest(MixedSemanticsCase):
         self.assertEqual(by[CODEX_SEM]["total_tokens"], 1100)
         self.assertEqual(by[CLAUDE_SEM]["total_tokens"], 1160)
         body = _publish.render(summary)
-        self.assertIn(CODEX_SEM, body)
+        self.assertIn("codex counters: input includes cached", body)
         self.assertNotIn("Total tokens", body)
 
     def test_mixed_codex_session_models_do_not_sum_semantics(self):

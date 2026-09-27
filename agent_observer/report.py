@@ -711,7 +711,9 @@ def _total_cost(con, task_id, estimate, attributed, shared, joint,
         if key not in whole and sub in joint:
             others.update(joint[sub]["tasks"])
     others.discard(task_id)
-    status = estimate["status"]
+    # Nothing priced is unknown, even when missing usage marks the estimate
+    # partial: an empty subtotal must never read as a numeric zero.
+    status = estimate["status"] if estimate.get("priced_responses") else "unknown"
     return {
         "text": _money(estimate),
         "usd": estimate.get("estimated_cost_usd_total") if status == "complete"

@@ -187,6 +187,23 @@ class SourcedCostTest(CloseLoopCase):
         self.assertIn(f"estimated cost: {s['total_cost']['text']} (includes work "
                       "shared with 1 other task,", text.stdout)
 
+    def test_shared_only_publish_withholds_per_model_basis_text(self):
+        private = os.path.join(self.tmp.name, "private.json")
+        rates = fixture_rates()
+        rates["gpt-6-fixture"]["basis"] = "/Users/someone/private-notes.txt"
+        write_prices(private, rates)
+        self.assertEqual(run(self.db, "sync", "--source", self.mini).returncode, 0)
+        for task in ("T-S1", "T-S2"):
+            self.assertEqual(
+                run(self.db, "capture", "create-task", "--task", task).returncode, 0)
+            self.assertEqual(run(self.db, "capture", "assign", "--task", task,
+                                 "--submission", "msg-mini-sub-02",
+                                 "--shared").returncode, 0)
+        pub = self._publish_json("T-S1", "--prices", private)
+        self.assertEqual(pub["summary"]["usage"]["responses"], 0)
+        self.assertNotIn("private-notes", pub["body"])
+        self.assertNotIn("/Users/", pub["body"])
+
     def test_partial_when_cached_rate_missing(self):
         partial = os.path.join(self.tmp.name, "partial.json")
         write_prices(partial, {"gpt-6-fixture": {

@@ -341,7 +341,11 @@ def _flags(summary: dict) -> list[str]:
     gaps = summary.get("coverage") or {}
     unpriced = ((summary.get("total_cost") or {}).get("estimate") or {}).get(
         "unpriced_responses", 0)
+    if gaps.get("no_measured_sessions"):
+        flags.append("no measured sessions")
     for count, singular, plural in (
+            (len(gaps.get("conflicting_sessions") or []),
+             "session with conflicting ownership", "sessions with conflicting ownership"),
             (len(summary.get("missing_assignments") or []),
              "prompt without an owner", "prompts without an owner"),
             (len(summary.get("conflicting_assignments") or []),
@@ -367,6 +371,16 @@ def _flags(summary: dict) -> list[str]:
     if summary.get("reconciles") is False:
         flags.append("totals do not reconcile")
     return flags
+
+
+def _semantics_text(semantics) -> str:
+    """Counter semantics in words: `codex:input_includes_cached,...` reads
+    as "codex counters: input includes cached, ..."."""
+    if not semantics:
+        return "unknown counters"
+    harness, _, rest = str(semantics).partition(":")
+    words = ", ".join(p.replace("_", " ") for p in rest.split(",") if p)
+    return _safe_field(f"{harness} counters: {words}" if words else f"{harness} counters")
 
 
 def _yes(value) -> str:
@@ -464,12 +478,10 @@ def render(summary: dict, target: str | None = None) -> str:
                          f"{_safe_field(est.get('schedule_as_of'))}, schedule "
                          f"`{_safe_field(summary.get('price_schedule_id'))}`. "
                          f"Unknown prices stay unknown, never zero.")
-            # Per-model bases are more specific; the schedule basis covers the rest.
+            # Only the schedule-level basis is published; per-model basis
+            # text from a caller's schedule never is (see #30).
             by_model = (total.get("estimate") or {}).get("by_model", [])
-            bases = {_safe_field(m["basis"]) for m in by_model if m.get("basis")}
-            bases = bases or {_safe_field(est.get("basis") or "Standard API list-price equivalent, not subscription spend.")}
-            for basis in sorted(bases):
-                lines.append(f"  - {basis}")
+            lines.append(f"  - {_safe_field(est.get('basis') or 'Standard API list-price equivalent, not subscription spend.')}")
             sources = {_safe_source(m.get("source_url")) for m in by_model}
             if sources:
                 lines.append(f"  - Model price sources: {', '.join(sorted(sources))}.")
@@ -503,7 +515,7 @@ def render(summary: dict, target: str | None = None) -> str:
               "across semantics):"]
     for m in models:
         lines.append(
-            f"- {_model_cell(m)}, `{_safe_field(m.get('semantics') or 'unknown')}`: "
+            f"- {_model_cell(m)}, {_semantics_text(m.get('semantics'))}: "
             f"{_fmt_bucket_row(m)}; harness total "
             f"{_fmt_tokens(m['tokens'], m.get('unknown_tokens') or 0)}.")
     if models:
@@ -542,9 +554,8 @@ def render(summary: dict, target: str | None = None) -> str:
                                 ('tool_calls', 'mcp_results', 'reads', 'file_changes', 'failed_tool_results'))
             lines.append(f"| {_safe_field(phase['phase'])} | {counts} |")
     lines += _price_evidence_lines(summary)
-    lines += ["", "</details>", "",
-              "<sub>Local measurement from native records; usage totals are not billing. "
-              "Updated in place by `agent-observer publish`.</sub>"]
+    lines += ["", "<sub>Local measurement from native records; usage totals are not billing. "
+              "Updated in place by `agent-observer publish`.</sub>", "", "</details>"]
     return "\n".join(lines) + "\n"
 
 
