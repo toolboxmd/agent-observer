@@ -147,9 +147,45 @@ class SourcedCostTest(CloseLoopCase):
         self.assertAlmostEqual(
             pub["summary"]["estimated_cost"]["estimated_cost_usd_total"],
             0.0073, places=6)
-        self.assertIn("partial", pub["body"])
-        self.assertIn("Complete total", pub["body"])
+        self.assertIn("**Estimated cost $0.01**", pub["body"])
+        self.assertNotIn("at least", pub["body"])
         self.assertIn("example.com", pub["body"])
+
+    def test_headline_is_one_total_including_the_whole_shared_pool(self):
+        self.assertEqual(run(self.db, "sync", "--source", self.mini).returncode, 0)
+        for task in ("T-A", "T-S"):
+            self.assertEqual(
+                run(self.db, "capture", "create-task", "--task", task).returncode, 0)
+        self.assertEqual(run(self.db, "capture", "assign", "--task", "T-A",
+                             "--submission", "msg-mini-sub-01").returncode, 0)
+        for task in ("T-A", "T-S"):
+            self.assertEqual(run(self.db, "capture", "assign", "--task", task,
+                                 "--submission", "msg-mini-sub-02",
+                                 "--shared").returncode, 0)
+        a = self._task_json("T-A", "--prices", self.prices)
+        own = a["estimated_cost"]["estimated_cost_usd_total"]
+        pool = a["estimated_cost_shared"]["estimated_cost_usd_total"]
+        self.assertGreater(own, 0)
+        self.assertGreater(pool, 0)
+        # One total: own usage plus the whole pool, never a split share.
+        total = a["total_cost"]
+        self.assertAlmostEqual(total["usd"], own + pool, places=9)
+        self.assertEqual(total["status"], "complete")
+        self.assertEqual(total["shared_with_tasks"], ["T-S"])
+        body = self._publish_json("T-A", "--prices", self.prices)["body"]
+        self.assertIn(f"**Estimated cost {total['text']}**", body)
+        self.assertIn("The total includes work shared with 1 other task,", body)
+        self.assertNotIn("own +", body)
+        self.assertNotIn("shared pool", body)
+        # A shared-only task leads with the pool, never $0.00.
+        s = self._task_json("T-S", "--prices", self.prices)
+        self.assertEqual(s["attributed"]["responses"], 0)
+        self.assertAlmostEqual(s["total_cost"]["usd"], pool, places=9)
+        shared_body = self._publish_json("T-S", "--prices", self.prices)["body"]
+        self.assertNotIn("$0.00", shared_body)
+        text = run(self.db, "task", "show", "--task", "T-S", "--prices", self.prices)
+        self.assertIn(f"estimated cost: {s['total_cost']['text']} (includes work "
+                      "shared with 1 other task,", text.stdout)
 
     def test_partial_when_cached_rate_missing(self):
         partial = os.path.join(self.tmp.name, "partial.json")
@@ -168,7 +204,8 @@ class SourcedCostTest(CloseLoopCase):
         self.assertAlmostEqual(est["estimated_cost_usd_partial"], 0.0028, places=6)
         self.assertFalse(est["complete"])
         pub = self._publish_json("T-A", "--prices", partial)
-        self.assertIn("No complete total", pub["body"])
+        self.assertIn("**Estimated cost at least under $0.01**", pub["body"])
+        self.assertIn("1 unpriced response", pub["body"])
         self.assertIn("unknown", pub["body"].lower())
 
     def test_unknown_model_and_semantics_stay_unknown(self):
@@ -341,7 +378,7 @@ class TaskScopeEvidenceTest(CloseLoopCase):
         self.assertEqual(a["acceptance_state"], "unknown")
         self.assertIsNone(a["outcome"])
         pub = self._publish_json("T-A")
-        self.assertIn("Acceptance: unknown", pub["body"])
+        self.assertIn("outcome unknown", pub["body"])
         # A successful attempt never implies acceptance.
         self.assertEqual(run(self.db, "capture", "attempt", "--task", "T-A",
                              "--turn", "codex:turn-mini-aaa", "--role", "parent",
@@ -402,7 +439,7 @@ class TaskScopeEvidenceTest(CloseLoopCase):
             self.assertNotIn(secret, body)
         # Native cost stays separate from the list-price estimate and
         # subscription readings are never posted as spend.
-        self.assertIn("Native harness-reported cost", body)
+        self.assertIn("Harness-reported cost", body)
         self.assertIn("Subscription spending is separate", body)
         local = self._task_json("T-A", "--prices", self.prices)
         self.assertIn("native_cost", local)

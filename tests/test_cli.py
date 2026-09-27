@@ -102,7 +102,12 @@ class CliTest(unittest.TestCase):
         self.assertEqual(published["summary"]["usage"]["total_tokens"], 0)
         self.assertEqual(published["summary"]["shared_tokens"], 3350)
         self.assertEqual(published["summary"]["models"], [])
-        self.assertIn("Shared with other tasks and not divided", published["body"])
+        # Shared-only usage is counted whole in the total, never shown as zero.
+        self.assertIn("The total includes work shared with 1 other task,", published["body"])
+        self.assertNotIn("$0.00", published["body"])
+        total = published["summary"]["total_cost"]
+        self.assertEqual(total["shared_responses"], total["responses"])
+        self.assertEqual(total["shared_with_tasks"], ["T-B"])
 
     def test_runtime_never_touches_ccusage(self):
         import re
@@ -240,7 +245,7 @@ class PublishDryRunJsonTest(unittest.TestCase):
         self.assertEqual(payload["summary"]["sessions"], 1)
         self.assertIn("usage", payload["summary"])
         self.assertIn("body", payload)
-        self.assertIn("Agent Observer", payload["body"])
+        self.assertIn("### Agent work", payload["body"])
 
     def test_dry_run_without_json_stays_markdown(self):
         r = run(self.db, "sync", "--source", self.mini)
@@ -248,7 +253,7 @@ class PublishDryRunJsonTest(unittest.TestCase):
         session = self._session()
         r = run(self.db, "publish", "--session", session, "--dry-run")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("Agent Observer", r.stdout)
+        self.assertIn("### Agent work", r.stdout)
         with self.assertRaises(ValueError):
             json.loads(r.stdout)
 

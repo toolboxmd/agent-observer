@@ -191,7 +191,11 @@ are counted separately and excluded from useful-work comparisons.
   candidate, proof, repairs and corrections; attempts; dispatches; active
   work; snapshot identity with source cutoff and measured set; task-scoped
   diagnostics and time with session context labeled; native cost and
-  sourced estimate with coverage. Exit 3 when
+  sourced estimate with coverage. `total_cost` states one estimated
+  total for the task's work: its own usage plus the whole shared pool,
+  never a divided share, with `shared_with_tasks` naming the other tasks
+  that count the same pool (sums across tasks overlap by it). Text
+  output leads with it. Exit 3 when
   missing, conflicting or wholly unbound ownership exists: a task whose
   sessions hold measured responses but nothing attributed or shared
   reports those sessions as `unbound_usage` instead of a silent
@@ -200,7 +204,11 @@ are counted separately and excluded from useful-work comparisons.
   render or post the summary comment; `--dry-run` prints the comment
   without posting, and `--dry-run --json` prints a JSON payload with the
   same summary data, the rendered body, and an explicit target naming the
-  task or sessions plus any repo, PR or commit. Task summaries carry the
+  task or sessions plus any repo, PR or commit. The body leads with a
+  title, one headline (the `total_cost` total, responses, sessions, wall
+  time), a per-model table and one flags line from existing diagnostics
+  and coverage gaps; snapshot, prices, coverage, counter semantics and
+  reconciliation sit in one collapsed details block. Task summaries carry the
   same usage, models, shared rows, outcome, coverage, scope, diagnostics,
   measured set, snapshot and cost as task JSON. Session summaries name
   their limited scope and carry no task outcome.

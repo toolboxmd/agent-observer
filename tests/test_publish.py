@@ -78,7 +78,7 @@ class PublishTest(LedgerCase):
         body = publish.render(publish.summarize(self.con, {"claude:s1"}, "task T"))
         self.assertTrue(body.startswith(publish.MARKER))
         self.assertIn("1 session on claude", body)
-        self.assertIn("| claude | claude-fable-5-1 | unknown | 1 | 1,234 |", body)
+        self.assertIn("| claude-fable-5-1 (claude) | 1 | 1,234 |", body)
         self.assertIn("AgentsMD 12.1.0", body)
 
     def test_render_marks_unknown_counters_honestly(self):
@@ -86,10 +86,14 @@ class PublishTest(LedgerCase):
             "INSERT INTO responses(response_id, source_id, harness, session_key,"
             " model, total_tokens, semantics) VALUES('claude:m2', 1, 'claude',"
             " 'claude:s1', NULL, NULL, 'claude:x')")
+        self.con.execute(
+            "INSERT INTO responses(response_id, source_id, harness, session_key,"
+            " model, total_tokens, semantics) VALUES('claude:m3', 1, 'claude',"
+            " 'claude:s1', 'claude-fable-5-1', NULL, 'claude:x')")
         self.con.commit()
         body = publish.render(publish.summarize(self.con, {"claude:s1"}, "task T"))
-        self.assertIn("unknown", body)
-        self.assertIn("lower bound", body)
+        self.assertIn("| unknown (claude) | 1 | unknown |", body)
+        self.assertIn("| claude-fable-5-1 (claude) | 2 | >=1,234 (lower bound) |", body)
 
     def test_second_publish_edits_the_same_owned_comment(self):
         gh = PublishGh([])
@@ -167,14 +171,6 @@ class PublishTest(LedgerCase):
         self.assertEqual(gh.patched, [20001])
         self.assertEqual(len(gh.posted), 0)
 
-    def test_shared_unknown_total_with_unknown_count_renders(self):
-        summary = publish.summarize(self.con, {"claude:s1"}, "task T")
-        summary["shared_tokens"] = None
-        summary["shared_tokens_unknown"] = 2
-        body = publish.render(summary)
-        self.assertIn("Shared with other tasks and not divided", body)
-        self.assertIn("unknown", body)
-
     def test_target_must_be_exactly_one(self):
         with self.assertRaises(ValueError):
             publish.post("o/r", "b")
@@ -211,6 +207,9 @@ class PublishTest(LedgerCase):
                  "source_url": other_local, "basis": None},
             ],
         }
+        # Per-model sources render from the task's total estimate.
+        summary["total_cost"] = {"text": "$0.00", "responses": 2, "models": [],
+                                 "estimate": summary["estimated_cost"]}
         body = publish.render(summary)
         self.assertNotIn("file://", body)
         self.assertNotIn("redacted-home", body)
