@@ -65,18 +65,19 @@ def _safe_source(value) -> str:
     """A publishable price-source label; local paths never leave the machine.
 
     Public http(s) schedule and model sources render unchanged
-    (Markdown-escaped). A file:// source, the T3 local rate table or any
-    caller-supplied local schedule, renders as a stable label naming the
-    kind with the path withheld, so a requested publish cannot expose a
+    (Markdown-escaped). Every other value, a file:// URI or a raw path such
+    as the bundled fallback, renders as a stable label naming the kind with
+    the path withheld, so a requested publish cannot expose a
     home-directory path. The T3 table is recognized by its fixed filename;
-    every other local file stays a generic local schedule.
+    every other local source stays a generic local schedule.
     """
-    if isinstance(value, str) and value.startswith("file://"):
-        remainder = value[len("file://"):]
-        if remainder.endswith("usage-model-rates.json"):
-            return "T3 local rate table (path withheld)"
-        return "local schedule (path withheld)"
-    return _safe_field(value)
+    if value is None or value == "":
+        return "unknown"
+    if isinstance(value, str) and value.startswith(("https://", "http://")):
+        return _safe_field(value)
+    if isinstance(value, str) and value.endswith("usage-model-rates.json"):
+        return "T3 local rate table (path withheld)"
+    return "local schedule (path withheld)"
 
 
 def _safe_ref(value) -> str | None:
@@ -422,7 +423,7 @@ def render(summary: dict) -> str:
                     f"| {model['priced_responses']}/{model['responses']} "
                     f"| {_fmt_cost(model['estimated_cost_usd_partial'] if model['priced_responses'] else None)} "
                     f"| {_fmt_cost(model['estimated_cost_usd'])} "
-                     f"| {_safe_source(model.get('source_url'))} |")
+                    f"| {_safe_source(model.get('source_url'))} |")
             for basis in sorted({m['basis'] for m in est.get('by_model', []) if m.get('basis')}):
                 lines.append(_safe_field(basis))
             lines += _price_evidence_lines(summary)

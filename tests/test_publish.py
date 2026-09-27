@@ -2,7 +2,7 @@
 
 from unittest import mock
 
-from agent_observer import db, publish
+from agent_observer import db, pricing, publish
 from tests.helpers import LedgerCase
 
 ME = "observer-bot"
@@ -241,3 +241,21 @@ class PublishTest(LedgerCase):
         }
         body = publish.render(summary)
         self.assertIn("https://example.com/pricing", body)
+
+    def test_raw_fallback_schedule_path_is_withheld(self):
+        # Bundled schedule unusable and no T3 rate table: default_schedule
+        # falls back to the raw bundled path, which must not be published.
+        self.con.execute(
+            "INSERT INTO tasks(task_id, project, title, created_at)"
+            " VALUES('T','p','T','2026-09-27')")
+        missing_home = f"{self.tmp.name}/no-t3"
+        with mock.patch.dict("os.environ", {"T3CODE_HOME": missing_home}), \
+                mock.patch.object(pricing, "load_schedule",
+                                  side_effect=ValueError("invalid")):
+            summary = publish.summarize(self.con, set(), "task T", task_id="T")
+        self.assertEqual(summary["estimated_cost"]["schedule_source"],
+                         pricing.DEFAULT_SCHEDULE_PATH)
+        body = publish.render(summary)
+        self.assertNotIn(pricing.DEFAULT_SCHEDULE_PATH, body)
+        self.assertNotIn("prices.json", body)
+        self.assertIn("local schedule (path withheld)", body)
