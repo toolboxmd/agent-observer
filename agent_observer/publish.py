@@ -46,9 +46,9 @@ def _safe_field(value) -> str:
     cannot break the table or inject markup. Newlines collapse to spaces.
     Underscores and other emphasis marks in closed-vocabulary identifiers
     (counter semantics, detector names) are preserved so existing aggregate
-    contracts keep their exact strings. Local paths and excerpts never
-    reach here: only aggregates, identifiers and validated references are
-    rendered.
+    contracts keep their exact strings. Price sources are routed through
+    _safe_source first: only aggregates, identifiers and validated
+    references are rendered, and local file paths never reach the body.
     """
     if value is None:
         return "unknown"
@@ -59,6 +59,24 @@ def _safe_field(value) -> str:
     text = text.replace("|", "\\|").replace("`", "\\`")
     text = " ".join(text.split())
     return text[:200] or "unknown"
+
+
+def _safe_source(value) -> str:
+    """A publishable price-source label; local paths never leave the machine.
+
+    Public http(s) schedule and model sources render unchanged
+    (Markdown-escaped). A file:// source, the T3 local rate table or any
+    caller-supplied local schedule, renders as a stable label naming the
+    kind with the path withheld, so a requested publish cannot expose a
+    home-directory path. The T3 table is recognized by its fixed filename;
+    every other local file stays a generic local schedule.
+    """
+    if isinstance(value, str) and value.startswith("file://"):
+        remainder = value[len("file://"):]
+        if remainder.endswith("usage-model-rates.json"):
+            return "T3 local rate table (path withheld)"
+        return "local schedule (path withheld)"
+    return _safe_field(value)
 
 
 def _safe_ref(value) -> str | None:
@@ -381,7 +399,7 @@ def render(summary: dict) -> str:
     if summary.get("scope_kind") == "task":
         est = summary.get("estimated_cost") or {}
         if est.get("schedule_source"):
-            lines += ["", f"Estimated list-price cost ({_safe_field(est.get('schedule_source'))} "
+            lines += ["", f"Estimated list-price cost ({_safe_source(est.get('schedule_source'))} "
                       f"as of {_safe_field(est.get('schedule_as_of'))}): "
                       f"partial {_fmt_cost(est.get('estimated_cost_usd_partial'))} "
                       f"over {est.get('priced_responses', 0)}/{est.get('responses', 0)} priced responses."]
@@ -404,7 +422,7 @@ def render(summary: dict) -> str:
                     f"| {model['priced_responses']}/{model['responses']} "
                     f"| {_fmt_cost(model['estimated_cost_usd_partial'] if model['priced_responses'] else None)} "
                     f"| {_fmt_cost(model['estimated_cost_usd'])} "
-                    f"| {_safe_field(model.get('source_url'))} |")
+                     f"| {_safe_source(model.get('source_url'))} |")
             for basis in sorted({m['basis'] for m in est.get('by_model', []) if m.get('basis')}):
                 lines.append(_safe_field(basis))
             lines += _price_evidence_lines(summary)
