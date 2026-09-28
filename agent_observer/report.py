@@ -539,7 +539,8 @@ def task_report(con: sqlite3.Connection, task_id: str,
     snapshot = _snapshot_id(snapshot_payload)
     estimated = _pricing.price_scope(attributed, schedule)
     shared_estimated = _pricing.price_scope(shared, schedule)
-    for estimate in (estimated, shared_estimated):
+    total_estimated = _pricing.price_scope(attributed + shared, schedule)
+    for estimate in (estimated, shared_estimated, total_estimated):
         estimate["status"] = ("complete" if estimate["complete"] else
                               "partial" if estimate["priced_responses"] else "unknown")
         if unavailable_usage:
@@ -664,7 +665,67 @@ def task_report(con: sqlite3.Connection, task_id: str,
                           and not report["has_active_work"])
     report["coverage"]["reconciles"] = report["reconciles"]
     report["coverage"]["complete"] = report["complete"]
+    report["total_cost"] = _total_cost(
+        con, task_id, total_estimated, attributed, shared, joint, whole)
     return report
+
+
+def _money(estimate: dict) -> str:
+    """One estimate as money: exact when complete, a floor when partial."""
+    value = estimate.get("estimated_cost_usd_total")
+    if value is None:
+        if not estimate.get("priced_responses"):
+            return "unknown"
+        value = estimate.get("estimated_cost_usd_partial") or 0.0
+        prefix = "at least "
+    else:
+        prefix = ""
+    text = "under $0.01" if 0 < value < 0.005 else f"${value:,.2f}"
+    return prefix + text
+
+
+def _total_cost(con, task_id, estimate, attributed, shared, joint,
+                whole) -> dict:
+    """One total for the task's work: its own usage plus the whole shared pool.
+
+    Shared usage is never divided, so every task drawing on a pool counts
+    it whole: the total is right for one task, and sums across tasks
+    overlap by the shared part. ``shared_with_tasks`` names those tasks.
+    """
+    turn_sub = _turn_submission(con)
+    others: set = set()
+    seen_sessions: set = set()
+    for r in shared:
+        key = r["session_key"]
+        if key not in seen_sessions:
+            # Whole-session owners, and prompt owners that conflict with them.
+            seen_sessions.add(key)
+            for row in con.execute(
+                    "SELECT task_id FROM session_assignments WHERE session_key=?"
+                    " UNION SELECT a.task_id FROM assignments a JOIN submissions s"
+                    " ON a.submission_native_id=s.native_id WHERE s.session_key=?"
+                    " AND ? IN (SELECT session_key FROM session_assignments)",
+                    (key, key, key)):
+                others.add(row["task_id"])
+        sub = turn_sub.get(r.get("turn_id"))
+        if key not in whole and sub in joint:
+            others.update(joint[sub]["tasks"])
+    others.discard(task_id)
+    # Nothing priced is unknown, even when missing usage marks the estimate
+    # partial: an empty subtotal must never read as a numeric zero.
+    status = estimate["status"] if estimate.get("priced_responses") else "unknown"
+    return {
+        "text": _money(estimate),
+        "usd": estimate.get("estimated_cost_usd_total") if status == "complete"
+        else estimate.get("estimated_cost_usd_partial") if status == "partial"
+        else None,
+        "status": status,
+        "responses": len(attributed) + len(shared),
+        "shared_responses": len(shared),
+        "shared_with_tasks": sorted(others),
+        "models": model_usage(attributed + shared),
+        "estimate": estimate,
+    }
 
 
 def timeline(con: sqlite3.Connection, task_id: str | None = None,

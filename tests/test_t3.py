@@ -424,7 +424,7 @@ class T3SyncTest(LedgerCase):
         self.assertEqual(thread_root(T1), T1)
         self.assertEqual(thread_root(SUB), T1)
         self.assertEqual(thread_root(NESTED), T1)
-        self.assertEqual(thread_root("import:codex:01a0d264-x"), 
+        self.assertEqual(thread_root("import:codex:01a0d264-x"),
                          "import:codex:01a0d264-x")
 
 

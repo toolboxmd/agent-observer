@@ -107,6 +107,11 @@ def _text(payload) -> str:
         r = payload
         lines = [
             f"task {r['task']['task_id']}: {r['task'].get('title') or ''}",
+            f"  estimated cost: {(r.get('total_cost') or {}).get('text') or 'unknown'}"
+            + (f" (includes work shared with {len(r['total_cost']['shared_with_tasks'])}"
+               f" other task{'' if len(r['total_cost']['shared_with_tasks']) == 1 else 's'},"
+               " counted whole; sums across tasks overlap)"
+               if (r.get('total_cost') or {}).get('shared_responses') else ""),
             f"  attributed responses: {r['attributed']['responses']} "
             f"total={_fmt_section_total(r['attributed'])}",
             f"  shared joint responses: {r['shared_joint']['responses']} "
@@ -692,7 +697,8 @@ def _publish(con, ns) -> int:
     except KeyError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    body = _publish_mod.render(summary)
+    body = _publish_mod.render(
+        summary, "pr" if ns.pr is not None else "commit" if ns.commit else None)
     if ns.dry_run:
         if ns.as_json:
             # Structured dry run: the same summary data plus an explicit

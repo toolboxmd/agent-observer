@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from datetime import datetime, timezone
 
 from . import analysis, report
 
@@ -211,6 +212,7 @@ def summarize(con, session_keys: set, label: str, task_id: str | None = None,
             "native_cost_shared": rep["native_cost_shared"],
             "estimated_cost": rep["estimated_cost"],
             "estimated_cost_shared": rep["estimated_cost_shared"],
+            "total_cost": rep["total_cost"],
             "subscription_note": rep["subscription_note"],
         })
     else:
@@ -242,13 +244,19 @@ def _fmt_bucket_row(model: dict) -> str:
     return "; ".join(parts)
 
 
+def _fmt_rate(rate) -> str:
+    """A rate without float noise (0.19999999999999998 renders as 0.2)."""
+    if isinstance(rate, (int, float)) and not isinstance(rate, bool):
+        return f"{rate:.6g}"
+    return _safe_field(rate)
+
+
 def _price_evidence_lines(summary: dict) -> list[str]:
     """Render numeric rates for reported models, never arbitrary schedule metadata."""
     schedule = summary.get("price_schedule")
     if not schedule:
         return []
-    lines = ["", f"Price schedule `{_safe_field(summary.get('price_schedule_id'))}`.",
-             "", "<details>", "<summary>Selected rates (USD per million tokens)</summary>", "",
+    lines = ["", "Selected rates (USD per million tokens). "
              "These rates value the report at the selected schedule date; "
              "they do not establish historical prices or subscription spending.", "",
              "| Model | Input tier | Input | Cache read | Cache write | Other output | Reasoning |",
@@ -266,233 +274,288 @@ def _price_evidence_lines(summary: dict) -> list[str]:
                            "output_tokens", "reasoning_output_tokens"):
                 rate = rates.get(bucket)
                 if isinstance(rate, dict):
-                    rate = "; ".join(f"{ttl}: {_safe_field(rate.get(ttl))}" for ttl in ("5m", "1h"))
-                cells.append(_safe_field(rate))
+                    rate = "; ".join(f"{ttl}: {_fmt_rate(rate.get(ttl))}" for ttl in ("5m", "1h"))
+                cells.append(_fmt_rate(rate))
             lines.append(f"| {_safe_field(model)} | {_safe_field(tier)} | " + " | ".join(cells) + " |")
     lines += ["", "Other output and reasoning are priced without double counting "
-              "inclusive native output. Missing rates remain unknown.", "", "</details>"]
+              "inclusive native output. Missing rates remain unknown."]
     return lines
 
 
-def render(summary: dict) -> str:
+FLAG_PHRASES = {
+    "repeated_read": ("repeated read", "repeated reads"),
+    "repeated_skill_load": ("repeated skill load", "repeated skill loads"),
+    "repeated_command": ("repeated command", "repeated commands"),
+    "repeated_failure": ("repeated failure", "repeated failures"),
+    "test_edit_after_failure": ("test edited after a failure", "tests edited after a failure"),
+    "permission_seeking": ("permission request", "permission requests"),
+    "human_correction": ("human correction", "human corrections"),
+    "large_tool_output": ("large tool output", "large tool outputs"),
+}
+
+
+def _counted(n: int, singular: str, plural: str) -> str:
+    return f"{n:,} {singular if n == 1 else plural}"
+
+
+def _incident(detector: str, n: int) -> str:
+    fallback = _safe_field(detector.replace("_", " "))
+    return _counted(n, *FLAG_PHRASES.get(detector, (fallback, fallback)))
+
+
+def _fmt_duration(seconds) -> str | None:
+    if seconds is None:
+        return None
+    seconds = float(seconds)
+    if seconds < 120:
+        return f"{seconds:.0f} s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.1f} h"
+
+
+def _model_cell(m: dict) -> str:
+    detail = _safe_field(m.get("harness"))
+    if m.get("effort") and m.get("effort") != "unknown":
+        detail += f", {_safe_field(m['effort'])}"
+    return f"{_safe_field(m.get('model') or 'unknown')} ({detail})"
+
+
+def _model_cost(m: dict, estimate: dict) -> str:
+    key = (m.get("harness"), m.get("model"), m.get("effort"), m.get("semantics"))
+    for row in (estimate or {}).get("by_model", []):
+        if (row.get("harness"), row.get("model"), row.get("effort"),
+                row.get("semantics")) == key:
+            return report._money({
+                "estimated_cost_usd_total": row.get("estimated_cost_usd"),
+                "estimated_cost_usd_partial": row.get("estimated_cost_usd_partial"),
+                "priced_responses": row.get("priced_responses")})
+    return "unknown"
+
+
+def _flags(summary: dict) -> list[str]:
+    """Short counted phrases from existing diagnostics and coverage gaps."""
+    flags = [_incident(k, n) for k, n in sorted(summary.get("incidents", {}).items()) if n]
+    if summary.get("scope_kind") != "task":
+        return flags
+    gaps = summary.get("coverage") or {}
+    unpriced = ((summary.get("total_cost") or {}).get("estimate") or {}).get(
+        "unpriced_responses", 0)
+    if gaps.get("no_measured_sessions"):
+        flags.append("no measured sessions")
+    for count, singular, plural in (
+            (len(gaps.get("conflicting_sessions") or []),
+             "session with conflicting ownership", "sessions with conflicting ownership"),
+            (len(summary.get("missing_assignments") or []),
+             "prompt without an owner", "prompts without an owner"),
+            (len(summary.get("conflicting_assignments") or []),
+             "conflicting ownership binding", "conflicting ownership bindings"),
+            (len(gaps.get("unbound_usage") or []),
+             "session with usage bound to no task", "sessions with usage bound to no task"),
+            (len(gaps.get("missing_sessions") or []),
+             "missing session record", "missing session records"),
+            (len(gaps.get("sessions_without_usage") or []),
+             "session without usage records", "sessions without usage records"),
+            (len(gaps.get("unbound_worker_sessions") or []),
+             "worker session without an owner", "worker sessions without an owner"),
+            (len(gaps.get("unbound_dispatches") or []),
+             "dispatch without a worker", "dispatches without a worker"),
+            (summary.get("crashes_counted_separately") or 0, "crashed run", "crashed runs"),
+            ((summary.get("unassigned_in_scope") or {}).get("responses", 0),
+             "unassigned response", "unassigned responses"),
+            (unpriced or 0, "unpriced response", "unpriced responses")):
+        if count:
+            flags.append(_counted(count, singular, plural))
+    if summary.get("has_active_work"):
+        flags.append("work still active")
+    if summary.get("reconciles") is False:
+        flags.append("totals do not reconcile")
+    return flags
+
+
+def _semantics_text(semantics) -> str:
+    """Counter semantics in words: `codex:input_includes_cached,...` reads
+    as "codex counters: input includes cached, ..."."""
+    if not semantics:
+        return "unknown counters"
+    harness, _, rest = str(semantics).partition(":")
+    words = ", ".join(p.replace("_", " ") for p in rest.split(",") if p)
+    return _safe_field(f"{harness} counters: {words}" if words else f"{harness} counters")
+
+
+def _yes(value) -> str:
+    return "yes" if value else "no"
+
+
+def render(summary: dict, target: str | None = None) -> str:
+    """The published comment: a glanceable summary, evidence collapsed.
+
+    Visible: title, one headline (cost, responses, sessions, wall time), a
+    per-model table and one flags line. Snapshot, prices, coverage, counter
+    semantics and reconciliation sit in one collapsed details block.
+    """
     u = summary["usage"]
-    label = _safe_field(summary['label'])
-    harnesses = ", ".join(_safe_field(h) for h in summary['harnesses']) or "no harness"
-    versions = ", ".join(_safe_field(v) for v in summary['agentsmd_versions']) or "unknown"
-    span_note = ""
-    if summary.get("scope_kind") == "task":
-        source = summary.get("span_source") or ""
-        if summary.get("span_s") is None:
-            span_note = f" (task time {source}; session span {_fmt(summary.get('session_span_s'))} s, session context)"
-        elif "task" in source:
-            span_note = " (task turns)"
-        else:
-            span_note = f" ({_safe_field(source)})"
-    lines = [MARKER, f"### Agent Observer: {label}", "",
-             f"{summary['sessions']} session{'s' if summary['sessions'] != 1 else ''} on "
-             f"{harnesses}; "
-             f"AgentsMD {versions}; "
-             f"span {_fmt(summary['span_s'])} s{span_note}.", ""]
-    if summary.get("scope_kind") == "session":
+    task = summary.get("scope_kind") == "task"
+    title = {"pr": "Agent work on this PR",
+             "commit": "Agent work on this commit"}.get(target, "Agent work")
+    total = summary.get("total_cost") or {}
+    # A task's own and shared usage render as one set of rows: shared
+    # usage is counted whole here and never split.
+    models = total.get("models", []) if task else summary["models"]
+    sessions = summary["sessions"]
+    responses = total.get("responses", 0) if task else u.get("responses", 0)
+    wall = _fmt_duration(summary.get("span_s"))
+    if wall and "task" not in (summary.get("span_source") or ""):
+        wall += " wall time (whole sessions)"
+    elif wall:
+        wall += " wall time"
+    else:
+        span = _fmt_duration(summary.get("session_span_s"))
+        wall = f"{span} wall time (whole sessions)" if span else "wall time unknown"
+    parts = []
+    if task:
+        parts.append(f"**Estimated cost {_safe_field(total.get('text') or 'unknown')}**")
+    parts += [_counted(responses, "response", "responses"),
+              _counted(sessions, "session", "sessions"), wall]
+    lines = [MARKER, f"### {title}", "", " · ".join(parts), ""]
+    if not task:
         lines += [f"_{_safe_field(summary.get('session_note') or 'Session scope only.')} "
                   f"Finished processes never imply an accepted task outcome._", ""]
-    sems = {m.get("semantics") for m in summary["models"]}
-    if len(sems) > 1:
-        lines += ["| Harness | Model | Effort | Semantics | Responses | Tokens |",
-                  "| --- | --- | --- | --- | ---: | ---: |"]
-        for m in summary["models"]:
-            lines.append(
-                f"| {_safe_field(m['harness'])} | {_safe_field(m['model'] or 'unknown')} | {_safe_field(m['effort'] or 'unknown')} "
-                f"| {_safe_field(m.get('semantics') or 'unknown')} "
-                f"| {m['responses']} | {_fmt_tokens(m['tokens'], m.get('unknown_tokens') or 0)} |")
-    else:
-        lines += ["| Harness | Model | Effort | Responses | Tokens |",
-                  "| --- | --- | --- | ---: | ---: |"]
-        for m in summary["models"]:
-            lines.append(
-                f"| {_safe_field(m['harness'])} | {_safe_field(m['model'] or 'unknown')} | {_safe_field(m['effort'] or 'unknown')} "
-                f"| {m['responses']} | {_fmt_tokens(m['tokens'], m.get('unknown_tokens') or 0)} |")
-    if summary["models"]:
-        lines += ["", "Generated tokens (reasoning and other output are disjoint):",
-                  "| Model / harness | Effort | Reasoning | Other output | Reasoning share | Split coverage |",
-                  "| --- | --- | ---: | ---: | ---: | ---: |"]
-        for m in summary["models"]:
+    cost_col = task
+    lines += ["| Model | Responses | Tokens |" + (" Estimated cost |" if cost_col else ""),
+              "| --- | ---: | ---: |" + (" ---: |" if cost_col else "")]
+    for m in models:
+        row = (f"| {_model_cell(m)} | {m['responses']:,} "
+               f"| {_fmt_tokens(m['tokens'], m.get('unknown_tokens') or 0)} |")
+        if cost_col:
+            row += f" {_model_cost(m, total.get('estimate'))} |"
+        lines.append(row)
+    flags = _flags(summary)
+    lines += ["", ("Flags: " + " · ".join(flags)) if flags else "No flags", ""]
+    lines += ["<details>", "<summary>Details: snapshot, prices, coverage, counters</summary>", ""]
+    harnesses = ", ".join(_safe_field(h) for h in summary['harnesses']) or "no harness"
+    versions = ", ".join(_safe_field(v) for v in summary['agentsmd_versions']) or "unknown"
+    if task:
+        acceptance = summary.get("acceptance_state") or "unknown"
+        lines.append(f"- Task `{_safe_field(summary.get('task_id'))}`: outcome "
+                     f"{_safe_field(acceptance)} (recorded acceptance only; a finished "
+                     f"process never implies it).")
+        outcome = summary.get("outcome") or {}
+        for key, name in (("candidate", "Candidate"), ("proof_ref", "Proof"),
+                          ("repairs", "Repairs"), ("corrections", "Corrections")):
+            ref = _safe_ref(outcome.get(key))
+            if ref is not None:
+                lines.append(f"- {name}: {ref}")
+            elif outcome.get(key):
+                lines.append(f"- {name}: [withheld: free-form reference not published]")
+        cutoff = summary.get("source_cutoff")
+        when = (datetime.fromtimestamp(cutoff, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                if isinstance(cutoff, (int, float)) else "unknown")
+        lines.append(f"- Snapshot `{_safe_field(summary.get('snapshot_id'))}`, "
+                     f"records up to {when}.")
+    lines.append(f"- {sessions} session{'s' if sessions != 1 else ''} on {harnesses}; "
+                 f"AgentsMD {versions}.")
+    if task:
+        n_other = len(total.get("shared_with_tasks") or [])
+        if total.get("shared_responses"):
+            lines.append(f"- The total includes work shared with {n_other} other "
+                         f"task{'s' if n_other != 1 else ''}, counted whole in each, "
+                         f"so sums across PRs overlap.")
+        unassigned = (summary.get("unassigned_in_scope") or {}).get("responses", 0)
+        if unassigned:
+            lines.append(f"- {unassigned:,} responses in these sessions belong to no "
+                         f"task and are not counted.")
+        lines.append(f"- Totals reconcile with the measured sessions: "
+                     f"{_yes(summary.get('reconciles'))}. Evidence complete: "
+                     f"{_yes(summary.get('complete'))}.")
+        if summary.get("has_active_work"):
+            lines.append("- Active work remains visible; reconciled totals alone are "
+                         "not completion.")
+        est = summary.get("estimated_cost") or {}
+        if est.get("schedule_source"):
+            lines.append(f"- Prices: list-price estimate from "
+                         f"{_safe_source(est.get('schedule_source'))} as of "
+                         f"{_safe_field(est.get('schedule_as_of'))}, schedule "
+                         f"`{_safe_field(summary.get('price_schedule_id'))}`. "
+                         f"Unknown prices stay unknown, never zero.")
+            # Only the schedule-level basis is published; per-model basis
+            # text from a caller's schedule never is (see #30).
+            by_model = (total.get("estimate") or {}).get("by_model", [])
+            lines.append(f"  - {_safe_field(est.get('basis') or 'Standard API list-price equivalent, not subscription spend.')}")
+            sources = {_safe_source(m.get("source_url")) for m in by_model}
+            if sources:
+                lines.append(f"  - Model price sources: {', '.join(sorted(sources))}.")
+            for reason, count in sorted(
+                    ((total.get("estimate") or {}).get("unpriced_reasons") or {}).items()):
+                lines.append(f"  - Unpriced: {_safe_field(reason)} ({count}).")
+        else:
+            lines.append("- Prices: no sourced price schedule, so the estimate is unknown.")
+        if est.get("coverage_note"):
+            lines.append(f"- {_safe_field(est['coverage_note'])}.")
+        natives = [summary.get("native_cost") or {}, summary.get("native_cost_shared") or {}]
+        known = sum(n.get("known_responses", 0) or 0 for n in natives)
+        if not known:
+            lines.append("- Harness-reported cost: none reported.")
+        else:
+            subtotal = sum(n.get("known_subtotal_usd") or 0.0 for n in natives
+                           if n.get("known_responses"))
+            unknown = sum(n.get("unknown_responses", 0) or 0 for n in natives)
+            lines.append(f"- Harness-reported cost (separate from the estimate): "
+                         f"{_fmt_cost(subtotal)} over {known:,} responses"
+                         + (f"; {unknown:,} responses report none." if unknown else "."))
+        lines.append("- Usage totals are not billing. Subscription spending is "
+                     "separate and is never posted as spend.")
+        lines.append(f"- Crashed runs are counted separately: "
+                     f"{summary.get('crashes_counted_separately') or 0}.")
+    if summary.get("session_context_incidents"):
+        lines.append("- Diagnostics from whole sessions, possibly other work: " + ", ".join(
+            _incident(k, n) for k, n in
+            sorted(summary["session_context_incidents"].items())) + ".")
+    lines += ["", "Token counters by model (native counter semantics; never added "
+              "across semantics):"]
+    for m in models:
+        lines.append(
+            f"- {_model_cell(m)}, {_semantics_text(m.get('semantics'))}: "
+            f"{_fmt_bucket_row(m)}; harness total "
+            f"{_fmt_tokens(m['tokens'], m.get('unknown_tokens') or 0)}.")
+    if models:
+        lines += ["", "Generated tokens (reasoning and other output are disjoint; other "
+                  "output includes code, tool calls and replies):", "",
+                  "| Model | Reasoning | Other output | Reasoning share | Split known for |",
+                  "| --- | ---: | ---: | ---: | ---: |"]
+        for m in models:
             g = m.get("generation") or {}
             share = g.get("reasoning_share")
-            share_text = f"{share:.1%}" if share is not None else "unknown"
-            lines.append(f"| {_safe_field(m['model'])} / {_safe_field(m['harness'])} | {_safe_field(m['effort'])} "
+            lines.append(f"| {_model_cell(m)} "
                          f"| {_fmt_tokens(g.get('reasoning_tokens'), g.get('unknown_responses', 0))} "
                          f"| {_fmt_tokens(g.get('other_output_tokens'), g.get('unknown_responses', 0))} "
-                         f"| {share_text} | {g.get('measured_responses', 0)}/{m['responses']} |")
-        lines.append("Other output includes code, tool calls and replies. Reasoning share uses generated tokens, not input/cache tokens.")
-        lines += ["", "Attributed token buckets by model "
-                  "(native semantics, never added across semantics):"]
-        for m in summary["models"]:
-            lines.append(
-                f"- {_safe_field(m['harness'])}/{_safe_field(m['model'] or 'unknown')}"
-                f" ({_safe_field(m['effort'] or 'unknown')}, "
-                f"{_safe_field(m.get('semantics') or 'unknown')}): "
-                f"{_fmt_bucket_row(m)}; harness total "
-                f"{_fmt_tokens(m['tokens'], m.get('unknown_tokens') or 0)} "
-                f"over {m['responses']} responses.")
+                         f"| {f'{share:.1%}' if share is not None else 'unknown'} "
+                         f"| {g.get('measured_responses', 0):,} of {m['responses']:,} |")
     if summary.get("phases"):
-        lines += ["", "Usage by work phase (explicit ownership; mixed or missing phases stay visible):",
-                  "| Phase | Model / harness | Responses | Input | Cache read | Cache write | Output (native) | Reasoning | Total (native) | Priced subtotal |",
+        lines += ["", "Usage by work phase (this task's own responses):", "",
+                  "| Phase | Model | Responses | Input | Cache read | Cache write | Output | Reasoning | Total | Priced part |",
                   "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
         for phase in summary["phases"]:
             costs = {(m['harness'], m['model'], m['effort'], m['semantics']): m
                      for m in phase['estimated_cost']['by_model']}
             for m in phase["models"]:
-                c = costs.get((m['harness'],m['model'],m['effort'],m['semantics']), {})
+                c = costs.get((m['harness'], m['model'], m['effort'], m['semantics']), {})
                 unknown = m.get('unknown_counts') or {}
                 buckets = " | ".join(_fmt_tokens(m.get(k), unknown.get(k, 0)) for k in report.BUCKETS)
                 cost = _fmt_cost(c.get('estimated_cost_usd_partial') if c.get('priced_responses') else None)
-                lines.append(f"| {_safe_field(phase['phase'])} | {_safe_field(m['model'])} / {_safe_field(m['harness'])} "
-                             f"({_safe_field(m['effort'])}) | {m['responses']} | {buckets} | {cost} |")
-        lines.append("Native semantics match the model rows above. Inclusive output already contains reasoning; do not add it again. Phase costs cover attributed responses only.")
-        lines += ["", "Recorded activity by phase (observations, not separate token bills):",
+                lines.append(f"| {_safe_field(phase['phase'])} | {_model_cell(m)} "
+                             f"| {m['responses']} | {buckets} | {cost} |")
+        lines += ["", "Recorded activity by phase (observations, not separate token bills):", "",
                   "| Phase | Tool calls | MCP results | Reads | File changes | Failed tool results |",
                   "| --- | ---: | ---: | ---: | ---: | ---: |"]
         for phase in summary['phases']:
             a = phase['activity']
             counts = " | ".join(str(a.get(k, 0)) for k in
-                ('tool_calls','mcp_results','reads','file_changes','failed_tool_results'))
+                                ('tool_calls', 'mcp_results', 'reads', 'file_changes', 'failed_tool_results'))
             lines.append(f"| {_safe_field(phase['phase'])} | {counts} |")
-        lines.append("Tool/MCP counters overlap and coverage varies by harness. Their input/output token cost cannot be separated from reused model context without stronger native attribution.")
-        context = summary.get('activity_session_context') or {}
-        if any(context.values()):
-            lines.append("Session-context activity without task/phase ownership (may include unrelated work): "
-                         + ", ".join(f"{k.replace('_', ' ')} {v}" for k,v in context.items()) + ".")
-    if "total_tokens" in u:
-        lines += ["", f"Total tokens {_fmt_tokens(u['total_tokens'], (u.get('unknown_counts') or {}).get('total_tokens', 0))} over {u['responses']} responses "
-                  f"(each harness's own total; cache and reasoning buckets are not added across "
-                  f"harnesses)."]
-    else:
-        # Mixed counter semantics: no top-level total exists and none is
-        # invented; each semantics keeps its own total.
-        parts = [f"{_safe_field(sem)} {_fmt_tokens(b.get('total_tokens'), (b.get('unknown_counts') or {}).get('total_tokens', 0))}"
-                 for sem, b in sorted((u.get("by_semantics") or {}).items())]
-        lines += ["", f"Tokens by counter semantics over {u['responses']} responses "
-                  f"(never added across semantics): {'; '.join(parts) or 'unknown'}."]
-    if summary.get("shared_models"):
-        lines += ["", "Shared model rows (joint usage, kept whole and never "
-                  "divided into the attributed headline):"]
-        for m in summary["shared_models"]:
-            lines.append(
-                f"- {_safe_field(m['harness'])}/{_safe_field(m['model'] or 'unknown')}"
-                f" ({_safe_field(m['effort'] or 'unknown')}, "
-                f"{_safe_field(m.get('semantics') or 'unknown')}): "
-                f"{_fmt_bucket_row(m)}; harness total "
-                f"{_fmt_tokens(m['tokens'], m.get('unknown_tokens') or 0)} "
-                f"over {m['responses']} responses.")
-    if summary.get("shared_by_semantics"):
-        parts = [f"{_safe_field(sem)} {_fmt_tokens(b.get('total_tokens'), (b.get('unknown_counts') or {}).get('total_tokens', 0))}"
-                 for sem, b in sorted(summary["shared_by_semantics"].items())]
-        lines.append("Shared with other tasks and not divided"
-                     f" (by semantics, never added): {'; '.join(parts) or 'unknown'}.")
-    elif summary["shared_tokens"] or summary.get("shared_tokens_unknown"):
-        lines.append(f"Shared with other tasks and not divided: {_fmt_tokens(summary['shared_tokens'], summary.get('shared_tokens_unknown') or 0)} tokens.")
-    unassigned = summary.get("unassigned_in_scope")
-    if isinstance(unassigned, dict) and unassigned.get("responses"):
-        lines.append(
-            f"Unassigned in scope (never task cost): "
-            f"{unassigned.get('responses')} responses.")
-    if summary.get("scope_kind") == "task":
-        est = summary.get("estimated_cost") or {}
-        if est.get("schedule_source"):
-            lines += ["", f"Estimated list-price cost ({_safe_source(est.get('schedule_source'))} "
-                      f"as of {_safe_field(est.get('schedule_as_of'))}): "
-                      f"partial {_fmt_cost(est.get('estimated_cost_usd_partial'))} "
-                      f"over {est.get('priced_responses', 0)}/{est.get('responses', 0)} priced responses."]
-            if est.get("estimated_cost_usd_total") is not None:
-                lines.append(f"Complete total {_fmt_cost(est.get('estimated_cost_usd_total'))} "
-                             f"(all {est.get('responses', 0)} responses priced).")
-            else:
-                reasons = ", ".join(
-                    f"{_safe_field(k)} {v}" for k, v in
-                    sorted((est.get("unpriced_reasons") or {}).items())) or "unpriced usage"
-                lines.append(f"No complete total: unpriced responses remain ({reasons}); "
-                             f"unknown stays unknown, never zero.")
-            lines.append(_safe_field(est.get("basis") or "Standard API list-price equivalent, not subscription spend."))
-            lines += ["", "| Model / harness | Effort | Priced responses | Known subtotal | Complete estimate | Source |",
-                      "| --- | --- | ---: | ---: | ---: | --- |"]
-            for model in est.get("by_model", []):
-                lines.append(
-                    f"| {_safe_field(model.get('model'))} / {_safe_field(model.get('harness'))} "
-                    f"| {_safe_field(model.get('effort'))} "
-                    f"| {model['priced_responses']}/{model['responses']} "
-                    f"| {_fmt_cost(model['estimated_cost_usd_partial'] if model['priced_responses'] else None)} "
-                    f"| {_fmt_cost(model['estimated_cost_usd'])} "
-                    f"| {_safe_source(model.get('source_url'))} |")
-            for basis in sorted({m['basis'] for m in est.get('by_model', []) if m.get('basis')}):
-                lines.append(_safe_field(basis))
-            lines += _price_evidence_lines(summary)
-        else:
-            lines += ["", "Estimated list-price cost: unknown "
-                      "(no sourced price schedule supplied; unpriced models stay unknown)."]
-        if est.get("coverage_note"):
-            lines.append(_safe_field(est["coverage_note"]))
-        native = summary.get("native_cost") or {}
-        if native.get("total_usd") is not None:
-            lines.append(f"Native harness-reported cost: {_fmt_cost(native.get('total_usd'))} "
-                         f"({native.get('known_responses', 0)} known, "
-                         f"{native.get('unknown_responses', 0)} unknown responses; "
-                         f"separate from the list-price estimate).")
-        else:
-            lines.append("Native harness-reported cost: complete total unknown; "
-                         f"known subtotal {_fmt_cost(native.get('known_subtotal_usd') if native.get('known_responses') else None)} "
-                         f"over {native.get('known_responses', 0)} reported responses "
-                         "(separate from the list-price estimate).")
-        lines.append("_Usage totals are not billing. Subscription spending is "
-                     "separate and is never posted as spend._")
-        lines += ["", f"Snapshot `{_safe_field(summary.get('snapshot_id'))}` at source cutoff "
-                  f"{_fmt(summary.get('source_cutoff'))}; measured "
-                  f"{len(summary.get('scope_sessions') or [])} session(s), "
-                  f"{u.get('responses', 0)} attributed + "
-                  f"{(summary.get('shared_models') and sum(m['responses'] for m in summary['shared_models'])) or 0} shared + "
-                  f"{(unassigned or {}).get('responses', 0)} unassigned responses."]
-        acceptance = summary.get("acceptance_state") or "unknown"
-        lines.append(f"Acceptance: {_safe_field(acceptance)} "
-                     f"(finished processes never imply acceptance).")
-        outcome = summary.get("outcome") or {}
-        for key, title in (("candidate", "Candidate"), ("proof_ref", "Proof"),
-                           ("repairs", "Repairs"), ("corrections", "Corrections")):
-            ref = _safe_ref(outcome.get(key))
-            if ref is not None:
-                lines.append(f"{title}: {ref}")
-            elif outcome.get(key):
-                lines.append(f"{title}: [withheld: free-form reference not published]")
-        if summary.get("missing_assignments") or summary.get("conflicting_assignments"):
-            lines.append(
-                "Coverage: missing "
-                f"{len(summary.get('missing_assignments') or [])}, conflicting "
-                f"{len(summary.get('conflicting_assignments') or [])}; "
-                f"reconciles {summary.get('reconciles')}, complete {summary.get('complete')}.")
-        else:
-            lines.append(
-                f"Coverage: reconciles {summary.get('reconciles')}, "
-                f"complete {summary.get('complete')}; "
-                f"crashes counted separately {summary.get('crashes_counted_separately')}.")
-        if summary.get("has_active_work"):
-            lines.append("Active work remains visible; arithmetic reconciliation "
-                         "alone is not completion.")
-        gaps = summary.get("coverage") or {}
-        for key, label in (("missing_sessions", "Missing native sessions"),
-                           ("sessions_without_usage", "Sessions without native usage"),
-                           ("unbound_worker_sessions", "Unbound worker sessions"),
-                           ("unbound_dispatches", "Dispatches without worker ownership"),
-                           ("conflicting_sessions", "Conflicting session ownership")):
-            if gaps.get(key):
-                lines.append(f"{label}: {len(gaps[key])}; task consumption remains incomplete.")
-    if summary["incidents"]:
-        lines += ["", "Diagnostics, task turns only (candidates, not verdicts): " + ", ".join(
-            f"{k.replace('_', ' ')} {v}" for k, v in sorted(summary["incidents"].items()))]
-    if summary.get("session_context_incidents"):
-        lines.append("Diagnostics, session context (not task-only): " + ", ".join(
-            f"{k.replace('_', ' ')} {v}" for k, v in
-            sorted(summary["session_context_incidents"].items())))
+    lines += _price_evidence_lines(summary)
     lines += ["", "<sub>Local measurement from native records; usage totals are not billing. "
-              "Updated in place by `agent-observer publish`.</sub>"]
+              "Updated in place by `agent-observer publish`.</sub>", "", "</details>"]
     return "\n".join(lines) + "\n"
 
 

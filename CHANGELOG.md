@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0] - 2026-09-28
+
+### Added
+
+- Lead `task show` and published summaries with one estimated total per
+  task: its own usage plus the whole shared pool, which is never divided
+  (`total_cost` in JSON), so a shared-only task no longer reads $0.00
+
+### Changed
+
+- Published PR summaries are glanceable: a headline, a per-model table
+  and one flags line, with evidence in a collapsed details block
+
 ## [0.4.1] - 2026-09-28
 
 ### Changed
