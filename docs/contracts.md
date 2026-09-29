@@ -106,10 +106,15 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
    known secret shapes (private key blocks, `sk-`, `ghp_`, `github_pat_`,
    `glpat-`, `xox?-`, AWS, Google and JWT tokens, secret-named
    assignments and flags, bearer tokens, URL passwords) become
-   `[redacted]`, and every `apply_patch` hunk keeps only its
-   `*** Add/Update/Delete File:` and `*** Move to:` lines, so file
-   contents never persist. Other arguments (messages, prompts, edit
-   strings) are free text and stay out.
+   `[redacted]`. Every `apply_patch` hunk keeps only its
+   `*** Add/Update/Delete File:` and `*** Move to:` lines. A heredoc
+   whose introducing line redirects to a file or pipes into `tee` keeps
+   its delimiters and `[content omitted]` instead of its body, and so
+   does the payload of `echo` or `printf` redirected to a file; a
+   heredoc feeding an interpreter (`python3 - <<EOF`) is the program and
+   stays. Other arguments (messages, prompts, edit strings, Codex
+   function arguments that are not a JSON object) are free text and stay
+   out.
 
 ### Counter semantics by harness
 

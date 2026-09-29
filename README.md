@@ -247,7 +247,8 @@ serialized. A tool call keeps the full path or command it names, up to
 65,536 characters, so an audit can list what a session read before an
 edit. Known secret shapes (API keys, tokens, private keys,
 secret-named assignments and flags, URL passwords) become `[redacted]`
-first, and patches keep only their file header lines. When these rules change, the next sync fully re-imports
+first, patches keep only their file header lines, and file bodies a
+command writes through a heredoc, `echo` or `printf` are omitted. When these rules change, the next sync fully re-imports
 affected sources, corrects older rows in place (including replacing
 source-owned session identity and clearing omitted or invalid fields),
 and replaces that source's prior import errors. Reports never add

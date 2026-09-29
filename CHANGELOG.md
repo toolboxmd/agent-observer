@@ -8,8 +8,9 @@
   Claude Code, Codex, OpenCode and Grok Build, so an audit can list what a
   session read before an edit; Codex tool calls now record their command
   (#36)
-- Redact known secret shapes from stored paths and commands, and keep only
-  the file header lines of patches
+- Redact known secret shapes from stored paths and commands, keep only
+  the file header lines of patches, and omit file bodies that a command
+  writes through a heredoc, `echo` or `printf`
 
 ### Fixed
 

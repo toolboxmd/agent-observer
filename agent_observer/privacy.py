@@ -16,8 +16,9 @@ Rule 5: import_errors.line_excerpt holds only sorted top-level key names.
 Rule 6: events.detail_json keeps only allowlisted keys with typed values.
 Rule 7 (docs/contracts.md) covers tables not named here.
 Rule 8: events.target keeps a tool call's full path or command up to
-ARGUMENT_CHARS, with known secret patterns redacted and apply_patch hunk
-bodies reduced to their file header lines.
+ARGUMENT_CHARS, with known secret patterns redacted, apply_patch hunk
+bodies reduced to their file header lines, and file bodies written by a
+heredoc, echo or printf omitted.
 """
 
 from __future__ import annotations
@@ -271,11 +272,67 @@ def strip_patch_bodies(text: str) -> str:
     return _PATCH_RE.sub(keep_headers, text)
 
 
+OMITTED = "[content omitted]"
+
+_HEREDOC_RE = re.compile(r"<<[-~]?[ \t]*(\\?['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+# A heredoc writes a file when its introducing line redirects output to a
+# path (not 2>&1) or pipes into tee; an interpreter fed by a heredoc
+# (python3 - <<EOF) runs a program, which is the command and stays.
+_FILE_WRITE_RE = re.compile(r"(?<![0-9&>])>>?[ \t]*[^&\s|;>]|\btee\b")
+_INLINE_WRITE_RE = re.compile(
+    r"\b(echo|printf)\b(?:[ \t]+-[a-zA-Z]+)*[ \t]+[^|;&\n]*?"
+    r"((?<![0-9&])[ \t]*>>?[ \t]*[^&\s|;>]+)")
+
+
+def _strip_heredocs(text: str, sep: str) -> str:
+    out, pos, cursor = [], 0, 0
+    while True:
+        match = _HEREDOC_RE.search(text, cursor)
+        if match is None:
+            break
+        line_start = text.rfind(sep, 0, match.start())
+        line_start = 0 if line_start == -1 else line_start + len(sep)
+        body_start = text.find(sep, match.end())
+        if body_start == -1:
+            break
+        intro = text[line_start:body_start]
+        body_start += len(sep)
+        word = match.group(2)
+        end = re.compile(re.escape(sep) + r"[\t ]*" + re.escape(word)
+                         + r"(?=" + re.escape(sep) + r"|$|[\"'`);])")
+        close = end.search(text, body_start - len(sep))
+        if not _FILE_WRITE_RE.search(intro):
+            cursor = close.end() if close else len(text)
+            continue
+        out.append(text[pos:body_start] + OMITTED)
+        if close is None:
+            pos = len(text)
+            break
+        pos, cursor = close.start(), close.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def strip_file_writes(text: str) -> str:
+    """Rule 8: omit literal file bodies written by a command.
+
+    A heredoc whose introducing line redirects to a file or pipes into tee
+    keeps its delimiters but not its body, whether newlines are real or
+    escaped inside a Codex exec program. The payload of echo or printf
+    redirected to a file is omitted too; the target path stays.
+    """
+    text = _strip_heredocs(text, "\n")
+    text = _strip_heredocs(text, "\\n")
+    return _INLINE_WRITE_RE.sub(
+        lambda m: f"{m.group(1)} {OMITTED}{m.group(2)}", text)
+
+
 def argument_text(value: object) -> str | None:
     """Rule 8: one stored tool argument, or None for a non-string."""
     if not isinstance(value, str) or not value:
         return None
-    return redact_secrets(strip_patch_bodies(value))[:ARGUMENT_CHARS]
+    text = strip_file_writes(strip_patch_bodies(value))
+    return redact_secrets(text)[:ARGUMENT_CHARS]
 
 # Rule 6, native identifiers for the tool/skill name families: a complete
 # ASCII match of [A-Za-z_][A-Za-z0-9_.:/-]{0,79}. fullmatch (not ^...$)

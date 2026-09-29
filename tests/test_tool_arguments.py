@@ -84,6 +84,36 @@ class RedactionUnitTest(unittest.TestCase):
             'await tools.apply_patch("*** Begin Patch\\n*** Update File: /r/a.py'
             '\\n*** End Patch");')
 
+    def test_file_bodies_written_by_commands_are_omitted(self):
+        body = "FILE-BODY-must-not-persist"
+        cases = {
+            f"cat > /tmp/c.py <<'EOF'\n{body}\nEOF\npython3 /tmp/c.py":
+                "cat > /tmp/c.py <<'EOF'\n[content omitted]\nEOF\npython3 /tmp/c.py",
+            f"cat <<EOF | tee -a /r/n.md\n{body}\nEOF\n":
+                "cat <<EOF | tee -a /r/n.md\n[content omitted]\nEOF\n",
+            f"cat > /r/a <<A\n{body}\nA\ncat > /r/b <<-B\n\t{body}\n\tB\nls":
+                "cat > /r/a <<A\n[content omitted]\nA\n"
+                "cat > /r/b <<-B\n[content omitted]\n\tB\nls",
+            f"printf '%s' '{body}' > /r/f && ls":
+                "printf [content omitted] > /r/f && ls",
+            f"echo {body} >> /r/notes.md; cat /r/notes.md":
+                "echo [content omitted] >> /r/notes.md; cat /r/notes.md",
+            f'tools.exec_command({{cmd:"cat > /r/x.md <<\'EOF\'\\n{body}\\nEOF\\ngit add /r/x.md"}})':
+                'tools.exec_command({cmd:"cat > /r/x.md <<\'EOF\'\\n[content omitted]'
+                '\\nEOF\\ngit add /r/x.md"})',
+            f"cat > /r/open <<EOF\n{body} never closed":
+                "cat > /r/open <<EOF\n[content omitted]",
+        }
+        for raw, want in cases.items():
+            with self.subTest(raw[:30]):
+                self.assertEqual(privacy.argument_text(raw), want)
+
+    def test_programs_fed_by_heredoc_stay_as_the_command(self):
+        for raw in ("python3 - <<'EOF'\nprint(open('/r/a').read())\nEOF",
+                    'git commit -F - <<EOF\nfix: message\nEOF',
+                    "echo done 2>&1 | tail -1"):
+            self.assertEqual(privacy.argument_text(raw), raw)
+
     def test_grok_paths_containing_sk_dash_survive(self):
         path = "/w/concepts/issue-led-risk-tiered-vertical-slice-workflow.md"
         self.assertEqual(grok._safe_target({"path": path}), path)
@@ -154,6 +184,12 @@ class FullArgumentLedgerTest(LedgerCase):
             _codex_line(3, {"type": "function_call", "name": "spawn_agent",
                             "call_id": "c-spawn", "arguments": json.dumps(
                                 {"message": "private brief text"})}),
+            _codex_line(4, {"type": "function_call", "name": "send_message",
+                            "call_id": "c-raw",
+                            "arguments": "private raw argument text"}),
+            _codex_line(5, {"type": "function_call", "name": "send_message",
+                            "call_id": "c-str",
+                            "arguments": json.dumps("private json string")}),
         ])
         import_codex_file(self.con, path)
         rows = {r["native_id"]: r["target"] for r in self.query(
@@ -164,14 +200,19 @@ class FullArgumentLedgerTest(LedgerCase):
         self.assertGreater(len(rows["c-exec"]), 500)
         self.assertEqual(rows["c-fn"], "bash -lc sed -n 1,9p /r/README.md")
         self.assertIsNone(rows["c-spawn"])
+        self.assertIsNone(rows["c-raw"])
+        self.assertIsNone(rows["c-str"])
         blob = self.blob()
         self.assertNotIn(SECRETS["github classic"], blob)
         self.assertNotIn(PATCH_BODY, blob)
         self.assertNotIn("private brief text", blob)
+        self.assertNotIn("private raw argument text", blob)
+        self.assertNotIn("private json string", blob)
 
     def test_claude_long_command_is_full_and_redacted(self):
         command = (f"export OPENAI_API_KEY={SECRETS['openai']}; "
                    f"cat /r/docs/guide.md {LONG_TAIL}")
+        write = f"cat > /r/new.md <<'EOF'\n{PATCH_BODY}\nEOF"
         path = self.write("claude-args.jsonl", [
             _claude_line("a1", 1, [{"type": "tool_use", "id": "t-read",
                                     "name": "Read",
@@ -179,7 +220,10 @@ class FullArgumentLedgerTest(LedgerCase):
             _claude_line("a2", 2, [{"type": "tool_use", "id": "t-bash",
                                     "name": "Bash",
                                     "input": {"command": command}}]),
-            _claude_line("a3", 3, [{"type": "tool_use", "id": "t-edit",
+            _claude_line("a4", 3, [{"type": "tool_use", "id": "t-write",
+                                    "name": "Bash",
+                                    "input": {"command": write}}]),
+            _claude_line("a3", 4, [{"type": "tool_use", "id": "t-edit",
                                     "name": "Edit",
                                     "input": {"file_path": "/r/app.py",
                                               "old_string": PATCH_BODY,
@@ -193,7 +237,9 @@ class FullArgumentLedgerTest(LedgerCase):
         self.assertEqual(before[1][0], "Bash")
         self.assertEqual(before[1][1], command.replace(
             SECRETS["openai"], privacy.REDACTED))
-        self.assertEqual(len(before), 2)
+        self.assertEqual(before[2], (
+            "Bash", "cat > /r/new.md <<'EOF'\n[content omitted]\nEOF"))
+        self.assertEqual(len(before), 3)
         blob = self.blob()
         self.assertNotIn(SECRETS["openai"], blob)
         self.assertNotIn(PATCH_BODY, blob)

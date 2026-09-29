@@ -994,7 +994,8 @@ def _ingest_response_item(r: _Reader, obj: dict) -> None:
         prefix = f"{namespace}." if isinstance(namespace, str) else ""
         args = p.get("arguments") if ptype == "function_call" else p.get("input")
         r.event(obj, "tool_call", call_id or p.get("id"), turn_id=turn_id,
-                name=f"{prefix}{name}", target=_call_target(args),
+                name=f"{prefix}{name}", target=_call_target(
+                    args, custom=ptype == "custom_tool_call"),
                 status=p.get("status"),
                 fingerprint=fingerprint(name, str(args)[:2000]))
     elif ptype in ("function_call_output", "custom_tool_call_output"):
@@ -1012,22 +1013,23 @@ def _ingest_response_item(r: _Reader, obj: dict) -> None:
 _PATH_KEYS = ("file_path", "path", "filePath", "target_file", "filename")
 
 
-def _call_target(args) -> str | None:
+def _call_target(args, custom: bool = False) -> str | None:
     """The path or full command a tool call names (privacy rule 8).
 
     A custom tool input string (a code-mode exec program or an apply_patch
     body) is the command itself. Function arguments are a JSON object whose
     path key or cmd/command (a string, or string parts joined by spaces)
     is the target. Other arguments, such as agent messages, are free text
-    and stay out.
+    and stay out. Only a custom tool input string is taken raw; function
+    arguments that are not a JSON object yield no target.
     """
     if isinstance(args, str):
         try:
             parsed = json.loads(args)
         except ValueError:
-            return args
+            return args if custom else None
         if not isinstance(parsed, dict):
-            return None
+            return args if custom else None
         args = parsed
     if not isinstance(args, dict):
         return None
