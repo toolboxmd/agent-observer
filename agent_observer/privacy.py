@@ -281,7 +281,6 @@ _HEREDOC_RE = re.compile(r"<<[-~]?[ \t]*(\\?['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 _FILE_WRITE_RE = re.compile(
     r"(?:^|[^0-9&>]|(?<![0-9])1|&)>>?[ \t]*[^&\s|;>]|\btee\b")
 _WRITER_RE = re.compile(r"\b(?:echo|printf)\b")
-_TEE_RE = re.compile(r"\|[ \t]*tee\b")
 
 
 def _fd_before(text: str, j: int) -> tuple[int, str] | None:
@@ -339,22 +338,33 @@ def _strip_heredocs(text: str, sep: str) -> str:
     return "".join(out)
 
 
-def _strip_inline_writes(text: str) -> str:
-    """Omit the payload of echo or printf redirected to a file.
+def _is_word_at(text: str, j: int, word: str) -> bool:
+    """Whether word stands alone at text[j] ('/usr/bin/tee' counts)."""
+    if not text.startswith(word, j):
+        return False
+    before = text[j - 1] if j > 0 else " "
+    after = text[j + len(word)] if j + len(word) < len(text) else " "
+    return not (before.isalnum() or before in "_-.") and not (
+        after.isalnum() or after in "_-.")
 
-    One linear pass: each echo/printf segment is scanned once, honoring
+
+def _strip_inline_writes(text: str) -> str:
+    """Omit the payload of echo or printf whose output reaches a file.
+
+    One linear pass: each echo/printf pipeline is scanned once, honoring
     quotes (which may span lines) and backslash escapes, up to an unquoted
-    ';', '&', '|', newline or escaped newline. When the segment holds an
-    unquoted stdout redirect ('>', '>>', '1>', '&>', '&>>'; not 2> or >&)
-    or a pipe into tee, the words before it become OMITTED; the redirect
-    or pipe and its target stay.
+    ';', '&&', '||', a lone '&', a newline or an escaped newline. The
+    payload ends at the first pipe or redirect operator. It becomes
+    OMITTED when the pipeline writes stdout to a file ('>', '>>', '1>',
+    '&>', '&>>', '>&file'; not 2>f or >&2) or pipes into tee in any
+    later stage ('| sudo tee', '| cat | /usr/bin/tee').
     """
     out, pos, n = [], 0, len(text)
     while True:
         match = _WRITER_RE.search(text, pos)
         if match is None:
             break
-        j, quote, redirect = match.end(), None, None
+        j, quote, end, writes, piped = match.end(), None, None, False, False
         while j < n:
             c = text[j]
             if c == "\\":
@@ -368,32 +378,53 @@ def _strip_inline_writes(text: str) -> str:
             elif c in "'\"":
                 quote = c
             elif c == "&" and text.startswith(">", j + 1):
-                if redirect is None:
-                    redirect = j
+                end = j if end is None else end
+                writes = True
                 j += 1
-            elif c == "|" and _TEE_RE.match(text, j):
-                if redirect is None:
-                    redirect = j
+            elif c == "|" and not text.startswith("|", j + 1):
+                end = j if end is None else end
+                piped = True
             elif c in ";&|\n":
                 break
-            elif (c == ">" and redirect is None
-                  and not text.startswith("&", j + 1)
-                  and text[j - 1] != ">"):
+            elif c == ">" and text[j - 1] != ">":
                 fd = _fd_before(text, j)
-                if fd is None:
-                    redirect = j
-                elif fd[1] == "1":
-                    redirect = fd[0]
+                end = (fd[0] if fd else j) if end is None else end
+                k = j + 1 + text.startswith(">", j + 1)
+                dup = text.startswith("&", k)
+                if dup:
+                    k += 1
+                if fd is None or fd[1] == "1":
+                    if not dup or not (k < n and (text[k].isdigit()
+                                                  or text[k] == "-")):
+                        writes = True
+                j = k - 1
+            elif piped and _is_word_at(text, j, "tee"):
+                writes = True
             j += 1
         j = min(j, n)
         out.append(text[pos:match.end()])
-        if redirect is None:
-            out.append(text[match.end():j])
+        if writes and end is not None:
+            out.append(f" {OMITTED} " + text[end:j])
         else:
-            out.append(f" {OMITTED} " + text[redirect:j])
+            out.append(text[match.end():j])
         pos = j
     out.append(text[pos:])
     return "".join(out)
+
+
+# Here-strings feeding tee or a stdout redirect to a file: the payload word
+# is omitted. Both orders are bounded to one command's length.
+_HERESTRING_AFTER_RE = re.compile(
+    r"((?:\btee\b|(?<![0-9&>])>)[^;&|\n<]{0,512}<<<[ \t]*)"
+    r"('[^']*'|\"(?:[^\"\\]|\\.)*\"|[^\s;&|]+)")
+_HERESTRING_BEFORE_RE = re.compile(
+    r"(<<<[ \t]*)('[^']*'|\"(?:[^\"\\]|\\.)*\"|[^\s;&|]+)"
+    r"(?=[^;&|\n]{0,512}?(?:\btee\b|(?<![0-9&>])>[ \t]*[^&\s|;>]))")
+
+
+def _strip_herestrings(text: str) -> str:
+    text = _HERESTRING_AFTER_RE.sub(lambda m: m.group(1) + OMITTED, text)
+    return _HERESTRING_BEFORE_RE.sub(lambda m: m.group(1) + OMITTED, text)
 
 
 def strip_file_writes(text: str) -> str:
@@ -406,7 +437,7 @@ def strip_file_writes(text: str) -> str:
     """
     text = _strip_heredocs(text, "\n")
     text = _strip_heredocs(text, "\\n")
-    return _strip_inline_writes(text)
+    return _strip_herestrings(_strip_inline_writes(text))
 
 
 def argument_text(value: object) -> str | None:

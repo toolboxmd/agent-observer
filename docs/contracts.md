@@ -110,9 +110,13 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
    `*** Add/Update/Delete File:` and `*** Move to:` lines. A heredoc
    whose introducing line redirects to a file or pipes into `tee` keeps
    its delimiters and `[content omitted]` instead of its body, and so
-   does the payload of `echo` or `printf` redirected to a file; a
-   heredoc feeding an interpreter (`python3 - <<EOF`) is the program and
-   stays. Other arguments (messages, prompts, edit strings, Codex
+   does the payload of `echo` or `printf` whose pipeline writes stdout
+   to a file (`>`, `>>`, `1>`, `&>`, `>&file`) or pipes into `tee` in any
+   later stage, and a here-string (`<<<`) feeding `tee` or a file
+   redirect. A heredoc feeding an interpreter (`python3 - <<EOF`) is the
+   program and stays. Known limits: redirects applied to a whole group
+   or shell (`exec >f`, `{ echo x; } >f`, `( … ) >f`) and programmatic
+   writes (`python3 -c` writing a literal) keep their payloads. Other arguments (messages, prompts, edit strings, Codex
    function arguments that are not a JSON object) are free text and stay
    out.
 

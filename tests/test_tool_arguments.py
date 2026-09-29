@@ -117,6 +117,16 @@ class RedactionUnitTest(unittest.TestCase):
             f"printf '{body}' | tee -a /r/out; ls":
                 "printf [content omitted] | tee -a /r/out; ls",
             f"echo {body}2>/r/out": "echo [content omitted] >/r/out",
+            f"echo {body} | sudo tee /r/f": "echo [content omitted] | sudo tee /r/f",
+            f"printf {body} | /usr/bin/tee /r/f":
+                "printf [content omitted] | /usr/bin/tee /r/f",
+            f"echo {body} | cat | tee /r/f": "echo [content omitted] | cat | tee /r/f",
+            f"echo {body} 2>&1 | tee /r/f": "echo [content omitted] 2>&1 | tee /r/f",
+            f"echo {body} 2>&1 > /r/f": "echo [content omitted] 2>&1 > /r/f",
+            f"printf {body} >&/r/f": "printf [content omitted] >&/r/f",
+            f"tee /r/f <<<{body}": "tee /r/f <<<[content omitted]",
+            f"tee /r/f <<< '{body} two'": "tee /r/f <<< [content omitted]",
+            f"cat <<<{body} > /r/f": "cat <<<[content omitted] > /r/f",
             f"cat <<E &>/r/f\n{body}\nE\n": "cat <<E &>/r/f\n[content omitted]\nE\n",
             f"cat <<E 1>/r/f\n{body}\nE\n": "cat <<E 1>/r/f\n[content omitted]\nE\n",
         }
@@ -132,12 +142,17 @@ class RedactionUnitTest(unittest.TestCase):
                     "python3 - <<E 2>&1\nprint(1)\nE\n",
                     "echo a && ls",
                     "echo a | grep a",
-                    "echo warn 2>/dev/null"):
+                    "echo warn 2>/dev/null",
+                    "echo x 2>&1 | tail -1",
+                    "grep x <<<needle",
+                    "echo a | tee-log x"):
             self.assertEqual(privacy.argument_text(raw), raw)
 
     def test_long_commands_are_stripped_in_linear_time(self):
         for raw in (("echo x " * 8000) + "z", "printf '" + "a" * 60000,
-                    "cat > /r/f <<A\n" * 5000, "<<EOF\n" * 10000):
+                    "cat > /r/f <<A\n" * 5000, "<<EOF\n" * 10000,
+                    "echo x 2>&1 | " * 5000, "tee <<<a " * 8000,
+                    "<<<a " * 12000):
             start = time.monotonic()
             privacy.argument_text(raw)
             self.assertLess(time.monotonic() - start, 1.0, raw[:20])

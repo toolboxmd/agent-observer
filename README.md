@@ -248,7 +248,10 @@ serialized. A tool call keeps the full path or command it names, up to
 edit. Known secret shapes (API keys, tokens, private keys,
 secret-named assignments and flags, URL passwords) become `[redacted]`
 first, patches keep only their file header lines, and file bodies a
-command writes through a heredoc, `echo` or `printf` are omitted. When these rules change, the next sync fully re-imports
+command writes through a heredoc, here-string, `echo` or `printf` (by
+redirect or `tee`) are omitted. Known limits: writes through `exec >f`,
+a redirected group or subshell (`{ echo x; } >f`), or a program such as
+`python3 -c` keep their payloads. When these rules change, the next sync fully re-imports
 affected sources, corrects older rows in place (including replacing
 source-owned session identity and clearing omitted or invalid fields),
 and replaces that source's prior import errors. Reports never add
