@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.6.0] - 2026-09-29
+
+### Added
+
+- Keep the full path or command of every tool call, up to 64 KiB, for
+  Claude Code, Codex, OpenCode and Grok Build, so an audit can list what a
+  session read before an edit; Codex tool calls now record their command
+  (#36)
+- Redact known secret shapes from stored paths and commands, keep only
+  the file header lines of patches, and omit file bodies that a command
+  writes through a heredoc, `echo` or `printf`
+
+### Fixed
+
+- Grok Build paths containing `sk-` inside a word (such as `risk-tiered`)
+  are no longer mangled by secret redaction
+
 ## [0.5.1] - 2026-09-29
 
 ### Fixed

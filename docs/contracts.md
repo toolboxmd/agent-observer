@@ -97,6 +97,28 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
 7. Tables not named above store no free text from native records beyond
    identifiers, model and provider names, paths and commands. Native
    free-text titles are discarded.
+8. Tool arguments: `events.target` keeps the full path or command a tool
+   call names, up to 65,536 characters (`privacy.ARGUMENT_CHARS`). The
+   longest real values measured on 2026-09-29 were 42,102 characters
+   (Claude Code Bash) and 54,843 (Codex exec). For Codex, a code-mode
+   `exec` program or other custom tool input is the command; function
+   arguments give their path key or `cmd`/`command`. Before storage,
+   known secret shapes (private key blocks, `sk-`, `ghp_`, `github_pat_`,
+   `glpat-`, `xox?-`, AWS, Google and JWT tokens, secret-named
+   assignments and flags, bearer tokens, URL passwords) become
+   `[redacted]`. Every `apply_patch` hunk keeps only its
+   `*** Add/Update/Delete File:` and `*** Move to:` lines. A heredoc
+   whose introducing line redirects to a file or pipes into `tee` keeps
+   its delimiters and `[content omitted]` instead of its body, and so
+   does the payload of `echo` or `printf` whose pipeline writes stdout
+   to a file (`>`, `>>`, `1>`, `&>`, `>&file`) or pipes into `tee` in any
+   later stage, and a here-string (`<<<`) feeding `tee` or a file
+   redirect. A heredoc feeding an interpreter (`python3 - <<EOF`) is the
+   program and stays. Known limits: redirects applied to a whole group
+   or shell (`exec >f`, `{ echo x; } >f`, `( … ) >f`) and programmatic
+   writes (`python3 -c` writing a literal) keep their payloads. Other arguments (messages, prompts, edit strings, Codex
+   function arguments that are not a JSON object) are free text and stay
+   out.
 
 ### Counter semantics by harness
 
@@ -111,7 +133,7 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
 
 | Family | Meaning | Key detail |
 | --- | --- | --- |
-| `tool_call` | Model requested a tool | name, argument fingerprint, `target` (file path or command when present) |
+| `tool_call` | Model requested a tool | name, argument fingerprint, `target` (full file path or command when present, rule 8) |
 | `tool_result` | Tool returned | status (`ok`, `error`, `denied`), size, truncation, duration, exit code in detail |
 | `read` | Observed file read | `target` path; content identity when recorded |
 | `skill_read` | Read under an installed Skill directory | validated skill identifier in `target` (never a title or directory path); installed file path only in detail `skill_path`; skill name and AgentsMD version from the path |

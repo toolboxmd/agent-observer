@@ -1,4 +1,4 @@
-"""Ledger privacy: the single implementation of the privacy spec rules 1-6.
+"""Ledger privacy: the single implementation of the privacy spec rules 1-6 and 8.
 
 Every adapter and writer routes through this module; no private copies of
 these rules exist elsewhere. Fail closed: when in doubt, store less.
@@ -14,6 +14,11 @@ Rule 3: PRIVACY_VERSION records the rules a source was imported under.
 Rule 4: import_errors.error is one closed category, else the fallback.
 Rule 5: import_errors.line_excerpt holds only sorted top-level key names.
 Rule 6: events.detail_json keeps only allowlisted keys with typed values.
+Rule 7 (docs/contracts.md) covers tables not named here.
+Rule 8: events.target keeps a tool call's full path or command up to
+ARGUMENT_CHARS, with known secret patterns redacted, apply_patch hunk
+bodies reduced to their file header lines, and file bodies written by a
+heredoc, echo or printf omitted.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ import re
 
 # Rule 3: bump when any rule in this module changes meaning. A stored source
 # version that differs forces a full re-import with in-place correction.
-PRIVACY_VERSION = 5
+PRIVACY_VERSION = 6
 
 SUBMISSION_EXCERPT_CHARS = 300
 ASSISTANT_EXCERPT_CHARS = 400
@@ -196,6 +201,252 @@ EVENT_DETAIL_ALLOWLIST: dict[str, dict[str, str]] = {
 
 _TARGET_CHARS = 500
 
+# Rule 8: one target argument (a path or a full shell command, including a
+# Codex code-mode exec program) keeps up to 64 KiB. The longest real values
+# measured on 2026-09-29 over 14 days of local sessions were 42,102 chars
+# (Claude Bash) and 54,843 chars (Codex exec); p99 was under 8,000.
+ARGUMENT_CHARS = 65536
+
+REDACTED = "[redacted]"
+
+# Rule 8: known secret shapes. Each match is replaced by REDACTED; for
+# assignments and flags the name survives and only the value is replaced.
+_SECRET_RES = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?"
+               r"(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\bA(?:KIA|SIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+)
+_SECRET_VALUE_RES = (
+    # Uppercase NAME=value (environment style) where NAME mentions a
+    # token, secret, password or key.
+    re.compile(r"(\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY"
+               r"|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIALS?)[A-Z0-9_]*=)"
+               r"(\"[^\"]*\"|'[^']*'|[^\s;&|]+)"),
+    # Exact lowercase keys such as "api_key": "..." or password=...
+    re.compile(r"(?i)((?<![A-Za-z0-9_])[\"']?(?:api_?key|access_?token"
+               r"|refresh_?token|client_?secret|secret|password|passwd|token)"
+               r"[\"']?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&|}]+)"),
+    # --token value, --password=value and similar flags.
+    re.compile(r"(?i)(--?(?:token|secret|password|passwd|api-?key"
+               r"|access-?key|auth)(?:=|\s+))(\"[^\"]*\"|'[^']*'|[^\s;&|]+)"),
+    # Authorization headers and bearer tokens.
+    re.compile(r"(?i)(\b(?:bearer|basic)\s+)([A-Za-z0-9._~+/=-]{16,})"),
+    # user:password@ in URLs.
+    re.compile(r"(://[^/\s:@]+:)([^/\s@]+)(@)"),
+)
+
+_PATCH_RE = re.compile(r"\*\*\* Begin Patch(.*?)(?:\*\*\* End Patch|\Z)", re.S)
+_PATCH_HEADER_RE = re.compile(
+    r"\*\*\* (?:Add|Update|Delete) File: [^\n\\\"'`]+|\*\*\* Move to: [^\n\\\"'`]+")
+
+
+def redact_secrets(text: str) -> str:
+    """Rule 8: replace known secret shapes in text with REDACTED."""
+    for rx in _SECRET_RES:
+        text = rx.sub(REDACTED, text)
+    for rx in _SECRET_VALUE_RES:
+        text = rx.sub(lambda m: m.group(1) + REDACTED + (
+            m.group(3) if m.lastindex and m.lastindex >= 3 else ""), text)
+    return text
+
+
+def strip_patch_bodies(text: str) -> str:
+    """Rule 8: keep only file header lines of apply_patch hunks.
+
+    File contents are never stored; a patch inside a command or a Codex
+    exec program keeps its '*** Add/Update/Delete File:' and '*** Move to:'
+    lines, whether the program spells newlines as real or escaped ones.
+    """
+    def keep_headers(match: re.Match) -> str:
+        headers = _PATCH_HEADER_RE.findall(match.group(1))
+        sep = "\n" if "\n" in match.group(0) else "\\n"
+        return "*** Begin Patch" + sep + "".join(
+            h.strip() + sep for h in headers) + "*** End Patch"
+    return _PATCH_RE.sub(keep_headers, text)
+
+
+OMITTED = "[content omitted]"
+
+_HEREDOC_RE = re.compile(r"<<[-~]?[ \t]*(\\?['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+# A heredoc writes a file when its introducing line redirects output to a
+# path (not 2>&1) or pipes into tee; an interpreter fed by a heredoc
+# (python3 - <<EOF) runs a program, which is the command and stays.
+_FILE_WRITE_RE = re.compile(
+    r"(?:^|[^0-9&>]|(?<![0-9])1|&)>>?[ \t]*[^&\s|;>]|\btee\b")
+_WRITER_RE = re.compile(r"\b(?:echo|printf)\b")
+
+
+def _fd_before(text: str, j: int) -> tuple[int, str] | None:
+    """The descriptor word ending right before text[j] ('>'), if any.
+
+    As in the shell, digits form a descriptor only when they are the whole
+    word (start of text or whitespace before them); BODY2>f writes BODY2
+    to f.
+    """
+    k = j
+    while k > 0 and text[k - 1].isdigit():
+        k -= 1
+    if k == j or (k > 0 and text[k - 1] not in " \t"):
+        return None
+    return k, text[k:j]
+
+
+def _strip_heredocs(text: str, sep: str) -> str:
+    """Omit the bodies of every heredoc on a line that writes a file.
+
+    Bodies follow their introducing line in marker order, so every heredoc
+    on that line is consumed in turn. An unclosed body fails closed and is
+    omitted to the end of the text.
+    """
+    out, pos, cursor = [], 0, 0
+    while True:
+        match = _HEREDOC_RE.search(text, cursor)
+        if match is None:
+            break
+        line_start = text.rfind(sep, 0, match.start())
+        line_start = 0 if line_start == -1 else line_start + len(sep)
+        line_end = text.find(sep, match.end())
+        if line_end == -1:
+            break
+        intro = text[line_start:line_end]
+        writes = _FILE_WRITE_RE.search(intro) is not None
+        words = [m.group(2) for m in
+                 _HEREDOC_RE.finditer(text, match.start(), line_end)]
+        body_start = line_end + len(sep)
+        for word in words:
+            end = re.compile(re.escape(sep) + r"[\t ]*" + re.escape(word)
+                             + r"(?=" + re.escape(sep) + r"|$|[\"'`);])")
+            close = end.search(text, body_start - len(sep))
+            if writes:
+                out.append(text[pos:body_start] + OMITTED)
+                pos = close.start() if close else len(text)
+            if close is None:
+                body_start = len(text)
+                break
+            body_start = close.end() + len(sep)
+        cursor = min(body_start, len(text))
+        if cursor <= match.start():
+            cursor = match.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _is_word_at(text: str, j: int, word: str) -> bool:
+    """Whether word stands alone at text[j] ('/usr/bin/tee' counts)."""
+    if not text.startswith(word, j):
+        return False
+    before = text[j - 1] if j > 0 else " "
+    after = text[j + len(word)] if j + len(word) < len(text) else " "
+    return not (before.isalnum() or before in "_-.") and not (
+        after.isalnum() or after in "_-.")
+
+
+def _strip_inline_writes(text: str) -> str:
+    """Omit the payload of echo or printf whose output reaches a file.
+
+    One linear pass: each echo/printf pipeline is scanned once, honoring
+    quotes (which may span lines) and backslash escapes, up to an unquoted
+    ';', '&&', '||', a lone '&', a newline or an escaped newline. The
+    payload ends at the first pipe or redirect operator. It becomes
+    OMITTED when the pipeline writes stdout to a file ('>', '>>', '1>',
+    '&>', '&>>', '>&file'; not 2>f or >&2) or pipes into tee in any
+    later stage ('| sudo tee', '| cat | /usr/bin/tee').
+    """
+    out, pos, n = [], 0, len(text)
+    while True:
+        match = _WRITER_RE.search(text, pos)
+        if match is None:
+            break
+        j, quote, end, writes, piped = match.end(), None, None, False, False
+        while j < n:
+            c = text[j]
+            if c == "\\":
+                if quote is None and text.startswith("n", j + 1):
+                    break
+                j += 2
+                continue
+            if quote is not None:
+                if c == quote:
+                    quote = None
+            elif c in "'\"":
+                quote = c
+            elif c == "&" and text.startswith(">", j + 1):
+                end = j if end is None else end
+                writes = True
+                j += 1
+            elif c == "|" and not text.startswith("|", j + 1):
+                end = j if end is None else end
+                piped = True
+            elif c in ";&|\n":
+                break
+            elif c == ">" and text[j - 1] != ">":
+                fd = _fd_before(text, j)
+                end = (fd[0] if fd else j) if end is None else end
+                k = j + 1 + text.startswith(">", j + 1)
+                dup = text.startswith("&", k)
+                if dup:
+                    k += 1
+                if fd is None or fd[1] == "1":
+                    if not dup or not (k < n and (text[k].isdigit()
+                                                  or text[k] == "-")):
+                        writes = True
+                j = k - 1
+            elif piped and _is_word_at(text, j, "tee"):
+                writes = True
+            j += 1
+        j = min(j, n)
+        out.append(text[pos:match.end()])
+        if writes and end is not None:
+            out.append(f" {OMITTED} " + text[end:j])
+        else:
+            out.append(text[match.end():j])
+        pos = j
+    out.append(text[pos:])
+    return "".join(out)
+
+
+# Here-strings feeding tee or a stdout redirect to a file: the payload word
+# is omitted. Both orders are bounded to one command's length.
+_HERESTRING_AFTER_RE = re.compile(
+    r"((?:\btee\b|(?<![0-9&>])>)[^;&|\n<]{0,512}<<<[ \t]*)"
+    r"('[^']*'|\"(?:[^\"\\]|\\.)*\"|[^\s;&|]+)")
+_HERESTRING_BEFORE_RE = re.compile(
+    r"(<<<[ \t]*)('[^']*'|\"(?:[^\"\\]|\\.)*\"|[^\s;&|]+)"
+    r"(?=[^;&|\n]{0,512}?(?:\btee\b|(?<![0-9&>])>[ \t]*[^&\s|;>]))")
+
+
+def _strip_herestrings(text: str) -> str:
+    text = _HERESTRING_AFTER_RE.sub(lambda m: m.group(1) + OMITTED, text)
+    return _HERESTRING_BEFORE_RE.sub(lambda m: m.group(1) + OMITTED, text)
+
+
+def strip_file_writes(text: str) -> str:
+    """Rule 8: omit literal file bodies written by a command.
+
+    A heredoc whose introducing line redirects to a file or pipes into tee
+    keeps its delimiters but not its body, whether newlines are real or
+    escaped inside a Codex exec program. The payload of echo or printf
+    redirected to a file is omitted too; the target path stays.
+    """
+    text = _strip_heredocs(text, "\n")
+    text = _strip_heredocs(text, "\\n")
+    return _strip_herestrings(_strip_inline_writes(text))
+
+
+def argument_text(value: object) -> str | None:
+    """Rule 8: one stored tool argument, or None for a non-string."""
+    if not isinstance(value, str) or not value:
+        return None
+    text = strip_file_writes(strip_patch_bodies(value))
+    return redact_secrets(text)[:ARGUMENT_CHARS]
+
 # Rule 6, native identifiers for the tool/skill name families: a complete
 # ASCII match of [A-Za-z_][A-Za-z0-9_.:/-]{0,79}. fullmatch (not ^...$)
 # so a trailing newline can never slip through the $ anchor. Covers MCP
@@ -233,14 +484,12 @@ def filter_target(target: object, family: object = None) -> str | None:
     only a validated native skill identifier under the same complete
     identifier rule as names: titles, sentences, paths, whitespace,
     markers and wrong types fail closed to None. Other families keep
-    the historical bounded-string behavior, so existing non-skill
-    callers passing no family are unaffected.
+    the full string under rule 8 (argument_text): secrets redacted,
+    patch bodies reduced to file headers, bounded to ARGUMENT_CHARS.
     """
     if family in _SKILL_TARGET_FAMILIES:
         return _valid_native_identifier(target)
-    if isinstance(target, str):
-        return target[:_TARGET_CHARS]
-    return None
+    return argument_text(target)
 
 
 def _valid_int(value: object) -> bool:
@@ -255,9 +504,8 @@ def _valid_identifier(value: object) -> str | None:
 
 
 def _valid_command(value: object) -> str | None:
-    if isinstance(value, str) and value:
-        return value[:_TARGET_CHARS]
-    return None
+    kept = argument_text(value)
+    return kept[:_TARGET_CHARS] if kept else None
 
 
 def _valid_path_detail(value: object) -> str | None:

@@ -1262,7 +1262,9 @@ class PrivacyUnitTest(unittest.TestCase):
 
     def test_filter_target_keeps_only_bounded_strings(self):
         self.assertEqual(privacy.filter_target("/p/x.py"), "/p/x.py")
-        self.assertEqual(len(privacy.filter_target("c" * 5000)), 500)
+        self.assertEqual(len(privacy.filter_target("c" * 5000)), 5000)
+        self.assertEqual(len(privacy.filter_target("c" * 70000)),
+                         privacy.ARGUMENT_CHARS)
         self.assertIsNone(privacy.filter_target({"path": "x"}))
         self.assertIsNone(privacy.filter_target(["x"]))
         self.assertIsNone(privacy.filter_target(42))
