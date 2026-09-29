@@ -32,6 +32,7 @@ agent-observer sessions list --project myapp --since 2026-09-01
 agent-observer diagnose --since 2026-09-01   # repeated work and behavior incidents
 agent-observer compare --by agentsmd         # behavior per AgentsMD version
 agent-observer health                        # live sessions Observer cannot see
+agent-observer claims --session claude:<id>  # final-report claims checked against tool calls
 ```
 
 Every command accepts `--json`. The ledger lives at
@@ -82,6 +83,34 @@ the exact moments:
 Comparisons are observational: groups differ in period, projects and task
 mix, so differences are leads to inspect, not causal effects. Detector
 output is a candidate list with evidence, not a verdict.
+
+## Claim audit
+
+`claims --session claude:<id>` lists each factual claim in a finished Claude
+Code session's final report (the assistant text after the last prompt or
+tool result) and marks it backed by numbered evidence or `unsupported`.
+Evidence is every tool call with its result, plus every message the agent
+received, since some hosts deliver a delegated reviewer's verdict as a
+message instead of a tool result. One Claude Opus 5.5 call through the
+`claude` CLI (no tools, hooks, MCP servers or saved session) names the
+claims and cites evidence; the command then drops any citation that names
+no evidence, so an invented citation leaves the claim `unsupported`. The
+output ends with the unsupported rate.
+
+```text
+- [backed by #12 Bash] All 387 tests passed
+- [backed by #20 message] The reviewer approved with no blocking findings
+- [unsupported] The summary for existing records is byte-identical
+unsupported: 1/3 (33%)
+```
+
+`unsupported` means the transcript shows no evidence, not that the claim is
+false. Long inputs and results are clipped (6,000 characters, or the first
+6,000 and last 3,000 of a result, shrinking for very long sessions), so a
+claim resting on a clipped part can read as unsupported. The audit reads
+the transcript at audit time and sends it to Anthropic through Claude
+Code; it writes nothing to the ledger. Other harnesses, and claims in
+Issues or PRs, are not audited yet.
 
 ## Ownership and tasks
 

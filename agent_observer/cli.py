@@ -1,4 +1,4 @@
-"""CLI: agent-observer sync|sessions|capture|task|trace. Stdlib only."""
+"""CLI: agent-observer sync|sessions|capture|task|claims|trace. Stdlib only."""
 
 from __future__ import annotations
 
@@ -316,6 +316,10 @@ def build_parser() -> argparse.ArgumentParser:
     hl = sub.add_parser("health", help="find live sessions Observer cannot see")
     hl.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
+    cl = sub.add_parser("claims", help="check a Claude Code session's final report against its tool calls")
+    cl.add_argument("--session", required=True, help="session key, e.g. claude:<id>")
+    cl.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
+
     tr = sub.add_parser("trace", help="inspect the execution timeline")
     tr.add_argument("--task", default=None)
     tr.add_argument("--turn", default=None)
@@ -331,11 +335,11 @@ def main(argv=None) -> int:
     ap = build_parser()
     ns = ap.parse_args(argv)
     try:
-        con = _db.connect_read_only(ns.db) if ns.cmd in ("task", "publish") else _con(ns.db)
+        con = _db.connect_read_only(ns.db) if ns.cmd in ("task", "publish", "claims") else _con(ns.db)
     except (RuntimeError, sqlite3.Error) as exc:
         print(str(exc), file=sys.stderr)
-        if ns.cmd in ("task", "publish"):
-            print("Task reports require an existing ledger; run agent-observer sync first.", file=sys.stderr)
+        if ns.cmd in ("task", "publish", "claims"):
+            print("Task reports and claim audits require an existing ledger; run agent-observer sync first.", file=sys.stderr)
             if os.path.exists(ns.db):
                 print("If a read-only sandbox prevents access, consume a coordinator-exported task JSON instead.", file=sys.stderr)
         return 2
@@ -367,6 +371,21 @@ def main(argv=None) -> int:
 
         if ns.cmd == "capture":
             return _capture(con, ns)
+
+        if ns.cmd == "claims":
+            from . import claims as _claims
+            try:
+                path = _claims.transcript_path(con, ns.session)
+                result = _claims.audit(_claims.read_transcript(path))
+            except _claims.AuditError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            result["session"] = ns.session
+            if ns.as_json:
+                _emit(result, True)
+            else:
+                print(_claims.render(result))
+            return 0
 
         if ns.cmd == "task":
             if ns.op == "list":

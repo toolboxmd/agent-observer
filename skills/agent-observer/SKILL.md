@@ -29,6 +29,7 @@ Run `sync` first; it is incremental and takes seconds after the first run.
 | Repeated work and behavior incidents | `diagnose [--project P] [--since D] [--detector test_edit_after_failure]` |
 | Behavior by AgentsMD version, model, harness or project | `compare --by agentsmd` (or `model`, `harness`, `project`) |
 | Sessions Observer cannot see | `health` |
+| Which claims in a Claude Code session's final report its tool calls back | `claims --session claude:<id>` (one Opus call per run) |
 | Usage of a task with explicit ownership | `task show --task <id> [--prices schedule.json]` |
 | Summary comment on a PR or commit | `publish --task <id> --repo owner/name --pr N [--prices schedule.json]` (explicit request only) |
 

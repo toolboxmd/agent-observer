@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.7.0] - 2026-09-30
+
+### Added
+
+- `claims --session claude:<id>` lists the factual claims in a Claude Code
+  session's final report and marks each backed by a cited tool call or
+  received message, or `unsupported`, with the unsupported rate. One
+  Claude Opus 5.5 call names the claims; citations to evidence that does
+  not exist are dropped (toolboxmd/agentsmd#162)
+
 ## [0.6.0] - 2026-09-29
 
 ### Added
