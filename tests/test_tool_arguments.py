@@ -7,6 +7,7 @@ Tool calls keep their full path or command in events.target (privacy rule
 import json
 import os
 import tempfile
+import time
 import unittest
 
 from agent_observer import privacy
@@ -58,9 +59,9 @@ class RedactionUnitTest(unittest.TestCase):
             self.assertEqual(privacy.argument_text(raw), want)
 
     def test_private_key_block_is_redacted(self):
-        raw = ("printf '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\n"
-               "-----END OPENSSH PRIVATE KEY-----' > k")
-        self.assertEqual(privacy.argument_text(raw), "printf '[redacted]' > k")
+        raw = ("echo '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\n"
+               "-----END OPENSSH PRIVATE KEY-----' | ssh-add -")
+        self.assertEqual(privacy.argument_text(raw), "echo '[redacted]' | ssh-add -")
 
     def test_ordinary_commands_are_unchanged(self):
         for raw in ('await tools.exec_command({cmd:"cat a",max_output_tokens:5000})',
@@ -103,6 +104,12 @@ class RedactionUnitTest(unittest.TestCase):
                 '\\nEOF\\ngit add /r/x.md"})',
             f"cat > /r/open <<EOF\n{body} never closed":
                 "cat > /r/open <<EOF\n[content omitted]",
+            f"cat <<A <<B > /r/out\nfirst\nA\n{body}\nB\nls":
+                "cat <<A <<B > /r/out\n[content omitted]\nA\n[content omitted]\nB\nls",
+            f"printf 'first line\n{body}' > /r/out\nls":
+                "printf [content omitted] > /r/out\nls",
+            f"echo a; printf '{body}' >> /r/f; echo b":
+                "echo a; printf [content omitted] >> /r/f; echo b",
         }
         for raw, want in cases.items():
             with self.subTest(raw[:30]):
@@ -111,8 +118,16 @@ class RedactionUnitTest(unittest.TestCase):
     def test_programs_fed_by_heredoc_stay_as_the_command(self):
         for raw in ("python3 - <<'EOF'\nprint(open('/r/a').read())\nEOF",
                     'git commit -F - <<EOF\nfix: message\nEOF',
-                    "echo done 2>&1 | tail -1"):
+                    "echo done 2>&1 | tail -1",
+                    "echo failed >&2; exit 1"):
             self.assertEqual(privacy.argument_text(raw), raw)
+
+    def test_long_commands_are_stripped_in_linear_time(self):
+        for raw in (("echo x " * 8000) + "z", "printf '" + "a" * 60000,
+                    "cat > /r/f <<A\n" * 5000, "<<EOF\n" * 10000):
+            start = time.monotonic()
+            privacy.argument_text(raw)
+            self.assertLess(time.monotonic() - start, 1.0, raw[:20])
 
     def test_grok_paths_containing_sk_dash_survive(self):
         path = "/w/concepts/issue-led-risk-tiered-vertical-slice-workflow.md"

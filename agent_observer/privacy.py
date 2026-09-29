@@ -279,12 +279,16 @@ _HEREDOC_RE = re.compile(r"<<[-~]?[ \t]*(\\?['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 # path (not 2>&1) or pipes into tee; an interpreter fed by a heredoc
 # (python3 - <<EOF) runs a program, which is the command and stays.
 _FILE_WRITE_RE = re.compile(r"(?<![0-9&>])>>?[ \t]*[^&\s|;>]|\btee\b")
-_INLINE_WRITE_RE = re.compile(
-    r"\b(echo|printf)\b(?:[ \t]+-[a-zA-Z]+)*[ \t]+[^|;&\n]*?"
-    r"((?<![0-9&])[ \t]*>>?[ \t]*[^&\s|;>]+)")
+_WRITER_RE = re.compile(r"\b(?:echo|printf)\b")
 
 
 def _strip_heredocs(text: str, sep: str) -> str:
+    """Omit the bodies of every heredoc on a line that writes a file.
+
+    Bodies follow their introducing line in marker order, so every heredoc
+    on that line is consumed in turn. An unclosed body fails closed and is
+    omitted to the end of the text.
+    """
     out, pos, cursor = [], 0, 0
     while True:
         match = _HEREDOC_RE.search(text, cursor)
@@ -292,23 +296,73 @@ def _strip_heredocs(text: str, sep: str) -> str:
             break
         line_start = text.rfind(sep, 0, match.start())
         line_start = 0 if line_start == -1 else line_start + len(sep)
-        body_start = text.find(sep, match.end())
-        if body_start == -1:
+        line_end = text.find(sep, match.end())
+        if line_end == -1:
             break
-        intro = text[line_start:body_start]
-        body_start += len(sep)
-        word = match.group(2)
-        end = re.compile(re.escape(sep) + r"[\t ]*" + re.escape(word)
-                         + r"(?=" + re.escape(sep) + r"|$|[\"'`);])")
-        close = end.search(text, body_start - len(sep))
-        if not _FILE_WRITE_RE.search(intro):
-            cursor = close.end() if close else len(text)
-            continue
-        out.append(text[pos:body_start] + OMITTED)
-        if close is None:
-            pos = len(text)
+        intro = text[line_start:line_end]
+        writes = _FILE_WRITE_RE.search(intro) is not None
+        words = [m.group(2) for m in
+                 _HEREDOC_RE.finditer(text, match.start(), line_end)]
+        body_start = line_end + len(sep)
+        for word in words:
+            end = re.compile(re.escape(sep) + r"[\t ]*" + re.escape(word)
+                             + r"(?=" + re.escape(sep) + r"|$|[\"'`);])")
+            close = end.search(text, body_start - len(sep))
+            if writes:
+                out.append(text[pos:body_start] + OMITTED)
+                pos = close.start() if close else len(text)
+            if close is None:
+                body_start = len(text)
+                break
+            body_start = close.end() + len(sep)
+        cursor = min(body_start, len(text))
+        if cursor <= match.start():
+            cursor = match.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _strip_inline_writes(text: str) -> str:
+    """Omit the payload of echo or printf redirected to a file.
+
+    One linear pass: each echo/printf segment is scanned once, honoring
+    quotes (which may span lines) and backslash escapes, up to an unquoted
+    ';', '&', '|', newline or escaped newline. When the segment holds an
+    unquoted '>' or '>>' that is not a descriptor redirect (2>, >&), the
+    words before it become OMITTED; the redirect and target stay.
+    """
+    out, pos, n = [], 0, len(text)
+    while True:
+        match = _WRITER_RE.search(text, pos)
+        if match is None:
             break
-        pos, cursor = close.start(), close.end()
+        j, quote, redirect = match.end(), None, None
+        while j < n:
+            c = text[j]
+            if c == "\\":
+                if quote is None and text.startswith("n", j + 1):
+                    break
+                j += 2
+                continue
+            if quote is not None:
+                if c == quote:
+                    quote = None
+            elif c in "'\"":
+                quote = c
+            elif c in ";&|\n":
+                break
+            elif (c == ">" and redirect is None
+                  and text[j - 1] not in "0123456789&>"
+                  and not text.startswith("&", j + 1)):
+                redirect = j
+            j += 1
+        j = min(j, n)
+        out.append(text[pos:match.end()])
+        if redirect is None:
+            out.append(text[match.end():j])
+        else:
+            out.append(f" {OMITTED} " + text[redirect:j])
+        pos = j
     out.append(text[pos:])
     return "".join(out)
 
@@ -323,8 +377,7 @@ def strip_file_writes(text: str) -> str:
     """
     text = _strip_heredocs(text, "\n")
     text = _strip_heredocs(text, "\\n")
-    return _INLINE_WRITE_RE.sub(
-        lambda m: f"{m.group(1)} {OMITTED}{m.group(2)}", text)
+    return _strip_inline_writes(text)
 
 
 def argument_text(value: object) -> str | None:
