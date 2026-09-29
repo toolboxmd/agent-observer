@@ -148,11 +148,60 @@ class RedactionUnitTest(unittest.TestCase):
                     "echo a | tee-log x"):
             self.assertEqual(privacy.argument_text(raw), raw)
 
+    def test_commands_after_a_heredoc_survive(self):
+        # Issue #39, Codex: a python3 heredoc inside one exec string, with a
+        # '>' in its program, then a second exec call. Before the fix the
+        # whole line counted as the heredoc's introducing line, so the
+        # second command became [content omitted].
+        program = ('await tools.exec_command({cmd: "python3 - <<\'PY\'\\n'
+                   'import json\\nprint(\'<summary>\' + str(1) + \'</summary>\')'
+                   '\\nPY\\n", workdir: "/w"});')
+        issue = ('await tools.exec_command({cmd: "gh issue create --repo '
+                 'example/repo --title T --body-file /tmp/b.md"});')
+        # Issue #39, Claude: an interpreter heredoc whose program holds a
+        # '>' and a string literal with escaped newlines.
+        claude = ("python3 - <<'EOF'\nimport sys\nif len(sys.argv) > 1:\n"
+                  "    pass\nSTUB = \"#!/bin/sh\\nexit 0\\n\"\nprint(STUB)\n"
+                  "EOF\ngh issue create --title T")
+        for raw in (program + "\n" + issue, program + " " + issue, claude,
+                    "const f = (x) => x;\n" + program + "\n" + issue):
+            with self.subTest(raw[:40]):
+                self.assertEqual(privacy.argument_text(raw), raw)
+
+    def test_file_bodies_stay_omitted_around_kept_commands(self):
+        body = "FILE-BODY-must-not-persist"
+        cases = {
+            # An escaped write in one exec call, then another call.
+            f'tools.exec_command({{cmd:"cat > /r/x <<\'EOF\'\\n{body}\\nEOF\\n"}});'
+            ' tools.exec_command({cmd:"gh pr list"});':
+                'tools.exec_command({cmd:"cat > /r/x <<\'EOF\'\\n[content omitted]'
+                '\\nEOF\\n"}); tools.exec_command({cmd:"gh pr list"});',
+            # A kept interpreter program whose string holds a shell stub
+            # that writes a file through a heredoc.
+            f"python3 - <<'EOF'\nS = \"cat > /r/f <<'X'\\n{body}\\nX\\nexit 0\\n\"\n"
+            "EOF\ngh issue create --title T":
+                "python3 - <<'EOF'\nS = \"cat > /r/f <<'X'\\n[content omitted]"
+                "\\nX\\nexit 0\\n\"\nEOF\ngh issue create --title T",
+            # A real-newline write whose body or introducing line holds an
+            # escaped newline.
+            f"cat > /r/f <<EOF; printf 'x\\n'\n{body}\nEOF\ngh pr list":
+                "cat > /r/f <<EOF; printf 'x\\n'\n[content omitted]\nEOF\ngh pr list",
+            f"cat > /r/f <<EOF\n{body} with \\n inside\nEOF\nls":
+                "cat > /r/f <<EOF\n[content omitted]\nEOF\nls",
+            # An unclosed escaped write still fails closed to the end.
+            f'tools.exec_command({{cmd:"cat > /r/o <<EOF\\n{body}"}});\nls':
+                'tools.exec_command({cmd:"cat > /r/o <<EOF\\n[content omitted]',
+        }
+        for raw, want in cases.items():
+            with self.subTest(raw[:40]):
+                self.assertEqual(privacy.argument_text(raw), want)
+
     def test_long_commands_are_stripped_in_linear_time(self):
         for raw in (("echo x " * 8000) + "z", "printf '" + "a" * 60000,
                     "cat > /r/f <<A\n" * 5000, "<<EOF\n" * 10000,
                     "echo x 2>&1 | " * 5000, "tee <<<a " * 8000,
-                    "<<<a " * 12000):
+                    "<<<a " * 12000, "cat > f <<A\\n x\n" * 5000,
+                    "<<A\n<<B\\n" * 8000):
             start = time.monotonic()
             privacy.argument_text(raw)
             self.assertLess(time.monotonic() - start, 1.0, raw[:20])
