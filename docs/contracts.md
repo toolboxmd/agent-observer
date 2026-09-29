@@ -113,8 +113,11 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
    does the payload of `echo` or `printf` whose pipeline writes stdout
    to a file (`>`, `>>`, `1>`, `&>`, `>&file`) or pipes into `tee` in any
    later stage, and a here-string (`<<<`) feeding `tee` or a file
-   redirect. A heredoc feeding an interpreter (`python3 - <<EOF`) is the
-   program and stays. Known limits: redirects applied to a whole group
+   redirect. A heredoc's introducing line ends at the first real or
+   escaped (`\n`, as in a Codex `exec` string) newline, and its body
+   closes at a terminator line of the same kind, so commands after the
+   terminator stay. A heredoc feeding an interpreter (`python3 - <<EOF`)
+   is the program and stays. Known limits: redirects applied to a whole group
    or shell (`exec >f`, `{ echo x; } >f`, `( … ) >f`) and programmatic
    writes (`python3 -c` writing a literal) keep their payloads. Other arguments (messages, prompts, edit strings, Codex
    function arguments that are not a JSON object) are free text and stay

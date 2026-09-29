@@ -28,7 +28,7 @@ import re
 
 # Rule 3: bump when any rule in this module changes meaning. A stored source
 # version that differs forces a full re-import with in-place correction.
-PRIVACY_VERSION = 6
+PRIVACY_VERSION = 7
 
 SUBMISSION_EXCERPT_CHARS = 300
 ASSISTANT_EXCERPT_CHARS = 400
@@ -298,32 +298,77 @@ def _fd_before(text: str, j: int) -> tuple[int, str] | None:
     return k, text[k:j]
 
 
+_SEPS = ("\n", "\\n")
+
+
+def _terminator(sep: str, word: str) -> re.Pattern:
+    return re.compile(re.escape(sep) + r"[\t ]*" + re.escape(word)
+                      + r"(?=" + re.escape(sep) + r"|$|[\"'`);])")
+
+
+def _heredoc_sep(text: str, match: re.Match, memo: dict) -> str | None:
+    """The line separator a heredoc marker uses: real or escaped newline.
+
+    A command in a Codex exec string spells its lines as escaped '\\n' on
+    one physical line; a heredoc in a real script may hold escaped '\\n' in
+    string literals. The separator whose terminator line closes the body
+    wins; when both or neither close it, the one that ends the marker's
+    line first. memo caches terminator searches so a pass stays linear.
+    """
+    ends = {s: text.find(s, match.end()) for s in _SEPS}
+    closed = set()
+    for sep, line_end in ends.items():
+        if line_end == -1:
+            continue
+        key, start = (sep, match.group(2)), line_end
+        cached = memo.get(key)
+        if cached and cached[0] <= start and (
+                cached[1] is None or cached[1] >= start):
+            found = cached[1]
+        else:
+            hit = _terminator(sep, match.group(2)).search(text, start)
+            found = hit.start() if hit else None
+            memo[key] = (start, found)
+        if found is not None:
+            closed.add(sep)
+    candidates = [s for s in _SEPS if ends[s] != -1]
+    if len(closed) == 1:
+        return closed.pop()
+    return min(candidates, key=lambda s: ends[s]) if candidates else None
+
+
 def _strip_heredocs(text: str, sep: str) -> str:
     """Omit the bodies of every heredoc on a line that writes a file.
 
-    Bodies follow their introducing line in marker order, so every heredoc
-    on that line is consumed in turn. An unclosed body fails closed and is
-    omitted to the end of the text.
+    A pass handles only the markers that use its separator, and bounds the
+    introducing line by both separators, so a '>' in an earlier or later
+    line never marks the heredoc as a file write. Bodies follow their
+    introducing line in marker order, so every heredoc on that line is
+    consumed in turn. An unclosed body fails closed and is omitted to the
+    end of the text.
     """
-    out, pos, cursor = [], 0, 0
+    out, pos, cursor, memo = [], 0, 0, {}
     while True:
         match = _HEREDOC_RE.search(text, cursor)
         if match is None:
             break
-        line_start = text.rfind(sep, 0, match.start())
-        line_start = 0 if line_start == -1 else line_start + len(sep)
-        line_end = text.find(sep, match.end())
-        if line_end == -1:
+        own = _heredoc_sep(text, match, memo)
+        if own is None:
             break
+        if own != sep:
+            cursor = match.end()
+            continue
+        line_start = max(
+            (i + len(s) for s in _SEPS
+             if (i := text.rfind(s, 0, match.start())) != -1), default=0)
+        line_end = text.find(sep, match.end())
         intro = text[line_start:line_end]
         writes = _FILE_WRITE_RE.search(intro) is not None
         words = [m.group(2) for m in
                  _HEREDOC_RE.finditer(text, match.start(), line_end)]
         body_start = line_end + len(sep)
         for word in words:
-            end = re.compile(re.escape(sep) + r"[\t ]*" + re.escape(word)
-                             + r"(?=" + re.escape(sep) + r"|$|[\"'`);])")
-            close = end.search(text, body_start - len(sep))
+            close = _terminator(sep, word).search(text, body_start - len(sep))
             if writes:
                 out.append(text[pos:body_start] + OMITTED)
                 pos = close.start() if close else len(text)

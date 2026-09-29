@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.7.1] - 2026-09-30
+
+### Fixed
+
+- Stored commands keep everything after a heredoc's terminator. A
+  `>` elsewhere on a Codex `exec` line or in an interpreter program no
+  longer turns the rest of the command into `[content omitted]`; file
+  bodies written through a heredoc stay omitted. Affected sources
+  re-import on the next sync (#39)
+
 ## [0.7.0] - 2026-09-30
 
 ### Added
