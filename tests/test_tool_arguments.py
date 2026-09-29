@@ -110,6 +110,11 @@ class RedactionUnitTest(unittest.TestCase):
                 "printf [content omitted] > /r/out\nls",
             f"echo a; printf '{body}' >> /r/f; echo b":
                 "echo a; printf [content omitted] >> /r/f; echo b",
+            f"echo {body} &>/r/out": "echo [content omitted] &>/r/out",
+            f"echo {body} &>> /r/out; ls": "echo [content omitted] &>> /r/out; ls",
+            f"printf '{body}' 1>/r/out": "printf [content omitted] 1>/r/out",
+            f"cat <<E &>/r/f\n{body}\nE\n": "cat <<E &>/r/f\n[content omitted]\nE\n",
+            f"cat <<E 1>/r/f\n{body}\nE\n": "cat <<E 1>/r/f\n[content omitted]\nE\n",
         }
         for raw, want in cases.items():
             with self.subTest(raw[:30]):
@@ -119,7 +124,9 @@ class RedactionUnitTest(unittest.TestCase):
         for raw in ("python3 - <<'EOF'\nprint(open('/r/a').read())\nEOF",
                     'git commit -F - <<EOF\nfix: message\nEOF',
                     "echo done 2>&1 | tail -1",
-                    "echo failed >&2; exit 1"):
+                    "echo failed >&2; exit 1",
+                    "python3 - <<E 2>&1\nprint(1)\nE\n",
+                    "echo a && ls"):
             self.assertEqual(privacy.argument_text(raw), raw)
 
     def test_long_commands_are_stripped_in_linear_time(self):
