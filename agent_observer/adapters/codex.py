@@ -994,7 +994,7 @@ def _ingest_response_item(r: _Reader, obj: dict) -> None:
         prefix = f"{namespace}." if isinstance(namespace, str) else ""
         args = p.get("arguments") if ptype == "function_call" else p.get("input")
         r.event(obj, "tool_call", call_id or p.get("id"), turn_id=turn_id,
-                name=f"{prefix}{name}",
+                name=f"{prefix}{name}", target=_call_target(args),
                 status=p.get("status"),
                 fingerprint=fingerprint(name, str(args)[:2000]))
     elif ptype in ("function_call_output", "custom_tool_call_output"):
@@ -1007,6 +1007,41 @@ def _ingest_response_item(r: _Reader, obj: dict) -> None:
             size = len(str(out or ""))
         r.event(obj, "tool_result", call_id or p.get("id"), turn_id=turn_id,
                 name=ptype, size_bytes=size)
+
+
+_PATH_KEYS = ("file_path", "path", "filePath", "target_file", "filename")
+
+
+def _call_target(args) -> str | None:
+    """The path or full command a tool call names (privacy rule 8).
+
+    A custom tool input string (a code-mode exec program or an apply_patch
+    body) is the command itself. Function arguments are a JSON object whose
+    path key or cmd/command (a string, or string parts joined by spaces)
+    is the target. Other arguments, such as agent messages, are free text
+    and stay out.
+    """
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+        except ValueError:
+            return args
+        if not isinstance(parsed, dict):
+            return None
+        args = parsed
+    if not isinstance(args, dict):
+        return None
+    for key in _PATH_KEYS:
+        value = args.get(key)
+        if isinstance(value, str) and value:
+            return value
+    for key in ("cmd", "command"):
+        value = args.get(key)
+        if isinstance(value, list):
+            value = " ".join(v for v in value if isinstance(v, str))
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def _ingest_event_msg(r: _Reader, obj: dict, ordinal: int) -> None:
@@ -1091,7 +1126,7 @@ def _ingest_event_msg(r: _Reader, obj: dict, ordinal: int) -> None:
             r.event(obj, "tool_result", item.get("call_id") or item.get("id"),
                     turn_id=turn_id,
                     name=dynamic_name,
-                    target=target[:500] if target else None,
+                    target=target,
                     status=item.get("status"))
         elif itype in ("Plan", "HookPrompt", "EnteredReviewMode",
                        "ExitedReviewMode"):
@@ -1161,7 +1196,7 @@ def _ingest_command(r: _Reader, obj: dict, item: dict, turn_id) -> None:
     elif isinstance(cmd, str) and cmd:
         shown = cmd
     r.event(obj, "tool_result", item.get("id"), turn_id=turn_id,
-            name="exec", target=shown[:500] if shown else None,
+            name="exec", target=shown,
             status=item.get("status"), duration_ms=_duration(item),
             size_bytes=size,
             truncated=1 if item.get("truncated") else None,

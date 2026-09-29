@@ -93,7 +93,7 @@ _MCP_IGNORED_SHAPES: dict[str, set[frozenset]] = {
 }
 
 USER_RULE_RE = re.compile(r"<user_rule>(.*?)</user_rule>", re.S)
-SECRET_SK_RE = re.compile(r"sk-[A-Za-z0-9\-_]{8,}")
+SECRET_SK_RE = re.compile(r"\bsk-[A-Za-z0-9\-_]{8,}")
 SECRET_TOKEN_RE = re.compile(r"SECRET[A-Za-z0-9\-_]*")
 # Event targets come only from validated path or command fields. Pattern
 # and URL values are never targets (rule 6: targets follow the same type
@@ -365,7 +365,7 @@ def _safe_target(raw) -> str | None:
         text = value
         text = SECRET_SK_RE.sub("[redacted]", text)
         text = SECRET_TOKEN_RE.sub("[redacted]", text)
-        return text[:500]
+        return privacy.filter_target(text)
     return None
 
 

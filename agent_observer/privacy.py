@@ -1,4 +1,4 @@
-"""Ledger privacy: the single implementation of the privacy spec rules 1-6.
+"""Ledger privacy: the single implementation of the privacy spec rules 1-6 and 8.
 
 Every adapter and writer routes through this module; no private copies of
 these rules exist elsewhere. Fail closed: when in doubt, store less.
@@ -14,6 +14,10 @@ Rule 3: PRIVACY_VERSION records the rules a source was imported under.
 Rule 4: import_errors.error is one closed category, else the fallback.
 Rule 5: import_errors.line_excerpt holds only sorted top-level key names.
 Rule 6: events.detail_json keeps only allowlisted keys with typed values.
+Rule 7 (docs/contracts.md) covers tables not named here.
+Rule 8: events.target keeps a tool call's full path or command up to
+ARGUMENT_CHARS, with known secret patterns redacted and apply_patch hunk
+bodies reduced to their file header lines.
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ import re
 
 # Rule 3: bump when any rule in this module changes meaning. A stored source
 # version that differs forces a full re-import with in-place correction.
-PRIVACY_VERSION = 5
+PRIVACY_VERSION = 6
 
 SUBMISSION_EXCERPT_CHARS = 300
 ASSISTANT_EXCERPT_CHARS = 400
@@ -196,6 +200,83 @@ EVENT_DETAIL_ALLOWLIST: dict[str, dict[str, str]] = {
 
 _TARGET_CHARS = 500
 
+# Rule 8: one target argument (a path or a full shell command, including a
+# Codex code-mode exec program) keeps up to 64 KiB. The longest real values
+# measured on 2026-09-29 over 14 days of local sessions were 42,102 chars
+# (Claude Bash) and 54,843 chars (Codex exec); p99 was under 8,000.
+ARGUMENT_CHARS = 65536
+
+REDACTED = "[redacted]"
+
+# Rule 8: known secret shapes. Each match is replaced by REDACTED; for
+# assignments and flags the name survives and only the value is replaced.
+_SECRET_RES = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?"
+               r"(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\bA(?:KIA|SIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+)
+_SECRET_VALUE_RES = (
+    # Uppercase NAME=value (environment style) where NAME mentions a
+    # token, secret, password or key.
+    re.compile(r"(\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY"
+               r"|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIALS?)[A-Z0-9_]*=)"
+               r"(\"[^\"]*\"|'[^']*'|[^\s;&|]+)"),
+    # Exact lowercase keys such as "api_key": "..." or password=...
+    re.compile(r"(?i)((?<![A-Za-z0-9_])[\"']?(?:api_?key|access_?token"
+               r"|refresh_?token|client_?secret|secret|password|passwd|token)"
+               r"[\"']?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&|}]+)"),
+    # --token value, --password=value and similar flags.
+    re.compile(r"(?i)(--?(?:token|secret|password|passwd|api-?key"
+               r"|access-?key|auth)(?:=|\s+))(\"[^\"]*\"|'[^']*'|[^\s;&|]+)"),
+    # Authorization headers and bearer tokens.
+    re.compile(r"(?i)(\b(?:bearer|basic)\s+)([A-Za-z0-9._~+/=-]{16,})"),
+    # user:password@ in URLs.
+    re.compile(r"(://[^/\s:@]+:)([^/\s@]+)(@)"),
+)
+
+_PATCH_RE = re.compile(r"\*\*\* Begin Patch(.*?)(?:\*\*\* End Patch|\Z)", re.S)
+_PATCH_HEADER_RE = re.compile(
+    r"\*\*\* (?:Add|Update|Delete) File: [^\n\\\"'`]+|\*\*\* Move to: [^\n\\\"'`]+")
+
+
+def redact_secrets(text: str) -> str:
+    """Rule 8: replace known secret shapes in text with REDACTED."""
+    for rx in _SECRET_RES:
+        text = rx.sub(REDACTED, text)
+    for rx in _SECRET_VALUE_RES:
+        text = rx.sub(lambda m: m.group(1) + REDACTED + (
+            m.group(3) if m.lastindex and m.lastindex >= 3 else ""), text)
+    return text
+
+
+def strip_patch_bodies(text: str) -> str:
+    """Rule 8: keep only file header lines of apply_patch hunks.
+
+    File contents are never stored; a patch inside a command or a Codex
+    exec program keeps its '*** Add/Update/Delete File:' and '*** Move to:'
+    lines, whether the program spells newlines as real or escaped ones.
+    """
+    def keep_headers(match: re.Match) -> str:
+        headers = _PATCH_HEADER_RE.findall(match.group(1))
+        sep = "\n" if "\n" in match.group(0) else "\\n"
+        return "*** Begin Patch" + sep + "".join(
+            h.strip() + sep for h in headers) + "*** End Patch"
+    return _PATCH_RE.sub(keep_headers, text)
+
+
+def argument_text(value: object) -> str | None:
+    """Rule 8: one stored tool argument, or None for a non-string."""
+    if not isinstance(value, str) or not value:
+        return None
+    return redact_secrets(strip_patch_bodies(value))[:ARGUMENT_CHARS]
+
 # Rule 6, native identifiers for the tool/skill name families: a complete
 # ASCII match of [A-Za-z_][A-Za-z0-9_.:/-]{0,79}. fullmatch (not ^...$)
 # so a trailing newline can never slip through the $ anchor. Covers MCP
@@ -233,14 +314,12 @@ def filter_target(target: object, family: object = None) -> str | None:
     only a validated native skill identifier under the same complete
     identifier rule as names: titles, sentences, paths, whitespace,
     markers and wrong types fail closed to None. Other families keep
-    the historical bounded-string behavior, so existing non-skill
-    callers passing no family are unaffected.
+    the full string under rule 8 (argument_text): secrets redacted,
+    patch bodies reduced to file headers, bounded to ARGUMENT_CHARS.
     """
     if family in _SKILL_TARGET_FAMILIES:
         return _valid_native_identifier(target)
-    if isinstance(target, str):
-        return target[:_TARGET_CHARS]
-    return None
+    return argument_text(target)
 
 
 def _valid_int(value: object) -> bool:
@@ -255,9 +334,8 @@ def _valid_identifier(value: object) -> str | None:
 
 
 def _valid_command(value: object) -> str | None:
-    if isinstance(value, str) and value:
-        return value[:_TARGET_CHARS]
-    return None
+    kept = argument_text(value)
+    return kept[:_TARGET_CHARS] if kept else None
 
 
 def _valid_path_detail(value: object) -> str | None:

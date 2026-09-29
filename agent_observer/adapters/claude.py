@@ -202,7 +202,7 @@ def _target(name: str, tool_input: dict):
             return value
     command = tool_input.get("command")
     if isinstance(command, str) and command:
-        return command[:500]
+        return command
     skill = tool_input.get("skill")
     if isinstance(skill, str) and skill:
         return privacy.filter_target(skill, family="skill_invoke")
