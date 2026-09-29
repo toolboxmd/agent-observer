@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.1] - 2026-09-29
+
+### Fixed
+
+- Retry the post-creation release read with bounded exponential backoff
+  (6 attempts, 1 s start, x2, max 8 s, 30 s budget, ported from Model
+  Router), so a just-created release is never judged on one read and the
+  Marketplace wake-up is not skipped
+
 ## [0.5.0] - 2026-09-28
 
 ### Added
