@@ -107,7 +107,9 @@ unsupported: 1/3 (33%)
 `unsupported` means the transcript shows no evidence, not that the claim is
 false. Long inputs and results are clipped (6,000 characters, or the first
 6,000 and last 3,000 of a result, shrinking for very long sessions), so a
-claim resting on a clipped part can read as unsupported. The audit reads
+claim resting on a clipped part can read as unsupported. Transcript text
+is treated as untrusted data in the prompt, but an injected instruction can
+still sway the model's judgment. The audit reads
 the transcript at audit time and sends it to Anthropic through Claude
 Code; it writes nothing to the ledger. Other harnesses, and claims in
 Issues or PRs, are not audited yet.
