@@ -234,6 +234,17 @@ are counted separately and excluded from useful-work comparisons.
   same usage, models, shared rows, outcome, coverage, scope, diagnostics,
   measured set, snapshot and cost as task JSON. Session summaries name
   their limited scope and carry no task outcome.
+- `claims --session claude:ID`: read-only claim audit of one Claude Code
+  session's final report. Resolves the transcript through `sources.path`,
+  numbers tool calls and received messages (user-role text and
+  `queued_command` attachments), and asks Claude Opus 5.5 once, through
+  `claude -p` with no tools, hooks, MCP servers or saved session, for
+  claims with cited numbers. Citations naming no evidence are dropped; a
+  claim with none left is `unsupported`. Output: `claims` (claim, status
+  `backed` or `unsupported`, calls, reason), `total`, `unsupported`,
+  `unsupported_rate`, `invalid_citations`, `models`, `cost_usd`. Exit 2 for
+  an unknown or non-Claude session, an unreadable transcript, no final
+  report, or a failed model call. The ledger is not written.
 - `trace --task ID | --session KEY | --turn ID [--family F]`: ordered events
   with tool join status. `trace --capabilities` prints coverage per harness.
 
