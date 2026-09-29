@@ -281,6 +281,22 @@ _HEREDOC_RE = re.compile(r"<<[-~]?[ \t]*(\\?['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 _FILE_WRITE_RE = re.compile(
     r"(?:^|[^0-9&>]|(?<![0-9])1|&)>>?[ \t]*[^&\s|;>]|\btee\b")
 _WRITER_RE = re.compile(r"\b(?:echo|printf)\b")
+_TEE_RE = re.compile(r"\|[ \t]*tee\b")
+
+
+def _fd_before(text: str, j: int) -> tuple[int, str] | None:
+    """The descriptor word ending right before text[j] ('>'), if any.
+
+    As in the shell, digits form a descriptor only when they are the whole
+    word (start of text or whitespace before them); BODY2>f writes BODY2
+    to f.
+    """
+    k = j
+    while k > 0 and text[k - 1].isdigit():
+        k -= 1
+    if k == j or (k > 0 and text[k - 1] not in " \t"):
+        return None
+    return k, text[k:j]
 
 
 def _strip_heredocs(text: str, sep: str) -> str:
@@ -329,8 +345,9 @@ def _strip_inline_writes(text: str) -> str:
     One linear pass: each echo/printf segment is scanned once, honoring
     quotes (which may span lines) and backslash escapes, up to an unquoted
     ';', '&', '|', newline or escaped newline. When the segment holds an
-    unquoted stdout redirect ('>', '>>', '1>', '&>', '&>>'; not 2> or >&),
-    the words before it become OMITTED; the redirect and target stay.
+    unquoted stdout redirect ('>', '>>', '1>', '&>', '&>>'; not 2> or >&)
+    or a pipe into tee, the words before it become OMITTED; the redirect
+    or pipe and its target stay.
     """
     out, pos, n = [], 0, len(text)
     while True:
@@ -354,14 +371,19 @@ def _strip_inline_writes(text: str) -> str:
                 if redirect is None:
                     redirect = j
                 j += 1
+            elif c == "|" and _TEE_RE.match(text, j):
+                if redirect is None:
+                    redirect = j
             elif c in ";&|\n":
                 break
             elif (c == ">" and redirect is None
                   and not text.startswith("&", j + 1)
-                  and (text[j - 1] not in "0123456789&>"
-                       or (text[j - 1] == "1"
-                           and text[j - 2:j - 1] in (" ", "\t")))):
-                redirect = j - 1 if text[j - 1] == "1" else j
+                  and text[j - 1] != ">"):
+                fd = _fd_before(text, j)
+                if fd is None:
+                    redirect = j
+                elif fd[1] == "1":
+                    redirect = fd[0]
             j += 1
         j = min(j, n)
         out.append(text[pos:match.end()])

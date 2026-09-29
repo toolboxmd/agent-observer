@@ -113,6 +113,10 @@ class RedactionUnitTest(unittest.TestCase):
             f"echo {body} &>/r/out": "echo [content omitted] &>/r/out",
             f"echo {body} &>> /r/out; ls": "echo [content omitted] &>> /r/out; ls",
             f"printf '{body}' 1>/r/out": "printf [content omitted] 1>/r/out",
+            f"echo {body} | tee /r/out": "echo [content omitted] | tee /r/out",
+            f"printf '{body}' | tee -a /r/out; ls":
+                "printf [content omitted] | tee -a /r/out; ls",
+            f"echo {body}2>/r/out": "echo [content omitted] >/r/out",
             f"cat <<E &>/r/f\n{body}\nE\n": "cat <<E &>/r/f\n[content omitted]\nE\n",
             f"cat <<E 1>/r/f\n{body}\nE\n": "cat <<E 1>/r/f\n[content omitted]\nE\n",
         }
@@ -126,7 +130,9 @@ class RedactionUnitTest(unittest.TestCase):
                     "echo done 2>&1 | tail -1",
                     "echo failed >&2; exit 1",
                     "python3 - <<E 2>&1\nprint(1)\nE\n",
-                    "echo a && ls"):
+                    "echo a && ls",
+                    "echo a | grep a",
+                    "echo warn 2>/dev/null"):
             self.assertEqual(privacy.argument_text(raw), raw)
 
     def test_long_commands_are_stripped_in_linear_time(self):
