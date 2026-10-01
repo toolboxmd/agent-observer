@@ -125,3 +125,12 @@ class PlacementTest(LedgerCase):
         self.assertEqual(placed["r0"], "o/beta#2")
         self.assertEqual(placement.checkout_of(self.con, self.checkouts["alpha"]),
                          ("o/beta", "fix/b"))
+
+    def test_checkout_without_origin_forgets_its_old_record(self):
+        # Second review of 382552e: no origin now, removed later.
+        root = self.checkouts["alpha"]
+        self.assertEqual(placement.checkout_of(self.con, root), ("o/alpha", "fix/a"))
+        _git("-C", root, "remote", "remove", "origin")
+        self.assertIsNone(placement.checkout_of(self.con, root))
+        shutil.rmtree(root)
+        self.assertIsNone(placement.checkout_of(self.con, root))

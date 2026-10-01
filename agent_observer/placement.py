@@ -81,6 +81,12 @@ def _live(con, root: str, known: list | None, roots: dict | None):
             known[:] = [r for r in known if r["root"] != root]
             known.append({"root": root, "repository": found[0], "branch": branch})
             known.sort(key=lambda r: -len(r["root"]))
+    else:
+        # No recognizable origin now: drop the old mapping so it cannot
+        # answer for this path after the checkout is removed.
+        con.execute("DELETE FROM checkouts WHERE root=?", (root,))
+        if known is not None:
+            known[:] = [r for r in known if r["root"] != root]
     if roots is not None:
         roots[root] = found
     return found
