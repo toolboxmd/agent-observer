@@ -134,3 +134,15 @@ class PlacementTest(LedgerCase):
         self.assertIsNone(placement.checkout_of(self.con, root))
         shutil.rmtree(root)
         self.assertIsNone(placement.checkout_of(self.con, root))
+
+    def test_read_only_ledger_still_splits(self):
+        # publish and task open the ledger read-only (cli.py).
+        self.claude_session()
+        placement.record_shared_checkouts(self.con)
+        self.con.commit()
+        ro = db.connect_read_only(self.db_path)
+        try:
+            alpha = report.task_report(ro, "o/alpha#1", schedule=SCHEDULE)
+        finally:
+            ro.close()
+        self.assertEqual(alpha["measured"]["attributed_responses"], ["r0"])

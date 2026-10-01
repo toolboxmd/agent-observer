@@ -15,6 +15,7 @@ from __future__ import annotations
 import bisect
 import os
 import re
+import sqlite3
 import subprocess
 import time
 
@@ -65,6 +66,15 @@ def checkout_of(con, path: str, known: list | None = None,
     return None
 
 
+def _write(con, sql: str, args: tuple) -> None:
+    """Record a checkout; `task` and `publish` read a read-only ledger,
+    where the live answer still applies and only the record is skipped."""
+    try:
+        con.execute(sql, args)
+    except sqlite3.OperationalError:
+        pass
+
+
 def _live(con, root: str, known: list | None, roots: dict | None):
     if roots is not None and root in roots:
         return roots[root]
@@ -75,8 +85,8 @@ def _live(con, root: str, known: list | None, roots: dict | None):
         branch = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
         branch = branch if branch and branch != "HEAD" else None
         found = (match.group(1), branch)
-        con.execute("INSERT OR REPLACE INTO checkouts(root, repository, branch, seen_at)"
-                    " VALUES(?,?,?,?)", (root, found[0], branch, time.time()))
+        _write(con, "INSERT OR REPLACE INTO checkouts(root, repository, branch, seen_at)"
+               " VALUES(?,?,?,?)", (root, found[0], branch, time.time()))
         if known is not None:
             known[:] = [r for r in known if r["root"] != root]
             known.append({"root": root, "repository": found[0], "branch": branch})
@@ -84,7 +94,7 @@ def _live(con, root: str, known: list | None, roots: dict | None):
     else:
         # No recognizable origin now: drop the old mapping so it cannot
         # answer for this path after the checkout is removed.
-        con.execute("DELETE FROM checkouts WHERE root=?", (root,))
+        _write(con, "DELETE FROM checkouts WHERE root=?", (root,))
         if known is not None:
             known[:] = [r for r in known if r["root"] != root]
     if roots is not None:
