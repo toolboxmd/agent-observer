@@ -331,6 +331,29 @@ class HumanSignalsTest(AnalysisCase):
         self.assertEqual(signals, ["correction wording", "denial", "interrupt"])
 
 
+    def test_only_user_rejections_count_as_denials(self):
+        # 2026-09-30 council: 71 of 81 counted denials were permission rules.
+        self.session("claude:k")
+        for kind in ("user-rejected", "permission-rule", "automode-blocked", "interrupted"):
+            self.event("claude:k", "permission", name="Bash", status="denied",
+                       detail={"denial": kind})
+        denials = [i for i in self.found("claude:k", "human_correction")
+                   if i["signal"] == "denial"]
+        self.assertEqual(len(denials), 1)
+
+
+class DiagnoseWindowTest(AnalysisCase):
+    def test_incidents_outside_the_window_are_dropped(self):
+        # A session spanning the window boundary keeps only in-window incidents.
+        self.session("claude:w", started=1000.0)
+        for ts in (1010.0, 1050.0):
+            self.prompt("claude:w", "[Request interrupted by user]", kind="interrupt")
+            self.con.execute("UPDATE submissions SET ts=? WHERE native_id=?",
+                             (ts, f"s{self.seq}"))
+        found = analysis.diagnose(self.con, since=1030.0, until=1100.0)
+        self.assertEqual(found["counts"].get("human_correction"), 1)
+        self.assertEqual(found["incidents"][0]["ts"], 1050.0)
+
 class CompareTest(AnalysisCase):
     def test_groups_by_version_with_sample_sizes_and_skip_subagents(self):
         self.session("claude:g", version="12.0.1", project="/p/one")

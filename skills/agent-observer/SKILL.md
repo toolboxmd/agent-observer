@@ -8,7 +8,7 @@ description: Measure what agents actually did on this machine. Use when someone 
 Agent Observer reads native Codex, Claude Code, OpenCode and Grok Build
 records, Model Router's ledger and Chromeria/T3 Code state into one
 private local ledger. It never changes those records, never calls a model,
-and posts nothing unless asked.
+and posts only its cost comment, on a PR being delivered or when asked.
 
 Resolve this `SKILL.md` to its real path. The plugin root is two directories
 above its `agent-observer` directory; run `<plugin-root>/bin/agent-observer`
@@ -31,7 +31,7 @@ Run `sync` first; it is incremental and takes seconds after the first run.
 | Sessions Observer cannot see | `health` |
 | Which claims in a Claude Code session's final report its tool calls back | `claims --session claude:<id>` (one Opus call per run) |
 | Usage of a task with explicit ownership | `task show --task <id> [--prices schedule.json]` |
-| Summary comment on a PR or commit | `publish --task <id> --repo owner/name --pr N [--prices schedule.json]` (explicit request only) |
+| Summary comment on a PR or commit | `publish --task <id> --repo owner/name --pr N [--prices schedule.json]` |
 
 Add `--json` to any command for structured output. `publish --dry-run
 --json` returns a JSON payload with the summary data, the rendered body,
@@ -79,5 +79,6 @@ valuations with `--prices`.
 
 - Keep transcripts, prompts, tool arguments and file contents out of any
   reply meant for others; quote aggregates and event references instead.
-- `publish` writes to GitHub. Run it only when a person asks for it, and
-  only against the repository and PR or commit they named.
+- `publish` writes to GitHub. Run it on the PR of the task you are
+  delivering, or when a person asks, and only against the repository and
+  PR or commit of that task or request.

@@ -375,7 +375,11 @@ def _human_corrections(con, session, events) -> list:
                 e["status"] == "cancelled":
             out.append(_incident(session, "human_correction", e["ts"],
                                  "interrupted the agent", [e["id"]], {"signal": "interrupt"}))
-        if e["family"] == "permission" and e["status"] == "denied":
+        # Claude names who denied: only `user-rejected` is a person. A
+        # permission rule or auto mode is policy, and `interrupted` is
+        # already counted from the interrupt itself.
+        if e["family"] == "permission" and e["status"] == "denied" and \
+                _detail(e).get("denial", "user-rejected") == "user-rejected":
             out.append(_incident(session, "human_correction", e["ts"],
                                  f"denied {e['name']}", [e["id"]], {"signal": "denial"}))
     return out
@@ -394,8 +398,12 @@ def diagnose(con, detectors=None, limit=200, **filters) -> dict:
     wanted = set(detectors or DETECTORS)
     incidents = []
     sessions = sessions_in_scope(con, **filters)
+    since, until = filters.get("since"), filters.get("until")
     for s in sessions:
         incidents += [i for i in detect_session(con, s) if i["detector"] in wanted]
+    # A session overlapping the window can hold incidents outside it.
+    incidents = [i for i in incidents if i["ts"] is None or (
+        (since is None or i["ts"] >= since) and (until is None or i["ts"] < until))]
     incidents.sort(key=lambda i: (i["ts"] or 0), reverse=True)
     counts: dict = defaultdict(int)
     for i in incidents:

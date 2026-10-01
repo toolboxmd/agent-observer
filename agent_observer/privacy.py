@@ -28,7 +28,7 @@ import re
 
 # Rule 3: bump when any rule in this module changes meaning. A stored source
 # version that differs forces a full re-import with in-place correction.
-PRIVACY_VERSION = 7
+PRIVACY_VERSION = 8
 
 SUBMISSION_EXCERPT_CHARS = 300
 ASSISTANT_EXCERPT_CHARS = 400
@@ -196,7 +196,7 @@ EVENT_DETAIL_ALLOWLIST: dict[str, dict[str, str]] = {
     "skill_invoke": {"skill_path": "path"},
     "compaction": {},
     "lifecycle": {},
-    "permission": {},
+    "permission": {"denial": "identifier"},
 }
 
 _TARGET_CHARS = 500

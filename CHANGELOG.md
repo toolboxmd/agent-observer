@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.8.0] - 2026-10-01
+
+### Added
+
+- diagnose counts only incidents inside --since/--until; only user rejections count as human corrections; agents publish the cost on the PR they deliver. Claude sources re-import on the next sync
+
 ## [0.7.1] - 2026-09-30
 
 ### Fixed
