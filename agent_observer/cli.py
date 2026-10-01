@@ -1,4 +1,4 @@
-"""CLI: agent-observer sync|sessions|capture|task|claims|trace. Stdlib only."""
+"""CLI: agent-observer sync|sessions|capture|task|claims|thread-misuse|trace. Stdlib only."""
 
 from __future__ import annotations
 
@@ -320,6 +320,12 @@ def build_parser() -> argparse.ArgumentParser:
     cl.add_argument("--session", required=True, help="session key, e.g. claude:<id>")
     cl.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
+    tm = sub.add_parser("thread-misuse",
+                        help="list deep Chromeria spawn chains and cross-thread messages")
+    tm.add_argument("--since", default=None, help="ISO date or epoch seconds")
+    tm.add_argument("--until", default=None, help="ISO date or epoch seconds")
+    tm.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
+
     tr = sub.add_parser("trace", help="inspect the execution timeline")
     tr.add_argument("--task", default=None)
     tr.add_argument("--turn", default=None)
@@ -335,10 +341,10 @@ def main(argv=None) -> int:
     ap = build_parser()
     ns = ap.parse_args(argv)
     try:
-        con = _db.connect_read_only(ns.db) if ns.cmd in ("task", "publish", "claims") else _con(ns.db)
+        con = _db.connect_read_only(ns.db) if ns.cmd in ("task", "publish", "claims", "thread-misuse") else _con(ns.db)
     except (RuntimeError, sqlite3.Error) as exc:
         print(str(exc), file=sys.stderr)
-        if ns.cmd in ("task", "publish", "claims"):
+        if ns.cmd in ("task", "publish", "claims", "thread-misuse"):
             print("Task reports and claim audits require an existing ledger; run agent-observer sync first.", file=sys.stderr)
             if os.path.exists(ns.db):
                 print("If a read-only sandbox prevents access, consume a coordinator-exported task JSON instead.", file=sys.stderr)
@@ -371,6 +377,16 @@ def main(argv=None) -> int:
 
         if ns.cmd == "capture":
             return _capture(con, ns)
+
+        if ns.cmd == "thread-misuse":
+            from . import misuse as _misuse
+            result = _misuse.report(con, since=_when(ns.since),
+                                    until=_when(ns.until))
+            if ns.as_json:
+                _emit(result, True)
+            else:
+                print(_misuse.render(result))
+            return 0 if result["imported"] else 2
 
         if ns.cmd == "claims":
             from . import claims as _claims

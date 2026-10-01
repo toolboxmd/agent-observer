@@ -30,6 +30,7 @@ checkout, run `bin/agent-observer` directly.
 agent-observer sync                          # import everything; later runs are incremental
 agent-observer sessions list --project myapp --since 2026-09-01
 agent-observer diagnose --since 2026-09-01   # repeated work and behavior incidents
+agent-observer thread-misuse --since 2026-10-01  # deep Chromeria spawns, cross-thread messages
 agent-observer compare --by agentsmd         # behavior per AgentsMD version
 agent-observer health                        # live sessions Observer cannot see
 agent-observer claims --session claude:<id>  # final-report claims checked against tool calls
@@ -113,6 +114,31 @@ still sway the model's judgment. The audit reads
 the transcript at audit time and sends it to Anthropic through Claude
 Code; it writes nothing to the ledger. Other harnesses, and claims in
 Issues or PRs, are not audited yet.
+
+## Chromeria thread misuse
+
+`thread-misuse [--since <date>] [--until <date>]` lists two signals from
+Chromeria threads that `sync --harness t3` imported:
+
+- every thread more than two spawn levels below the thread a person
+  started, with its chain from the root;
+- every `message_thread` message into a thread that is not the sender's
+  own child, with sender, target, how they relate in the spawn tree
+  (`child to parent`, `to ancestor`, `to grandchild or deeper`,
+  `within tree`, `across trees`) and the time.
+
+```text
+spawn chains deeper than 2 levels: 0
+  none
+messages into a thread other than the sender's own child: 1
+- 2026-09-30T10:00:00Z child to parent: sub.<root>.worker-bbbb (worker) -> <root> (unknown)
+```
+
+Roles come from Prism's `<role>-<hex>` child id suffix and print
+`unknown` otherwise. The ledger keeps only thread and message ids and
+times, never titles or message text. Both lists are evidence to inspect,
+not verdicts; replies a child sends its parent through `message_thread`
+appear as `child to parent`.
 
 ## Ownership and tasks
 
