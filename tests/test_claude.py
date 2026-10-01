@@ -244,3 +244,25 @@ class ClaudeQueueOperationTest(LedgerCase):
             (r["error"] or "") + (r["line_excerpt"] or "")
             for r in self.query("SELECT error, line_excerpt FROM import_errors"))
         self.assertNotIn("SECRET-QUEUE-aaa111", blob)
+
+
+class ClaudeDenialKindTest(LedgerCase):
+    def test_known_denial_kind_is_kept_and_unknown_is_dropped(self):
+        dst = os.path.join(self.tmp.name, "sess-deny.jsonl")
+        head = ('{"sessionId": "sess-deny", "cwd": "/redacted/repo", "version": "2.1.280",'
+                ' "isSidechain": false, ')
+        lines = []
+        for n, kind in ((1, "permission-rule"), (2, "unknown-SECRET")):
+            lines.append(head + '"type": "assistant", "uuid": "a%d", "timestamp":'
+                         ' "2026-09-14T10:00:0%dZ", "message": {"id": "m%d", "role": "assistant",'
+                         ' "content": [{"type": "tool_use", "id": "t%d", "name": "Bash",'
+                         ' "input": {"command": "ls"}}]}}\n' % (n, n, n, n))
+            lines.append(head + '"type": "user", "uuid": "u%d", "timestamp":'
+                         ' "2026-09-14T10:00:0%dZ", "toolDenialKind": "%s", "message":'
+                         ' {"role": "user", "content": [{"type": "tool_result",'
+                         ' "tool_use_id": "t%d", "content": "denied"}]}}\n' % (n, n, kind, n))
+        _write(dst, lines)
+        claude.import_claude_file(self.con, dst)
+        details = sorted((r["detail_json"] or "") for r in self.query(
+            "SELECT detail_json FROM events WHERE family='permission'"))
+        self.assertEqual(details, ["", '{"denial": "permission-rule"}'])

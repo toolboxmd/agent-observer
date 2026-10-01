@@ -145,7 +145,7 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
 | `compaction` | Context compaction boundary | trigger, before and after sizes when recorded |
 | `lifecycle` | Turn start, completion, abort, subagent activity, stop reasons | duration, reason |
 | `assistant_message` | Final assistant text of a turn | last 400 characters per Claude assistant text block; one combined-message excerpt on Codex |
-| `permission` | Permission request or denial | tool, outcome |
+| `permission` | Permission request or denial | tool, outcome; Claude's denial kind (`user-rejected`, `permission-rule`, `automode-blocked`, `interrupted`) in detail `denial` |
 
 A tool call joins its result only on an equal native call id. Nothing is
 guessed into a join.

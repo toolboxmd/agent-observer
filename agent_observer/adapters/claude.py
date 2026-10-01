@@ -707,6 +707,11 @@ def _user(r: _Reader, obj: dict, ordinal: int, ts) -> None:
     _submission(r, native, ordinal, ts, kind, text)
 
 
+# Claude's toolDenialKind values seen in native records; any other value
+# stays out of the ledger.
+DENIAL_KINDS = frozenset({"user-rejected", "permission-rule", "automode-blocked",
+                          "interrupted"})
+
 def _tool_result(r: _Reader, obj: dict, result: dict, ordinal: int, ts) -> None:
     call_id = result.get("tool_use_id")
     if not call_id:
@@ -724,7 +729,8 @@ def _tool_result(r: _Reader, obj: dict, result: dict, ordinal: int, ts) -> None:
             detail=detail)
     if denied:
         r.event("permission", call_id, ordinal, ts, name=name or "unknown",
-                status="denied")
+                status="denied",
+                detail={"denial": denied} if denied in DENIAL_KINDS else None)
     file_info = structured.get("file") if isinstance(structured.get("file"), dict) else None
     path = (file_info or {}).get("filePath") or (tool_input or {}).get(READ_TOOLS.get(name or "", ""), None)
     if not isinstance(path, str):
