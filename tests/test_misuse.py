@@ -76,6 +76,9 @@ MESSAGES = [
      "2026-10-01T10:03:00Z"),
     ("m5", DISP, "user", attributed("Sibling", OTHER_WORKER.replace(
         OTHER, ROOT)), "2026-10-01T10:04:00Z"),
+    # A very long title still yields its sender.
+    ("m9", OTHER, "user", attributed("T" * 2000, DISP),
+     "2026-09-30T10:08:00Z"),
     # Parent to own child: Chromeria adds no attribution, nothing listed.
     ("m6", WORK, "user", SECRET, "2026-09-30T10:05:00Z"),
     # An assistant quoting the line is not a delivery.
@@ -97,7 +100,7 @@ class ThreadMisuseTest(LedgerCase):
     def test_sync_mirrors_spawns_and_messages_without_text(self):
         self.assertEqual(self.totals["failed"], [])
         self.assertEqual(self.totals["spawns"], 5)
-        self.assertEqual(self.totals["messages"], 5)
+        self.assertEqual(self.totals["messages"], 6)
         self.assertEqual(self.totals["malformed"], 1)
         depths = {r["thread_id"]: r["depth"] for r in self.query(
             "SELECT thread_id, depth FROM t3_spawns")}
@@ -128,6 +131,7 @@ class ThreadMisuseTest(LedgerCase):
         self.assertEqual(listed, [
             (WORK, DISP, "child to parent", "2026-09-30T10:00:00Z"),
             (DISP, OTHER, "across trees", "2026-09-30T10:01:00Z"),
+            (DISP, OTHER, "across trees", "2026-09-30T10:08:00Z"),
             (ROOT, WORK, "to grandchild or deeper", "2026-10-01T10:02:00Z"),
             (OTHER_WORKER, WORK, "across trees", "2026-10-01T10:03:00Z"),
             (f"sub.{ROOT}.worker-eeee00000005", DISP, "within tree",
@@ -147,7 +151,7 @@ class ThreadMisuseTest(LedgerCase):
         result = misuse.report(self.con, until=since)
         self.assertEqual([s["thread_id"] for s in result["deep_spawns"]],
                          [DEEP3])
-        self.assertEqual(len(result["cross_messages"]), 2)
+        self.assertEqual(len(result["cross_messages"]), 3)
 
     def test_render_names_chain_and_messages(self):
         text = misuse.render(misuse.report(self.con))

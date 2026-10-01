@@ -575,7 +575,8 @@ def _import_messages(con: sqlite3.Connection, native: sqlite3.Connection,
 
     Chromeria prefixes a delivery only when the target is not the
     sender's child, so every prefixed message is one the report lists.
-    Only the attribution line is read; the body never leaves T3.
+    Only the whole first line, the attribution, is read, so a title of
+    any length parses; the body never leaves T3.
     """
     totals["messages"] = 0
     if "projection_thread_messages" not in _tables(native):
@@ -583,7 +584,9 @@ def _import_messages(con: sqlite3.Connection, native: sqlite3.Connection,
     try:
         rows = native.execute(
             "SELECT message_id, thread_id, created_at,"
-            " substr(text, 1, 512) AS head FROM projection_thread_messages"
+            " CASE WHEN instr(text, char(10))>0"
+            " THEN substr(text, 1, instr(text, char(10))-1) ELSE text END"
+            " AS head FROM projection_thread_messages"
             " WHERE role='user' AND text LIKE '[Message from %'").fetchall()
     except sqlite3.DatabaseError:
         return
@@ -591,7 +594,7 @@ def _import_messages(con: sqlite3.Connection, native: sqlite3.Connection,
         message_id = _valid_id(row["message_id"])
         target = _valid_id(row["thread_id"])
         head = row["head"] if isinstance(row["head"], str) else ""
-        match = MESSAGE_FROM_RE.match(head.split("\n", 1)[0])
+        match = MESSAGE_FROM_RE.match(head)
         sender = _valid_id(match.group(1)) if match else None
         if message_id is None or target is None or sender is None:
             totals["malformed"] += 1
