@@ -43,36 +43,47 @@ def _known_checkouts(con) -> list:
     ).fetchall()
 
 
-def checkout_of(con, path: str, known: list | None = None):
+def checkout_of(con, path: str, known: list | None = None,
+                roots: dict | None = None):
     """(repository, branch) of the checkout holding path, or None.
 
-    A recorded checkout answers first; otherwise the nearest existing
-    directory with a `.git` entry is asked through git and recorded.
-    Detached checkouts record no branch and so match no PR.
+    A checkout that still exists is read live through git and its record
+    refreshed, so a reused path never keeps a stale repository or branch.
+    Only a removed checkout falls back to its recorded mapping. Detached
+    checkouts record no branch and so match no PR.
     """
     path = os.path.normpath(os.path.expanduser(path))
-    for row in known if known is not None else _known_checkouts(con):
-        if path == row["root"] or path.startswith(row["root"] + "/"):
-            return row["repository"], row["branch"]
     probe = path
     while probe and probe != os.path.dirname(probe):
         if os.path.exists(os.path.join(probe, ".git")):
-            break
+            return _live(con, probe, known, roots)
         probe = os.path.dirname(probe)
-    else:
-        return None
-    remote = _git(probe, "remote", "get-url", "origin") or ""
+    for row in known if known is not None else _known_checkouts(con):
+        if path == row["root"] or path.startswith(row["root"] + "/"):
+            if not os.path.exists(row["root"]):
+                return row["repository"], row["branch"]
+    return None
+
+
+def _live(con, root: str, known: list | None, roots: dict | None):
+    if roots is not None and root in roots:
+        return roots[root]
+    remote = _git(root, "remote", "get-url", "origin") or ""
     match = REMOTE_RE.search(remote)
-    if match is None:
-        return None
-    branch = _git(probe, "rev-parse", "--abbrev-ref", "HEAD")
-    branch = branch if branch and branch != "HEAD" else None
-    con.execute("INSERT OR REPLACE INTO checkouts(root, repository, branch, seen_at)"
-                " VALUES(?,?,?,?)", (probe, match.group(1), branch, time.time()))
-    if known is not None:
-        known.append({"root": probe, "repository": match.group(1), "branch": branch})
-        known.sort(key=lambda r: -len(r["root"]))
-    return match.group(1), branch
+    found = None
+    if match is not None:
+        branch = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
+        branch = branch if branch and branch != "HEAD" else None
+        found = (match.group(1), branch)
+        con.execute("INSERT OR REPLACE INTO checkouts(root, repository, branch, seen_at)"
+                    " VALUES(?,?,?,?)", (root, found[0], branch, time.time()))
+        if known is not None:
+            known[:] = [r for r in known if r["root"] != root]
+            known.append({"root": root, "repository": found[0], "branch": branch})
+            known.sort(key=lambda r: -len(r["root"]))
+    if roots is not None:
+        roots[root] = found
+    return found
 
 
 def task_heads(con, task_ids) -> dict:
@@ -120,6 +131,7 @@ def place_session(con, session_key: str) -> dict | None:
         " AND ordinal_num IS NOT NULL ORDER BY ordinal_num", (session_key,)).fetchall()
     known = [dict(r) for r in _known_checkouts(con)]
     seen: dict = {}
+    roots: dict = {}
     touched: dict = {r["response_id"]: set() for r in responses}
     ordinals = [r["ordinal_num"] for r in responses]
     for call in calls:
@@ -129,7 +141,7 @@ def place_session(con, session_key: str) -> dict | None:
         rid = responses[owner]["response_id"]
         for path in PATH_RE.findall(call["target"] or ""):
             if path not in seen:
-                seen[path] = checkout_of(con, path, known)
+                seen[path] = checkout_of(con, path, known, roots)
             found = seen[path]
             if found in by_head:
                 touched[rid].add(by_head[found])

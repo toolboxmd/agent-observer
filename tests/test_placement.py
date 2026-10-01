@@ -113,3 +113,15 @@ class PlacementTest(LedgerCase):
         root = self.checkouts["alpha"]
         _git("-C", root, "checkout", "-q", "--detach")
         self.assertEqual(placement.checkout_of(self.con, root), ("o/alpha", None))
+
+    def test_reused_checkout_path_is_read_live_not_from_its_record(self):
+        # Review of 8e20c4b: a recorded root later holding another branch.
+        self.claude_session()
+        placement.record_shared_checkouts(self.con)
+        _git("-C", self.checkouts["alpha"], "checkout", "-q", "-b", "fix/b")
+        _git("-C", self.checkouts["alpha"], "remote", "set-url", "origin",
+             "git@github.com:o/beta.git")
+        placed = placement.place_session(self.con, "claude:s")
+        self.assertEqual(placed["r0"], "o/beta#2")
+        self.assertEqual(placement.checkout_of(self.con, self.checkouts["alpha"]),
+                         ("o/beta", "fix/b"))
