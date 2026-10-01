@@ -31,6 +31,7 @@ Run `sync` first; it is incremental and takes seconds after the first run.
 | Sessions Observer cannot see | `health` |
 | Chromeria spawn chains deeper than two levels and messages into threads other than the sender's child | `thread-misuse [--since D] [--until D]` |
 | Which claims in a Claude Code session's final report its tool calls back | `claims --session claude:<id>` (one Opus call per run) |
+| Planner dispatch versus a dispatcher thread on real jobs | `dispatch-modes [--planner <thread>] [--job owner/repo#N] [--since D]` |
 | Usage of a task with explicit ownership | `task show --task <id> [--prices schedule.json]` |
 | Summary comment on a PR or commit | `publish --task <id> --repo owner/name --pr N [--prices schedule.json]` |
 

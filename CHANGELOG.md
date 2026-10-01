@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.11.0] - 2026-10-01
+
+### Added
+
+- dispatch-modes compares planner dispatch with a dispatcher thread on Chromeria jobs: per mode, jobs, success rate, median time to the first worker and to an approving review, and tokens and cost per job, each with its sample size; missing data, including a job thread with no ledger session, prints unknown (#44)
+
 ## [0.10.0] - 2026-10-01
 
 ### Added

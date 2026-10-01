@@ -34,6 +34,7 @@ agent-observer thread-misuse --since 2026-10-01  # deep Chromeria spawns, cross-
 agent-observer compare --by agentsmd         # behavior per AgentsMD version
 agent-observer health                        # live sessions Observer cannot see
 agent-observer claims --session claude:<id>  # final-report claims checked against tool calls
+agent-observer dispatch-modes --since 2026-10-01  # planner dispatch versus a dispatcher thread
 ```
 
 Every command accepts `--json`. The ledger lives at
@@ -139,6 +140,41 @@ Roles come from Prism's `<role>-<hex>` child id suffix and print
 times, never titles or message text. Both lists are evidence to inspect,
 not verdicts; replies a child sends its parent through `message_thread`
 appear as `child to parent`.
+
+## Dispatch modes
+
+`dispatch-modes` compares the two ways a Chromeria planner delegates a job:
+starting workers and reviewers itself (planner mode), or starting one
+`dispatcher-` thread that starts them (dispatcher mode). Per mode it prints
+jobs, succeeded, success rate, median time to the first worker thread,
+median time to an approving review, and tokens and list-price cost per job,
+each with its sample size. A figure with no data prints `unknown (n=0)`.
+
+```sh
+agent-observer dispatch-modes --planner <thread> --job owner/repo#N --since 2026-10-01
+```
+
+- A job is one planner thread and the PR its children link, or the Issue
+  when they link no PR. `--job` accepts either. The job's threads are the
+  planner's direct children whose subtree links it.
+- The mode comes from the child thread names: a `dispatcher-` child makes a
+  dispatcher job, other role names (`worker-`, `reviewer-`, `retry-`,
+  `escalation-`) a planner job. Older children without a role name leave
+  the mode `unknown`.
+- Times start at the planner turn that created the job's first child. The
+  approving review is the first `review/independent` success status or
+  approving review on the PR, read through `gh`. A job succeeds when that
+  approval exists or the PR merged; when GitHub is unreachable, success is
+  `unknown`.
+- Tokens and cost cover every thread in the job's subtrees plus the planner
+  turns that coordinated it: a turn that a child's report started, or in
+  which the planner created or messaged a child. A thread or planner turn
+  serving several jobs is split evenly between them. If any of those threads
+  has no session in the ledger (a Grok child, or a thread not yet synced),
+  the job's tokens and cost print `unknown` and leave the mode's sample.
+
+Thread trees, turns and links come from T3's `state.sqlite`, read-only at
+report time; usage comes from the ledger, so run `sync` first.
 
 ## Ownership and tasks
 
