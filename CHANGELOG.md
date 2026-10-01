@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.0] - 2026-10-01
+
+### Added
+
+- thread-misuse lists Chromeria spawn chains deeper than two levels and message_thread messages into threads other than the sender's own child, with ids, roles where known and times; Chromeria trees re-import on the next sync (#42)
+
 ## [0.9.0] - 2026-10-01
 
 ### Added

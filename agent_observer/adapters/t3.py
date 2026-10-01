@@ -30,6 +30,12 @@ never writes, never deletes) from ``$T3CODE_HOME/userdata/state.sqlite``
   from exit codes (which are never read).
 - Ghostty bodies and unknown provider shapes are out of scope: their
   rows are skipped, never guessed.
+- spawns and cross-thread messages (#42): every ``sub.`` thread in
+  ``projection_threads`` mirrors its parent, depth and creation time;
+  every delivered message Chromeria prefixed with ``[Message from <title>
+  (thread <id>)]`` (``message_thread`` into a thread that is not the
+  sender's child) mirrors its sender id, target id and time. Titles and
+  message text are never stored.
 
 Privacy (fail closed): only identifiers (thread, message and session
 ids), link coordinates (host, repository, number, url), PR snapshot
@@ -67,6 +73,11 @@ CAPABILITIES = [
 STATE_RELATIVE = os.path.join("userdata", "state.sqlite")
 RATES_RELATIVE = os.path.join("userdata", "usage-model-rates.json")
 TURN_START_EVENT = "thread.turn-start-requested"
+
+# Chromeria's attribution line on a message_thread delivery whose target
+# is not the sender's child; group 1 is the sender thread id.
+MESSAGE_FROM_RE = re.compile(r"^\[Message from .* \(thread ([^\s()]+)\)\]$")
+SUB_PREFIX = "sub."
 
 # Closed native vocabularies. Anything outside is skipped, never stored.
 ACTORS = ("client", "server")
@@ -123,6 +134,18 @@ def _ensure_tables(con: sqlite3.Connection) -> None:
     if "head_branch" not in {r["name"] for r in con.execute("PRAGMA table_info(t3_links)")}:
         con.execute("ALTER TABLE t3_links ADD COLUMN head_branch TEXT")
     con.execute(
+        "CREATE TABLE IF NOT EXISTS t3_spawns("
+        " thread_id TEXT PRIMARY KEY,"
+        " parent_thread_id TEXT NOT NULL,"
+        " depth INTEGER NOT NULL,"
+        " created_at TEXT)")
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS t3_messages("
+        " message_id TEXT PRIMARY KEY,"
+        " sender_thread_id TEXT NOT NULL,"
+        " target_thread_id TEXT NOT NULL,"
+        " sent_at TEXT)")
+    con.execute(
         "CREATE TABLE IF NOT EXISTS checkouts("
         " root TEXT PRIMARY KEY,"
         " repository TEXT NOT NULL,"
@@ -168,6 +191,28 @@ def thread_root(thread_id: str) -> str:
     while rest.startswith("sub."):
         rest = rest[len("sub."):]
     return rest.split(".")[0]
+
+
+def parent_thread(thread_id: str) -> str | None:
+    """The spawning thread of a ``sub.<parent>.<suffix>`` id, or None.
+
+    Mirrors Chromeria's ``parentThreadIdOf``: the parent is everything
+    between the first ``sub.`` and the last dot.
+    """
+    if not thread_id.startswith(SUB_PREFIX) \
+            or thread_id.rfind(".") <= len(SUB_PREFIX):
+        return None
+    return thread_id[len(SUB_PREFIX):thread_id.rfind(".")]
+
+
+def spawn_depth(thread_id: str) -> int:
+    """Spawn levels below the root: 0 for a user thread, 1 for its child."""
+    depth = 0
+    parent = parent_thread(thread_id)
+    while parent is not None:
+        depth += 1
+        parent = parent_thread(parent)
+    return depth
 
 
 def _valid_id(value) -> str | None:
@@ -220,6 +265,8 @@ def sync(con: sqlite3.Connection, root: str | None = None,
         _import_turn_origins(con, native, path, totals)
         threads = _import_threads(con, native, totals)
         links = _import_links(con, native, totals)
+        _import_spawns(con, native, totals)
+        _import_messages(con, native, totals)
         totals["submissions_reclassified"] = _backfill_submissions(con)
         totals["responses_retouched"] = _retouch_response_turns(con)
         bound = _bind_trees(con, threads, links)
@@ -492,6 +539,71 @@ def _import_links(con: sqlite3.Connection, native: sqlite3.Connection,
              link.get("head_branch")))
     totals["links"] = len(links)
     return links
+
+
+def _import_spawns(con: sqlite3.Connection, native: sqlite3.Connection,
+                   totals: dict) -> None:
+    """Mirror every child thread's parent, depth and creation time."""
+    totals["spawns"] = 0
+    if "projection_threads" not in _tables(native):
+        return
+    try:
+        rows = native.execute(
+            "SELECT thread_id, created_at FROM projection_threads"
+            " WHERE thread_id LIKE 'sub.%'").fetchall()
+    except sqlite3.DatabaseError:
+        return
+    for row in rows:
+        thread_id = _valid_id(row["thread_id"])
+        parent = parent_thread(thread_id) if thread_id else None
+        if parent is None:
+            totals["malformed"] += 1
+            continue
+        con.execute(
+            "INSERT INTO t3_spawns(thread_id, parent_thread_id, depth,"
+            " created_at) VALUES(?,?,?,?) ON CONFLICT(thread_id) DO UPDATE"
+            " SET created_at=excluded.created_at",
+            (thread_id, parent, spawn_depth(thread_id),
+             row["created_at"] if isinstance(row["created_at"], str)
+             else None))
+        totals["spawns"] += 1
+
+
+def _import_messages(con: sqlite3.Connection, native: sqlite3.Connection,
+                     totals: dict) -> None:
+    """Mirror attributed message_thread deliveries: ids and time only.
+
+    Chromeria prefixes a delivery only when the target is not the
+    sender's child, so every prefixed message is one the report lists.
+    Only the attribution line is read; the body never leaves T3.
+    """
+    totals["messages"] = 0
+    if "projection_thread_messages" not in _tables(native):
+        return
+    try:
+        rows = native.execute(
+            "SELECT message_id, thread_id, created_at,"
+            " substr(text, 1, 512) AS head FROM projection_thread_messages"
+            " WHERE role='user' AND text LIKE '[Message from %'").fetchall()
+    except sqlite3.DatabaseError:
+        return
+    for row in rows:
+        message_id = _valid_id(row["message_id"])
+        target = _valid_id(row["thread_id"])
+        head = row["head"] if isinstance(row["head"], str) else ""
+        match = MESSAGE_FROM_RE.match(head.split("\n", 1)[0])
+        sender = _valid_id(match.group(1)) if match else None
+        if message_id is None or target is None or sender is None:
+            totals["malformed"] += 1
+            continue
+        con.execute(
+            "INSERT INTO t3_messages(message_id, sender_thread_id,"
+            " target_thread_id, sent_at) VALUES(?,?,?,?)"
+            " ON CONFLICT(message_id) DO NOTHING",
+            (message_id, sender, target,
+             row["created_at"] if isinstance(row["created_at"], str)
+             else None))
+        totals["messages"] += 1
 
 
 def _backfill_submissions(con: sqlite3.Connection) -> int:

@@ -21,6 +21,7 @@ are committed.
 | `events` | session_key, family, native_id | Operational events (families below). |
 | `tasks`, `assignments`, `session_assignments`, `dispatches`, `attempts`, `outcomes` | see capture | Workload ownership and outcomes. |
 | `t3_turn_origins`, `t3_threads`, `t3_links` | T3 message, thread, link ids | Chromeria turn origins, thread to native-session map, thread-tree links with PR snapshot state, mirrored read-only from T3 state. |
+| `t3_spawns`, `t3_messages` | T3 thread id, T3 message id | Child thread parent, depth and creation time; sender, target and time of each attributed `message_thread` delivery. Ids and times only. |
 | `t3_outcome_provenance` (`router_outcome_provenance`) | task id | Last adapter-written outcome snapshot; a row that differs is human-owned and survives re-import. |
 | `router_jobs`, `router_invocations`, `router_readings` | router ids | Model Router ledger rows, copied read-only. |
 | `agentsmd_versions` | AGENTS.md SHA-256 | Release map from the local AgentsMD tags. |
@@ -419,6 +420,12 @@ re-read every sync; workload bindings are durable ledger rows.
   Ghostty bodies and unknown cursor shapes are skipped.
 - Outcomes come from the PR snapshot (`merged` completes); exit codes are
   never read.
+- Spawns and messages: every `sub.` thread in `projection_threads` records
+  its parent, depth (count of `sub.` levels) and creation time. Every
+  `user` message whose first line is Chromeria's
+  `[Message from <title> (thread <id>)]` records sender id, target thread
+  and time; Chromeria adds that line only when the target is not the
+  sender's child. `thread-misuse` reads these two tables only.
 
 ## Codex model context across imports
 
