@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.0] - 2026-10-01
+
+### Added
+
+- A session shared by several PRs is split per response: each PR's cost counts only the Claude and Codex responses that worked in its checkout; the rest is shown as unplaced (#43)
+
 ## [0.8.0] - 2026-10-01
 
 ### Added

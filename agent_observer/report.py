@@ -404,6 +404,11 @@ def task_report(con: sqlite3.Connection, task_id: str,
     whole_shared |= whole_conflicts
     responses = _responses(con, scope_keys)
     attributed, shared, unassigned = [], [], []
+    # A session shared by several PRs is split per response by the checkout
+    # its tool calls worked in (#43); None keeps whole-session sharing.
+    placements = {key: _place(con, key) for key in whole_shared & set(whole)
+                  if key not in whole_conflicts}
+    unplaced, elsewhere = [], []
     missing_submissions = []
     assigned_anywhere = {r["submission_native_id"] for r in
                          con.execute("SELECT submission_native_id "
@@ -412,6 +417,12 @@ def task_report(con: sqlite3.Connection, task_id: str,
         if r["is_overlap"]:
             continue
         if r["session_key"] in whole:
+            placed = placements.get(r["session_key"])
+            if placed is not None:
+                owner = placed.get(r["response_id"])
+                (attributed if owner == task_id else
+                 unplaced if owner is None else elsewhere).append(dict(r))
+                continue
             (shared if r["session_key"] in whole_shared else attributed).append(dict(r))
             continue
         sub = turn_sub.get(r["turn_id"])
@@ -524,6 +535,8 @@ def task_report(con: sqlite3.Connection, task_id: str,
         "attributed": sorted(_resp_tuple(r) for r in attributed),
         "shared": sorted(_resp_tuple(r) for r in shared),
         "unassigned": sorted(_resp_tuple(r) for r in unassigned),
+        "unplaced": sorted(_resp_tuple(r) for r in unplaced),
+        "elsewhere": sorted(_resp_tuple(r) for r in elsewhere),
         "assignments": sorted(
             [a["submission_native_id"], a["task_id"], a["shared"]]
             for a in con.execute(
@@ -540,7 +553,8 @@ def task_report(con: sqlite3.Connection, task_id: str,
     estimated = _pricing.price_scope(attributed, schedule)
     shared_estimated = _pricing.price_scope(shared, schedule)
     total_estimated = _pricing.price_scope(attributed + shared, schedule)
-    for estimate in (estimated, shared_estimated, total_estimated):
+    unplaced_estimated = _pricing.price_scope(unplaced, schedule)
+    for estimate in (estimated, shared_estimated, total_estimated, unplaced_estimated):
         estimate["status"] = ("complete" if estimate["complete"] else
                               "partial" if estimate["priced_responses"] else "unknown")
         if unavailable_usage:
@@ -562,6 +576,9 @@ def task_report(con: sqlite3.Connection, task_id: str,
         "shared_joint": total(shared),
         "shared_models": model_usage(shared),
         "unassigned_in_scope": total(unassigned),
+        "unplaced_shared": total(unplaced),
+        "placed_on_other_tasks": total(elsewhere),
+        "estimated_cost_unplaced": unplaced_estimated,
         "scope": scope,
         "scope_sessions": sorted(scope_keys),
         "scope_kind": "task",
@@ -592,6 +609,8 @@ def task_report(con: sqlite3.Connection, task_id: str,
             "shared_responses": sorted(r.get("response_id") for r in shared),
             "unassigned_responses": sorted(
                 r.get("response_id") for r in unassigned),
+            "unplaced_responses": sorted(r.get("response_id") for r in unplaced),
+            "other_task_responses": sorted(r.get("response_id") for r in elsewhere),
             "source_cutoff": cutoff,
         },
         "diagnostics": diagnostics,
@@ -637,18 +656,20 @@ def task_report(con: sqlite3.Connection, task_id: str,
     responses_reconcile = (
         report["attributed"]["responses"]
         + report["shared_joint"]["responses"]
-        + report["unassigned_in_scope"]["responses"] == scope["responses"]
+        + report["unassigned_in_scope"]["responses"]
+        + len(unplaced) + len(elsewhere) == scope["responses"]
     )
     if "total_tokens" in scope:
         totals_reconcile = (
             _known(report["attributed"]["total_tokens"])
             + _known(report["shared_joint"]["total_tokens"])
             + _known(report["unassigned_in_scope"]["total_tokens"])
+            + sum(_known(r["total_tokens"]) for r in unplaced + elsewhere)
             == _known(scope["total_tokens"])
         )
     else:
         parts = _sem_known_sums(attributed)
-        for rows in (shared, unassigned):
+        for rows in (shared, unassigned, unplaced, elsewhere):
             for sem, value in _sem_known_sums(rows).items():
                 parts[sem] = parts.get(sem, 0) + value
         wholes = _sem_known_sums(live_scope)
@@ -667,7 +688,21 @@ def task_report(con: sqlite3.Connection, task_id: str,
     report["coverage"]["complete"] = report["complete"]
     report["total_cost"] = _total_cost(
         con, task_id, total_estimated, attributed, shared, joint, whole)
+    report["total_cost"]["unplaced"] = {
+        "text": _money(unplaced_estimated) if unplaced else None,
+        "responses": len(unplaced),
+        "other_task_responses": len(elsewhere),
+    }
     return report
+
+
+def _place(con, session_key: str):
+    from . import placement
+    try:
+        return placement.place_session(con, session_key)
+    except sqlite3.OperationalError:
+        # A ledger without T3 head branches or checkouts keeps whole sharing.
+        return None
 
 
 def _money(estimate: dict) -> str:

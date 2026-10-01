@@ -41,8 +41,10 @@ and an explicit target (task or sessions, plus repo, PR or commit).
 
 `sync` attributes Chromeria/T3 Code work on its own from T3 state: prompts
 typed in T3 Code count as human submissions, one task per linked Issue or
-PR (`owner/repo#N`) owns its thread tree's sessions whole, and a merged PR
-marks the task complete. Never run `capture` commands: per-prompt
+PR (`owner/repo#N`) owns its thread tree's sessions, and a merged PR
+marks the task complete. When one thread serves several PRs, each Claude
+or Codex response counts for the PR whose checkout it worked in; the rest
+is reported as unplaced, never added to a PR's cost. Never run `capture` commands: per-prompt
 assignment, phase labels and outcome recording stay out of agent workflows.
 If reporting fails, record the measurement gap in the existing handoff and
 continue other authorized work. `task show` keeps the stable task id across

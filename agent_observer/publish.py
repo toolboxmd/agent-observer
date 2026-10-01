@@ -399,8 +399,8 @@ def render(summary: dict, target: str | None = None) -> str:
     title = {"pr": "Agent work on this PR",
              "commit": "Agent work on this commit"}.get(target, "Agent work")
     total = summary.get("total_cost") or {}
-    # A task's own and shared usage render as one set of rows: shared
-    # usage is counted whole here and never split.
+    # A task's own and shared usage render as one set of rows. Responses
+    # placed on another PR or left unplaced (#43) are not in these rows.
     models = total.get("models", []) if task else summary["models"]
     sessions = summary["sessions"]
     responses = total.get("responses", 0) if task else u.get("responses", 0)
@@ -461,6 +461,14 @@ def render(summary: dict, target: str | None = None) -> str:
             lines.append(f"- The total includes work shared with {n_other} other "
                          f"task{'s' if n_other != 1 else ''}, counted whole in each, "
                          f"so sums across PRs overlap.")
+        unplaced = total.get("unplaced") or {}
+        if unplaced.get("responses"):
+            lines.append(f"- Not counted: {unplaced['responses']:,} responses "
+                         f"({_safe_field(unplaced.get('text') or 'unknown')}) in sessions "
+                         f"shared with other PRs that worked in no single PR's checkout.")
+        if unplaced.get("other_task_responses"):
+            lines.append(f"- {unplaced['other_task_responses']:,} responses in these "
+                         f"sessions worked on other PRs and are counted there.")
         unassigned = (summary.get("unassigned_in_scope") or {}).get("responses", 0)
         if unassigned:
             lines.append(f"- {unassigned:,} responses in these sessions belong to no "
