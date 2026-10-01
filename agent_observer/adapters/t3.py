@@ -45,9 +45,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 
-from .. import db, privacy
+from .. import db, placement, privacy
+
+# A PR head branch as T3 snapshots it; anything else is not stored.
+BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
 
 HARNESS = "t3"
 
@@ -116,6 +120,14 @@ def _ensure_tables(con: sqlite3.Connection) -> None:
         " state TEXT,"
         " linked_at TEXT,"
         " PRIMARY KEY (thread_id, kind, repository, number))")
+    if "head_branch" not in {r["name"] for r in con.execute("PRAGMA table_info(t3_links)")}:
+        con.execute("ALTER TABLE t3_links ADD COLUMN head_branch TEXT")
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS checkouts("
+        " root TEXT PRIMARY KEY,"
+        " repository TEXT NOT NULL,"
+        " branch TEXT,"
+        " seen_at REAL NOT NULL)")
     con.execute(
         "CREATE TABLE IF NOT EXISTS t3_outcome_provenance("
         " task_id TEXT PRIMARY KEY,"
@@ -214,6 +226,8 @@ def sync(con: sqlite3.Connection, root: str | None = None,
         totals["tasks"] = bound["tasks"]
         totals["sessions_bound"] = bound["sessions_bound"]
         totals["outcomes"] = _write_outcomes(con, links)
+        # Record checkouts while task worktrees still exist (#43).
+        totals["shared_sessions"] = placement.record_shared_checkouts(con)
         con.execute(
             "INSERT INTO sources(harness, path, sha256, imported_at)"
             " VALUES(?,?,?,?) ON CONFLICT(harness, path) DO UPDATE SET"
@@ -423,7 +437,7 @@ def _import_links(con: sqlite3.Connection, native: sqlite3.Connection,
                 totals["malformed"] += 1
                 continue
             host, repository, number, url = valid
-            state = None
+            state = head = None
             try:
                 snapshot = json.loads(row["snapshot_json"] or "{}")
             except (ValueError, TypeError):
@@ -431,12 +445,16 @@ def _import_links(con: sqlite3.Connection, native: sqlite3.Connection,
             if isinstance(snapshot, dict) and isinstance(
                     snapshot.get("state"), str):
                 state = snapshot["state"][:32] or None
+            if isinstance(snapshot, dict) and isinstance(snapshot.get("headBranch"), str) \
+                    and BRANCH_RE.match(snapshot["headBranch"]):
+                head = snapshot["headBranch"]
             source = row["source"]
             links.append({"thread_id": thread_id, "kind": "pr",
                           "host": host, "repository": repository,
                           "number": number, "url": url,
                           "source": source if source in LINK_SOURCES else None,
-                          "state": state, "linked_at": row["linked_at"]
+                          "state": state, "head_branch": head,
+                          "linked_at": row["linked_at"]
                           if isinstance(row["linked_at"], str) else None})
     if "fork_thread_issue_links" in tables:
         try:
@@ -463,13 +481,15 @@ def _import_links(con: sqlite3.Connection, native: sqlite3.Connection,
     for link in links:
         con.execute(
             "INSERT INTO t3_links(thread_id, kind, host, repository, number,"
-            " url, source, state, linked_at) VALUES(?,?,?,?,?,?,?,?,?)"
+            " url, source, state, linked_at, head_branch) VALUES(?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(thread_id, kind, repository, number) DO UPDATE SET"
             " host=excluded.host, url=excluded.url, source=excluded.source,"
-            " state=excluded.state, linked_at=excluded.linked_at",
+            " state=excluded.state, linked_at=excluded.linked_at,"
+            " head_branch=COALESCE(excluded.head_branch, t3_links.head_branch)",
             (link["thread_id"], link["kind"], link["host"],
              link["repository"], link["number"], link["url"],
-             link["source"], link["state"], link["linked_at"]))
+             link["source"], link["state"], link["linked_at"],
+             link.get("head_branch")))
     totals["links"] = len(links)
     return links
 
