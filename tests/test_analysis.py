@@ -323,7 +323,8 @@ class HumanSignalsTest(AnalysisCase):
         self.prompt("claude:f", "no, that's wrong, revert it")
         self.prompt("claude:f", "please continue with the next step")
         self.prompt("claude:f", "[Request interrupted by user]", kind="interrupt")
-        self.event("claude:f", "permission", name="Bash", status="denied")
+        self.event("claude:f", "permission", name="Bash", status="denied",
+                   detail={"denial": "user-rejected"})
         asks = self.found("claude:f", "permission_seeking")
         self.assertEqual(len(asks), 1)
         self.assertTrue(asks[0]["heuristic"])
@@ -341,6 +342,14 @@ class HumanSignalsTest(AnalysisCase):
                    if i["signal"] == "denial"]
         self.assertEqual(len(denials), 1)
 
+    def test_unknown_claude_denial_is_not_a_person_but_other_harnesses_count(self):
+        self.session("claude:u")
+        self.event("claude:u", "permission", name="Bash", status="denied")
+        self.assertEqual(self.found("claude:u", "human_correction"), [])
+        self.session("grok:u")
+        self.event("grok:u", "permission", name="Bash", status="denied")
+        self.assertEqual(len(self.found("grok:u", "human_correction")), 1)
+
 
 class DiagnoseWindowTest(AnalysisCase):
     def test_incidents_outside_the_window_are_dropped(self):
@@ -353,6 +362,13 @@ class DiagnoseWindowTest(AnalysisCase):
         found = analysis.diagnose(self.con, since=1030.0, until=1100.0)
         self.assertEqual(found["counts"].get("human_correction"), 1)
         self.assertEqual(found["incidents"][0]["ts"], 1050.0)
+
+    def test_incidents_without_a_timestamp_are_dropped_from_a_bounded_window(self):
+        self.session("claude:n", started=1000.0)
+        self.prompt("claude:n", "[Request interrupted by user]", kind="interrupt")
+        self.con.execute("UPDATE submissions SET ts=NULL WHERE native_id=?", (f"s{self.seq}",))
+        self.assertEqual(analysis.diagnose(self.con, since=900.0)["counts"], {})
+        self.assertEqual(analysis.diagnose(self.con)["counts"], {"human_correction": 1})
 
 class CompareTest(AnalysisCase):
     def test_groups_by_version_with_sample_sizes_and_skip_subagents(self):
