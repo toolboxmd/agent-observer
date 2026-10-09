@@ -323,11 +323,14 @@ class CodexLookupTest(LookupCase):
 
     def test_replaced_source_is_reported_changed(self):
         call = self.event_id("tool_call", "call-1")
+        # Write the copy while the original exists so it gets a new inode
+        # (Linux reuses a freed inode for a file created after removal).
         with open(self.path, encoding="utf-8") as fh:
             body = fh.read()
-        os.remove(self.path)
-        with open(self.path, "w", encoding="utf-8") as fh:
+        copy = self.path + ".new"
+        with open(copy, "w", encoding="utf-8") as fh:
             fh.write(body)
+        os.replace(copy, self.path)
         [item] = self.show(call)
         self.assertEqual(item["status"], "source_changed")
 
