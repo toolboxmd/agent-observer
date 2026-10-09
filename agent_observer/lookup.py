@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from pathlib import Path
 
@@ -247,8 +248,17 @@ def _index_opencode(path: str) -> _Index:
             " LEFT JOIN message m ON m.id = p.message_id"
             " WHERE p.session_id=? ORDER BY p.time_created, p.id",
             (session,)).fetchall()
+        messages = native.execute(
+            "SELECT id, data FROM message WHERE session_id=?",
+            (session,)).fetchall()
     finally:
         native.close()
+    # Lifecycle events (message errors) are keyed by message id.
+    for message_id, raw in messages:
+        try:
+            index.records[message_id] = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
     for part_id, raw, message in rows:
         try:
             data = json.loads(raw)
@@ -309,13 +319,34 @@ def _grok_updates_state(con: sqlite3.Connection, path: str) -> str:
     return _source_state(row)
 
 
+# Structured inputs split a secret's name from its value, which the string
+# rules in privacy.redact_secrets only catch together. A string under one
+# of these keys (case, `-` and `_` ignored) or under an environment-style
+# NAME such as GH_TOKEN is replaced whole.
+_SECRET_KEYS = frozenset({
+    "apikey", "accesstoken", "refreshtoken", "clientsecret", "secret",
+    "password", "passwd", "token", "privatekey", "accesskey",
+    "authorization", "credential", "credentials", "auth", "bearer"})
+_SECRET_ENV_KEY = re.compile(
+    r"^[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_?KEY"
+    r"|PRIVATE_?KEY|CREDENTIALS?)[A-Z0-9_]*$")
+
+
+def _secret_key(key) -> bool:
+    if not isinstance(key, str):
+        return False
+    return (key.lower().replace("-", "").replace("_", "") in _SECRET_KEYS
+            or bool(_SECRET_ENV_KEY.match(key)))
+
+
 def _redacted(value):
     if isinstance(value, str):
         return privacy.redact_secrets(value)
     if isinstance(value, list):
         return [_redacted(v) for v in value]
     if isinstance(value, dict):
-        return {k: _redacted(v) for k, v in value.items()}
+        return {k: privacy.REDACTED if _secret_key(k) and isinstance(v, str)
+                and v else _redacted(v) for k, v in value.items()}
     return value
 
 

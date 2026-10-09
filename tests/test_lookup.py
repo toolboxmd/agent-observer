@@ -94,7 +94,9 @@ def _codex_rollout(path):
             "type": "function_call", "call_id": "call-1",
             "name": "exec_command", "id": "fc-1",
             "arguments": json.dumps({"cmd": "cat > /tmp/body.md <<'EOF'\n"
-                                            "secret body line\nEOF"})}),
+                                            "secret body line\nEOF",
+                                     "api_key": "hunter2value",
+                                     "env": {"GH_TOKEN": "plainvalue1"}})}),
         line(6, "response_item", {"type": "function_call_output",
                                   "call_id": "call-1", "output": "written"}),
         line(7, "event_msg", {"type": "item_completed", "turn_id": "t1",
@@ -104,6 +106,7 @@ def _codex_rollout(path):
                                                    "echo hi"],
                                        "status": "completed",
                                        "stdout": "hi\n"}}),
+        line(20, "event_msg", {"type": "task_complete", "turn_id": "t1"}),
     ])
 
 
@@ -235,6 +238,19 @@ class ClaudeLookupTest(LookupCase):
         self.assertEqual(item["status"], "source_changed")
         self.assertNotIn("input", item)
 
+    def test_rewritten_prefix_is_reported_changed(self):
+        call = self.event_id("tool_call", "toolu_1")
+        path = os.path.join(self.claude_root, "proj", "sess-a.jsonl")
+        with open(path, "r+b") as fh:
+            data = fh.read()
+            at = data.rindex(b"attached")
+            fh.seek(at)
+            fh.write(b"ATTACHED")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(_claude_line("user", "u9", "thanks")) + "\n")
+        [item] = self.show(call)
+        self.assertEqual(item["status"], "source_changed")
+
     def test_grown_source_still_resolves(self):
         call = self.event_id("tool_call", "toolu_1")
         path = os.path.join(self.claude_root, "proj", "sess-a.jsonl")
@@ -269,6 +285,30 @@ class CodexLookupTest(LookupCase):
                          "cat > /tmp/body.md <<'EOF'\nsecret body line\nEOF")
         self.assertEqual(item["result"], "written")
         self.assertEqual(item["assistant_text"], "Writing the body file.")
+
+    def test_structured_secrets_are_redacted(self):
+        [item] = self.show(self.event_id("tool_call", "call-1"))
+        self.assertEqual(item["input"]["api_key"], "[redacted]")
+        self.assertEqual(item["input"]["env"]["GH_TOKEN"], "[redacted]")
+        self.assertNotIn("hunter2value", json.dumps(item))
+        self.assertNotIn("plainvalue1", json.dumps(item))
+
+    def test_lifecycle_record_by_native_ordinal(self):
+        row = self.con.execute(
+            "SELECT id, ordinal_num FROM events WHERE family='lifecycle'"
+            " AND native_id LIKE 'task_complete:%'").fetchone()
+        self.assertEqual(row["ordinal_num"], 20)
+        [item] = self.show(row["id"])
+        self.assertEqual(item["status"], "ok")
+        self.assertEqual(item["record"]["payload"]["type"], "task_complete")
+
+    def test_id_absent_from_intact_source_is_not_found(self):
+        call = self.event_id("tool_call", "call-1")
+        self.con.execute("UPDATE events SET native_id='call-gone',"
+                         " ordinal_num=99 WHERE id=?", (call,))
+        [item] = self.show(call)
+        self.assertEqual(item["status"], "not_found")
+        self.assertNotIn("input", item)
 
     def test_command_execution_item(self):
         [item] = self.show(self.event_id("tool_result", "exec-1"))
@@ -344,6 +384,12 @@ class OpenCodeLookupTest(LookupCase):
             ("p_ctool", "msg_ca1", "ses_child", T0 + 71, T0 + 71,
              _tool("bash", "call_child1", "completed", {"command": "ls"},
                    "a.txt", T0 + 71, T0 + 72)))
+        native.execute(
+            "INSERT INTO message VALUES(?,?,?,?,?)",
+            ("msg_err", "ses_parent", T0 + 90, T0 + 90,
+             json.dumps({"role": "assistant", "time": {"created": T0 + 90},
+                         "error": {"name": "APIError",
+                                   "data": {"statusCode": 500}}})))
         native.commit()
         native.close()
         opencode.sync(self.con, source=self.native)
@@ -362,6 +408,11 @@ class OpenCodeLookupTest(LookupCase):
         self.assertTrue(item["source"].endswith("#ses_child"))
         self.assertEqual(item["input"], {"command": "ls"})
         self.assertEqual(item["result"], "a.txt")
+
+    def test_message_error_lifecycle_record(self):
+        [item] = self.show(self.event_id("lifecycle", "msg_err"))
+        self.assertEqual(item["status"], "ok")
+        self.assertEqual(item["record"]["error"]["data"]["statusCode"], 500)
 
     def test_missing_database(self):
         call = self.event_id("tool_call", "call_read1")
@@ -416,6 +467,13 @@ class EventShowCliTest(LookupCase):
         self.assertIn(f"event {self.call}", r.stdout)
         self.assertIn("**What:** adds the lookup", r.stdout)
         self.assertIn("I will open the PR now.", r.stdout)
+
+    def test_missing_ids_file_is_a_usage_error(self):
+        r = self.run_cli("event", "show", "--ids-from",
+                         os.path.join(self.root, "absent.txt"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("cannot read event ids", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
 
     def test_unresolved_event_exits_nonzero(self):
         r = self.run_cli("event", "show", "987654", "--json")

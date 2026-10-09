@@ -363,7 +363,7 @@ def main(argv=None) -> int:
     except (RuntimeError, sqlite3.Error) as exc:
         print(str(exc), file=sys.stderr)
         if ns.cmd in ("task", "publish", "claims", "thread-misuse", "dispatch-modes", "event"):
-            print("Task reports and claim audits require an existing ledger; run agent-observer sync first.", file=sys.stderr)
+            print("Task reports, claim audits and event lookups require an existing ledger; run agent-observer sync first.", file=sys.stderr)
             if os.path.exists(ns.db):
                 print("If a read-only sandbox prevents access, consume a coordinator-exported task JSON instead.", file=sys.stderr)
         return 2
@@ -505,7 +505,11 @@ def _event_show(con, ns) -> int:
     from . import lookup as _lookup
     ids = list(ns.ids)
     if ns.ids_from:
-        stream = sys.stdin if ns.ids_from == "-" else open(ns.ids_from, encoding="utf-8")
+        try:
+            stream = sys.stdin if ns.ids_from == "-" else open(ns.ids_from, encoding="utf-8")
+        except OSError as exc:
+            print(f"cannot read event ids: {exc}", file=sys.stderr)
+            return 2
         try:
             for line in stream:
                 line = line.strip()
