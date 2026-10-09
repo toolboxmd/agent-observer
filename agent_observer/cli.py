@@ -1,4 +1,4 @@
-"""CLI: agent-observer sync|sessions|capture|task|claims|thread-misuse|dispatch-modes|trace. Stdlib only."""
+"""CLI: agent-observer sync|sessions|capture|task|claims|thread-misuse|dispatch-modes|trace|event. Stdlib only."""
 
 from __future__ import annotations
 
@@ -337,6 +337,13 @@ def build_parser() -> argparse.ArgumentParser:
     dm.add_argument("--t3-state", default=None, help="T3 state.sqlite (default ~/.t3)")
     dm.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
+    ev = sub.add_parser("event", help="show the full content behind ledger events")
+    evsub = ev.add_subparsers(dest="op", required=True)
+    es = evsub.add_parser("show", help="read tool input, result and assistant text from the native log")
+    es.add_argument("ids", nargs="*", type=int, help="event ids (the id column of trace --json)")
+    es.add_argument("--ids-from", default=None, metavar="FILE",
+                    help="read event ids, one per line, from FILE or - for stdin")
+    es.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     tr = sub.add_parser("trace", help="inspect the execution timeline")
     tr.add_argument("--task", default=None)
     tr.add_argument("--turn", default=None)
@@ -352,11 +359,11 @@ def main(argv=None) -> int:
     ap = build_parser()
     ns = ap.parse_args(argv)
     try:
-        con = _db.connect_read_only(ns.db) if ns.cmd in ("task", "publish", "claims", "thread-misuse", "dispatch-modes") else _con(ns.db)
+        con = _db.connect_read_only(ns.db) if ns.cmd in ("task", "publish", "claims", "thread-misuse", "dispatch-modes", "event") else _con(ns.db)
     except (RuntimeError, sqlite3.Error) as exc:
         print(str(exc), file=sys.stderr)
-        if ns.cmd in ("task", "publish", "claims", "thread-misuse", "dispatch-modes"):
-            print("Task reports and claim audits require an existing ledger; run agent-observer sync first.", file=sys.stderr)
+        if ns.cmd in ("task", "publish", "claims", "thread-misuse", "dispatch-modes", "event"):
+            print("Task reports, claim audits and event lookups require an existing ledger; run agent-observer sync first.", file=sys.stderr)
             if os.path.exists(ns.db):
                 print("If a read-only sandbox prevents access, consume a coordinator-exported task JSON instead.", file=sys.stderr)
         return 2
@@ -464,6 +471,9 @@ def main(argv=None) -> int:
                 print(_dispatch.render(payload))
             return 0
 
+        if ns.cmd == "event":
+            return _event_show(con, ns)
+
         if ns.cmd == "trace":
             if ns.capabilities:
                 caps = {"capabilities": _report.capabilities(),
@@ -489,6 +499,40 @@ def main(argv=None) -> int:
     finally:
         con.close()
     return 2
+
+
+def _event_show(con, ns) -> int:
+    from . import lookup as _lookup
+    ids = list(ns.ids)
+    if ns.ids_from:
+        try:
+            stream = sys.stdin if ns.ids_from == "-" else open(ns.ids_from, encoding="utf-8")
+        except OSError as exc:
+            print(f"cannot read event ids: {exc}", file=sys.stderr)
+            return 2
+        try:
+            for line in stream:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ids.append(int(line))
+                except ValueError:
+                    print(f"not an event id: {line}", file=sys.stderr)
+                    return 2
+        finally:
+            if stream is not sys.stdin:
+                stream.close()
+    if not ids:
+        print("give event ids or --ids-from", file=sys.stderr)
+        return 2
+    items = _lookup.show(con, ids)
+    if ns.as_json:
+        print(json.dumps(items, indent=2, ensure_ascii=False, default=str))
+    else:
+        print(_lookup.render(items))
+    # Any event without content is visible in the exit status.
+    return 0 if all(i["status"] == "ok" for i in items) else 3
 
 
 def _capture(con, ns) -> int:

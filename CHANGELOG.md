@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.12.0] - 2026-10-09
+
+### Added
+
+- `event show <id>...` (and `--ids-from`, `--json`) reads the full tool input, tool result and assistant text behind ledger events from the original Claude Code, Codex, Grok Build or OpenCode log, including subagent transcripts, with secrets redacted and nothing stored; a missing or changed source is reported per event (#48)
+
 ## [0.11.0] - 2026-10-01
 
 ### Added

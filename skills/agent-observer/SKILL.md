@@ -1,6 +1,6 @@
 ---
 name: agent-observer
-description: Measure what agents actually did on this machine. Use when someone asks about agent token usage, time, models, repeated reads or commands, tests edited after failures, interrupts or corrections, invisible sessions, a task's or PR's consumption, or how behavior changed between AgentsMD versions, models or harnesses.
+description: Measure what agents actually did on this machine. Use when someone asks about agent token usage, time, models, repeated reads or commands, tests edited after failures, interrupts or corrections, invisible sessions, a task's or PR's consumption, how behavior changed between AgentsMD versions, models or harnesses, or the full command, tool output or assistant text behind recorded events.
 ---
 
 # Agent Observer
@@ -26,6 +26,7 @@ Run `sync` first; it is incremental and takes seconds after the first run.
 | Recent sessions for a project | `sessions list --project <name> [--since 2026-09-01]` |
 | One session's usage, events and prompts | `sessions show --session <key>` |
 | What happened inside a session or task | `trace --session <key>` or `trace --task <id>` |
+| The full command, heredoc body, tool output or assistant text behind events (the ledger keeps none) | `event show <id>...` or `event show --ids-from - --json` with ids from `trace --json` |
 | Repeated work and behavior incidents | `diagnose [--project P] [--since D] [--detector test_edit_after_failure]` |
 | Behavior by AgentsMD version, model, harness or project | `compare --by agentsmd` (or `model`, `harness`, `project`) |
 | Sessions Observer cannot see | `health` |
@@ -83,6 +84,10 @@ valuations with `--prices`.
 
 - Keep transcripts, prompts, tool arguments and file contents out of any
   reply meant for others; quote aggregates and event references instead.
+  `event show` output is such content: use it for your analysis, and
+  report counts and event ids.
+- Use `event show` instead of parsing host logs yourself. Report any
+  event whose status is not `ok` as unknown; never fill it in.
 - `publish` writes to GitHub. Run it on the PR of the task you are
   delivering, or when a person asks, and only against the repository and
   PR or commit of that task or request.

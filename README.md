@@ -35,6 +35,7 @@ agent-observer compare --by agentsmd         # behavior per AgentsMD version
 agent-observer health                        # live sessions Observer cannot see
 agent-observer claims --session claude:<id>  # final-report claims checked against tool calls
 agent-observer dispatch-modes --since 2026-10-01  # planner dispatch versus a dispatcher thread
+agent-observer event show <id> [<id> ...]    # full tool input, result and assistant text from the native log
 ```
 
 Every command accepts `--json`. The ledger lives at
@@ -176,6 +177,44 @@ agent-observer dispatch-modes --planner <thread> --job owner/repo#N --since 2026
 Thread trees, turns and links come from T3's `state.sqlite`, read-only at
 report time; usage comes from the ledger, so run `sync` first.
 
+## Event content
+
+The ledger keeps no file contents, tool outputs or full assistant text
+(see Privacy). When an analysis needs them, for example to check how a PR
+body begins, `event show` reads them again from the host's original log
+for the events you name, prints them, and stores nothing.
+
+```sh
+agent-observer trace --session claude:<id> --family tool_call --json   # event ids are the "id" field
+agent-observer event show 31995 31997 --json
+sqlite3 observer.db "SELECT id FROM events WHERE ..." | agent-observer event show --ids-from - --json
+```
+
+Each event returns `status` and, when it is `ok`:
+
+- `input` and `result`: the full tool input (command, heredoc body, patch)
+  and the full tool result, plus `tool`, the native tool name. Read, file
+  change, Skill and permission events resolve to the tool call behind them.
+- `assistant_text`: the assistant text written between the previous tool
+  result or prompt and the call, when there is any.
+- `text`: the full text of an `assistant_message` event.
+- `record`: the native record, for lifecycle, compaction and other events
+  with no tool call.
+
+The other statuses carry no content: `source_missing` (the log or OpenCode
+database is gone), `source_changed` (the log shrank or was replaced since
+the last sync), `not_found` (the log no longer holds that native id) and
+`no_such_event`. The exit status is 3 when any event is not `ok`.
+
+It works for Claude Code, Codex, Grok Build and OpenCode, including
+subagent transcripts, because every event keeps its source and native id.
+Grok tool content comes from the session's `updates.jsonl`. OpenCode
+change detection is limited to the database still existing and holding
+the part. Known secret shapes are redacted as in the ledger; heredoc
+bodies, patches and outputs are shown in full, so treat the output as
+private. Each source is parsed once per run: 1,000 live events across all
+four hosts took 4.4 seconds on rocky.
+
 ## Ownership and tasks
 
 Put `observer_task_id` in related Router jobs' prepared task JSON to connect
@@ -307,7 +346,8 @@ The ledger is private and local: its directory is created or hardened to
 mode 0700, and the database plus SQLite sidecars to mode 0600. It stores
 counters, identities, paths, hashes and short excerpts needed for the
 detectors; it never stores file contents, tool outputs or AgentsMD
-preference contents. Only sanitized fixtures are committed to this
+preference contents. `event show` reads those from the native logs on
+request and prints them without storing them. Only sanitized fixtures are committed to this
 repository.
 
 Prompt excerpts are kept only for genuine human prompts in the main
