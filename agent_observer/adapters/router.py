@@ -274,9 +274,12 @@ def sync(con: sqlite3.Connection, root: str | None = None,
     ledger_changed = False
     pending_reconcile = None
     if db_path is None or not os.path.isfile(db_path):
-        totals["failed"].append({
-            "path": db_path or source or "",
-            "error": privacy.error_category("source_unreadable")})
+        # Discovery found no ledger when no root or source was named: this
+        # host has no Model Router, an absent optional source, not a failure.
+        if root is not None or source is not None:
+            totals["failed"].append({
+                "path": db_path or source or "",
+                "error": privacy.error_category("source_unreadable")})
     else:
         try:
             changed, invocations, bound = _sync_ledger(
