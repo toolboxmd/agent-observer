@@ -218,6 +218,21 @@ class RouterAdapterTest(LedgerCase):
             self.assertEqual(result["sources"], 2)
             self.assertEqual(self.con.execute("SELECT count(*) FROM responses").fetchone()[0], 2)
 
+    def test_default_sync_without_router_ledger_is_not_a_failure(self):
+        # A host with no Model Router: nothing to import, nothing failed (#50).
+        from unittest.mock import patch
+        absent = os.path.join(self.tmp.name, "absent")
+        env = {k: v for k, v in os.environ.items()
+               if k != "DURABLE_RUNNER_STATE_DIR"}
+        with patch.object(router, "DEFAULT_ROOT", absent), \
+                patch.object(router, "LEGACY_ROOT", absent + "-legacy"), \
+                patch.dict(os.environ, env, clear=True):
+            result = router.sync(self.con)
+        self.assertEqual(result["failed"], [])
+        self.assertEqual(result["sources"], 0)
+        # A missing ledger the caller named is still a failure.
+        self.assertEqual(len(router.sync(self.con, root=absent)["failed"]), 1)
+
     def test_job_to_task_fields_and_unknown_outcome(self):
         stats = router.sync(self.con, root=self.state)
         self.assertEqual(stats["jobs"], 2)

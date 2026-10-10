@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.12.1] - 2026-10-10
+
+### Fixed
+
+- `sync` no longer exits 1 on a host without Model Router: the router reports 0 sources instead of a failed source. A missing ledger named with an explicit root or source still fails (#50)
+
 ## [0.12.0] - 2026-10-09
 
 ### Added
