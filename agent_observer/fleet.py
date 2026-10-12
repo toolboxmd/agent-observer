@@ -41,6 +41,9 @@ MACHINE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 # id stays home and is counted as withheld.
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/#@+-]{0,199}$")
 REMOTE_COMMAND = "agent-observer export"
+# Largest count an export may carry. Real token totals are far below it,
+# and sums of millions of such values still print and serialize.
+MAX_COUNT = 2 ** 53
 # Usage fields an export keeps per model group; everything else stays home.
 USAGE_FIELDS = ("harness", "model", "effort", "semantics", "responses",
                 *report.BUCKETS, "unknown_counts")
@@ -122,10 +125,11 @@ def export(con: sqlite3.Connection, machine: str | None = None) -> dict:
 
 
 def _clean(value) -> bool:
-    """A string safe to print one per line: no control, format or line
-    separator characters (ASCII or Unicode)."""
+    """A string safe to print one per line: no control, format, surrogate
+    or line separator characters (ASCII or Unicode)."""
     return isinstance(value, str) and not any(
-        unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in value)
+        unicodedata.category(c) in ("Cc", "Cf", "Cs", "Zl", "Zp")
+        for c in value)
 
 
 def _text_or_none(value) -> bool:
@@ -134,7 +138,7 @@ def _text_or_none(value) -> bool:
 
 def _count(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) \
-        and value >= 0
+        and 0 <= value <= MAX_COUNT
 
 
 def _count_or_none(value) -> bool:
@@ -222,7 +226,12 @@ def pull(host: str, directory: str, command: str = REMOTE_COMMAND,
                         f" {(proc.stderr or '').strip()[-300:]}")
     try:
         doc = validate(json.loads(proc.stdout))
-    except ValueError as exc:
+        # Store only what a report can print and serialize: a document
+        # that passes validation but cannot be reported is refused here,
+        # not discovered by every later fleet report.
+        render(combine([doc])).encode("utf-8")
+        json.dumps(doc)
+    except (ValueError, TypeError, UnicodeError) as exc:
         raise PullError(f"{host}: {exc}") from None
     os.makedirs(directory, mode=0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")

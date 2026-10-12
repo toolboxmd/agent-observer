@@ -238,16 +238,26 @@ class ReportTest(LedgerCase):
                     # Line, format and C1 control characters, not just ASCII.
                     *({**good, "sessions": [{**session, "usage": [
                         {**group, "semantics": "s" + ch + "x"}]}]}
-                      for ch in ("\x7f", "\x85", "\u2028", "\u202e"))):
+                      for ch in ("\x7f", "\x85", "\u2028", "\u202e",
+                                 "\ud800")),
+                    {**good, "sessions": [{**session, "usage": [
+                        {**group, "total_tokens": fleet.MAX_COUNT + 1}]}]},
+                    {**good, "withheld_tasks": fleet.MAX_COUNT + 1}):
             with self.subTest(bad=json.dumps(bad, ensure_ascii=True)[:300]):
                 with self.assertRaises(ValueError):
                     fleet.validate(bad)
 
-    def test_validated_documents_always_combine(self):
-        # The promise behind validate: anything it accepts reports.
-        good = _doc("rocky", [("codex:a", None)], [_task("T-1", ["codex:a"])])
-        good["sessions"][0]["usage"][0]["unknown_counts"] = {"total_tokens": 1}
-        fleet.render(fleet.combine([fleet.validate(good)]))
+    def test_largest_accepted_counts_still_report(self):
+        # The promise behind validate: anything it accepts reports, even
+        # summed at the cap across many sessions and machines.
+        top = fleet.MAX_COUNT
+        docs = [fleet.validate(_doc(m, [(f"codex:{m}{i}", top)
+                                        for i in range(50)]))
+                for m in ("rocky", "bestia", "cavallo")]
+        result = fleet.combine(docs)
+        self.assertEqual(result["totals"]["s1"]["total_tokens"], 150 * top)
+        fleet.render(result)
+        json.dumps(result)
 
 
 class PullTest(LedgerCase):
@@ -282,6 +292,16 @@ class PullTest(LedgerCase):
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
         self.assertEqual([d["machine"] for d in fleet.stored(store)],
                          ["bestia"])
+
+    def test_pull_refuses_an_export_that_cannot_be_reported(self):
+        from unittest import mock
+        store = os.path.join(self.tmp.name, "fleet")
+        run, _ = self.run_fake(json.dumps(_doc("bestia", [("codex:b", 7)])))
+        with mock.patch.object(fleet, "render",
+                               side_effect=ValueError("unprintable")):
+            with self.assertRaises(fleet.PullError):
+                fleet.pull("bestia", store, run=run)
+        self.assertEqual(fleet.stored(store), [])
 
     def test_pull_warns_when_the_host_names_another_machine(self):
         store = os.path.join(self.tmp.name, "fleet")
