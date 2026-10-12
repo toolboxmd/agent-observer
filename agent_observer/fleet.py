@@ -287,55 +287,66 @@ def _valid_judgment(entry) -> bool:
 
 def _from_legacy(doc: dict) -> dict:
     """A schema-1 export in schema-2 terms: moments become interventions,
-    origin becomes created_by and `human` becomes `user`. Shapes stay as
-    sent; validation still checks every field afterwards."""
+    origin becomes created_by and `human` becomes `user`.
+
+    Judge evidence is optional (exports from before #60 carry none), but
+    when present it must have its schema-1 shape: a malformed value is
+    refused here with a specific error, never translated into absent
+    evidence that would let `pull` replace a good stored export. Values
+    inside are then checked by `validate` like any schema-2 export."""
     who = {"human": "user"}
     parts = {"by_origin": "by_created_by",
              "judged_by_origin": "judged_by_created_by"}
 
-    def counts(value):
-        if not isinstance(value, dict):
-            return value
-        return {key: {parts.get(part, part): (
-                    {who.get(k, k): v for k, v in c.items()}
-                    if isinstance(c, dict) else c)
-                    for part, c in counts_.items()}
-                if isinstance(counts_, dict) else counts_
-                for key, counts_ in value.items()}
+    def counts(value, what):
+        if not isinstance(value, dict) or not all(
+                isinstance(c, dict) and all(isinstance(x, dict)
+                                            for x in c.values())
+                for c in value.values()):
+            raise ValueError(f"invalid legacy {what} counts")
+        return {key: {parts.get(part, part): {who.get(k, k): v
+                                               for k, v in c.items()}
+                      for part, c in per.items()}
+                for key, per in value.items()}
 
-    def point(p):
-        if not isinstance(p, dict):
-            return p
-        out = {k: v for k, v in p.items() if k != "origin"}
-        out["created_by"] = who.get(p.get("origin"), p.get("origin"))
-        return out
+    def points(value, what):
+        if not isinstance(value, list) or not all(
+                isinstance(p, dict) and "origin" in p for p in value):
+            raise ValueError(f"invalid legacy {what}")
+        return [{**{k: v for k, v in p.items() if k != "origin"},
+                 "created_by": who.get(p["origin"], p["origin"])}
+                for p in value]
 
-    new = {k: v for k, v in doc.items() if k != "moments"}
+    new = {k: v for k, v in doc.items() if k not in ("moments", "judgments")}
     new["schema"] = SCHEMA
-    if isinstance(doc.get("moments"), dict):
+    if "moments" in doc:
+        moments = doc["moments"]
+        if not isinstance(moments, dict):
+            raise ValueError("invalid legacy moment counts")
         new["interventions"] = {"sessions": counts(
-            doc["moments"].get("sessions", {}))}
-    judgments = []
-    for j in doc.get("judgments", []) if isinstance(
-            doc.get("judgments", []), list) else []:
-        if not isinstance(j, dict):
-            judgments.append(j)
-            continue
-        j = dict(j)
-        j["sessions"] = counts(j.get("sessions"))
-        groups = []
-        for g in j.get("groups", []) if isinstance(j.get("groups"), list) \
-                else []:
-            if isinstance(g, dict) and isinstance(g.get("moments"), list):
-                old_points = g["moments"]
-                g = {k: v for k, v in g.items() if k != "moments"}
-                g["interventions"] = [point(p) for p in old_points]
-            groups.append(g)
-        j["groups"] = groups
-        if isinstance(j.get("ungrouped"), list):
-            j["ungrouped"] = [point(p) for p in j["ungrouped"]]
-        judgments.append(j)
-    new["judgments"] = judgments
+            moments.get("sessions"), "moment")}
+    if "judgments" in doc:
+        if not isinstance(doc["judgments"], list):
+            raise ValueError("invalid legacy judgments")
+        judgments = []
+        for j in doc["judgments"]:
+            if not isinstance(j, dict) or not isinstance(j.get("groups"), list):
+                raise ValueError("invalid legacy judgment groups")
+            groups = []
+            for g in j["groups"]:
+                if not isinstance(g, dict):
+                    raise ValueError("invalid legacy judgment groups")
+                groups.append({**{k: v for k, v in g.items()
+                                  if k != "moments"},
+                               "interventions": points(g.get("moments"),
+                                                       "group moments")})
+            judgments.append({**j,
+                              "sessions": counts(j.get("sessions"),
+                                                 "judgment"),
+                              "groups": groups,
+                              "ungrouped": points(j.get("ungrouped"),
+                                                  "ungrouped moments")})
+        new["judgments"] = judgments
     return new
 
 

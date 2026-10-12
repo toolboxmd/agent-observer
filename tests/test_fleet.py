@@ -565,3 +565,44 @@ class SchemaSwitchTest(FleetRecurrenceTest):
         stored = fleet._schema_only(fleet.validate(old))
         self.assertEqual(stored["schema"], "agent-observer.fleet-export/2")
         self.assertEqual(stored["judgments"], rocky["judgments"])
+
+
+class LegacyValidationTest(SchemaSwitchTest):
+    """Malformed schema-1 evidence is refused, never read as absent (#68)."""
+
+    def legacy(self):
+        return to_schema_1(self.machine("rocky", "sess-r"))
+
+    def test_malformed_legacy_evidence_is_refused(self):
+        cases = []
+        doc = self.legacy(); doc["judgments"] = {}; cases.append(doc)
+        doc = self.legacy(); doc["judgments"][0]["groups"] = None; cases.append(doc)
+        doc = self.legacy(); del doc["judgments"][0]["groups"]; cases.append(doc)
+        doc = self.legacy(); doc["moments"] = []; cases.append(doc)
+        doc = self.legacy(); doc["moments"]["sessions"] = None; cases.append(doc)
+        doc = self.legacy(); doc["judgments"][0]["ungrouped"] = {}; cases.append(doc)
+        for n, bad in enumerate(cases):
+            with self.assertRaises(ValueError, msg=f"case {n}"):
+                fleet.validate(bad)
+
+    def test_legacy_export_without_judge_evidence_stays_valid(self):
+        doc = self.legacy()
+        del doc["moments"], doc["judgments"]
+        self.assertEqual(fleet.validate(doc).get("judgments", []), [])
+
+    def test_refused_pull_keeps_the_stored_export(self):
+        store = os.path.join(self.tmp.name, "fleet")
+
+        def run_with(doc):
+            def run(argv, **kwargs):
+                return subprocess.CompletedProcess(argv, 0, json.dumps(doc), "")
+            return run
+        good = self.legacy()
+        fleet.pull("rocky", store, run=run_with(good))
+        path = os.path.join(store, "rocky.json")
+        before = open(path, "rb").read()
+        bad = json.loads(json.dumps(good))
+        bad["judgments"] = {}
+        with self.assertRaises(fleet.PullError):
+            fleet.pull("rocky", store, run=run_with(bad))
+        self.assertEqual(open(path, "rb").read(), before)
