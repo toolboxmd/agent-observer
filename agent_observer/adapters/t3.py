@@ -217,7 +217,7 @@ def turn_actor(con: sqlite3.Connection, message_id: str) -> str | None:
 
 def prompt_actor(con: sqlite3.Connection, native_session,
                  digest: str) -> str | None:
-    """The V2 origin of a prompt by native Claude session and text hash.
+    """The V2 origin of a prompt by native session and text hash.
 
     Missing table, unknown session or hash read as None, never as a
     guessed origin.
@@ -566,12 +566,14 @@ def _prompt_actor_of(created_by, source) -> str | None:
 
 def _import_prompt_origins(con: sqlite3.Connection,
                            native: sqlite3.Connection, totals: dict) -> None:
-    """Mirror V2 prompt origins per native Claude session and text hash.
+    """Mirror V2 prompt origins per native session and text hash.
 
-    A message joins the native session of its run's provider thread, or
-    every Claude session of its thread when the run names none. A hash
-    sent by both a person and an agent in one session is dropped. Only
-    hashes are stored; the text never leaves this function.
+    A message joins the native session of its run's provider thread (any
+    driver: Claude import reclassifies by it, judge moments read it for
+    every harness), or every Claude session of its thread when the run
+    names none. A hash sent by both a person and an agent in one session
+    is dropped. Only hashes are stored; the text never leaves this
+    function.
     """
     tables = _tables(native)
     if not {V2_MESSAGES, V2_PROVIDER_THREADS} <= tables:
@@ -595,13 +597,12 @@ def _import_prompt_origins(con: sqlite3.Connection,
     by_thread: dict[str, list] = {}
     known = {row["provider_thread_id"] for row in providers}
     for row in providers:
-        if (row["provider"] or "") != "claudeAgent":
-            continue
         session = _v2_native_ref(row["payload_json"], row["provider"])
         if session is None:
             continue
         by_provider[row["provider_thread_id"]] = session
-        by_thread.setdefault(row["thread_id"], []).append(session)
+        if (row["provider"] or "") == "claudeAgent":
+            by_thread.setdefault(row["thread_id"], []).append(session)
     seen: dict[tuple, set] = {}
     for row in messages:
         actor = _prompt_actor_of(row["created_by"], row["source"])
@@ -612,7 +613,7 @@ def _import_prompt_origins(con: sqlite3.Connection,
         if provider in by_provider:
             sessions = [by_provider[provider]]
         elif provider in known:
-            # A run on a Codex, Grok or OpenCode provider thread says
+            # A run on a provider thread without a native session says
             # nothing about the thread's Claude sessions.
             continue
         else:

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.14.0] - 2026-10-12
+
+### Added
+
+- Judge moments: `moments`, `moment show`, `verdict add|groups`, `recurrence` and `session-attr add` select every moment where a person acted, give an outside LLM judge each one in context from the native logs, store its verdicts and report recurring problems; hook and rule denials are counted separately and Chromeria prompt origins now cover every harness (#60)
+
 ## [0.13.1] - 2026-10-12
 
 ### Changed

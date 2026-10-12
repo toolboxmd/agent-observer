@@ -22,6 +22,8 @@ are committed.
 | `tasks`, `assignments`, `session_assignments`, `dispatches`, `attempts`, `outcomes` | see capture | Workload ownership and outcomes. |
 | `t3_turn_origins`, `t3_threads`, `t3_links` | T3 message, thread, link ids | Chromeria turn origins, thread to native-session map, thread-tree links with PR snapshot state, mirrored read-only from T3 state. |
 | `t3_spawns`, `t3_messages` | T3 thread id, T3 message id | Child thread parent, depth and creation time; sender, target and time of each attributed `message_thread` delivery. Ids and times only. |
+| `verdicts` | moment id, behavior, judge | An outside judge's `yes`, `no` or `unclear` on one moment, with a redacted one-line problem and an optional group id for `yes`. |
+| `session_attributes` | session_key, name | Attributes other tools supply (contextmd's `arm`), used only as report filters. |
 | `t3_outcome_provenance` (`router_outcome_provenance`) | task id | Last adapter-written outcome snapshot; a row that differs is human-owned and survives re-import. |
 | `router_jobs`, `router_invocations`, `router_readings` | router ids | Model Router ledger rows, copied read-only. |
 | `agentsmd_versions` | AGENTS.md SHA-256 | Release map from the local AgentsMD tags. |
@@ -226,6 +228,22 @@ are counted separately and excluded from useful-work comparisons.
   sessions hold measured responses but nothing attributed or shared
   reports those sessions as `unbound_usage` instead of a silent
   `missing assignments: none`. Every command accepts `--json`.
+- `moments`, `moment show`, `verdict add|groups`, `recurrence`,
+  `session-attr add`: the judge interface (README "Judge moments").
+  Moment ids are `sub:<submission native id>` (genuine or interrupt
+  submissions) and `ev:<session_key>/<family>/<native id>` (Codex
+  `turn_aborted` cancelled; a denied permission that is `user-rejected`
+  on Claude or kindless elsewhere). An interrupt submission within one
+  second after a `user-rejected` denial in the same session is the same
+  act and no moment. `permission-rule` and `automode-blocked` denials are
+  `policy_denials`, never moments. Origin precedence: T3 turn origin
+  (Claude uuid), then V2 prompt origin by native session and text hash,
+  then a headless entrypoint (`agent`), `user-rejected` (`human`), an
+  interactive entrypoint (`human`), and for interrupts and rejections a
+  top-level T3 thread (`human`); otherwise `unknown`. Moment text and
+  context are read from native logs on request, redacted, never stored.
+  A verdict batch is validated whole; `recurrence` counts a group as
+  recurring when its yes verdicts span two or more sessions.
 - `publish --task ID|--session KEY [--prices schedule.json] --repo owner/name --pr N|--commit SHA`:
   render or post the summary comment; `--dry-run` prints the comment
   without posting, and `--dry-run --json` prints a JSON payload with the
@@ -407,8 +425,9 @@ re-read every sync; workload bindings are durable ledger rows.
   snapshot replaces the V1 row for the same thread and PR). Each provider
   thread's strong `nativeThreadRef.nativeId` is a native Claude, Codex,
   Grok or OpenCode session of its thread. V2 has no native turn ids, so a
-  Claude prompt takes its origin from a V2 user message with the same
-  text hash in the same native session (a run on another driver's provider
+  prompt takes its origin from a V2 user message with the same text hash
+  in the same native session (mirrored for every driver; the Claude
+  import reclassifies by it, judge moments read it for every harness) (a run on another driver's provider
   thread is no evidence): `createdBy=user` from `web` or `mobile` is `genuine`, `agent` or `system` is `synthetic`, a hash sent by
   both stays unknown, and uuid evidence outranks it. Legacy copies of V1
   messages (`user` from `server`) are no evidence. Only hashes are

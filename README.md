@@ -218,6 +218,62 @@ bodies, patches and outputs are shown in full, so treat the output as
 private. Each source is parsed once per run: 1,000 live events across all
 four hosts took 4.4 seconds on rocky.
 
+## Judge moments
+
+Some behaviors, such as a person correcting an agent, need judgment that
+pattern matching cannot supply. Agent Observer prepares the evidence for
+an outside LLM judge and stores the judge's answers; it never runs a
+model itself. [docs/judge-corrections.md](docs/judge-corrections.md) is
+a reference judge prompt for corrections.
+
+A moment is one point in a main session where a person acted: a
+`prompt`, an `interrupt`, or a `rejection` of a tool call. Each moment has
+an `origin`, which records who acted, from evidence only:
+
+- `human`: Chromeria recorded a person starting the turn or sending the
+  prompt, the session ran in a terminal or desktop app (`cli`,
+  `Codex Desktop`, `codex-tui`), Claude reported `user-rejected`, or an
+  interrupt or rejection stopped a top-level Chromeria thread.
+- `agent`: Chromeria recorded an agent or the server sending it, or the
+  session ran headless (`sdk-cli`, `codex_exec`).
+- `unknown`: no evidence either way, for example a prompt in a delegated
+  child thread from before Chromeria V2.
+
+Hook and permission-rule denials and auto-mode blocks are policy, not a
+person. They are never moments and are counted as `policy_denials`.
+Claude writes a rejected tool call twice, as the denial and as an
+interrupt in the same second; that is one moment.
+
+```sh
+agent-observer moments --since 2026-09-14 --unjudged correction --json   # default --origin human
+agent-observer moment show sub:claude:<uuid> ev:codex:<id>/lifecycle/turn_aborted:<turn> --json
+agent-observer verdict add --json < verdicts.jsonl
+agent-observer verdict groups --behavior correction --json
+agent-observer recurrence --behavior correction --since 2026-09-14 [--attr arm=holdout]
+agent-observer session-attr add --json < arms.jsonl     # {"session": "claude:<id>", "name": "arm", "value": "holdout"}
+```
+
+`moments` lists the selected moments and counts every moment in scope by
+origin and kind, so filtered moments stay visible as numbers. `moment show`
+reads each moment from the native log: the person's full text (including
+text inside Chromeria wrapper tags), the agent's messages and tool calls
+before and after it, and the previous and next prompt. `--before`,
+`--after` and `--chars` bound the size. Its statuses match `event show`,
+plus `no_such_moment`; the exit status is 3 when any moment is not `ok`.
+
+A verdict is `yes`, `no` or `unclear` for one moment, behavior and judge;
+`yes` carries a one-line `problem` and an optional `group`. Observer
+validates a batch whole and stores it only when every line is valid.
+Adding the same moment, behavior and judge again replaces the verdict,
+so grouping can run as a second pass. `recurrence` reports the yes
+verdicts, the problems (groups), the problems that recur in two or more
+sessions, and repeats per group, with first and last seen, sessions and
+hosts, plus judge coverage by origin and the policy denials. When more
+than one judge labeled the scope, it requires `--judge`.
+
+Moment text, problem lines and session attributes stay on this machine:
+`publish` never includes them.
+
 ## Ownership and tasks
 
 Put `observer_task_id` in related Router jobs' prepared task JSON to connect

@@ -1,4 +1,4 @@
-"""CLI: agent-observer sync|sessions|capture|task|claims|thread-misuse|dispatch-modes|trace|event. Stdlib only."""
+"""CLI: agent-observer sync|sessions|capture|task|claims|thread-misuse|dispatch-modes|trace|event|moments|moment|verdict|recurrence|session-attr. Stdlib only."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from . import adapters as _adapters
 from . import analysis as _analysis
 from . import db as _db
 from . import identity as _identity
+from . import moments as _moments
 from . import report as _report
 
 
@@ -344,6 +345,56 @@ def build_parser() -> argparse.ArgumentParser:
     es.add_argument("--ids-from", default=None, metavar="FILE",
                     help="read event ids, one per line, from FILE or - for stdin")
     es.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
+    def _moment_scope(parser):
+        parser.add_argument("--since", default=None, help="ISO date or epoch seconds")
+        parser.add_argument("--until", default=None, help="ISO date or epoch seconds")
+        parser.add_argument("--harness", default=None)
+        parser.add_argument("--project", default=None)
+        parser.add_argument("--attr", action="append", default=None,
+                            metavar="NAME=VALUE",
+                            help="only sessions with this attribute (repeatable)")
+        parser.add_argument("--json", action="store_true", dest="as_json",
+                            default=argparse.SUPPRESS)
+
+    mo = sub.add_parser("moments", help="list moments where a person acted, for a judge")
+    _moment_scope(mo)
+    mo.add_argument("--origin", action="append", default=None,
+                    choices=list(_moments.ORIGINS) + ["all"],
+                    help="who acted (repeatable; default human)")
+    mo.add_argument("--kind", action="append", default=None,
+                    choices=list(_moments.KINDS))
+    mo.add_argument("--unjudged", default=None, metavar="BEHAVIOR",
+                    help="only moments without a verdict for BEHAVIOR")
+    mo.add_argument("--limit", type=int, default=None)
+    mm = sub.add_parser("moment", help="read moments in context from the native logs")
+    mmsub = mm.add_subparsers(dest="op", required=True)
+    ms = mmsub.add_parser("show", help="full text, agent activity before and after, nearby prompts")
+    ms.add_argument("ids", nargs="*", help="moment ids from moments --json")
+    ms.add_argument("--ids-from", default=None, metavar="FILE",
+                    help="read moment ids, one per line, from FILE or - for stdin")
+    ms.add_argument("--before", type=int, default=_moments.DEFAULT_BEFORE)
+    ms.add_argument("--after", type=int, default=_moments.DEFAULT_AFTER)
+    ms.add_argument("--chars", type=int, default=_moments.DEFAULT_CHARS,
+                    help="cut each text field to about this many characters")
+    ms.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
+    vd = sub.add_parser("verdict", help="store and list judge verdicts on moments")
+    vdsub = vd.add_subparsers(dest="op", required=True)
+    va = vdsub.add_parser("add", help="store JSON-line verdicts; the batch is all or nothing")
+    va.add_argument("--file", default="-", help="JSON lines file, or - for stdin")
+    va.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
+    vg = vdsub.add_parser("groups", help="list existing groups and their problem lines")
+    vg.add_argument("--behavior", required=True)
+    vg.add_argument("--judge", default=None)
+    vg.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
+    rc = sub.add_parser("recurrence", help="report problems that come back, from judge verdicts")
+    rc.add_argument("--behavior", required=True)
+    rc.add_argument("--judge", default=None)
+    _moment_scope(rc)
+    sa = sub.add_parser("session-attr", help="store session attributes used as report filters")
+    sasub = sa.add_subparsers(dest="op", required=True)
+    saa = sasub.add_parser("add", help="store JSON lines {session, name, value}")
+    saa.add_argument("--file", default="-", help="JSON lines file, or - for stdin")
+    saa.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     tr = sub.add_parser("trace", help="inspect the execution timeline")
     tr.add_argument("--task", default=None)
     tr.add_argument("--turn", default=None)
@@ -379,6 +430,10 @@ def main(argv=None) -> int:
 
         if ns.cmd == "publish":
             return _publish(con, ns)
+
+        if ns.cmd in ("moments", "moment", "verdict", "recurrence",
+                      "session-attr"):
+            return _judge(con, ns)
 
         if ns.cmd == "health":
             from . import health as _health
@@ -730,6 +785,110 @@ def _when(value):
         return None
     from .ingest import iso_ts
     return float(value) if str(value).replace(".", "").isdigit() else iso_ts(value)
+
+
+def _json_lines(path: str) -> list:
+    """Records from a JSON lines file or stdin; a bad line stays a
+    non-object so validation names its line number."""
+    fh = sys.stdin if path == "-" else open(path, encoding="utf-8")
+    try:
+        records = []
+        for raw in fh:
+            if not raw.strip():
+                continue
+            try:
+                records.append(json.loads(raw))
+            except ValueError:
+                records.append(None)
+        return records
+    finally:
+        if fh is not sys.stdin:
+            fh.close()
+
+
+def _attrs(values) -> dict:
+    out = {}
+    for value in values or []:
+        name, sep, val = value.partition("=")
+        if not sep or not name:
+            raise ValueError(f"--attr needs NAME=VALUE, got {value!r}")
+        out[name] = val
+    return out
+
+
+def _judge(con, ns) -> int:
+    from . import verdicts as _verdicts
+    as_json = getattr(ns, "as_json", False)
+    try:
+        if ns.cmd == "moments":
+            origins = None if ns.origin and "all" in ns.origin \
+                else tuple(ns.origin or ("human",))
+            payload = _moments.select(
+                con, since=_when(ns.since), until=_when(ns.until),
+                harness=ns.harness, project=ns.project, origins=origins,
+                kinds=ns.kind, unjudged=ns.unjudged, attrs=_attrs(ns.attr),
+                limit=ns.limit)
+            if as_json:
+                _emit(payload, True)
+            else:
+                counts = payload["counts"]
+                print(f"{counts['selected']} moments; in scope by origin: "
+                      + ", ".join(f"{k} {v}" for k, v in counts["by_origin"].items())
+                      + "; policy denials: "
+                      + ", ".join(f"{k} {v}" for k, v in payload["policy_denials"].items()))
+                for m in payload["moments"]:
+                    print(f"{m['id']}  {m['kind']} {m['origin']} {m['at']} {m['project'] or ''}")
+            return 0
+        if ns.cmd == "moment":
+            ids = list(ns.ids)
+            if ns.ids_from:
+                fh = sys.stdin if ns.ids_from == "-" else open(ns.ids_from, encoding="utf-8")
+                ids += [line.strip() for line in fh if line.strip()]
+            if not ids:
+                print("no moment ids given", file=sys.stderr)
+                return 2
+            items = _moments.show(con, ids, before=ns.before, after=ns.after,
+                                  chars=ns.chars)
+            if as_json:
+                _emit({"moments": items}, True)
+            else:
+                print(_moments.render(items))
+            return 3 if any(i["status"] != "ok" for i in items) else 0
+        if ns.cmd == "verdict" and ns.op == "add":
+            result = _verdicts.add(con, _json_lines(ns.file))
+            _emit(result, True) if as_json else print(
+                f"stored {result['stored']}, updated {result['updated']}")
+            return 0
+        if ns.cmd == "verdict":
+            groups = _verdicts.groups(con, ns.behavior, judge=ns.judge)
+            if as_json:
+                _emit({"groups": groups}, True)
+            else:
+                for g in groups:
+                    print(f"{g['group']} ({g['judge']}, {g['occurrences']}x): {g['problem']}")
+            return 0
+        if ns.cmd == "recurrence":
+            report = _verdicts.recurrence(
+                con, ns.behavior, judge=ns.judge, since=_when(ns.since),
+                until=_when(ns.until), harness=ns.harness, project=ns.project,
+                attrs=_attrs(ns.attr))
+            _emit(report, True) if as_json else print(_verdicts.render(report))
+            return 0
+        result = _verdicts.add_session_attributes(con, _json_lines(ns.file))
+        _emit(result, True) if as_json else print(
+            f"stored {result['stored']}, updated {result['updated']}")
+        return 0
+    except _verdicts.VerdictError as exc:
+        if as_json:
+            _emit({"error": str(exc), "errors": exc.errors}, True)
+        else:
+            print(str(exc), file=sys.stderr)
+            for e in exc.errors:
+                print(f"line {e['line']}: {e['error']}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
 
 def _analyze(con, ns) -> int:

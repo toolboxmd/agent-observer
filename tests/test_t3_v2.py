@@ -15,6 +15,7 @@ from unittest import mock
 from agent_observer import db, misuse
 from agent_observer.adapters import claude
 from agent_observer.adapters import t3 as t3_adapter
+from agent_observer.ingest import text_hash
 from tests.helpers import LedgerCase
 from tests.test_t3 import (CLSESS, PR7, T1, SUB, U2, assistant_line,
                            user_line, write_state, write_transcript)
@@ -279,6 +280,16 @@ class ChromeriaV2Test(LedgerCase):
         self.assertEqual(kinds["claude:" + P1]["text_excerpt"],
                          "please build it")
         self.assertEqual(kinds["claude:" + P2]["kind"], "synthetic")
+
+    def test_prompt_origins_cover_every_driver(self):
+        # Judge moments (#60) need the origin of Codex, Grok and OpenCode
+        # prompts too; the Claude session's prompt stays without evidence.
+        t3_adapter.sync(self.con, source=self.v2_path)
+        digest = text_hash("please build it")
+        self.assertEqual(t3_adapter.prompt_actor(self.con, CX8, digest),
+                         "server")
+        self.assertEqual(t3_adapter.prompt_actor(self.con, CL2, digest),
+                         "client")
 
     def test_prompt_origins_store_no_text(self):
         t3_adapter.sync(self.con, source=self.v2_path)
