@@ -15,6 +15,7 @@ from unittest import mock
 from agent_observer import db, misuse
 from agent_observer.adapters import claude
 from agent_observer.adapters import t3 as t3_adapter
+from agent_observer.ingest import text_hash
 from tests.helpers import LedgerCase
 from tests.test_t3 import (CLSESS, PR7, T1, SUB, U2, assistant_line,
                            user_line, write_state, write_transcript)
@@ -167,6 +168,14 @@ def write_v2(path, legacy=True):
                by="system", source="server")
         message("lm1", T1, "2026-09-27T10:00:00Z", "dispatched followup",
                 "user", "server")
+        native.execute(
+            "CREATE TABLE orchestration_v2_legacy_imports(thread_id TEXT"
+            " PRIMARY KEY, source_updated_at TEXT NOT NULL,"
+            " shell_imported_at TEXT NOT NULL)")
+        for tid in (T1, SUB):
+            native.execute(
+                "INSERT INTO orchestration_v2_legacy_imports VALUES(?,?,?)",
+                (tid, "2026-09-27T09:00:00Z", "2026-10-08T00:00:00Z"))
     native.commit()
     native.close()
     return path
@@ -279,6 +288,30 @@ class ChromeriaV2Test(LedgerCase):
         self.assertEqual(kinds["claude:" + P1]["text_excerpt"],
                          "please build it")
         self.assertEqual(kinds["claude:" + P2]["kind"], "synthetic")
+
+    def test_threads_record_who_opened_them(self):
+        # Judge moments (#60): only a person-opened top-level thread makes
+        # a stop or refusal there human evidence.
+        claude.import_claude_file(self.con, self.transcript)
+        t3_adapter.sync(self.con, source=self.v2_path)
+        opened = {r["thread_id"]: r["opened_by"] for r in self.query(
+            "SELECT thread_id, opened_by FROM t3_threads")}
+        self.assertEqual(opened[ROOT], "client")
+        self.assertEqual(opened[CHILD], "server")
+        # Chromeria's legacy import marks every V1 thread system-created;
+        # that is no evidence, so the first turn start decides.
+        self.assertEqual(opened[T1], "client")
+        self.assertIsNone(opened[SUB])
+
+    def test_prompt_origins_cover_every_driver(self):
+        # Judge moments (#60) need the origin of Codex, Grok and OpenCode
+        # prompts too; the Claude session's prompt stays without evidence.
+        t3_adapter.sync(self.con, source=self.v2_path)
+        digest = text_hash("please build it")
+        self.assertEqual(t3_adapter.prompt_actor(self.con, CX8, digest),
+                         "server")
+        self.assertEqual(t3_adapter.prompt_actor(self.con, CL2, digest),
+                         "client")
 
     def test_prompt_origins_store_no_text(self):
         t3_adapter.sync(self.con, source=self.v2_path)

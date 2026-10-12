@@ -218,6 +218,99 @@ bodies, patches and outputs are shown in full, so treat the output as
 private. Each source is parsed once per run: 1,000 live events across all
 four hosts took 4.4 seconds on rocky.
 
+## Judge moments
+
+Some behaviors, such as a person correcting an agent, need judgment that
+pattern matching cannot supply. Agent Observer prepares the evidence for
+an outside LLM judge and stores the judge's answers; it never runs a
+model itself. [docs/judge-corrections.md](docs/judge-corrections.md) is
+a reference judge prompt for corrections.
+
+A moment is one point in a main session where someone acted on the
+agent: a `prompt`, an `interrupt`, or a `rejection` of a tool call. Its
+`origin` is the source label: who acted, from evidence only. A message
+another agent sent (a parent's brief, a reviewer's findings, a child's
+report) is a `prompt` moment with origin `agent` when Chromeria records
+it as agent-sent. Corrections from a person and from another agent both
+count, so selection and reports default to `human` and `agent`, with the
+two reported apart and combined; `unknown` moments are counted but left
+out.
+
+- `human`: Chromeria recorded a person starting the turn or sending the
+  prompt, the session ran in a terminal or desktop app (`cli`,
+  `Codex Desktop`, `codex-tui`), or an interrupt or rejection stopped a
+  top-level Chromeria thread that a person opened, or a session outside
+  Chromeria (Claude's `user-rejected` included).
+- `agent`: Chromeria recorded an agent or the server sending it, or the
+  session ran headless (`sdk-cli`, `codex_exec`). Other synthetic input,
+  such as reminders, is no moment.
+- `unknown`: no evidence either way, for example a prompt in a delegated
+  child thread from before Chromeria V2, a Grok or OpenCode prompt (their
+  Chromeria text does not match the native prompt), or any interrupt or
+  rejection in a child thread or in a top-level thread an agent launched
+  (`thread` `child` or `launched`), which an agent can cause. A
+  top-level thread counts as person-opened from Chromeria V2's
+  `createdBy`, or, for V1 threads and V2's legacy imports of them, from
+  who started its first turn; a ledger not synced since that evidence
+  existed reads every top-level thread as `launched`. Codex
+  prompt origins come from Chromeria V2 only, so older Codex child
+  prompts stay `unknown`.
+
+Hook and permission-rule denials and auto-mode blocks are policy, not a
+person. They are never moments and are counted as `policy_denials`.
+Claude writes a rejected tool call twice, as the denial and as an
+interrupt in the same second; that is one moment.
+
+```sh
+agent-observer moments --since 2026-09-14 --unjudged correction --json   # default --origin human --origin agent
+agent-observer moment show sub:claude:<uuid> ev:codex:<id>/lifecycle/turn_aborted:<turn> --json
+agent-observer verdict add --json < verdicts.jsonl
+agent-observer verdict list --behavior correction --verdict yes --json
+agent-observer verdict groups --behavior correction --json
+agent-observer recurrence --behavior correction --since 2026-09-14 [--attr arm=holdout]
+agent-observer session-attr add --json < arms.jsonl     # {"session": "claude:<id>", "name": "arm", "value": "holdout"}
+```
+
+`moments` lists the selected moments and counts every moment in scope by
+origin and kind, so filtered moments stay visible as numbers. A moment
+marked `opening` comes before anything the agent did in its session (a
+first prompt, a worker's brief), so it cannot correct that agent. `moment show`
+reads each moment from the native log: its full text (including text
+inside Chromeria wrapper tags) and whole turns around it. A turn is a
+prompt or interrupt (with its `origin`) plus the agent's messages and
+tool calls up to the next one. `before` lists turns oldest first, each
+opened by its prompt; `after` lists the moment's own turn first, each
+closed by the next prompt. The window is a parameter, echoed back as
+`window`, so a judge can measure its accuracy against context size on a
+labeled sample: `--turns-before 0 --turns-after 0` is the moment alone,
+the default `1`/`1` adds the turn it answers and the agent's reply, and
+larger values add more turns. `--items` caps agent messages and tool
+calls per turn (each turn reports how many it `omitted`), `--chars` cuts each of them, and `--text-chars` (default
+20,000) bounds prompt text separately, so a context limit never cuts the
+person's words. Its statuses match `event show`,
+plus `no_such_moment`; the exit status is 3 when any moment is not `ok`.
+
+A verdict is `yes`, `no` or `unclear` for one moment, behavior and judge;
+`yes` carries a one-line `problem` and an optional `group`. Observer
+validates a batch whole and stores it only when every line is valid.
+Adding the same moment, behavior and judge again replaces the verdict,
+so grouping can run as a second pass. `recurrence` reports the yes
+verdicts, the problems (groups), the problems that recur in two or more
+sessions, and repeats per group, with first and last seen, sessions and
+hosts, plus judge coverage by origin and the policy denials. Its
+headline numbers combine `human` and `agent` moments (each group shows
+how many of each), and `by_origin` repeats the counts for each source
+alone; `--origin` narrows or widens the set. When more than one judge labeled the scope, it requires
+`--judge`. `moments --unjudged B --judge J` lists the work left for one
+judge; `verdict list` returns stored verdicts with their problem lines,
+which the grouping pass reads. A batch that names the same moment,
+behavior and judge twice is rejected. Yes verdicts on moments outside
+the reported origins appear only in `other_origins`, never in the
+headline numbers.
+
+Moment text, problem lines and session attributes stay on this machine:
+`publish` never includes them.
+
 ## Ownership and tasks
 
 Put `observer_task_id` in related Router jobs' prepared task JSON to connect
@@ -350,7 +443,11 @@ mode 0700, and the database plus SQLite sidecars to mode 0600. It stores
 counters, identities, paths, hashes and short excerpts needed for the
 detectors; it never stores file contents, tool outputs or AgentsMD
 preference contents. `event show` reads those from the native logs on
-request and prints them without storing them. Only sanitized fixtures are committed to this
+request and prints them without storing them. Two tables hold free text
+that tools other than the harness write: `verdicts.problem`, a one-line
+problem an outside judge wrote after reading private session content
+(redacted for known secret shapes), and `session_attributes.value`.
+Both stay on this machine and are never published. Only sanitized fixtures are committed to this
 repository.
 
 Prompt excerpts are kept only for genuine human prompts in the main

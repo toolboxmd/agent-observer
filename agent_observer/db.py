@@ -240,6 +240,28 @@ CREATE TABLE IF NOT EXISTS events (
   detail_json TEXT,
   UNIQUE (session_key, family, native_id)
 );
+-- Judge verdicts on moments (agent_observer/moments.py ids). Observer
+-- runs no model: an outside judge writes these through `verdict add`.
+-- problem is a judge-written line, redacted, and stays on this machine.
+CREATE TABLE IF NOT EXISTS verdicts (
+  moment_id TEXT NOT NULL,
+  behavior TEXT NOT NULL,
+  judge TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  problem TEXT,
+  group_id TEXT,
+  recorded_at REAL NOT NULL,
+  PRIMARY KEY (moment_id, behavior, judge)
+);
+-- Session attributes supplied by other tools (contextmd's served or
+-- holdout arm), used only as report filters.
+CREATE TABLE IF NOT EXISTS session_attributes (
+  session_key TEXT NOT NULL,
+  name TEXT NOT NULL,
+  value TEXT NOT NULL,
+  recorded_at REAL NOT NULL,
+  PRIMARY KEY (session_key, name)
+);
 -- Model Router ledger rows, copied read-only from its jobs.db and guarded by
 -- its schema_version. Observer never writes the router's database.
 CREATE TABLE IF NOT EXISTS router_jobs (

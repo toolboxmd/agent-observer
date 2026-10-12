@@ -93,6 +93,7 @@ V2_THREADS = "orchestration_v2_projection_threads"
 V2_PROVIDER_THREADS = "orchestration_v2_projection_provider_threads"
 V2_MESSAGES = "orchestration_v2_projection_messages"
 V2_RUNS = "orchestration_v2_projection_runs"
+V2_LEGACY_IMPORTS = "orchestration_v2_legacy_imports"
 # V2 drivers whose nativeThreadRef is the ledger's native session id.
 V2_DRIVERS = ("claudeAgent", "codex", "grok", "opencode")
 # Chromeria surfaces where a person types; any other source is no evidence.
@@ -160,6 +161,10 @@ def _ensure_tables(con: sqlite3.Connection) -> None:
         " state TEXT,"
         " linked_at TEXT,"
         " PRIMARY KEY (thread_id, kind, repository, number))")
+    if "opened_by" not in {r["name"] for r in con.execute("PRAGMA table_info(t3_threads)")}:
+        # Who created the thread: client (a person), server (an agent or
+        # the system), or NULL without evidence (V1 threads).
+        con.execute("ALTER TABLE t3_threads ADD COLUMN opened_by TEXT")
     if "head_branch" not in {r["name"] for r in con.execute("PRAGMA table_info(t3_links)")}:
         con.execute("ALTER TABLE t3_links ADD COLUMN head_branch TEXT")
     con.execute(
@@ -217,7 +222,7 @@ def turn_actor(con: sqlite3.Connection, message_id: str) -> str | None:
 
 def prompt_actor(con: sqlite3.Connection, native_session,
                  digest: str) -> str | None:
-    """The V2 origin of a prompt by native Claude session and text hash.
+    """The V2 origin of a prompt by native session and text hash.
 
     Missing table, unknown session or hash read as None, never as a
     guessed origin.
@@ -491,7 +496,8 @@ def _import_turn_origins(con: sqlite3.Connection, native: sqlite3.Connection,
 
 
 def _v2_lineage(native: sqlite3.Connection) -> dict:
-    """V2 thread id -> parent, root, creation time and PR link payloads.
+    """V2 thread id -> parent, root, creation time, PR link payloads and
+    who opened it (client, server or None, as for prompt origins).
 
     Empty when the database has no V2 tables (a V1 ``state.sqlite``).
     """
@@ -501,11 +507,20 @@ def _v2_lineage(native: sqlite3.Connection) -> dict:
     try:
         rows = native.execute(
             "SELECT thread_id, created_at,"
+            " json_extract(payload_json, '$.createdBy') AS created_by,"
+            " json_extract(payload_json, '$.creationSource') AS source,"
             " json_extract(payload_json, '$.lineage') AS lineage,"
             " json_extract(payload_json, '$.pullRequests') AS prs"
             f" FROM {V2_THREADS}").fetchall()
     except sqlite3.DatabaseError:
         return out
+    legacy = set()
+    if V2_LEGACY_IMPORTS in _tables(native):
+        try:
+            legacy = {r[0] for r in native.execute(
+                f"SELECT thread_id FROM {V2_LEGACY_IMPORTS}")}
+        except sqlite3.DatabaseError:
+            legacy = set()
     for row in rows:
         thread_id = _valid_id(row["thread_id"])
         if thread_id is None:
@@ -527,7 +542,11 @@ def _v2_lineage(native: sqlite3.Connection) -> dict:
             "root": root or (None if parent else thread_id),
             "created_at": row["created_at"]
             if isinstance(row["created_at"], str) else None,
-            "prs": prs if isinstance(prs, list) else []}
+            "prs": prs if isinstance(prs, list) else [],
+            # Chromeria's legacy import marks every V1 thread created by
+            # the system from the server: no evidence of who opened it.
+            "opened_by": None if thread_id in legacy
+            else _prompt_actor_of(row["created_by"], row["source"])}
     # A child whose lineage names no root inherits its parent's.
     for thread_id, entry in out.items():
         if entry["root"] is None:
@@ -566,12 +585,15 @@ def _prompt_actor_of(created_by, source) -> str | None:
 
 def _import_prompt_origins(con: sqlite3.Connection,
                            native: sqlite3.Connection, totals: dict) -> None:
-    """Mirror V2 prompt origins per native Claude session and text hash.
+    """Mirror V2 prompt origins per native session and text hash.
 
-    A message joins the native session of its run's provider thread, or
-    every Claude session of its thread when the run names none. A hash
-    sent by both a person and an agent in one session is dropped. Only
-    hashes are stored; the text never leaves this function.
+    A message joins the native session of its run's provider thread (any
+    driver: Claude import reclassifies by it, judge moments read it;
+    Grok and OpenCode native prompt text differs from V2 text, so only
+    Claude and Codex hashes match), or every Claude session of its thread when the run
+    names none. A hash sent by both a person and an agent in one session
+    is dropped. Only hashes are stored; the text never leaves this
+    function.
     """
     tables = _tables(native)
     if not {V2_MESSAGES, V2_PROVIDER_THREADS} <= tables:
@@ -595,13 +617,12 @@ def _import_prompt_origins(con: sqlite3.Connection,
     by_thread: dict[str, list] = {}
     known = {row["provider_thread_id"] for row in providers}
     for row in providers:
-        if (row["provider"] or "") != "claudeAgent":
-            continue
         session = _v2_native_ref(row["payload_json"], row["provider"])
         if session is None:
             continue
         by_provider[row["provider_thread_id"]] = session
-        by_thread.setdefault(row["thread_id"], []).append(session)
+        if (row["provider"] or "") == "claudeAgent":
+            by_thread.setdefault(row["thread_id"], []).append(session)
     seen: dict[tuple, set] = {}
     for row in messages:
         actor = _prompt_actor_of(row["created_by"], row["source"])
@@ -612,7 +633,7 @@ def _import_prompt_origins(con: sqlite3.Connection,
         if provider in by_provider:
             sessions = [by_provider[provider]]
         elif provider in known:
-            # A run on a Codex, Grok or OpenCode provider thread says
+            # A run on a provider thread without a native session says
             # nothing about the thread's Claude sessions.
             continue
         else:
@@ -657,6 +678,17 @@ def _import_threads(con: sqlite3.Connection, native: sqlite3.Connection,
     """
     lineage = lineage or {}
     result: dict[str, list] = {}
+    # Without V2 creation evidence (V1 threads, legacy imports), the first
+    # turn start says who opened the thread.
+    first_turn = {}
+    for r in con.execute(
+            "SELECT thread_id, actor_kind FROM t3_turn_origins"
+            " ORDER BY occurred_at DESC"):
+        first_turn[r["thread_id"]] = r["actor_kind"]
+
+    def opened_by(thread_id):
+        evidence = (lineage.get(thread_id) or {}).get("opened_by")
+        return evidence or first_turn.get(thread_id)
     rows = []
     if "provider_session_runtime" in _tables(native):
         try:
@@ -685,16 +717,17 @@ def _import_threads(con: sqlite3.Connection, native: sqlite3.Connection,
         provider = row["provider_name"]
         con.execute(
             "INSERT INTO t3_threads(thread_id, root_thread_id, provider,"
-            " adapter_key, native_session) VALUES(?,?,?,?,?)"
+            " adapter_key, native_session, opened_by) VALUES(?,?,?,?,?,?)"
             " ON CONFLICT(thread_id) DO UPDATE SET"
             " root_thread_id=excluded.root_thread_id,"
             " provider=excluded.provider, adapter_key=excluded.adapter_key,"
-            " native_session=excluded.native_session",
+            " native_session=excluded.native_session,"
+            " opened_by=excluded.opened_by",
             (thread_id, _lineage_root(thread_id, lineage),
              provider if isinstance(provider, str) else None,
              row["adapter_key"]
              if isinstance(row["adapter_key"], str) else None,
-             native_session))
+             native_session, opened_by(thread_id)))
         result.setdefault(thread_id, []).append(native_session)
         seen += 1
     if V2_PROVIDER_THREADS in _tables(native):
@@ -714,14 +747,15 @@ def _import_threads(con: sqlite3.Connection, native: sqlite3.Connection,
                 continue
             con.execute(
                 "INSERT INTO t3_threads(thread_id, root_thread_id, provider,"
-                " adapter_key, native_session) VALUES(?,?,?,?,?)"
+                " adapter_key, native_session, opened_by) VALUES(?,?,?,?,?,?)"
                 " ON CONFLICT(thread_id) DO UPDATE SET"
                 " root_thread_id=excluded.root_thread_id,"
                 " provider=excluded.provider,"
                 " adapter_key=excluded.adapter_key,"
-                " native_session=excluded.native_session",
+                " native_session=excluded.native_session,"
+                " opened_by=excluded.opened_by",
                 (thread_id, _lineage_root(thread_id, lineage), row["provider"],
-                 row["provider"], native_session))
+                 row["provider"], native_session, opened_by(thread_id)))
             sessions = result.setdefault(thread_id, [])
             if native_session not in sessions:
                 sessions.append(native_session)
