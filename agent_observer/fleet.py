@@ -7,10 +7,10 @@ show`` reports, never summed across counter semantics), and per task its
 outcome, identifiers and session keys. It carries no prompt or assistant text,
 excerpts, titles, local paths or branch names; a task's project and URL
 travel only as validated GitHub identifiers. Judge evidence (#60) travels
-as intervention counts by origin and kind, and per judge its verdict counts,
+as intervention counts by created_by and kind, and per judge its verdict counts,
 coverage and groups: group id, the judge's one-line problem and each
-judged-yes intervention's id, session, origin and time, so ``combine`` can merge
-groups across machines and count a intervention seen twice once. Intervention and
+judged-yes intervention's id, session, created_by and time, so ``combine`` can merge
+groups across machines and count an intervention seen twice once. Intervention and
 transcript text never leave.
 
 ``pull`` fetches another machine's export over SSH and stores it beside
@@ -597,9 +597,9 @@ def _combine_judgments(docs: list) -> tuple[list, list, dict]:
     takes all its evidence (interventions, denials, verdicts, yes interventions) from
     one owner, the first machine by name, as token usage does. A behavior
     judged by different judges on different machines is reported per
-    judge and listed in ``unmerged_behaviors``. Headline numbers count the created_by
-    whose corrections count (human and agent); each group keeps its
-    per-origin counts."""
+    judge and listed in ``unmerged_behaviors``. Headline numbers count the created_by values
+    whose corrections count (user and agent); each group keeps its
+    per-created_by counts."""
     counted = _interventions.COUNTED
     moment_counts = {"by_created_by": {o: 0 for o in _interventions.CREATED_BY},
                      "by_kind": {k: 0 for k in _interventions.KINDS},
@@ -742,7 +742,7 @@ def render(result: dict) -> str:
         if withheld else ""))
     counts = result.get("interventions") or {}
     if counts:
-        lines.append("interventions by origin: " + ", ".join(
+        lines.append("interventions by created_by: " + ", ".join(
             f"{k} {v}" for k, v in counts["by_created_by"].items())
             + "; policy denials (not corrections): " + ", ".join(
             f"{k} {v}" for k, v in counts["policy_denials"].items()))

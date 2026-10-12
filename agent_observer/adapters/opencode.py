@@ -38,7 +38,7 @@ CAPABILITIES = [
     ("file_change", True, "edit/write/patch tool calls and patch parts as file_change; patch parts keyed by part id with snapshot hash"),
     ("compaction", True, "compaction parts and session time_compacting as compaction boundaries"),
     ("lifecycle_task", True, "message errors as lifecycle error events carrying the status code"),
-    ("human_input", True, "user text parts as genuine/synthetic submissions; child sessions and synthetic flags told apart"),
+    ("human_input", True, "user text parts as genuine/synthetic user messages; child sessions and synthetic flags told apart"),
     ("instruction_identity", True, "AgentsMD direction block from user text; versioned plugin paths read"),
     ("subagents", True, "child sessions as subagent sessions of their parent"),
 ]
@@ -150,7 +150,7 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
     db_path = _resolve_db(source or root)
     totals: dict = {"harness": HARNESS, "sources": 0, "unchanged": 0,
                     "responses_inserted": 0, "events_inserted": 0,
-                    "submissions_inserted": 0, "malformed": 0, "failed": []}
+                    "user_messages_inserted": 0, "malformed": 0, "failed": []}
     if not os.path.exists(db_path):
         totals["failed"].append({"path": db_path, "error": "not found"})
         return totals
@@ -182,7 +182,7 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
             totals["sources"] += 1
             totals["unchanged"] += 1 if stats.get("unchanged") else 0
             for key in ("responses_inserted", "events_inserted",
-                        "submissions_inserted", "malformed"):
+                        "user_messages_inserted", "malformed"):
                 totals[key] += stats.get(key, 0)
     finally:
         native.close()
@@ -404,7 +404,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     started = time.monotonic()
     stats: dict = {"responses_inserted": 0, "responses_duplicate": 0,
                    "events_inserted": 0, "events_duplicate": 0,
-                   "submissions_inserted": 0, "malformed": 0}
+                   "user_messages_inserted": 0, "malformed": 0}
     sess_id = sess.get("id")
     src_path = f"{abs_db_path}#{sess_id}"
     session_key = f"{HARNESS}:{sess_id}"
@@ -714,7 +714,7 @@ def _ingest_submission(con, stats, identity, src_path, source_id,
                 " is_genuine=? WHERE native_id=?",
                 (source_id, session_key, index, ts, "synthetic", digest, "",
                  0, native_id))
-            stats["submissions_inserted"] += 1
+            stats["user_messages_inserted"] += 1
         return
     if is_child:
         kind = "synthetic"
@@ -744,7 +744,7 @@ def _ingest_submission(con, stats, identity, src_path, source_id,
             " VALUES(?,?,?,?,?,?,?,?,?)",
             (native_id, source_id, session_key, index, ts,
              kind, digest, excerpt, is_genuine))
-        stats["submissions_inserted"] += 1
+        stats["user_messages_inserted"] += 1
         return
     if (existing["kind"] != kind or existing["text_hash"] != digest
             or (existing["text_excerpt"] or "") != excerpt
@@ -755,7 +755,7 @@ def _ingest_submission(con, stats, identity, src_path, source_id,
             " is_genuine=? WHERE native_id=?",
             (source_id, session_key, index, ts, kind, digest, excerpt,
              is_genuine, native_id))
-        stats["submissions_inserted"] += 1
+        stats["user_messages_inserted"] += 1
 
 
 def _ingest_part(con, stats, identity, src_path, source_id, session_key,

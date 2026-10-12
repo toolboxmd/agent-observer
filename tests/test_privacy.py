@@ -872,8 +872,8 @@ class PrivacyVersionTest(LedgerCase):
             "SELECT privacy_version FROM sources")}
         self.assertEqual(versions, {privacy.PRIVACY_VERSION})
         self.assertGreaterEqual(
-            first.get("submissions_updated", 0)
-            + second.get("submissions_updated", 0), 1)
+            first.get("user_messages_updated", 0)
+            + second.get("user_messages_updated", 0), 1)
         self.assertGreaterEqual(
             first.get("events_updated", 0)
             + second.get("events_updated", 0), 1)

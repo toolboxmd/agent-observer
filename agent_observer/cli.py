@@ -1,4 +1,4 @@
-"""CLI: agent-observer sync|sessions|capture|task|claims|thread-misuse|dispatch-modes|trace|event|interventions|intervention|verdict|recurrence|session-attr. Stdlib only."""
+"""CLI: agent-observer sync|sessions|capture|task|claims|thread-misuse|delegation-modes|trace|event|interventions|intervention|verdict|recurrence|session-attr. Stdlib only."""
 
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ def _text(payload) -> str:
                     f"({h.get('unchanged', 0)} unchanged), "
                     f"{h.get('responses_inserted', 0)} new responses, "
                     f"{h.get('events_inserted', 0)} new events, "
-                    f"{h.get('submissions_inserted', 0)} new submissions, "
+                    f"{h.get('user_messages_inserted', 0)} new user messages, "
                     f"{h.get('malformed', 0)} malformed records kept in import_errors")
             if h.get("failed"):
                 line += f", {len(h['failed'])} sources failed"
@@ -337,7 +337,7 @@ def build_parser() -> argparse.ArgumentParser:
     tm.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
     dm = sub.add_parser("delegation-modes", aliases=["dispatch-modes"],
-                        help="compare planner dispatch with a dispatcher thread per job")
+                        help="compare planner delegation with a dispatcher thread per job")
     dm.add_argument("--planner", action="append", default=None,
                     help="planner T3 thread id (repeatable; default every planner)")
     dm.add_argument("--job", action="append", default=None,
@@ -1155,7 +1155,7 @@ def _sessions(con, ns) -> int:
         payload["events"] = {r["family"]: r["n"] for r in con.execute(
             "SELECT family, COUNT(*) n FROM events WHERE session_key=?"
             " GROUP BY family", (ns.session,))}
-        payload["submissions"] = {r["kind"]: r["n"] for r in con.execute(
+        payload["user_messages"] = {r["kind"]: r["n"] for r in con.execute(
             "SELECT kind, COUNT(*) n FROM user_messages WHERE session_key=?"
             " GROUP BY kind", (ns.session,))}
         _emit(payload, True)

@@ -84,7 +84,7 @@ CAPABILITIES = [
     ("workload_binding", True, "thread-tree PR/Issue links become repo#N tasks with whole-session ownership; multi-link trees stay shared whole"),
     ("acceptance", True, "merged PR snapshots complete task outcomes; other states stay explicit"),
     ("tool_calls", False, "no tool evidence is imported from T3 state"),
-    ("human_input", False, "no submissions are synthesized; existing submissions are only reclassified"),
+    ("human_input", False, "no user messages are synthesized; existing user messages are only reclassified"),
 ]
 
 STATE_RELATIVE = os.path.join("userdata", "state.sqlite")
@@ -340,7 +340,7 @@ def sync(con: sqlite3.Connection, root: str | None = None,
          full: bool = False, source: str | None = None) -> dict:
     totals = {"harness": HARNESS, "sources": 0, "unchanged": 0,
               "responses_inserted": 0, "events_inserted": 0,
-              "submissions_inserted": 0, "malformed": 0, "failed": []}
+              "user_messages_inserted": 0, "malformed": 0, "failed": []}
     _ = full  # The T3 mirror is always a full re-read; bindings are durable.
     path = state_path(root=root, source=source)
     if not os.path.exists(path):
@@ -361,7 +361,7 @@ def sync(con: sqlite3.Connection, root: str | None = None,
         _import_spawns(con, native, totals, lineage)
         _import_messages(con, native, totals, lineage)
         _import_prompt_origins(con, native, totals)
-        totals["submissions_reclassified"] = _backfill_submissions(con) \
+        totals["user_messages_reclassified"] = _backfill_submissions(con) \
             + _backfill_prompt_origins(con)
         totals["responses_retouched"] = _retouch_response_turns(con)
         bound = _bind_trees(con, threads, links, lineage)

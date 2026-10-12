@@ -1,12 +1,12 @@
-"""Judge interventions: where a person acted in a main session, in context.
+"""Judge interventions: where someone acted on an agent in a main session.
 
 Observer runs no model. It selects interventions deterministically, gives an
 outside judge (an LLM) each one in context from the native logs, and
-stores the judge's verdicts (agent_observer/verdicts.py). A intervention is one
+stores the judge's verdicts (agent_observer/verdicts.py). An intervention is one
 of:
 
-- prompt: a genuine submission (`sub:<submission native id>`);
-- interrupt: an interrupt submission, or a Codex `turn_aborted` event
+- prompt: a genuine user message (`sub:<user message native id>`);
+- interrupt: an interrupt user message, or a Codex `turn_aborted` event
   (`ev:<session_key>/<family>/<native id>`);
 - rejection: a denied permission that a person decided: Claude's
   `user-rejected`, or a denial without a kind on another harness.
@@ -14,8 +14,8 @@ of:
 Hook and rule denials (Claude `permission-rule`) and auto-mode blocks are
 policy, never interventions; they are counted separately.
 
-`origin` says who acted, from evidence only: `human`, `agent` or
-`unknown`. Chromeria turn and prompt created_by outrank the session's
+`created_by` says who acted, from evidence only: `user`, `agent` or
+`unknown`. Chromeria turn and prompt origins outrank the session's
 entrypoint; nothing is guessed.
 
 Intervention text and context are read on request and never stored; secrets
@@ -68,7 +68,7 @@ def _iso(ts) -> str | None:
 
 
 class _Evidence:
-    """Chromeria created_by and thread positions, loaded once per call."""
+    """Chromeria origin evidence and thread positions, loaded once per call."""
 
     def __init__(self, con: sqlite3.Connection):
         self.turns = self._pairs(
@@ -158,15 +158,15 @@ def _scope(harness=None, project=None, attrs=None) -> tuple[str, list]:
     return " AND ".join(where), args
 
 
-def _base(row, intervention_id: str, kind: str, ts, origin: str, thread: str) -> dict:
-    return {"id": intervention_id, "kind": kind, "created_by": origin, "thread": thread,
+def _base(row, intervention_id: str, kind: str, ts, created_by: str, thread: str) -> dict:
+    return {"id": intervention_id, "kind": kind, "created_by": created_by, "thread": thread,
             "ts": ts, "at": _iso(ts), "session": row["session_key"],
             "harness": row["harness"], "project": row["project_dir"]}
 
 
 def _from_submission(row, ev: _Evidence) -> dict | None:
-    """A intervention for a genuine prompt, an interrupt, or a message another
-    agent sent (a synthetic submission Chromeria records as agent-sent);
+    """An intervention for a genuine prompt, an interrupt, or a message another
+    agent sent (a synthetic user message Chromeria records as agent-sent);
     None for other synthetic input such as reminders."""
     kind = "interrupt" if row["kind"] == "interrupt" else "prompt"
     thread = ev.thread(row["session_native"])
@@ -307,7 +307,7 @@ def judged_ids(con, behavior: str, judge=None) -> set:
 def select(con: sqlite3.Connection, since=None, until=None, harness=None,
            project=None, created_by=COUNTED, kinds=None, unjudged=None,
            attrs=None, limit=None, judge=None) -> dict:
-    """Interventions in scope. Counts cover every origin and kind in scope, so
+    """Interventions in scope. Counts cover every created_by value and kind in scope, so
     interventions the filters leave out stay visible as numbers."""
     found, policy = _all(con, harness, project, attrs)
     found = [m for m in found if _in_period(m["ts"], since, until)]

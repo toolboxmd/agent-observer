@@ -227,7 +227,7 @@ class T3SyncTest(LedgerCase):
         self.assertEqual(before["claude:" + U2][0], "synthetic")
         self.assertEqual(before["claude:" + U6][0], "synthetic")
         totals = t3_adapter.sync(self.con, source=self.t3_path)
-        self.assertGreaterEqual(totals["submissions_reclassified"], 1)
+        self.assertGreaterEqual(totals["user_messages_reclassified"], 1)
         kinds = self.kinds()
         # Client turn typed by a person: genuine with its turn for joining.
         self.assertEqual(kinds["claude:" + U1][0], "genuine")

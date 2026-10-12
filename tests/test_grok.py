@@ -183,7 +183,7 @@ class GrokAdapterTest(LedgerCase):
         again = grok.sync(self.con, root=ROOT)
         self.assertEqual(again["unchanged"], 2)
         self.assertEqual(again["responses_inserted"], 0)
-        self.assertEqual(again["submissions_inserted"], 0)
+        self.assertEqual(again["user_messages_inserted"], 0)
         self.assertEqual(again["events_inserted"], 0)
         full = grok.sync(self.con, root=ROOT, full=True)
         self.assertEqual(full["responses_inserted"], 0)
@@ -218,7 +218,7 @@ class GrokAdapterTest(LedgerCase):
             fh.write(json.dumps(completion) + "\n")
         grown = grok.sync(self.con, root=tmp)
         self.assertEqual(grown["responses_inserted"], 1)
-        self.assertEqual(grown["submissions_inserted"], 0)
+        self.assertEqual(grown["user_messages_inserted"], 0)
         row = self.query(
             "SELECT total_tokens FROM responses WHERE response_id=?",
             (f"{sid}:p-eee",))[0]
@@ -1453,7 +1453,7 @@ class GrokAdapterTest(LedgerCase):
         versions = {r["privacy_version"] for r in con.execute(
             "SELECT privacy_version FROM sources WHERE harness='grok'")}
         self.assertEqual(versions, {privacy.PRIVACY_VERSION})
-        self.assertGreaterEqual(stats.get("submissions_updated", 0), 1)
+        self.assertGreaterEqual(stats.get("user_messages_updated", 0), 1)
         self.assertGreaterEqual(stats.get("events_updated", 0), 1)
         con.close()
 
@@ -1736,7 +1736,7 @@ class GrokAdapterTest(LedgerCase):
         # Idempotent: a second sync writes nothing new.
         again = grok.sync(con, root=tmp)
         self.assertEqual(again["responses_inserted"], 0)
-        self.assertEqual(again["submissions_inserted"], 0)
+        self.assertEqual(again["user_messages_inserted"], 0)
         con.close()
 
     def test_child_import_order_parent_link_reclassifies(self):
@@ -3226,7 +3226,7 @@ class GrokAdapterTest(LedgerCase):
         self.assertEqual(second["sources"], 2)
         self.assertEqual(second["unchanged"], 2)
         self.assertEqual(second["responses_inserted"], 0)
-        self.assertEqual(second["submissions_inserted"], 0)
+        self.assertEqual(second["user_messages_inserted"], 0)
         self.assertEqual(second["events_inserted"], 0)
         # Zero parses of unchanged updates/events files and zero JSON
         # parses of unchanged chat files on the second sync.

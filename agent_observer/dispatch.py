@@ -1,4 +1,4 @@
-"""Dispatch-mode comparison: planner dispatch versus a dispatcher thread.
+"""Delegation-mode comparison: planner delegation versus a dispatcher thread.
 
 A job is one planner thread and the PR (or, lacking one, the Issue) that
 its children deliver. The planner's direct children are the job's

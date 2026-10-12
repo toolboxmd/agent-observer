@@ -75,14 +75,14 @@ DEFAULT_ROOT = os.path.expanduser("~/.local/share/durable-runner")
 LEGACY_ROOT = os.path.expanduser("~/.local/state/model-router")
 
 CAPABILITIES = [
-    ("router_ledger", True, "router jobs, invocations and readings copied read-only; usage stays numeric-only evidence on attempts, never native responses"),
+    ("router_ledger", True, "router jobs, invocations and readings copied read-only; usage stays numeric-only evidence on task turns, never native responses"),
     ("tool_calls", False, "no router tool-call import; native rollouts carry tool evidence"),
     ("tool_results", False, "no router tool-result import; native rollouts carry tool evidence"),
     ("read_evidence", False, "no file-read import from the router ledger"),
-    ("lifecycle_task", True, "invocation terminal_class maps onto attempt state; router job status stays outcome evidence only"),
-    ("human_input", False, "no submissions are synthesized from router rows"),
+    ("lifecycle_task", True, "invocation terminal_class maps onto task-turn state; router job status stays outcome evidence only"),
+    ("human_input", False, "no user messages are synthesized from router rows"),
     ("instruction_identity", False, "no instruction identity is inferred from router rows"),
-    ("workload_binding", True, "jobs map to tasks and invocations to attempts; worker sessions bind through session_assignments"),
+    ("workload_binding", True, "jobs map to tasks and invocations to task turns; child sessions bind through session_assignments"),
 ]
 
 # Closed router vocabularies, derived from Model Router's own contract
@@ -254,7 +254,7 @@ def sync(con: sqlite3.Connection, root: str | None = None,
          full: bool = False, source: str | None = None) -> dict:
     totals = {"harness": HARNESS, "sources": 0, "unchanged": 0,
               "responses_inserted": 0, "events_inserted": 0,
-              "submissions_inserted": 0, "malformed": 0, "failed": [],
+              "user_messages_inserted": 0, "malformed": 0, "failed": [],
               "jobs": 0, "invocations": 0, "bindings": 0, "readings": 0,
               "rollouts": 0}
     if root is None and source is None:
@@ -1364,8 +1364,8 @@ def _sync_rollouts(con: sqlite3.Connection, rollout_root: str, totals: dict,
         totals["rollouts"] += 1
         totals["responses_inserted"] += stats.get("responses_inserted", 0)
         totals["events_inserted"] += stats.get("events_inserted", 0)
-        totals["submissions_inserted"] += stats.get(
-            "submissions_inserted", 0)
+        totals["user_messages_inserted"] += stats.get(
+            "user_messages_inserted", 0)
         totals["malformed"] += stats.get("malformed", 0)
         if not stats.get("unchanged"):
             changed = True

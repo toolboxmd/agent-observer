@@ -634,7 +634,7 @@ def session_sources_stale(con: sqlite3.Connection, session_key: str,
     multi-source sessions such as Grok, where updates.jsonl and
     events.jsonl are distinct source rows and either one may be stale.
     Sources are associated through the session row's stored source_id,
-    through the session's existing event, submission, response and turn
+    through the session's existing event, user message, response and turn
     rows, through sibling rows sharing the native session id, and through
     the incoming source_id. Unknown sessions need no replacement.
     """
@@ -655,7 +655,7 @@ def session_sources_stale(con: sqlite3.Connection, session_key: str,
         stored = None
     if isinstance(stored, int):
         candidate_ids.add(stored)
-    for table in ("events", "submissions", "responses", "turns"):
+    for table in ("events", "user_messages", "responses", "turns"):
         try:
             rows = con.execute(
                 f"SELECT DISTINCT source_id FROM {table} WHERE session_key=?",

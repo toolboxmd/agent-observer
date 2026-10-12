@@ -241,9 +241,9 @@ def listing(con: sqlite3.Connection, behavior: str, judge=None,
 def recurrence(con: sqlite3.Connection, behavior: str, judge=None,
                since=None, until=None, harness=None, project=None,
                attrs=None, created_by=_interventions.COUNTED) -> dict:
-    """Recurrence over interventions of the given created_by. The default counts
+    """Recurrence over interventions by the given creators. The default counts
     corrections from a person and from another agent together, with a
-    breakdown per origin; coverage still counts every origin in scope."""
+    breakdown per created_by value; coverage still counts every value in scope."""
     selected = _interventions.select(con, since=since, until=until,
                                harness=harness, project=project,
                                created_by=created_by, attrs=attrs)
@@ -275,7 +275,7 @@ def recurrence(con: sqlite3.Connection, behavior: str, judge=None,
             "problems": len(part),
             "recurring_problems": sum(1 for g in part if g["sessions"] >= 2),
             "repeats": sum(g["repeats"] for g in part)}
-    # Yes verdicts on interventions outside the chosen created_by (for example a
+    # Yes verdicts on interventions outside the chosen created_by values (for example a
     # parent agent correcting a worker) are reported apart, never mixed in.
     others: dict[str, dict] = {}
     if created_by:
@@ -326,7 +326,7 @@ def render(report: dict) -> str:
         f"problems {report['problems']}, recurring (2+ sessions)"
         f" {report['recurring_problems']}, repeats {report['repeats']},"
         f" ungrouped {report['ungrouped']}",
-        "unjudged by origin: " + ", ".join(
+        "unjudged by created_by: " + ", ".join(
             f"{k} {v}" for k, v in cov["unjudged_by_created_by"].items()),
         "policy denials (not corrections): " + ", ".join(
             f"{k} {v}" for k, v in report["policy_denials"].items()),

@@ -1008,7 +1008,7 @@ class OpencodeAdapterTest(unittest.TestCase):
         native.commit()
         native.close()
         stats = opencode.sync(self.con, source=self.db_file)
-        self.assertGreaterEqual(stats["submissions_inserted"], 1)
+        self.assertGreaterEqual(stats["user_messages_inserted"], 1)
         second = self.q("SELECT * FROM user_messages WHERE native_id=?",
                         ("opencode:msg_resync_u",))[0]
         self.assertEqual(
