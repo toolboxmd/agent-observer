@@ -428,6 +428,12 @@ fails or any field of the output fails validation, and warns when a host
 reports a machine name other than its own. Machine names come from
 `$AGENT_OBSERVER_MACHINE` or the short hostname.
 
+The machines are your own, reached over SSH keys you control. Validation
+guards against corrupt or buggy exports: every field is type- and
+range-checked, strings that could break report lines are refused, and `pull`
+stores only an export it can render. It does not make a hostile host safe to
+pull from.
+
 `fleet report` combines this machine's live export with the stored ones. Each
 session counts once. Sessions found on several machines, and machines
 expected with `--expect` but absent, are listed and make the exit status 3.

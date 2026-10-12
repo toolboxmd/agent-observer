@@ -242,7 +242,11 @@ class ReportTest(LedgerCase):
                                  "\ud800")),
                     {**good, "sessions": [{**session, "usage": [
                         {**group, "total_tokens": fleet.MAX_COUNT + 1}]}]},
-                    {**good, "withheld_tasks": fleet.MAX_COUNT + 1}):
+                    {**good, "withheld_tasks": fleet.MAX_COUNT + 1},
+                    # Too many counter semantics would make reports quadratic.
+                    {**good, "sessions": [{**session, "usage": [
+                        {**group, "semantics": f"s{i}"}
+                        for i in range(fleet.MAX_SEMANTICS + 1)]}]}):
             with self.subTest(bad=json.dumps(bad, ensure_ascii=True)[:300]):
                 with self.assertRaises(ValueError):
                     fleet.validate(bad)
@@ -302,6 +306,32 @@ class PullTest(LedgerCase):
             with self.assertRaises(fleet.PullError):
                 fleet.pull("bestia", store, run=run)
         self.assertEqual(fleet.stored(store), [])
+
+    def test_deeply_nested_export_fails_only_its_host(self):
+        store = os.path.join(self.tmp.name, "fleet")
+        deep = json.dumps(_doc("bestia", []))[:-1] + ', "x": ' \
+            + "[" * 5000 + "]" * 5000 + "}"
+        run, _ = self.run_fake(deep)
+        try:
+            fleet.pull("bestia", store, run=run)
+        except fleet.PullError:
+            pass  # Refused where the parser's recursion limit is lower.
+        # Either way nothing outside the export schema is ever stored.
+        for doc in fleet.stored(store):
+            self.assertNotIn("x", doc)
+
+    def test_pull_stores_only_schema_fields(self):
+        store = os.path.join(self.tmp.name, "fleet")
+        doc = _doc("bestia", [("codex:b", 7)], [_task("T-1", ["codex:b"])])
+        doc["extra"] = "drop me"
+        doc["sessions"][0]["title"] = "secret-title"
+        doc["sessions"][0]["usage"][0]["note"] = "drop me"
+        doc["tasks"][0]["title"] = "secret task title"
+        run, _ = self.run_fake(json.dumps(doc))
+        fleet.pull("bestia", store, run=run)
+        text = open(os.path.join(store, "bestia.json")).read()
+        for word in ("drop me", "secret-title", "secret task title"):
+            self.assertNotIn(word, text)
 
     def test_pull_warns_when_the_host_names_another_machine(self):
         store = os.path.join(self.tmp.name, "fleet")

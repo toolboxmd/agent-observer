@@ -44,6 +44,9 @@ REMOTE_COMMAND = "agent-observer export"
 # Largest count an export may carry. Real token totals are far below it,
 # and sums of millions of such values still print and serialize.
 MAX_COUNT = 2 ** 53
+# Distinct counter semantics one export may name (real exports carry 4-5).
+# Every task prints each semantics once, so this keeps reports linear.
+MAX_SEMANTICS = 64
 # Usage fields an export keeps per model group; everything else stays home.
 USAGE_FIELDS = ("harness", "model", "effort", "semantics", "responses",
                 *report.BUCKETS, "unknown_counts")
@@ -185,6 +188,11 @@ def validate(doc) -> dict:
                 or not isinstance(session.get("usage", []), list) \
                 or not all(_valid_group(g) for g in session.get("usage", [])):
             raise ValueError("invalid session entry")
+    # Checked after the types above, so every semantics is hashable.
+    semantics = {g.get("semantics") for s in doc["sessions"]
+                 for g in s.get("usage", [])}
+    if len(semantics) > MAX_SEMANTICS:
+        raise ValueError("too many counter semantics")
     for task in doc["tasks"]:
         sessions = task.get("sessions", [])
         if _task_id(task.get("task_id")) is None \
@@ -193,6 +201,25 @@ def validate(doc) -> dict:
                 or not all(_clean(k) for k in sessions):
             raise ValueError("invalid task entry")
     return doc
+
+
+HEADER_FIELDS = ("schema", "machine", "observer_version", "exported_at",
+                 "ledger_synced_at", "withheld_tasks")
+TASK_FIELDS = ("task_id", "project", "issue_url", "origin",
+               "acceptance_state", "sessions")
+
+
+def _schema_only(doc: dict) -> dict:
+    """A validated export reduced to its schema fields; extras never stored."""
+    out = {k: doc.get(k) for k in HEADER_FIELDS if k in doc}
+    out["sessions"] = [
+        {**{k: s.get(k) for k in SESSION_FIELDS if k in s},
+         "usage": [{k: g.get(k) for k in USAGE_FIELDS if k in g}
+                   for g in s.get("usage", [])]}
+        for s in doc["sessions"]]
+    out["tasks"] = [{k: t.get(k) for k in TASK_FIELDS if k in t}
+                    for t in doc["tasks"]]
+    return out
 
 
 def store_dir(db_path: str) -> str:
@@ -225,19 +252,19 @@ def pull(host: str, directory: str, command: str = REMOTE_COMMAND,
         raise PullError(f"{host}: ssh exit {proc.returncode}:"
                         f" {(proc.stderr or '').strip()[-300:]}")
     try:
-        doc = validate(json.loads(proc.stdout))
+        doc = _schema_only(validate(json.loads(proc.stdout)))
         # Store only what a report can print and serialize: a document
         # that passes validation but cannot be reported is refused here,
         # not discovered by every later fleet report.
         render(combine([doc])).encode("utf-8")
-        json.dumps(doc)
-    except (ValueError, TypeError, UnicodeError) as exc:
-        raise PullError(f"{host}: {exc}") from None
+        text = json.dumps(doc)
+    except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
+        raise PullError(f"{host}: {type(exc).__name__}: {exc}") from None
     os.makedirs(directory, mode=0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(doc, fh)
+            fh.write(text)
         os.chmod(tmp, 0o600)
         os.replace(tmp, os.path.join(directory, doc["machine"] + ".json"))
     except BaseException:
