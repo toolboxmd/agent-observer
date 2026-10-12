@@ -231,8 +231,10 @@ agent: a `prompt`, an `interrupt`, or a `rejection` of a tool call. Its
 `origin` is the source label: who acted, from evidence only. A message
 another agent sent (a parent's brief, a reviewer's findings, a child's
 report) is a `prompt` moment with origin `agent` when Chromeria records
-it as agent-sent. Selection and reports default to `human`; agent
-moments are opt-in and reported apart.
+it as agent-sent. Corrections from a person and from another agent both
+count, so selection and reports default to `human` and `agent`, with the
+two reported apart and combined; `unknown` moments are counted but left
+out.
 
 - `human`: Chromeria recorded a person starting the turn or sending the
   prompt, the session ran in a terminal or desktop app (`cli`,
@@ -256,7 +258,7 @@ Claude writes a rejected tool call twice, as the denial and as an
 interrupt in the same second; that is one moment.
 
 ```sh
-agent-observer moments --since 2026-09-14 --unjudged correction --json   # default --origin human
+agent-observer moments --since 2026-09-14 --unjudged correction --json   # default --origin human --origin agent
 agent-observer moment show sub:claude:<uuid> ev:codex:<id>/lifecycle/turn_aborted:<turn> --json
 agent-observer verdict add --json < verdicts.jsonl
 agent-observer verdict list --behavior correction --verdict yes --json
@@ -289,15 +291,16 @@ Adding the same moment, behavior and judge again replaces the verdict,
 so grouping can run as a second pass. `recurrence` reports the yes
 verdicts, the problems (groups), the problems that recur in two or more
 sessions, and repeats per group, with first and last seen, sessions and
-hosts, plus judge coverage by origin and the policy denials. It counts
-moments where a person acted (`--origin human`) unless `--origin` says
-otherwise. When more than one judge labeled the scope, it requires
+hosts, plus judge coverage by origin and the policy denials. Its
+headline numbers combine `human` and `agent` moments (each group shows
+how many of each), and `by_origin` repeats the counts for each source
+alone; `--origin` narrows or widens the set. When more than one judge labeled the scope, it requires
 `--judge`. `moments --unjudged B --judge J` lists the work left for one
 judge; `verdict list` returns stored verdicts with their problem lines,
 which the grouping pass reads. A batch that names the same moment,
 behavior and judge twice is rejected. Yes verdicts on moments outside
-the reported origins appear only in `other_origins` (for example agent
-corrections of a worker), never in the headline numbers.
+the reported origins appear only in `other_origins`, never in the
+headline numbers.
 
 Moment text, problem lines and session attributes stay on this machine:
 `publish` never includes them.

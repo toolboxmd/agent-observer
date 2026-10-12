@@ -360,7 +360,7 @@ def build_parser() -> argparse.ArgumentParser:
     _moment_scope(mo)
     mo.add_argument("--origin", action="append", default=None,
                     choices=list(_moments.ORIGINS) + ["all"],
-                    help="who acted (repeatable; default human)")
+                    help="who acted (repeatable; default human and agent)")
     mo.add_argument("--kind", action="append", default=None,
                     choices=list(_moments.KINDS))
     mo.add_argument("--unjudged", default=None, metavar="BEHAVIOR",
@@ -400,14 +400,14 @@ def build_parser() -> argparse.ArgumentParser:
     vg.add_argument("--judge", default=None)
     vg.add_argument("--origin", action="append", default=None,
                     choices=list(_moments.ORIGINS) + ["all"],
-                    help="moments counted (repeatable; default human)")
+                    help="moments counted (repeatable; default human and agent)")
     vg.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     rc = sub.add_parser("recurrence", help="report problems that come back, from judge verdicts")
     rc.add_argument("--behavior", required=True)
     rc.add_argument("--judge", default=None)
     rc.add_argument("--origin", action="append", default=None,
                     choices=list(_moments.ORIGINS) + ["all"],
-                    help="moments counted (repeatable; default human)")
+                    help="moments counted (repeatable; default human and agent)")
     _moment_scope(rc)
     sa = sub.add_parser("session-attr", help="store session attributes used as report filters")
     sasub = sa.add_subparsers(dest="op", required=True)
@@ -840,7 +840,7 @@ def _judge(con, ns) -> int:
     as_json = getattr(ns, "as_json", False)
     try:
         origins = None if getattr(ns, "origin", None) and "all" in ns.origin \
-            else tuple(getattr(ns, "origin", None) or ("human",))
+            else tuple(getattr(ns, "origin", None) or _moments.COUNTED_ORIGINS)
         if ns.cmd == "moments":
             if ns.judge and not ns.unjudged:
                 raise ValueError("--judge needs --unjudged BEHAVIOR")

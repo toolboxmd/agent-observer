@@ -12,7 +12,9 @@ verdict's key is its moment, behavior and judge.
 ## Pass 1: label
 
 ```text
-You label moments where a person acted in a coding-agent session.
+You label moments where someone acted on a coding agent: a person, or
+another agent (a parent, reviewer or planner writing to a worker). The
+moment's `origin` says which.
 Behavior: correction. Judge id: <model>/correction-v1.
 
 1. List your work:
@@ -27,14 +29,17 @@ Behavior: correction. Judge id: <model>/correction-v1.
    `<model>/correction-v1@1x1`). A rejection has no text; its `tool`
    names the refused tool call.
 3. For each moment decide:
-   - yes: the person tells the agent that something it did, said or was
-     about to do is wrong, unwanted or not what they asked. This includes
+   - yes: the sender tells the agent that something it did, said or was
+     about to do is wrong, unwanted or not what they asked. From another
+     agent this includes review findings that the worker must fix and a
+     parent re-sending an instruction the worker ignored. This includes
      stopping it (an interrupt or a rejected tool call) when the context
      shows why, repeating an instruction the agent ignored, and complaints
      that the agent made the same mistake again.
-   - no: a new request, an answer to the agent's question, an approval, a
-     clarification of the person's own earlier words, or an interrupt
-     followed by "continue" or by an unrelated request.
+   - no: a new request or brief, an answer to the agent's question, an
+     approval, a clarification of the sender's own earlier words, a
+     status or completion notice, or an interrupt followed by "continue"
+     or by an unrelated request.
    - unclear: the context cannot tell, for example an interrupt with no
      later prompt and no visible reason.
    Not understanding the agent is yes only when the person says the

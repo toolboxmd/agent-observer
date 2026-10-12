@@ -34,6 +34,9 @@ from .ingest import iso_ts
 
 KINDS = ("prompt", "interrupt", "rejection")
 ORIGINS = ("human", "agent", "unknown")
+# Origins whose corrections count toward the Objective (user decision,
+# 2026-10-12): a person's and another agent's. Unknown stays out.
+COUNTED_ORIGINS = ("human", "agent")
 # Session entrypoints that prove who typed: a terminal or desktop app is a
 # person, a headless run is an agent.
 INTERACTIVE_ENTRYPOINTS = frozenset({"cli", "Codex Desktop", "codex-tui"})
@@ -273,7 +276,7 @@ def judged_ids(con, behavior: str, judge=None) -> set:
 
 
 def select(con: sqlite3.Connection, since=None, until=None, harness=None,
-           project=None, origins=("human",), kinds=None, unjudged=None,
+           project=None, origins=COUNTED_ORIGINS, kinds=None, unjudged=None,
            attrs=None, limit=None, judge=None) -> dict:
     """Moments in scope. Counts cover every origin and kind in scope, so
     moments the filters leave out stay visible as numbers."""

@@ -248,15 +248,15 @@ are counted separately and excluded from useful-work comparisons.
   (`launched`: V2 `createdBy` agent or system, or no evidence), is
   `unknown`; then `user-rejected` (`human`), an
   interactive entrypoint (`human`), and for interrupts and rejections a
-  top-level T3 thread (`human`); otherwise `unknown`. `recurrence` and
-  `verdict groups` count `human` moments unless `--origin` says
-  otherwise; a batch naming one moment, behavior and judge twice is
+  top-level T3 thread (`human`); otherwise `unknown`. a batch naming one moment, behavior and judge twice is
   rejected. Moment text and
   context are read from native logs on request, redacted, never stored.
   `moment show` returns whole turns (`--turns-before`, `--turns-after`,
   `--items`, `--chars`, `--text-chars`) and echoes them as `window`.
-  `recurrence` reports yes verdicts outside its origins only under
-  `other_origins`.
+  `moments`, `recurrence` and `verdict groups` default to origins
+  `human` and `agent`; `recurrence` headline numbers combine them,
+  `by_origin` gives each alone, and yes verdicts outside the chosen
+  origins appear only under `other_origins`.
   A verdict batch is validated whole; `recurrence` counts a group as
   recurring when its yes verdicts span two or more sessions.
 - `publish --task ID|--session KEY [--prices schedule.json] --repo owner/name --pr N|--commit SHA`:

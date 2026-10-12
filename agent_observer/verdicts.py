@@ -175,8 +175,12 @@ def _group_entries(rows, scope: dict) -> list:
     for group, members in groups.items():
         members.sort(key=lambda m: (m[0]["ts"] or 0, m[0]["id"]))
         sessions = {m["session"] for m, _ in members}
+        by_origin: dict[str, int] = {}
+        for m, _ in members:
+            by_origin[m["origin"]] = by_origin.get(m["origin"], 0) + 1
         out.append({"group": group, "problem": members[0][1]["problem"],
                     "occurrences": len(members), "repeats": len(members) - 1,
+                    "by_origin": by_origin,
                     "sessions": len(sessions),
                     "hosts": sorted({m["harness"] for m, _ in members}),
                     "first_seen": members[0][0]["at"],
@@ -188,7 +192,7 @@ def _group_entries(rows, scope: dict) -> list:
 
 
 def groups(con: sqlite3.Connection, behavior: str, judge=None,
-           origins=("human",)) -> list:
+           origins=_moments.COUNTED_ORIGINS) -> list:
     """Existing groups, so a judge reuses a group id for the same problem."""
     found, _ = _moments._all(con)
     scope = {m["id"]: m for m in found
@@ -226,9 +230,10 @@ def listing(con: sqlite3.Connection, behavior: str, judge=None,
 
 def recurrence(con: sqlite3.Connection, behavior: str, judge=None,
                since=None, until=None, harness=None, project=None,
-               attrs=None, origins=("human",)) -> dict:
-    """Recurrence over moments of the given origins (default: a person
-    acted); coverage still counts every origin in scope."""
+               attrs=None, origins=_moments.COUNTED_ORIGINS) -> dict:
+    """Recurrence over moments of the given origins. The default counts
+    corrections from a person and from another agent together, with a
+    breakdown per origin; coverage still counts every origin in scope."""
     selected = _moments.select(con, since=since, until=until,
                                harness=harness, project=project,
                                origins=origins, attrs=attrs)
@@ -250,6 +255,16 @@ def recurrence(con: sqlite3.Connection, behavior: str, judge=None,
     for r in rows:
         verdict_counts[r["verdict"]] += 1
     entries = _group_entries(rows, scope)
+    by_origin = {}
+    for origin in (origins or _moments.ORIGINS):
+        part = _group_entries(rows, {k: m for k, m in scope.items()
+                                     if m["origin"] == origin})
+        by_origin[origin] = {
+            "occurrences": sum(1 for r in rows if r["verdict"] == "yes"
+                               and scope[r["moment_id"]]["origin"] == origin),
+            "problems": len(part),
+            "recurring_problems": sum(1 for g in part if g["sessions"] >= 2),
+            "repeats": sum(g["repeats"] for g in part)}
     # Yes verdicts on moments outside the chosen origins (for example a
     # parent agent correcting a worker) are reported apart, never mixed in.
     others: dict[str, dict] = {}
@@ -286,6 +301,7 @@ def recurrence(con: sqlite3.Connection, behavior: str, judge=None,
         "recurring_problems": sum(1 for g in entries if g["sessions"] >= 2),
         "repeats": sum(g["repeats"] for g in entries),
         "groups": entries,
+        "by_origin": by_origin,
         "policy_denials": selected["policy_denials"],
         "other_origins": others,
     }
@@ -305,6 +321,10 @@ def render(report: dict) -> str:
         "policy denials (not corrections): " + ", ".join(
             f"{k} {v}" for k, v in report["policy_denials"].items()),
     ]
+    for origin, part in report.get("by_origin", {}).items():
+        lines.append(f"  from {origin}: {part['occurrences']} yes,"
+                     f" problems {part['problems']}, recurring"
+                     f" {part['recurring_problems']}, repeats {part['repeats']}")
     for origin, entry in sorted(report.get("other_origins", {}).items()):
         lines.append(f"also {entry['occurrences']} yes on {origin} moments"
                      f" ({entry['problems']} problems), not counted above")

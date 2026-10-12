@@ -233,10 +233,13 @@ class SelectTest(MomentsCase):
         self.assertEqual(found["sub:claude:u1"]["thread"], "none")
         self.assertEqual(found["sub:claude:y2"]["thread"], "launched")
 
-    def test_default_selects_human_moments_and_counts_the_rest(self):
+    def test_default_selects_human_and_agent_moments_and_counts_the_rest(self):
+        # Corrections from a person and from another agent both count
+        # (user decision, 2026-10-12); unknown origin stays out.
         result = self.select()
-        self.assertEqual({m["origin"] for m in result["moments"]}, {"human"})
-        self.assertEqual(len(result["moments"]), 7)
+        self.assertEqual({m["origin"] for m in result["moments"]},
+                         {"human", "agent"})
+        self.assertEqual(len(result["moments"]), 10)
         self.assertEqual(result["counts"]["by_origin"],
                          {"human": 7, "agent": 3, "unknown": 5})
 
@@ -256,9 +259,11 @@ class SelectTest(MomentsCase):
             {"sub:codex:msg-u1", "ev:codex:cx-1/lifecycle/turn_aborted:t1"})
         since = moments.iso_to_ts("2026-10-01T10:00:06Z")
         until = moments.iso_to_ts("2026-10-01T10:00:09Z")
-        self.assertEqual(set(self.ids(self.select(since=since, until=until))),
+        self.assertEqual(set(self.ids(self.select(since=since, until=until,
+                                                  origins=("human",)))),
                          {"sub:claude:u3", "sub:claude:u4"})
-        self.assertEqual(set(self.ids(self.select(kinds=["interrupt"]))),
+        self.assertEqual(set(self.ids(self.select(kinds=["interrupt"],
+                                                  origins=("human",)))),
                          {"sub:claude:u3", "sub:claude:w3"})
 
     def test_session_attribute_filter(self):
@@ -266,7 +271,7 @@ class SelectTest(MomentsCase):
             {"session": "claude:sess-three", "name": "arm", "value": "holdout"},
             {"session": "claude:sess-one", "name": "arm", "value": "served"}])
         self.assertEqual(set(self.ids(self.select(attrs={"arm": "holdout"}))),
-                         {"sub:claude:w1", "sub:claude:w3"})
+                         {"sub:claude:w1", "sub:claude:w2", "sub:claude:w3"})
 
 
 class ShowTest(MomentsCase):
@@ -479,7 +484,10 @@ class RecurrenceTest(MomentsCase):
         coverage = report["coverage"]
         self.assertEqual(coverage["judged"], 6)
         self.assertEqual(coverage["unjudged_by_origin"],
-                         {"human": 1, "agent": 0, "unknown": 0})
+                         {"human": 1, "agent": 3, "unknown": 0})
+        self.assertEqual(report["by_origin"]["human"]["occurrences"], 3)
+        self.assertEqual(report["by_origin"]["agent"]["occurrences"], 0)
+        self.assertEqual(report["other_origins"]["unknown"]["occurrences"], 1)
 
     def test_problem_recurs_when_seen_in_two_sessions(self):
         verdicts.add(self.con, [verdict(
@@ -489,15 +497,26 @@ class RecurrenceTest(MomentsCase):
         self.assertEqual(report["recurring_problems"], 1)
         self.assertEqual(report["groups"][0]["sessions"], 2)
 
-    def test_only_human_moments_count_unless_asked(self):
-        verdicts.add(self.con, [verdict("sub:claude:v1",
-                                        problem="Agent brief", group="brief")])
+    def test_human_and_agent_corrections_combine_with_a_breakdown(self):
+        # An agent correcting a worker in the same problem group as a
+        # person's correction: one problem, recurring across sessions.
+        verdicts.add(self.con, [verdict(
+            "sub:claude:v1", problem="Deleted files without asking",
+            group="destructive-without-approval")])
         report = verdicts.recurrence(self.con, "correction")
-        self.assertNotIn("brief", [g["group"] for g in report["groups"]])
-        self.assertEqual(report["occurrences"], 3)
-        self.assertEqual(report["other_origins"]["agent"]["occurrences"], 1)
+        self.assertEqual(report["occurrences"], 4)
+        self.assertEqual(report["by_origin"]["human"]["occurrences"], 3)
+        self.assertEqual(report["by_origin"]["agent"]["occurrences"], 1)
+        self.assertEqual(report["by_origin"]["agent"]["problems"], 1)
+        first = report["groups"][0]
+        self.assertEqual(first["by_origin"], {"human": 2, "agent": 1})
+        self.assertEqual(first["sessions"], 2)
+        self.assertEqual(report["recurring_problems"], 1)
+        self.assertEqual(report["by_origin"]["human"]["recurring_problems"], 0)
+        human = verdicts.recurrence(self.con, "correction", origins=("human",))
+        self.assertEqual(human["occurrences"], 3)
+        self.assertEqual(human["other_origins"]["agent"]["occurrences"], 1)
         every = verdicts.recurrence(self.con, "correction", origins=None)
-        self.assertIn("brief", [g["group"] for g in every["groups"]])
         self.assertEqual(every["occurrences"], 5)
 
     def test_session_attribute_and_period_filters(self):
@@ -532,7 +551,7 @@ class CliTest(MomentsCase):
         code, out = self.run_cli("moments", "--json")
         self.assertEqual(code, 0)
         listed = json.loads(out)
-        self.assertEqual(len(listed["moments"]), 7)
+        self.assertEqual(len(listed["moments"]), 10)
         code, out = self.run_cli("moment", "show", "sub:claude:u2", "--json")
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)["moments"][0]["status"], "ok")
