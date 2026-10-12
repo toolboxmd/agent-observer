@@ -628,7 +628,8 @@ def _fleet_pull(ns) -> int:
         for r in results:
             print(f"{r['host']}: failed: {r['error']}" if "error" in r else
                   f"{r['host']}: stored {r['machine']} ({r['sessions']}"
-                  f" sessions, {r['tasks']} tasks, exported {r['exported_at']})")
+                  f" sessions, {r['tasks']} tasks, exported {r['exported_at']})"
+                  + (f"; warning: {r['warning']}" if r.get("warning") else ""))
     return 1 if failed else 0
 
 
@@ -639,10 +640,14 @@ def _fleet_report(con, ns) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    docs = [local] + [d for d in _fleet.stored(_fleet.store_dir(ns.db))
-                      if d["machine"] != local["machine"]]
+    stored = _fleet.stored(_fleet.store_dir(ns.db))
+    docs = [local] + [d for d in stored if d["machine"] != local["machine"]]
     expect = [m.strip() for m in (ns.expect or "").split(",") if m.strip()]
     result = _fleet.combine(docs, expect=expect)
+    # A stored export under this machine's own name is never combined;
+    # say so instead of dropping it silently.
+    result["skipped_stored"] = [d["machine"] for d in stored
+                                if d["machine"] == local["machine"]]
     if ns.task:
         result["tasks"] = [t for t in result["tasks"] if t["task_id"] == ns.task]
     if ns.as_json:

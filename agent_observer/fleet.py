@@ -36,6 +36,9 @@ from .publish import _GITHUB_URL_RE, _REPO_RE
 
 SCHEMA = "agent-observer.fleet-export/1"
 MACHINE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+# Task ids travel only as identifiers (repo#N, T-42, router ids); a free-text
+# id stays home and is counted as withheld.
+TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/#@+-]{0,199}$")
 REMOTE_COMMAND = "agent-observer export"
 # Usage fields an export keeps per model group; everything else stays home.
 USAGE_FIELDS = ("harness", "model", "effort", "semantics", "responses",
@@ -72,8 +75,7 @@ def _usage(models: list) -> list:
 
 
 def _task_id(value) -> str | None:
-    if not isinstance(value, str) or not value or len(value) > 200 \
-            or any(ord(c) < 32 for c in value):
+    if not isinstance(value, str) or not TASK_ID_RE.match(value):
         return None
     return value
 
@@ -95,9 +97,11 @@ def export(con: sqlite3.Connection, machine: str | None = None) -> dict:
     states = {r["task_id"]: r["acceptance_state"] for r in con.execute(
         "SELECT task_id, acceptance_state FROM outcomes")}
     tasks = []
+    withheld = 0
     for task in con.execute("SELECT * FROM tasks ORDER BY task_id"):
         task_id = _task_id(task["task_id"])
         if task_id is None:
+            withheld += 1
             continue
         project, url = task["project"], task["issue_url"]
         tasks.append({
@@ -113,11 +117,39 @@ def export(con: sqlite3.Connection, machine: str | None = None) -> dict:
     return {"schema": SCHEMA, "machine": machine,
             "observer_version": __version__, "exported_at": _now(),
             "ledger_synced_at": _iso(synced),
-            "sessions": sessions, "tasks": tasks}
+            "sessions": sessions, "tasks": tasks, "withheld_tasks": withheld}
+
+
+def _text_or_none(value) -> bool:
+    return value is None or isinstance(value, str)
+
+
+def _count_or_none(value) -> bool:
+    return value is None or (isinstance(value, int)
+                             and not isinstance(value, bool))
+
+
+def _valid_group(group) -> bool:
+    if not isinstance(group, dict):
+        return False
+    if not all(_text_or_none(group.get(k))
+               for k in ("harness", "model", "effort", "semantics")):
+        return False
+    if not all(_count_or_none(group.get(k))
+               for k in ("responses", *report.BUCKETS)):
+        return False
+    unknown = group.get("unknown_counts")
+    return unknown is None or (isinstance(unknown, dict) and all(
+        isinstance(k, str) and _count_or_none(v) for k, v in unknown.items()))
 
 
 def validate(doc) -> dict:
-    """An export document, or ValueError naming what is wrong."""
+    """An export document, or ValueError naming what is wrong.
+
+    Another machine's export is untrusted input: every field ``combine``
+    reads is type-checked here, so a stored export can never break a
+    later report.
+    """
     if not isinstance(doc, dict) or doc.get("schema") != SCHEMA:
         raise ValueError("not an Agent Observer fleet export")
     if not isinstance(doc.get("machine"), str) \
@@ -127,6 +159,18 @@ def validate(doc) -> dict:
         if not isinstance(doc.get(key), list) \
                 or not all(isinstance(x, dict) for x in doc[key]):
             raise ValueError(f"invalid {key} list")
+    for session in doc["sessions"]:
+        if not isinstance(session.get("session_key"), str) \
+                or not isinstance(session.get("usage", []), list) \
+                or not all(_valid_group(g) for g in session.get("usage", [])):
+            raise ValueError("invalid session entry")
+    for task in doc["tasks"]:
+        sessions = task.get("sessions", [])
+        if not isinstance(task.get("task_id"), str) \
+                or not _text_or_none(task.get("acceptance_state")) \
+                or not isinstance(sessions, list) \
+                or not all(isinstance(k, str) for k in sessions):
+            raise ValueError("invalid task entry")
     return doc
 
 
@@ -154,7 +198,7 @@ def pull(host: str, directory: str, command: str = REMOTE_COMMAND,
          run=subprocess.run) -> dict:
     """Fetch ``host``'s export over SSH and store it as <machine>.json."""
     argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
-            host, command]
+            "--", host, command]
     proc = run(argv, capture_output=True, text=True, timeout=600)
     if proc.returncode != 0:
         raise PullError(f"{host}: ssh exit {proc.returncode}:"
@@ -174,9 +218,13 @@ def pull(host: str, directory: str, command: str = REMOTE_COMMAND,
         if os.path.exists(tmp):
             os.remove(tmp)
         raise
-    return {"host": host, "machine": doc["machine"],
-            "exported_at": doc.get("exported_at"),
-            "sessions": len(doc["sessions"]), "tasks": len(doc["tasks"])}
+    result = {"host": host, "machine": doc["machine"],
+              "exported_at": doc.get("exported_at"),
+              "sessions": len(doc["sessions"]), "tasks": len(doc["tasks"])}
+    if doc["machine"] != host.split(".")[0].lower():
+        result["warning"] = (f"{host} reported machine {doc['machine']!r};"
+                             f" stored as {doc['machine']}.json")
+    return result
 
 
 def _add(totals: dict, usage: list, count_session: bool = False) -> None:
@@ -300,6 +348,9 @@ def render(result: dict) -> str:
                      f" tokens {_tokens(m['usage'])}")
     lines.append("missing machines: " + (", ".join(result["missing"])
                                          or "none"))
+    for machine in result.get("skipped_stored") or []:
+        lines.append(f"stored export named {machine} skipped: it is this"
+                     " machine's name, so the live export was used")
     lines.append(f"sessions on several machines (counted once):"
                  f" {len(result['duplicate_sessions'])}")
     for d in result["duplicate_sessions"]:

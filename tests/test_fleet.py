@@ -11,7 +11,7 @@ import stat
 import subprocess
 import sys
 
-from agent_observer import db, fleet
+from agent_observer import db, fleet, report
 from tests.helpers import LedgerCase
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -86,6 +86,22 @@ class ExportTest(LedgerCase):
         self.assertIsNone(tasks["local-task"]["issue_url"])
         self.assertIsNone(tasks["local-task"]["project"])
 
+    def test_free_text_task_ids_and_session_fields_stay_home(self):
+        key = add_session(self.con, "codex", "s-three", 5)
+        add_task(self.con, "fix the secret login bug", key, None, None)
+        add_task(self.con, "T-42", key, None, None)
+        self.con.execute("UPDATE sessions SET parent_session_key=?,"
+                         " agentsmd_version=? WHERE session_key=?",
+                         ("codex:parent", "16.1.1", key))
+        self.con.commit()
+        doc = fleet.export(self.con, machine="rocky")
+        self.assertNotIn("secret login", json.dumps(doc))
+        self.assertEqual([t["task_id"] for t in doc["tasks"]], ["T-42"])
+        self.assertEqual(doc["withheld_tasks"], 1)
+        session = doc["sessions"][0]
+        self.assertEqual(session["parent_session_key"], "codex:parent")
+        self.assertEqual(session["agentsmd_version"], "16.1.1")
+
     def test_machine_names_are_slugs(self):
         with self.assertRaises(ValueError):
             fleet.export(self.con, machine="../etc")
@@ -147,6 +163,22 @@ class ReportTest(LedgerCase):
         self.assertEqual(task["session_usage"]["s1"]["total_tokens"], 5)
         self.assertEqual(task["missing_sessions"], ["codex:gone"])
 
+    def test_real_unknown_counts_are_carried_not_recounted(self):
+        rows = [{"harness": "codex", "model": "m", "effort": None,
+                 "semantics": "s1", "is_overlap": 0,
+                 **{b: (None if b == "total_tokens" and i else 5)
+                    for b in report.BUCKETS},
+                 "reasoning_output_tokens": 0, "output_tokens": 5}
+                for i in range(3)]
+        usage = fleet._usage(report.model_usage(rows))
+        doc = {**_doc("rocky", []), "sessions": [
+            {"session_key": "codex:a", "harness": "codex", "usage": usage}]}
+        totals = fleet.combine([doc])["totals"]["s1"]
+        # One known total of 5 (a lower bound), two unknown responses.
+        self.assertEqual(totals["total_tokens"], 5)
+        self.assertEqual(totals["unknown_counts"], {"total_tokens": 2})
+        self.assertEqual(totals["responses"], 3)
+
     def test_unknown_tokens_stay_visible(self):
         doc = _doc("rocky", [("codex:a", None), ("codex:b", 5)])
         totals = fleet.combine([doc])["totals"]["s1"]
@@ -154,8 +186,21 @@ class ReportTest(LedgerCase):
         self.assertEqual(totals["unknown_counts"], {"total_tokens": 1})
 
     def test_rejects_invalid_documents(self):
-        for bad in ({"schema": "other"}, {**_doc("rocky", []), "machine": "a/b"},
-                    {**_doc("rocky", []), "sessions": "x"}):
+        good = _doc("rocky", [("codex:a", 5)], [_task("T-1", ["codex:a"])])
+        session = good["sessions"][0]
+        group = session["usage"][0]
+        for bad in ({"schema": "other"}, {**good, "machine": "a/b"},
+                    {**good, "sessions": "x"},
+                    {**good, "sessions": [{**session, "usage": "x"}]},
+                    {**good, "sessions": [{**session, "session_key": ["x"]}]},
+                    {**good, "sessions": [{**session, "usage": [
+                        {**group, "total_tokens": "5"}]}]},
+                    {**good, "sessions": [{**session, "usage": [
+                        {**group, "semantics": ["s1"]}]}]},
+                    {**good, "sessions": [{**session, "usage": [
+                        {**group, "unknown_counts": ["x"]}]}]},
+                    {**good, "tasks": [{**good["tasks"][0], "sessions": "abc"}]},
+                    {**good, "tasks": [{**good["tasks"][0], "task_id": 7}]}):
             with self.assertRaises(ValueError):
                 fleet.validate(bad)
 
@@ -175,17 +220,33 @@ class PullTest(LedgerCase):
         result = fleet.pull("bestia", store, run=run)
         self.assertEqual(result["machine"], "bestia")
         self.assertEqual(calls[0][0], "ssh")
-        self.assertEqual(calls[0][-2:], ["bestia", "agent-observer export"])
+        self.assertEqual(calls[0][-3:], ["--", "bestia", "agent-observer export"])
+        self.assertNotIn("warning", result)
+        # This machine's own name setting must not leak into the check.
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"AGENT_OBSERVER_MACHINE": "rocky"}):
+            run, _ = self.run_fake(json.dumps(_doc("bestia", [])))
+            self.assertNotIn("warning",
+                             fleet.pull("bestia.tailnet.ts.net", store,
+                                        run=run))
         path = os.path.join(store, "bestia.json")
         self.assertEqual(json.load(open(path))["machine"], "bestia")
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
         self.assertEqual([d["machine"] for d in fleet.stored(store)],
                          ["bestia"])
 
+    def test_pull_warns_when_the_host_names_another_machine(self):
+        store = os.path.join(self.tmp.name, "fleet")
+        run, _ = self.run_fake(json.dumps(_doc("cavallo", [])))
+        result = fleet.pull("bestia", store, run=run)
+        self.assertIn("cavallo", result["warning"])
+
     def test_failed_or_invalid_pull_writes_nothing(self):
         store = os.path.join(self.tmp.name, "fleet")
+        malformed = {**_doc("cavallo", []), "sessions": [{"usage": "x"}]}
         for stdout, code in (("", 255), ("not json", 0),
-                             (json.dumps({"schema": "other"}), 0)):
+                             (json.dumps({"schema": "other"}), 0),
+                             (json.dumps(malformed), 0)):
             run, _ = self.run_fake(stdout, code)
             with self.assertRaises(fleet.PullError):
                 fleet.pull("cavallo", store, run=run)
@@ -209,3 +270,34 @@ class CliTest(LedgerCase):
         # A missing machine is a visible, non-zero result.
         self.assertEqual(report.returncode, 3, report.stderr)
         self.assertEqual(json.loads(report.stdout)["missing"], ["bestia"])
+
+    def test_report_names_a_stored_export_it_skips(self):
+        add_session(self.con, "codex", "s-one", 100)
+        self.con.commit()
+        store = fleet.store_dir(self.db_path)
+        os.makedirs(store)
+        with open(os.path.join(store, "rocky.json"), "w") as fh:
+            json.dump(_doc("rocky", [("codex:other", 1)]), fh)
+        env = {**os.environ, "AGENT_OBSERVER_MACHINE": "rocky"}
+        out = subprocess.run(
+            [sys.executable, "-m", "agent_observer", "--db", self.db_path,
+             "--json", "fleet", "report"], cwd=REPO, env=env,
+            capture_output=True, text=True)
+        self.assertEqual(json.loads(out.stdout)["skipped_stored"], ["rocky"])
+
+    def test_pull_needs_no_ledger_and_report_creates_none(self):
+        missing = os.path.join(self.tmp.name, "none", "observer.db")
+        out = subprocess.run(
+            [sys.executable, "-m", "agent_observer", "--db", missing,
+             "fleet", "report"], cwd=REPO, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 2)
+        self.assertFalse(os.path.exists(missing))
+        pull = subprocess.run(
+            [sys.executable, "-m", "agent_observer", "--db", missing,
+             "fleet", "pull", "nohost.invalid",
+             "--remote-command", "true"], cwd=REPO, capture_output=True,
+            text=True, timeout=120)
+        # The ssh failure is reported per host; no ledger is needed or made.
+        self.assertEqual(pull.returncode, 1)
+        self.assertIn("nohost.invalid", pull.stdout)
+        self.assertFalse(os.path.exists(missing))

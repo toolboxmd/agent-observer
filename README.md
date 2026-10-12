@@ -418,11 +418,14 @@ agent-observer fleet report --expect rocky,cavallo,bestia
 
 `export` writes session usage by model and counter semantics, plus each task's
 outcome, GitHub identifiers and session keys. It never includes prompts,
-assistant text, excerpts, titles, local paths or branch names. `fleet pull`
+assistant text, excerpts, titles, local paths or branch names. Task ids travel
+only when they are identifiers such as `owner/repo#12` or `T-42`; a free-text
+id stays home and is counted in `withheld_tasks`. `fleet pull`
 runs `agent-observer export` on each host over SSH (`--remote-command` when
 the CLI is not on the remote PATH). It stores the result as
-`fleet/<machine>.json` beside the ledger, mode 600, and stores nothing when
-SSH fails or the output is not an export. Machine names come from
+`fleet/<machine>.json` beside the ledger, mode 600. It stores nothing when SSH
+fails or any field of the output fails validation, and warns when a host
+reports a machine name other than its own. Machine names come from
 `$AGENT_OBSERVER_MACHINE` or the short hostname.
 
 `fleet report` combines this machine's live export with the stored ones. Each
