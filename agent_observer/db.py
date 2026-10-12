@@ -501,22 +501,46 @@ def _main_file(con: sqlite3.Connection) -> str | None:
     return (row["file"] if "file" in row.keys() else row[2]) or None
 
 
+def _backup_once(path: str) -> None:
+    """Copy the schema-2 ledger next to itself; the first copy is kept."""
+    target = path + ".schema-2.bak"
+    if os.path.exists(target):
+        return
+    partial = target + ".partial"
+    # A separate reader: the caller holds the write lock, so this sees the
+    # committed schema-2 state and nothing can change it meanwhile.
+    reader = sqlite3.connect(path)
+    backup = sqlite3.connect(partial)
+    try:
+        reader.backup(backup)
+    finally:
+        backup.close()
+        reader.close()
+    os.replace(partial, target)
+    _harden_path(target)
+
+
 def _migrate_to_3(con: sqlite3.Connection) -> None:
-    """Back the ledger up next to itself, then migrate it in one
-    transaction; any failure rolls back and leaves schema 2."""
+    """Migrate a schema-2 ledger in one transaction, after a backup.
+
+    The write lock comes first, so two first runs cannot both migrate: the
+    version is re-read under the lock, and a ledger another process already
+    migrated is left alone. The backup is taken under the same lock and an
+    existing one is never replaced. Any failure rolls back to schema 2.
+    """
     path = _main_file(con)
-    if path:
-        backup = sqlite3.connect(path + ".schema-2.bak")
-        try:
-            con.backup(backup)
-        finally:
-            backup.close()
-        _harden_path(path + ".schema-2.bak")
     previous = con.isolation_level
     con.isolation_level = None
     try:
         con.execute("BEGIN IMMEDIATE")
         try:
+            row = con.execute("SELECT value FROM schema_meta"
+                              " WHERE key='schema_version'").fetchone()
+            if row is None or str(row[0]) != "2":
+                con.execute("ROLLBACK")
+                return
+            if path:
+                _backup_once(path)
             for statement in _MIGRATION_3:
                 con.execute(statement)
         except BaseException:

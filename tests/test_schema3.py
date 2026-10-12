@@ -127,6 +127,34 @@ class MigrationTest(unittest.TestCase):
         self.assertIn("sub:claude:u2", {m["id"] for m in found["interventions"]})
         con.close()
 
+    def test_foreign_keys_follow_the_renamed_tables(self):
+        con = self.migrate()
+        con.execute("PRAGMA foreign_keys=ON")
+        self.assertEqual(con.execute("PRAGMA foreign_key_check").fetchall(), [])
+        for (sql,) in con.execute("SELECT sql FROM sqlite_master"
+                                  " WHERE type='table'"):
+            for old in ("submissions", "dispatches", "attempts"):
+                self.assertNotIn(f"REFERENCES {old}", sql or "")
+        with self.assertRaises(sqlite3.IntegrityError):
+            con.execute("INSERT INTO assignments(user_message_id, task_id,"
+                        " created_at) VALUES('claude:missing', 'o/r#1', 1)")
+        self.assertIsNotNone(con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index'"
+            " AND name='idx_user_messages_session'").fetchone())
+        con.close()
+
+    def test_a_second_concurrent_migration_keeps_the_schema_2_backup(self):
+        # Two first runs read schema 2; the second gets the lock after the
+        # first committed. It must not fail or replace the backup.
+        first = db.connect(self.path)
+        second = db.connect(self.path)
+        db._migrate_to_3(first)
+        first.close()
+        db._migrate_to_3(second)
+        second.close()
+        self.assertEqual(version(self.path + ".schema-2.bak"), "2")
+        self.assertEqual(version(self.path), "3")
+
     def test_migration_runs_once(self):
         self.migrate().close()
         con = self.migrate()

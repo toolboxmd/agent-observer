@@ -517,6 +517,12 @@ For one release the old names keep working: read-only views
 `--submission`, `--worker`, `--worker-turn`, `--attempt` and `--origin`
 (with `human`), and the verdict key `moment`.
 
+Every Observer copy on a machine (Claude Code, Codex and Grok plugins,
+other tools' `agent-observer` paths) must move to 1.0 together. Observer
+0.15 refuses a schema-3 ledger and suggests moving it aside: do not.
+That would leave capture and verdict rows outside the active ledger.
+Upgrade the old copy instead.
+
 ## Privacy
 
 The ledger is private and local: its directory is created or hardened to

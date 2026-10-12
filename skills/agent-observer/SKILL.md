@@ -32,7 +32,7 @@ Run `sync` first; it is incremental and takes seconds after the first run.
 | Sessions Observer cannot see | `health` |
 | Chromeria spawn chains deeper than two levels and messages into threads other than the sender's child | `thread-misuse [--since D] [--until D]` |
 | Which claims in a Claude Code session's final report its tool calls back | `claims --session claude:<id>` (one Opus call per run) |
-| Planner dispatch versus a dispatcher thread on real jobs | `dispatch-modes [--planner <thread>] [--job owner/repo#N] [--since D]` |
+| Planner delegation versus a dispatcher thread on real jobs | `delegation-modes [--planner <thread>] [--job owner/repo#N] [--since D]` |
 | Usage of a task with explicit ownership | `task show --task <id> [--prices schedule.json]` |
 | Summary comment on a PR or commit | `publish --task <id> --repo owner/name --pr N [--prices schedule.json]` |
 
@@ -43,7 +43,7 @@ and an explicit target (task or sessions, plus repo, PR or commit).
 ## Attribution (automatic, no bookkeeping)
 
 `sync` attributes Chromeria/T3 Code work on its own from T3 state: prompts
-typed in T3 Code count as human submissions, one task per linked Issue or
+typed in T3 Code count as user messages from a person, one task per linked Issue or
 PR (`owner/repo#N`) owns its thread tree's sessions, and a merged PR
 marks the task complete. When one thread serves several PRs, each Claude
 or Codex response counts for the PR whose checkout it worked in; the rest
