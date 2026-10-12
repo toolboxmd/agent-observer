@@ -14,7 +14,7 @@ def _setup_tasks(case, *task_ids):
 
 def _assign(case, sub, task, shared=0):
     case.con.execute(
-        "INSERT INTO assignments(submission_native_id, task_id, attempt,"
+        "INSERT INTO assignments(user_message_id, task_id, task_turn,"
         " phase, evidence, shared, created_at) VALUES(?,?,?,?,?,?,?)",
         (sub, task, "a1", "research", "test binding", shared, db.now()))
     case.con.commit()
@@ -78,7 +78,7 @@ class CaptureTest(LedgerCase):
         _setup_tasks(self, "T-A")
         _assign(self, "codex:msg-mini-sub-01", "T-A")
         self.con.execute(
-            "INSERT INTO attempts(task_id, turn_id, role, harness, state,"
+            "INSERT INTO task_turns(task_id, turn_id, role, harness, state,"
             " usable_output) VALUES(?,?,?,?,?,?)",
             ("T-A", "codex:turn-mini-aaa", "parent", "codex", "crashed", 0))
         self.con.execute(

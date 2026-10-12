@@ -34,7 +34,7 @@ agent-observer thread-misuse --since 2026-10-01  # deep Chromeria spawns, cross-
 agent-observer compare --by agentsmd         # behavior per AgentsMD version
 agent-observer health                        # live sessions Observer cannot see
 agent-observer claims --session claude:<id>  # final-report claims checked against tool calls
-agent-observer dispatch-modes --since 2026-10-01  # planner dispatch versus a dispatcher thread
+agent-observer delegation-modes --since 2026-10-01  # planner delegation versus a dispatcher thread
 agent-observer event show <id> [<id> ...]    # full tool input, result and assistant text from the native log
 ```
 
@@ -72,7 +72,7 @@ version they ran under and reports, per version with sample sizes: tokens
 and elapsed time per session, genuine prompts per session, interrupts,
 AgentsMD reading cost, and incidents per detector. `diagnose` lists the
 incidents with session, project, time and event references, so you can open
-the exact moments:
+the exact interventions:
 
 | Detector | Finds |
 | --- | --- |
@@ -143,9 +143,9 @@ times, never titles or message text. Both lists are evidence to inspect,
 not verdicts; replies a child sends its parent through `message_thread`
 appear as `child to parent`.
 
-## Dispatch modes
+## Delegation modes
 
-`dispatch-modes` compares the two ways a Chromeria planner delegates a job:
+`delegation-modes` compares the two ways a Chromeria planner delegates a job:
 starting workers and reviewers itself (planner mode), or starting one
 `dispatcher-` thread that starts them (dispatcher mode). Per mode it prints
 jobs, succeeded, success rate, median time to the first worker thread,
@@ -153,7 +153,7 @@ median time to an approving review, and tokens and list-price cost per job,
 each with its sample size. A figure with no data prints `unknown (n=0)`.
 
 ```sh
-agent-observer dispatch-modes --planner <thread> --job owner/repo#N --since 2026-10-01
+agent-observer delegation-modes --planner <thread> --job owner/repo#N --since 2026-10-01
 ```
 
 - A job is one planner thread and the PR its children link, or the Issue
@@ -176,7 +176,7 @@ agent-observer dispatch-modes --planner <thread> --job owner/repo#N --since 2026
   the job's tokens and cost print `unknown` and leave the mode's sample.
 
 Thread trees, turns and links come from the V1 tables in T3's state
-database, read-only at report time, so `dispatch-modes` covers only
+database, read-only at report time, so `delegation-modes` covers only
 threads from before Chromeria's V2 move on 2026-10-09. Usage comes from
 the ledger, so run `sync` first.
 
@@ -218,7 +218,7 @@ bodies, patches and outputs are shown in full, so treat the output as
 private. Each source is parsed once per run: 1,000 live events across all
 four hosts took 4.4 seconds on rocky.
 
-## Judge moments
+## Judge interventions
 
 Some behaviors, such as a person correcting an agent, need judgment that
 pattern matching cannot supply. Agent Observer prepares the evidence for
@@ -226,24 +226,24 @@ an outside LLM judge and stores the judge's answers; it never runs a
 model itself. [docs/judge-corrections.md](docs/judge-corrections.md) is
 a reference judge prompt for corrections.
 
-A moment is one point in a main session where someone acted on the
+An intervention is one point in a main session where someone acted on the
 agent: a `prompt`, an `interrupt`, or a `rejection` of a tool call. Its
-`origin` is the source label: who acted, from evidence only. A message
+`created_by` is the source label: who acted, from evidence only. A message
 another agent sent (a parent's brief, a reviewer's findings, a child's
-report) is a `prompt` moment with origin `agent` when Chromeria records
+report) is a `prompt` intervention created by `agent` when Chromeria records
 it as agent-sent. Corrections from a person and from another agent both
-count, so selection and reports default to `human` and `agent`, with the
-two reported apart and combined; `unknown` moments are counted but left
+count, so selection and reports default to `user` and `agent`, with the
+two reported apart and combined; `unknown` interventions are counted but left
 out.
 
-- `human`: Chromeria recorded a person starting the turn or sending the
+- `user`: Chromeria recorded a person starting the turn or sending the
   prompt, the session ran in a terminal or desktop app (`cli`,
   `Codex Desktop`, `codex-tui`), or an interrupt or rejection stopped a
   top-level Chromeria thread that a person opened, or a session outside
   Chromeria (Claude's `user-rejected` included).
 - `agent`: Chromeria recorded an agent or the server sending it, or the
   session ran headless (`sdk-cli`, `codex_exec`). Other synthetic input,
-  such as reminders, is no moment.
+  such as reminders, is no intervention.
 - `unknown`: no evidence either way, for example a prompt in a delegated
   child thread from before Chromeria V2, a Grok or OpenCode prompt (their
   Chromeria text does not match the native prompt), or any interrupt or
@@ -257,13 +257,13 @@ out.
   prompts stay `unknown`.
 
 Hook and permission-rule denials and auto-mode blocks are policy, not a
-person. They are never moments and are counted as `policy_denials`.
+person. They are never interventions and are counted as `policy_denials`.
 Claude writes a rejected tool call twice, as the denial and as an
-interrupt in the same second; that is one moment.
+interrupt in the same second; that is one intervention.
 
 ```sh
-agent-observer moments --since 2026-09-14 --unjudged correction --json   # default --origin human --origin agent
-agent-observer moment show sub:claude:<uuid> ev:codex:<id>/lifecycle/turn_aborted:<turn> --json
+agent-observer interventions --since 2026-09-14 --unjudged correction --json   # default --created-by user --created-by agent
+agent-observer intervention show sub:claude:<uuid> ev:codex:<id>/lifecycle/turn_aborted:<turn> --json
 agent-observer verdict add --json < verdicts.jsonl
 agent-observer verdict list --behavior correction --verdict yes --json
 agent-observer verdict groups --behavior correction --json
@@ -271,44 +271,44 @@ agent-observer recurrence --behavior correction --since 2026-09-14 [--attr arm=h
 agent-observer session-attr add --json < arms.jsonl     # {"session": "claude:<id>", "name": "arm", "value": "holdout"}
 ```
 
-`moments` lists the selected moments and counts every moment in scope by
-origin and kind, so filtered moments stay visible as numbers. A moment
+`interventions` lists the selected interventions and counts every intervention in scope by
+`created_by` and kind, so filtered interventions stay visible as numbers. An intervention
 marked `opening` comes before anything the agent did in its session (a
-first prompt, a worker's brief), so it cannot correct that agent. `moment show`
-reads each moment from the native log: its full text (including text
+first prompt, a child's brief), so it cannot correct that agent. `intervention show`
+reads each intervention from the native log: its full text (including text
 inside Chromeria wrapper tags) and whole turns around it. A turn is a
-prompt or interrupt (with its `origin`) plus the agent's messages and
+prompt or interrupt (with its `created_by`) plus the agent's messages and
 tool calls up to the next one. `before` lists turns oldest first, each
-opened by its prompt; `after` lists the moment's own turn first, each
+opened by its prompt; `after` lists the intervention's own turn first, each
 closed by the next prompt. The window is a parameter, echoed back as
 `window`, so a judge can measure its accuracy against context size on a
-labeled sample: `--turns-before 0 --turns-after 0` is the moment alone,
+labeled sample: `--turns-before 0 --turns-after 0` is the intervention alone,
 the default `1`/`1` adds the turn it answers and the agent's reply, and
 larger values add more turns. `--items` caps agent messages and tool
 calls per turn (each turn reports how many it `omitted`), `--chars` cuts each of them, and `--text-chars` (default
 20,000) bounds prompt text separately, so a context limit never cuts the
 person's words. Its statuses match `event show`,
-plus `no_such_moment`; the exit status is 3 when any moment is not `ok`.
+plus `no_such_intervention`; the exit status is 3 when any intervention is not `ok`.
 
-A verdict is `yes`, `no` or `unclear` for one moment, behavior and judge;
+A verdict is `yes`, `no` or `unclear` for one intervention, behavior and judge;
 `yes` carries a one-line `problem` and an optional `group`. Observer
 validates a batch whole and stores it only when every line is valid.
-Adding the same moment, behavior and judge again replaces the verdict,
+Adding the same intervention, behavior and judge again replaces the verdict,
 so grouping can run as a second pass. `recurrence` reports the yes
 verdicts, the problems (groups), the problems that recur in two or more
 sessions, and repeats per group, with first and last seen, sessions and
-hosts, plus judge coverage by origin and the policy denials. Its
-headline numbers combine `human` and `agent` moments (each group shows
-how many of each), and `by_origin` repeats the counts for each source
-alone; `--origin` narrows or widens the set. When more than one judge labeled the scope, it requires
-`--judge`. `moments --unjudged B --judge J` lists the work left for one
+hosts, plus judge coverage by `created_by` and the policy denials. Its
+headline numbers combine `user` and `agent` interventions (each group shows
+how many of each), and `by_created_by` repeats the counts for each source
+alone; `--created-by` narrows or widens the set. When more than one judge labeled the scope, it requires
+`--judge`. `interventions --unjudged B --judge J` lists the work left for one
 judge; `verdict list` returns stored verdicts with their problem lines,
-which the grouping pass reads. A batch that names the same moment,
-behavior and judge twice is rejected. Yes verdicts on moments outside
-the reported origins appear only in `other_origins`, never in the
+which the grouping pass reads. A batch that names the same intervention,
+behavior and judge twice is rejected. Yes verdicts on interventions outside
+the reported `created_by` values appear only in `other_created_by`, never in the
 headline numbers.
 
-Moment text, problem lines and session attributes stay on this machine:
+Intervention text, problem lines and session attributes stay on this machine:
 `publish` never includes them.
 
 ## Ownership and tasks
@@ -322,7 +322,7 @@ briefs and handoffs:
 
 ```sh
 agent-observer capture create-task --task T-42 --project myapp --title "Fix login" --issue https://github.com/o/r/issues/42
-agent-observer capture assign --submission <native prompt id> --task T-42 --evidence "brief 2026-09-23"
+agent-observer capture assign --user-message <native prompt id> --task T-42 --evidence "brief 2026-09-23"
 agent-observer capture outcome --task T-42 --state complete --candidate <sha> --proof <ref>
 agent-observer task show --task T-42
 ```
@@ -336,14 +336,14 @@ native input, cache-read, cache-write, output and reasoning buckets plus
 exact counter semantics. Buckets are never added across semantics; a mixed
 scope exposes per-semantics groups with no combined total. The attributed
 headline excludes shared and outside-task usage; shared model rows render
-separately. Missing ownership, conflicting ownership, active attempts,
-crashes, missing native sessions, unbound workers and incomplete coverage stay visible; arithmetic reconciliation
+separately. Missing ownership, conflicting ownership, active task turns,
+crashes, missing native sessions, unbound child sessions and incomplete coverage stay visible; arithmetic reconciliation
 alone never claims completeness. Acceptance is explicit only: a zero exit
-or successful attempt never implies an accepted outcome.
+or successful task turn never implies an accepted outcome.
 
 Task reports carry a stable snapshot identity (`snapshot_id`, a SHA-256
 over the selected task, sessions, response counters, assignments, outcome,
-attempts, dispatches, source cutoff and price schedule) and a measured set (task, sessions
+task turns, delegations, source cutoff and price schedule) and a measured set (task, sessions
 and attributed/shared/unassigned response ids). Repeated rendering without
 ledger changes keeps the same identity; new evidence changes it. Time and
 diagnostics are task-turn scoped when turn timing exists, otherwise labeled
@@ -391,7 +391,7 @@ backfill for older imports. Muse Contributor Free uses its verified promotional
 route price of $0; a paid-model proxy is not substituted as actual cost.
 
 Work phase is separate from token type. Record `capture assign --phase review`
-or `capture attempt --phase implementation` for the entire observed turn.
+or `capture task-turn --phase implementation` for the entire observed turn.
 Reports partition attributed usage by phase and show reasoning versus other
 generated output, plus recorded tool/MCP activity. A long turn spanning phases
 stays `mixed`, and missing phase ownership stays `unclassified`. Tool counts
@@ -400,7 +400,7 @@ remains labeled session context. This supports investigating inefficiency
 without claiming that reasoning, tool use and implementation are disjoint work.
 
 For a provably dedicated session outside Router, `capture assign-session
---task T-42 --session <key> --exclusive --evidence <dispatch-ref>` binds the
+--task T-42 --session <key> --exclusive --evidence <delegation-ref>` binds the
 whole session. It rejects existing ownership conflicts. Do not use it for a
 conversation that has served, or will serve, other tasks. The installed
 Observer Skill owns the complete capture and delivery procedure.
@@ -421,10 +421,10 @@ outcome, GitHub identifiers and session keys. It never includes prompts,
 assistant text, excerpts, titles, local paths or branch names. Task ids travel
 only when they are identifiers such as `owner/repo#12` or `T-42`; a free-text
 id stays home and is counted in `withheld_tasks`. Judge evidence (see Judge
-moments) travels as counts and identifiers, per session: moments by origin
+interventions) travels as counts and identifiers, per session: interventions by `created_by`
 and kind and policy denials, and per behavior and judge the verdict counts
-and judged moments by origin; plus each group's id, the judge's one-line problem and its
-judged-yes moments (id, session key, origin, time). Moment and transcript
+and judged interventions by `created_by`; plus each group's id, the judge's one-line problem and its
+judged-yes interventions (id, session key, `created_by`, time). Intervention and transcript
 text never leave the machine; the problem line is the judge's own words,
 redacted for known secret shapes. `fleet pull`
 runs `agent-observer export` on each host over SSH (`--remote-command` when
@@ -452,10 +452,16 @@ them) merge, and a problem that
 appears in one session on each of two machines recurs. A behavior judged
 by different judges on different machines is reported per judge and
 listed under `unmerged_behaviors`. One rule covers every combined count:
-a session reported by several machines contributes its usage, moments,
-denials, verdicts and judged moments once, from the first of those machines
-by name. Headline numbers count human and agent
-moments, as `recurrence` does. Nothing pulls on a schedule.
+a session reported by several machines contributes its usage, interventions,
+denials, verdicts and judged interventions once, from the first of those machines
+by name. Headline numbers count user and agent
+interventions, as `recurrence` does. Nothing pulls on a schedule.
+
+Exports use `agent-observer.fleet-export/2`. During the switch to ledger
+schema 3, `pull` and `fleet report` also read `/1` exports from machines
+still on Observer 0.15 and translate them (`moments` to `interventions`,
+`origin` to `created_by`, `human` to `user`). Upgrade every machine, then
+the `/1` reader goes in the next release.
 
 ## GitHub summaries
 
@@ -487,6 +493,35 @@ A session is visible only if its harness writes its records:
 
 `agent-observer health` reports live sessions that break these rules, with
 the process, directory and fix.
+
+## Ledger schema 3
+
+Observer 1.0 uses ledger schema 3, which renames stored terms to match the
+rest of the system: `submissions` became `user_messages`, `dispatches`
+became `delegations` (`owning_user_message`, `child_thread`, `child_turn`),
+`attempts` became `task_turns` (`color_requested`; role `worker` is now
+`child`), and `verdicts.moment_id` became `intervention_id`.
+`assignments` names its columns `user_message_id` and `task_turn`.
+The `t3` identifiers, `sub:` and `ev:` ids and `tasks.origin` keep their names.
+
+The first command that opens a schema-2 ledger read-write (such as `sync`)
+copies it to `observer.db.schema-2.bak` next to it, then migrates it in
+one transaction; a failure rolls back and leaves schema 2. Read-only
+commands ask for a `sync` first. Capture, task and verdict rows survive:
+they cannot be rebuilt from native logs.
+
+For one release the old names keep working: read-only views
+`submissions`, `dispatches` and `attempts` with their schema-2 columns
+(and `worker` roles), the commands `moments`, `moment show`,
+`dispatch-modes`, `capture dispatch` and `capture attempt`, the flags
+`--submission`, `--worker`, `--worker-turn`, `--attempt` and `--origin`
+(with `human`), and the verdict key `moment`.
+
+Every Observer copy on a machine (Claude Code, Codex and Grok plugins,
+other tools' `agent-observer` paths) must move to 1.0 together. Observer
+0.15 refuses a schema-3 ledger and suggests moving it aside: do not.
+That would leave capture and verdict rows outside the active ledger.
+Upgrade the old copy instead.
 
 ## Privacy
 

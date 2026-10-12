@@ -2,7 +2,7 @@
 
 Reads persisted Codex rollouts (`~/.codex/sessions/**/rollout-*.jsonl`).
 Counter rule: each token_usage_record usage block is one atomic response.
-turn_token_usage and thread_token_usage are overlapping checkpoints and are
+turn_token_usage and thread_token_usage are overlapping usage snapshots and are
 stored per row but never summed. The compaction latest_token_usage_record is
 overlapping evidence of an existing response and is never inserted as a row.
 In this schema cached input is a subset of input and reasoning is part of
@@ -36,7 +36,7 @@ CAPABILITIES = [
     ("tool_results", True, "function_call_output/custom_tool_call_output joined by call_id; completed CommandExecution/McpToolCall retained with native ids"),
     ("compaction", True, "compacted record with window ids and compaction_response_id; latest usage is overlap"),
     ("lifecycle_task", True, "event_msg task_started/task_complete with turn timing; turn_aborted marks cancelled turns"),
-    ("lifecycle_dispatch", True, "collaboration.spawn_agent call plus SubAgentActivity started; worker join needs explicit dispatch capture"),
+    ("lifecycle_dispatch", True, "collaboration.spawn_agent call plus SubAgentActivity started; child join needs explicit delegation capture"),
     ("file_change", True, "FileChange items with path, change kind, content size/hash; contents never stored"),
     ("read_evidence", True, "CommandExecution parsed_cmd entries of type read; target/size/owner/window preserved"),
     ("skill_file_reads", True, "read events under an installed Skill directory; mentions never count"),
@@ -185,7 +185,7 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
     paths = [source] if source else discover(root)
     totals = {"harness": HARNESS, "sources": 0, "unchanged": 0,
               "responses_inserted": 0, "events_inserted": 0,
-              "submissions_inserted": 0, "malformed": 0, "failed": []}
+              "user_messages_inserted": 0, "malformed": 0, "failed": []}
     for path in paths:
         try:
             stats = import_codex_file(con, path, full=full)
@@ -195,7 +195,7 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
         totals["sources"] += 1
         totals["unchanged"] += 1 if stats.get("unchanged") else 0
         for key in ("responses_inserted", "events_inserted",
-                    "submissions_inserted", "malformed"):
+                    "user_messages_inserted", "malformed"):
             totals[key] += stats.get(key, 0)
     return totals
 
@@ -265,16 +265,16 @@ class _Reader:
         self.token_counts: list = []
         self.usage_context_seen: set[str] = set()
         # Compaction context for deferred token_count flushing: token_count
-        # checkpoints are collected during ingestion and reconciled only at
-        # flush, so each checkpoint captures whether a compaction boundary
+        # usage snapshots are collected during ingestion and reconciled only at
+        # flush, so each usage snapshot captures whether a compaction boundary
         # (compacted record or ContextCompaction item) already preceded it.
-        # A repeated cumulative checkpoint after compaction whose cumulative
+        # A repeated cumulative usage snapshot after compaction whose cumulative
         # bucket is unchanged is duplicate evidence, not a conflict.
         self.compaction_seen = False
         # Ordering guard for the deferred flush (set by import_codex_file
         # before ingestion): the structural ordinal where this import's
         # prefix begins, and a high-water mark over the events table. A
-        # checkpoint counts as post-compaction only when the boundary
+        # usage snapshot counts as post-compaction only when the boundary
         # precedes it: the captured flag covers this import, and the ledger
         # query below additionally requires id <= prior_event_ceiling (so
         # compaction events written later in this same import never leak
@@ -387,7 +387,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
     """
     stats = {
         "lines": 0, "responses_inserted": 0, "responses_duplicate": 0,
-        "submissions_inserted": 0, "events_inserted": 0,
+        "user_messages_inserted": 0, "events_inserted": 0,
         "events_duplicate": 0, "compactions": 0, "malformed": 0,
     }
     src = JsonlSource(con, HARNESS, path, full=full)
@@ -501,19 +501,19 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         # privacy-version re-imports already correct every row in place
         # above, so they skip this net.
         key_fix = con.execute(
-            "UPDATE submissions SET session_key=? WHERE source_id=?"
+            "UPDATE user_messages SET session_key=? WHERE source_id=?"
             " AND session_key!=?",
             (reader.session_key, src.source_id, reader.session_key))
         if key_fix.rowcount:
-            stats["submissions_updated"] = \
-                stats.get("submissions_updated", 0) + key_fix.rowcount
+            stats["user_messages_updated"] = \
+                stats.get("user_messages_updated", 0) + key_fix.rowcount
         if not reader.is_main:
             cleared = con.execute(
-                "UPDATE submissions SET text_excerpt='' WHERE source_id=?"
+                "UPDATE user_messages SET text_excerpt='' WHERE source_id=?"
                 " AND text_excerpt!=''", (src.source_id,))
             if cleared.rowcount:
-                stats["submissions_updated"] = \
-                    stats.get("submissions_updated", 0) + cleared.rowcount
+                stats["user_messages_updated"] = \
+                    stats.get("user_messages_updated", 0) + cleared.rowcount
     fields = {"started_at": reader.first_ts, "ended_at": reader.last_ts,
               **reader.meta, **reader.identity.fields(con)}
     db.upsert_session(con, reader.session_key, HARNESS,
@@ -579,12 +579,12 @@ def _ingest_record(r: _Reader, obj: dict, ordinal: int) -> None:
 
 
 def _reconcile_fallback(r: _Reader) -> None:
-    """Mark only genuinely reconciled fallback checkpoints as overlap.
+    """Mark only genuinely reconciled fallback usage snapshots as overlap.
 
-    A legacy cumulative checkpoint is covered when an authoritative
+    A legacy cumulative usage snapshot is covered when an authoritative
     response's own thread span (thread_total minus its own total up to
     thread_total) contains that cumulative point: the authoritative record
-    then accounts for the same native work. Checkpoints outside every
+    then accounts for the same native work. Usage snapshots outside every
     authoritative span stay counted, so partial transitions never undercount
     and no representation is ever counted twice. The rows stay as evidence.
     """
@@ -604,7 +604,7 @@ def _reconcile_fallback(r: _Reader) -> None:
 
 
 def _cumulative_sig(total_raw: dict) -> tuple:
-    """The cumulative accounting bucket of one fallback checkpoint.
+    """The cumulative accounting bucket of one fallback usage snapshot.
 
     Only the six known usage counters identify the cumulative point; extra
     native metadata (context window, rate-limit snapshots) never does, so
@@ -643,23 +643,23 @@ def _repair_usage_context(r: _Reader, rid: str, obj: dict, model, effort) -> Non
 
 
 def _flush_token_counts(r: _Reader) -> None:
-    """Count token_count checkpoints for rollouts without full usage cover.
+    """Count token_count usage snapshots for rollouts without full usage cover.
 
     Each rising cumulative total is one new response keyed by that total, so
     appended logs, copied snapshots and full reimports all converge. Every
     duplicate fallback key is compared across all fallback counters: an exact
     repeat is a no-op and any difference is quarantined without overwriting,
-    with one narrow exception. A repeated checkpoint with the same cumulative
+    with one narrow exception. A repeated usage snapshot with the same cumulative
     identity that arrives after a compaction boundary, and whose cumulative
-    bucket repeats this import's first checkpoint for that total while only
+    bucket repeats this import's first usage snapshot for that total while only
     last-token or rate-limit metadata changed, is duplicate compaction
     evidence: it is ignored without inserting another response, changing the
     stored row, or recording an error. Pre-compaction repeats with changed
     counters, and post-compaction repeats with a changed cumulative bucket,
     stay quarantined as usage conflicts. Malformed buckets are quarantined
-    before any SQL and later valid records still import. Rising checkpoints
+    before any SQL and later valid records still import. Rising usage snapshots
     are always preserved as evidence, wherever they appear; reconciliation
-    then marks only the checkpoints an authoritative span genuinely covers
+    then marks only the usage snapshots an authoritative span genuinely covers
     as overlap."""
 
     if r.token_counts:
@@ -673,14 +673,14 @@ def _flush_token_counts(r: _Reader) -> None:
         # signatures of earlier imports, so an incremental suffix that
         # begins with a post-compaction repeat compares against the same
         # reference as a full import. A repeat can only be compaction
-        # evidence when the total's first checkpoint is already known;
+        # evidence when the total's first usage snapshot is already known;
         # a lone repeat with no prior signature fails closed into the
         # usage_conflict path below.
         first_cumulative: dict = _load_cumulative_sigs(r.con, r.session_key)
         prior_compaction = None
 
         def _post_compaction(captured: bool) -> bool:
-            """Whether a compaction boundary precedes this checkpoint.
+            """Whether a compaction boundary precedes this usage snapshot.
 
             The flag captured at collection covers this import in file order.
             The ledger covers earlier incremental prefixes only: the row-id
@@ -714,8 +714,8 @@ def _flush_token_counts(r: _Reader) -> None:
                 last_raw = info.get("last_token_usage")
                 total_raw = info.get("total_token_usage")
                 if last_raw is None or total_raw is None:
-                    # A checkpoint without both usages is malformed: quarantine
-                    # before any SQL and continue with later checkpoints.
+                    # A usage snapshot without both usages is malformed: quarantine
+                    # before any SQL and continue with later usage snapshots.
                     raise _MalformedUsage("malformed usage")
                 _validate_bucket(last_raw)
                 _validate_bucket(total_raw)
@@ -812,7 +812,7 @@ def _flush_token_counts(r: _Reader) -> None:
                 continue
         r.token_counts = []
     # Cheap guards before the correlated reconciliation UPDATE: when the
-    # session holds no fallback checkpoints or no authoritative responses,
+    # session holds no fallback usage snapshots or no authoritative responses,
     # the UPDATE could match nothing and its full scan is pure overhead.
     # Both checks are indexed point lookups through idx_responses_reconcile.
     # Changed/full imports that actually need reconciliation (both sides
@@ -955,25 +955,25 @@ def _ingest_response_item(r: _Reader, obj: dict) -> None:
             text, is_genuine=kind == "genuine", is_main_session=r.is_main)
         genuine = 1 if kind == "genuine" else 0
         cur = r.con.execute(
-            "INSERT OR IGNORE INTO submissions(native_id, source_id,"
+            "INSERT OR IGNORE INTO user_messages(native_id, source_id,"
             " session_key, turn_id, ordinal_num, ts, kind, text_hash,"
             " text_excerpt, is_genuine) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (f"{HARNESS}:{native}", r.src.source_id, r.session_key, turn_id,
              obj.get("ordinal"), iso_ts(obj.get("timestamp")), kind,
              text_hash(text), excerpt, genuine))
         if cur.rowcount:
-            r.stats["submissions_inserted"] += 1
+            r.stats["user_messages_inserted"] += 1
         elif r.src.privacy_stale:
             # Rule 3: a privacy version change corrects rows in place.
             r.con.execute(
-                "UPDATE submissions SET source_id=?, session_key=?, turn_id=?,"
+                "UPDATE user_messages SET source_id=?, session_key=?, turn_id=?,"
                 " ordinal_num=?, ts=?, kind=?, text_hash=?, text_excerpt=?,"
                 " is_genuine=? WHERE native_id=?",
                 (r.src.source_id, r.session_key, turn_id, obj.get("ordinal"),
                  iso_ts(obj.get("timestamp")), kind, text_hash(text), excerpt,
                  genuine, f"{HARNESS}:{native}"))
-            r.stats["submissions_updated"] = \
-                r.stats.get("submissions_updated", 0) + 1
+            r.stats["user_messages_updated"] = \
+                r.stats.get("user_messages_updated", 0) + 1
         return
     if ptype == "message" and p.get("role") == "assistant":
         text = _text_of_message(p)
@@ -1144,7 +1144,7 @@ def _ingest_event_msg(r: _Reader, obj: dict, ordinal: int) -> None:
         r.event(obj, "lifecycle", f"thread_goal_updated:{obj.get('ordinal')}",
                 turn_id=turn_id, name="thread_goal_updated")
     elif etype == "token_count":
-        # A checkpoint of counters also carried by token_usage_record in
+        # A usage snapshot of counters also carried by token_usage_record in
         # current rollouts; kept only as the fallback for older ones.
         # No falsey shortcuts: malformed buckets are collected for flush to
         # quarantine before any SQL, so later valid records still import.
@@ -1158,12 +1158,12 @@ def _ingest_event_msg(r: _Reader, obj: dict, ordinal: int) -> None:
         if last_raw is None and total_raw is None:
             return
         # Collect for validated flush; missing halves, malformed shapes and
-        # counters quarantine there without losing later valid checkpoints.
+        # counters quarantine there without losing later valid usage snapshots.
         # The structural source ordinal travels along so deferred errors
         # deduplicate NULL-safely instead of passing a native ordinal that
         # may be absent. The compaction flag travels along for the same
         # reason: flushing happens after the whole file is read, so each
-        # checkpoint must remember whether a compaction boundary already
+        # usage snapshot must remember whether a compaction boundary already
         # preceded it at collection time.
         r.token_counts.append((ordinal, obj, info_raw, r.compaction_seen, r.model, r.effort))
     elif etype == "thread_settings_applied":

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.0] - 2026-10-12
+
+### Changed
+
+- Ledger schema 3 with the unified terms: moment becomes intervention (`interventions`, `intervention show`), submission becomes user message, dispatch becomes delegation (`capture delegation --child-thread`), attempt becomes task turn (`capture task-turn`, role `child`), origin becomes `created_by` (`human` becomes `user`), and checkpoint becomes usage snapshot. A schema-2 ledger migrates in place after a backup, keeping every row. Old commands, flags, values, the verdict key `moment` and read-only views `submissions`, `dispatches` and `attempts` work for one release. JSON report keys change (`task_turns`, `delegations`, `by_created_by`, `user_messages_inserted`), and fleet exports move to `/2` while still reading `/1` (#65)
+
 ## [0.15.1] - 2026-10-12
 
 ### Changed

@@ -256,16 +256,16 @@ class OpencodeAdapterTest(unittest.TestCase):
         self.assertEqual(parent["project_dir"], "/repo")
         self.assertEqual(parent["client_version"], "1.2.3")
         kinds = {r["native_id"]: r["kind"] for r in self.q(
-            "SELECT native_id, kind, is_genuine FROM submissions")}
+            "SELECT native_id, kind, is_genuine FROM user_messages")}
         self.assertEqual(kinds["opencode:msg_u1"], "genuine")
         self.assertEqual(kinds["opencode:msg_cu1"], "synthetic")
         gen = {r["native_id"]: r["is_genuine"] for r in self.q(
-            "SELECT native_id, is_genuine FROM submissions")}
+            "SELECT native_id, is_genuine FROM user_messages")}
         self.assertEqual(gen["opencode:msg_u1"], 1)
         self.assertEqual(gen["opencode:msg_cu1"], 0)
 
     def test_child_session_excerpt_is_empty(self):
-        rows = self.q("SELECT * FROM submissions WHERE native_id=?",
+        rows = self.q("SELECT * FROM user_messages WHERE native_id=?",
                       ("opencode:msg_cu1",))
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["kind"], "synthetic")
@@ -297,7 +297,7 @@ class OpencodeAdapterTest(unittest.TestCase):
         opencode.sync(self.con, source=self.db_file)
         # The sentinel appears in no ledger table and no submission excerpt.
         self._assert_no_secret_anywhere((sentinel,))
-        subs = self.q("SELECT native_id, text_excerpt FROM submissions")
+        subs = self.q("SELECT native_id, text_excerpt FROM user_messages")
         for row in subs:
             self.assertNotIn(sentinel, row["text_excerpt"] or "")
         trunc = [r for r in subs
@@ -461,7 +461,7 @@ class OpencodeAdapterTest(unittest.TestCase):
                        "SECRET_PREF_zzz"):
             self.assertNotIn(secret, haystack)
         subs = "\n".join(r["text_excerpt"] for r in self.q(
-            "SELECT text_excerpt FROM submissions"))
+            "SELECT text_excerpt FROM user_messages"))
         for secret in (SECRET_READ, SECRET_DATAURL):
             self.assertNotIn(secret, subs)
 
@@ -499,7 +499,7 @@ class OpencodeAdapterTest(unittest.TestCase):
         cols_by_table = self._ledger_text_columns()
         # Every ledger table with text content is inspected, including
         # submissions and import_errors.
-        self.assertIn("submissions", cols_by_table)
+        self.assertIn("user_messages", cols_by_table)
         self.assertIn("import_errors", cols_by_table)
         for table, cols in cols_by_table.items():
             rows = self.q(f"SELECT * FROM {table}")
@@ -522,7 +522,7 @@ class OpencodeAdapterTest(unittest.TestCase):
         # Submissions keep a short human-only excerpt: the direction block
         # (which carries preference contents) is stripped, synthetic parts
         # are excluded, and identity still observes the full text.
-        subs = self.q("SELECT native_id, text_excerpt FROM submissions")
+        subs = self.q("SELECT native_id, text_excerpt FROM user_messages")
         self.assertTrue(subs)
         for row in subs:
             excerpt = row["text_excerpt"] or ""
@@ -787,7 +787,7 @@ class OpencodeAdapterTest(unittest.TestCase):
         # Unknown message produced no response or submission.
         self.assertEqual(self.q("SELECT * FROM responses WHERE response_id=?",
                                 ("opencode:msg_alien",)), [])
-        self.assertEqual(self.q("SELECT * FROM submissions WHERE native_id=?",
+        self.assertEqual(self.q("SELECT * FROM user_messages WHERE native_id=?",
                                 ("opencode:msg_alien",)), [])
 
 
@@ -860,7 +860,7 @@ class OpencodeAdapterTest(unittest.TestCase):
         # Genuine excerpt under rule 1: collapsed, bounded, and only the
         # prefix before the first tag-like marker. Everything after that
         # marker is dropped, never parsed for closers or tails.
-        sub = self.q("SELECT * FROM submissions WHERE native_id=?",
+        sub = self.q("SELECT * FROM user_messages WHERE native_id=?",
                      ("opencode:msg_priv_u",))[0]
         self.assertEqual(sub["kind"], "genuine")
         self.assertEqual(sub["is_genuine"], 1)
@@ -960,7 +960,7 @@ class OpencodeAdapterTest(unittest.TestCase):
         native.close()
         opencode.sync(self.con, source=self.db_file)
         self._assert_no_secret_anywhere((s_dot, s_ns))
-        sub = self.q("SELECT * FROM submissions WHERE native_id=?",
+        sub = self.q("SELECT * FROM user_messages WHERE native_id=?",
                      ("opencode:msg_dottag_u",))[0]
         self.assertEqual(sub["kind"], "genuine")
         excerpt = sub["text_excerpt"] or ""
@@ -988,7 +988,7 @@ class OpencodeAdapterTest(unittest.TestCase):
         native.commit()
         native.close()
         opencode.sync(self.con, source=self.db_file)
-        first = self.q("SELECT * FROM submissions WHERE native_id=?",
+        first = self.q("SELECT * FROM user_messages WHERE native_id=?",
                        ("opencode:msg_resync_u",))[0]
         self.assertEqual(first["kind"], "genuine")
         self.assertEqual(first["is_genuine"], 1)
@@ -1008,11 +1008,11 @@ class OpencodeAdapterTest(unittest.TestCase):
         native.commit()
         native.close()
         stats = opencode.sync(self.con, source=self.db_file)
-        self.assertGreaterEqual(stats["submissions_inserted"], 1)
-        second = self.q("SELECT * FROM submissions WHERE native_id=?",
+        self.assertGreaterEqual(stats["user_messages_inserted"], 1)
+        second = self.q("SELECT * FROM user_messages WHERE native_id=?",
                         ("opencode:msg_resync_u",))[0]
         self.assertEqual(
-            self.q("SELECT COUNT(*) n FROM submissions WHERE native_id=?",
+            self.q("SELECT COUNT(*) n FROM user_messages WHERE native_id=?",
                    ("opencode:msg_resync_u",))[0]["n"], 1)
         self.assertEqual(second["kind"], "genuine")
         self.assertEqual(second["is_genuine"], 1)
@@ -1031,7 +1031,7 @@ class OpencodeAdapterTest(unittest.TestCase):
         native.commit()
         native.close()
         opencode.sync(self.con, source=self.db_file)
-        third = self.q("SELECT * FROM submissions WHERE native_id=?",
+        third = self.q("SELECT * FROM user_messages WHERE native_id=?",
                        ("opencode:msg_resync_u",))[0]
         self.assertEqual(third["kind"], "synthetic")
         self.assertEqual(third["is_genuine"], 0)
@@ -1062,7 +1062,7 @@ class OpencodeAdapterTest(unittest.TestCase):
         native.close()
         opencode.sync(self.con, source=self.db_file)
         self._assert_no_secret_anywhere((secret,))
-        sub = self.q("SELECT * FROM submissions WHERE native_id=?",
+        sub = self.q("SELECT * FROM user_messages WHERE native_id=?",
                      ("opencode:msg_quote_u",))[0]
         self.assertEqual(sub["kind"], "genuine")
         self.assertEqual(sub["text_excerpt"], "Keep this")
@@ -1101,7 +1101,7 @@ class OpencodeAdapterTest(unittest.TestCase):
         # source stale. Native fingerprints are untouched, so only the
         # version mismatch may trigger the re-import.
         self.con.execute(
-            "UPDATE submissions SET text_excerpt="
+            "UPDATE user_messages SET text_excerpt="
             "'leaked <tag>SECRET-STALE-OLD-zzz', text_hash='oldhash'"
             " WHERE native_id='opencode:msg_stale_u'")
         self.con.execute(
@@ -1114,7 +1114,7 @@ class OpencodeAdapterTest(unittest.TestCase):
         self.con.commit()
         counts_before = {
             table: self.q(f"SELECT COUNT(*) n FROM {table}")[0]["n"]
-            for table in ("submissions", "events", "import_errors",
+            for table in ("user_messages", "events", "import_errors",
                           "responses", "sources")}
         stats = opencode.sync(self.con, source=self.db_file)
         self.assertEqual(stats["unchanged"], 0)
@@ -1122,7 +1122,7 @@ class OpencodeAdapterTest(unittest.TestCase):
             self.assertEqual(
                 self.q(f"SELECT COUNT(*) n FROM {table}")[0]["n"],
                 counts_before[table], table)
-        sub = self.q("SELECT * FROM submissions WHERE native_id=?",
+        sub = self.q("SELECT * FROM user_messages WHERE native_id=?",
                      ("opencode:msg_stale_u",))[0]
         self.assertEqual(sub["text_excerpt"], "Fresh prompt")
         self.assertNotEqual(sub["text_hash"], "oldhash")
@@ -1158,7 +1158,7 @@ class OpencodeAdapterTest(unittest.TestCase):
         native.commit()
         native.close()
         opencode.sync(self.con, source=self.db_file)
-        first = self.q("SELECT * FROM submissions WHERE native_id=?",
+        first = self.q("SELECT * FROM user_messages WHERE native_id=?",
                        ("opencode:msg_clear_u",))[0]
         self.assertIn("Visible prompt here", first["text_excerpt"])
         # Replace the text part with a non-text part without touching any
@@ -1175,10 +1175,10 @@ class OpencodeAdapterTest(unittest.TestCase):
             "UPDATE sources SET privacy_version=0 WHERE harness='opencode'")
         self.con.commit()
         opencode.sync(self.con, source=self.db_file)
-        cleared = self.q("SELECT * FROM submissions WHERE native_id=?",
+        cleared = self.q("SELECT * FROM user_messages WHERE native_id=?",
                          ("opencode:msg_clear_u",))[0]
         self.assertEqual(
-            self.q("SELECT COUNT(*) n FROM submissions WHERE native_id=?",
+            self.q("SELECT COUNT(*) n FROM user_messages WHERE native_id=?",
                    ("opencode:msg_clear_u",))[0]["n"], 1)
         self.assertEqual(cleared["text_excerpt"], "")
         self.assertEqual(cleared["is_genuine"], 0)
@@ -1360,7 +1360,7 @@ class OpencodeAdapterTest(unittest.TestCase):
         native.commit()
         native.close()
         opencode.sync(self.con, source=self.db_file)
-        first = self.q("SELECT * FROM submissions WHERE native_id=?",
+        first = self.q("SELECT * FROM user_messages WHERE native_id=?",
                        ("opencode:msg_recon_u",))[0]
         self.assertEqual(first["kind"], "genuine")
         self.assertIn(sentinel, first["text_excerpt"] or "")
@@ -1394,10 +1394,10 @@ class OpencodeAdapterTest(unittest.TestCase):
             "UPDATE sources SET privacy_version=0 WHERE harness='opencode'")
         self.con.commit()
         opencode.sync(self.con, source=self.db_file)
-        cleared = self.q("SELECT * FROM submissions WHERE native_id=?",
+        cleared = self.q("SELECT * FROM user_messages WHERE native_id=?",
                          ("opencode:msg_recon_u",))[0]
         self.assertEqual(
-            self.q("SELECT COUNT(*) n FROM submissions WHERE native_id=?",
+            self.q("SELECT COUNT(*) n FROM user_messages WHERE native_id=?",
                    ("opencode:msg_recon_u",))[0]["n"], 1)
         self.assertEqual(cleared["text_excerpt"], "")
         self.assertEqual(cleared["kind"], "synthetic")
@@ -1467,7 +1467,7 @@ class OpencodeAdapterTest(unittest.TestCase):
         native.commit()
         native.close()
         opencode.sync(self.con, source=self.db_file)
-        sub = self.q("SELECT * FROM submissions WHERE native_id=?",
+        sub = self.q("SELECT * FROM user_messages WHERE native_id=?",
                      ("opencode:msg_strsyn_u",))[0]
         self.assertEqual(sub["kind"], "synthetic")
         self.assertEqual(sub["is_genuine"], 0)

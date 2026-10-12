@@ -1,4 +1,4 @@
-"""CLI: agent-observer sync|sessions|capture|task|claims|thread-misuse|dispatch-modes|trace|event|moments|moment|verdict|recurrence|session-attr. Stdlib only."""
+"""CLI: agent-observer sync|sessions|capture|task|claims|thread-misuse|delegation-modes|trace|event|interventions|intervention|verdict|recurrence|session-attr. Stdlib only."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from . import adapters as _adapters
 from . import analysis as _analysis
 from . import db as _db
 from . import identity as _identity
-from . import moments as _moments
+from . import interventions as _interventions
 from . import report as _report
 
 
@@ -86,7 +86,7 @@ def _text(payload) -> str:
                     f"({h.get('unchanged', 0)} unchanged), "
                     f"{h.get('responses_inserted', 0)} new responses, "
                     f"{h.get('events_inserted', 0)} new events, "
-                    f"{h.get('submissions_inserted', 0)} new submissions, "
+                    f"{h.get('user_messages_inserted', 0)} new user messages, "
                     f"{h.get('malformed', 0)} malformed records kept in import_errors")
             if h.get("failed"):
                 line += f", {len(h['failed'])} sources failed"
@@ -224,9 +224,10 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--issue", default=None)
     t.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     a = csub.add_parser("assign")
-    a.add_argument("--submission", required=True)
+    a.add_argument("--user-message", "--submission", dest="user_message",
+                   required=True)
     a.add_argument("--task", required=True)
-    a.add_argument("--attempt", default=None)
+    a.add_argument("--task-turn", "--attempt", dest="task_turn", default=None)
     a.add_argument("--phase", default=None)
     a.add_argument("--evidence", default=None)
     a.add_argument("--shared", action="store_true")
@@ -237,21 +238,28 @@ def build_parser() -> argparse.ArgumentParser:
     whole.add_argument("--exclusive", action="store_true", required=True)
     whole.add_argument("--evidence", required=True)
     whole.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
-    d = csub.add_parser("dispatch")
-    d.add_argument("--submission", required=True)
-    d.add_argument("--worker", required=True)
+    d = csub.add_parser("delegation", aliases=["dispatch"],
+                        help="record a parent delegating to a child thread")
+    d.add_argument("--user-message", "--submission", dest="user_message",
+                   required=True)
+    d.add_argument("--child-thread", "--worker", dest="child_thread",
+                   required=True)
     d.add_argument("--parent-turn", default=None)
-    d.add_argument("--worker-turn", default=None)
+    d.add_argument("--child-turn", "--worker-turn", dest="child_turn",
+                   default=None)
     d.add_argument("--requested-model", default=None)
     d.add_argument("--requested-effort", default=None)
     d.add_argument("--policy", default=None)
     d.add_argument("--reason", default=None)
     d.add_argument("--task-name", default=None)
     d.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
-    at = csub.add_parser("attempt")
+    at = csub.add_parser("task-turn", aliases=["attempt"],
+                         help="record one observed turn toward a task")
     at.add_argument("--task", required=True)
     at.add_argument("--turn", required=True)
-    at.add_argument("--role", required=True, choices=["parent", "worker"])
+    # `worker` is the schema-2 name for `child`, accepted for one release.
+    at.add_argument("--role", required=True,
+                    choices=["parent", "child", "worker"])
     at.add_argument("--model", default=None)
     at.add_argument("--effort", default=None)
     at.add_argument("--phase", choices=list(_report.PHASES)+["mixed"], default=None)
@@ -328,8 +336,8 @@ def build_parser() -> argparse.ArgumentParser:
     tm.add_argument("--until", default=None, help="ISO date or epoch seconds")
     tm.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
-    dm = sub.add_parser("dispatch-modes",
-                        help="compare planner dispatch with a dispatcher thread per job")
+    dm = sub.add_parser("delegation-modes", aliases=["dispatch-modes"],
+                        help="compare planner delegation with a dispatcher thread per job")
     dm.add_argument("--planner", action="append", default=None,
                     help="planner T3 thread id (repeatable; default every planner)")
     dm.add_argument("--job", action="append", default=None,
@@ -346,7 +354,7 @@ def build_parser() -> argparse.ArgumentParser:
     es.add_argument("--ids-from", default=None, metavar="FILE",
                     help="read event ids, one per line, from FILE or - for stdin")
     es.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
-    def _moment_scope(parser):
+    def _intervention_scope(parser):
         parser.add_argument("--since", default=None, help="ISO date or epoch seconds")
         parser.add_argument("--until", default=None, help="ISO date or epoch seconds")
         parser.add_argument("--harness", default=None)
@@ -357,41 +365,45 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument("--json", action="store_true", dest="as_json",
                             default=argparse.SUPPRESS)
 
-    mo = sub.add_parser("moments", help="list moments where a person acted, for a judge")
-    _moment_scope(mo)
-    mo.add_argument("--origin", action="append", default=None,
-                    choices=list(_moments.ORIGINS) + ["all"],
-                    help="who acted (repeatable; default human and agent)")
+    mo = sub.add_parser("interventions", aliases=["moments"],
+                        help="list interventions (user messages, interrupts, rejections) for a judge")
+    _intervention_scope(mo)
+    mo.add_argument("--created-by", "--origin", dest="created_by",
+                    action="append", default=None,
+                    choices=list(_interventions.CREATED_BY) + ["all", "human"],
+                    help="who acted (repeatable; default user and agent;"
+                         " --origin and human are the old names)")
     mo.add_argument("--kind", action="append", default=None,
-                    choices=list(_moments.KINDS))
+                    choices=list(_interventions.KINDS))
     mo.add_argument("--unjudged", default=None, metavar="BEHAVIOR",
-                    help="only moments without a verdict for BEHAVIOR")
+                    help="only interventions without a verdict for BEHAVIOR")
     mo.add_argument("--judge", default=None,
                     help="with --unjudged: only verdicts by this judge count")
     mo.add_argument("--limit", type=int, default=None)
-    mm = sub.add_parser("moment", help="read moments in context from the native logs")
+    mm = sub.add_parser("intervention", aliases=["moment"],
+                        help="read interventions in context from the native logs")
     mmsub = mm.add_subparsers(dest="op", required=True)
     ms = mmsub.add_parser("show", help="full text, agent activity before and after, nearby prompts")
-    ms.add_argument("ids", nargs="*", help="moment ids from moments --json")
+    ms.add_argument("ids", nargs="*", help="intervention ids from interventions --json")
     ms.add_argument("--ids-from", default=None, metavar="FILE",
-                    help="read moment ids, one per line, from FILE or - for stdin")
-    ms.add_argument("--turns-before", type=_nonnegative, default=_moments.DEFAULT_TURNS_BEFORE,
-                    help="whole turns before the moment (0 = the moment alone)")
-    ms.add_argument("--turns-after", type=_nonnegative, default=_moments.DEFAULT_TURNS_AFTER,
-                    help="whole turns after the moment, the first being its own")
-    ms.add_argument("--items", type=_nonnegative, default=_moments.DEFAULT_ITEMS,
+                    help="read intervention ids, one per line, from FILE or - for stdin")
+    ms.add_argument("--turns-before", type=_nonnegative, default=_interventions.DEFAULT_TURNS_BEFORE,
+                    help="whole turns before the intervention (0 = the intervention alone)")
+    ms.add_argument("--turns-after", type=_nonnegative, default=_interventions.DEFAULT_TURNS_AFTER,
+                    help="whole turns after the intervention, the first being its own")
+    ms.add_argument("--items", type=_nonnegative, default=_interventions.DEFAULT_ITEMS,
                     help="at most this many agent messages and tool calls per turn")
-    ms.add_argument("--chars", type=_nonnegative, default=_moments.DEFAULT_CHARS,
+    ms.add_argument("--chars", type=_nonnegative, default=_interventions.DEFAULT_CHARS,
                     help="cut each agent message, tool input and output to about this many characters")
-    ms.add_argument("--text-chars", type=_nonnegative, default=_moments.DEFAULT_TEXT_CHARS,
-                    help="cut the person's own text (moment, previous and next prompt) to about this many characters")
+    ms.add_argument("--text-chars", type=_nonnegative, default=_interventions.DEFAULT_TEXT_CHARS,
+                    help="cut the person's own text (intervention, previous and next prompt) to about this many characters")
     ms.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
-    vd = sub.add_parser("verdict", help="store and list judge verdicts on moments")
+    vd = sub.add_parser("verdict", help="store and list judge verdicts on interventions")
     vdsub = vd.add_subparsers(dest="op", required=True)
     va = vdsub.add_parser("add", help="store JSON-line verdicts; the batch is all or nothing")
     va.add_argument("--file", default="-", help="JSON lines file, or - for stdin")
     va.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
-    vl = vdsub.add_parser("list", help="list stored verdicts with their moments")
+    vl = vdsub.add_parser("list", help="list stored verdicts with their interventions")
     vl.add_argument("--behavior", required=True)
     vl.add_argument("--judge", default=None)
     vl.add_argument("--verdict", default=None, choices=["yes", "no", "unclear"])
@@ -399,17 +411,21 @@ def build_parser() -> argparse.ArgumentParser:
     vg = vdsub.add_parser("groups", help="list existing groups and their problem lines")
     vg.add_argument("--behavior", required=True)
     vg.add_argument("--judge", default=None)
-    vg.add_argument("--origin", action="append", default=None,
-                    choices=list(_moments.ORIGINS) + ["all"],
-                    help="moments counted (repeatable; default human and agent)")
+    vg.add_argument("--created-by", "--origin", dest="created_by",
+                    action="append", default=None,
+                    choices=list(_interventions.CREATED_BY) + ["all", "human"],
+                    help="who acted (repeatable; default user and agent;"
+                         " --origin and human are the old names)")
     vg.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     rc = sub.add_parser("recurrence", help="report problems that come back, from judge verdicts")
     rc.add_argument("--behavior", required=True)
     rc.add_argument("--judge", default=None)
-    rc.add_argument("--origin", action="append", default=None,
-                    choices=list(_moments.ORIGINS) + ["all"],
-                    help="moments counted (repeatable; default human and agent)")
-    _moment_scope(rc)
+    rc.add_argument("--created-by", "--origin", dest="created_by",
+                    action="append", default=None,
+                    choices=list(_interventions.CREATED_BY) + ["all", "human"],
+                    help="who acted (repeatable; default user and agent;"
+                         " --origin and human are the old names)")
+    _intervention_scope(rc)
     sa = sub.add_parser("session-attr", help="store session attributes used as report filters")
     sasub = sa.add_subparsers(dest="op", required=True)
     saa = sasub.add_parser("add", help="store JSON lines {session, name, value}")
@@ -442,13 +458,22 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-READ_ONLY = ("task", "publish", "claims", "thread-misuse", "dispatch-modes",
+READ_ONLY = ("task", "publish", "claims", "thread-misuse", "delegation-modes",
              "event", "export", "fleet")
+
+
+# Schema-2 command names, accepted for one release (#65).
+CMD_ALIASES = {"moments": "interventions", "moment": "intervention",
+               "dispatch-modes": "delegation-modes"}
+OP_ALIASES = {"dispatch": "delegation", "attempt": "task-turn"}
 
 
 def main(argv=None) -> int:
     ap = build_parser()
     ns = ap.parse_args(argv)
+    ns.cmd = CMD_ALIASES.get(ns.cmd, ns.cmd)
+    if getattr(ns, "op", None) in OP_ALIASES:
+        ns.op = OP_ALIASES[ns.op]
     if ns.cmd == "fleet" and ns.op == "pull":
         return _fleet_pull(ns)
     try:
@@ -473,7 +498,7 @@ def main(argv=None) -> int:
         if ns.cmd == "publish":
             return _publish(con, ns)
 
-        if ns.cmd in ("moments", "moment", "verdict", "recurrence",
+        if ns.cmd in ("interventions", "intervention", "verdict", "recurrence",
                       "session-attr"):
             return _judge(con, ns)
 
@@ -552,7 +577,7 @@ def main(argv=None) -> int:
                 return 3
             return 0
 
-        if ns.cmd == "dispatch-modes":
+        if ns.cmd == "delegation-modes":
             from . import dispatch as _dispatch
             from .adapters import t3 as _t3
             path = _t3.state_path(source=ns.t3_state)
@@ -703,8 +728,8 @@ def _capture(con, ns) -> int:
             return 2
         other = con.execute(
             "SELECT task_id FROM session_assignments WHERE session_key=? AND task_id<>?"
-            " UNION SELECT a.task_id FROM assignments a JOIN submissions s"
-            " ON s.native_id=a.submission_native_id WHERE s.session_key=? AND a.task_id<>?",
+            " UNION SELECT a.task_id FROM assignments a JOIN user_messages s"
+            " ON s.native_id=a.user_message_id WHERE s.session_key=? AND a.task_id<>?",
             (ns.session, ns.task, ns.session, ns.task)).fetchone()
         if other or not ns.evidence.strip():
             print("ownership conflict or missing evidence for exclusive session", file=sys.stderr)
@@ -725,20 +750,20 @@ def _capture(con, ns) -> int:
         return 0
     if ns.op == "assign":
         con.execute("BEGIN IMMEDIATE")
-        ns.submission = _resolve_submission(con, ns.submission)
-        sub = con.execute("SELECT native_id, is_genuine FROM submissions "
-                          "WHERE native_id=?", (ns.submission,)).fetchone()
+        ns.user_message = _resolve_submission(con, ns.user_message)
+        sub = con.execute("SELECT native_id, is_genuine FROM user_messages "
+                          "WHERE native_id=?", (ns.user_message,)).fetchone()
         if sub is None:
-            print(f"unknown submission: {ns.submission}", file=sys.stderr)
+            print(f"unknown user message: {ns.user_message}", file=sys.stderr)
             return 2
         if not sub["is_genuine"]:
-            print(f"refused: {ns.submission} is not a genuine submission",
+            print(f"refused: {ns.user_message} is not a genuine user message",
                   file=sys.stderr)
             return 2
         if con.execute(
-                "SELECT 1 FROM session_assignments w JOIN submissions s"
+                "SELECT 1 FROM session_assignments w JOIN user_messages s"
                 " ON s.session_key=w.session_key WHERE s.native_id=? AND w.task_id<>?",
-                (ns.submission, ns.task)).fetchone():
+                (ns.user_message, ns.task)).fetchone():
             print("ownership conflict: session already bound to another task", file=sys.stderr)
             return 2
         if con.execute("SELECT 1 FROM tasks WHERE task_id=?",
@@ -746,47 +771,49 @@ def _capture(con, ns) -> int:
             print(f"unknown task: {ns.task}", file=sys.stderr)
             return 2
         con.execute(
-            "INSERT OR IGNORE INTO assignments(submission_native_id, task_id,"
-            " attempt, phase, evidence, shared, created_at)"
+            "INSERT OR IGNORE INTO assignments(user_message_id, task_id,"
+            " task_turn, phase, evidence, shared, created_at)"
             " VALUES(?,?,?,?,?,?,?)",
-            (ns.submission, ns.task, ns.attempt, ns.phase, ns.evidence,
+            (ns.user_message, ns.task, ns.task_turn, ns.phase, ns.evidence,
              1 if ns.shared else 0, _db.now()))
         con.commit()
-        _emit({"ok": True, "submission": ns.submission, "task": ns.task,
+        _emit({"ok": True, "user_message": ns.user_message, "task": ns.task,
                "shared": bool(ns.shared)}, ns.as_json)
         return 0
-    if ns.op == "dispatch":
-        ns.submission = _resolve_submission(con, ns.submission)
-        if con.execute("SELECT 1 FROM submissions WHERE native_id=?",
-                       (ns.submission,)).fetchone() is None:
-            print(f"unknown submission: {ns.submission}", file=sys.stderr)
+    if ns.op == "delegation":
+        ns.user_message = _resolve_submission(con, ns.user_message)
+        if con.execute("SELECT 1 FROM user_messages WHERE native_id=?",
+                       (ns.user_message,)).fetchone() is None:
+            print(f"unknown user message: {ns.user_message}", file=sys.stderr)
             return 2
         con.execute(
-            "INSERT OR IGNORE INTO dispatches(owning_submission, parent_turn,"
-            " worker_thread, worker_turn, requested_model, requested_effort,"
+            "INSERT OR IGNORE INTO delegations(owning_user_message, parent_turn,"
+            " child_thread, child_turn, requested_model, requested_effort,"
             " policy_version, reason, task_name, created_at)"
             " VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (ns.submission, ns.parent_turn, ns.worker, ns.worker_turn,
+            (ns.user_message, ns.parent_turn, ns.child_thread, ns.child_turn,
              ns.requested_model, ns.requested_effort, ns.policy, ns.reason,
              ns.task_name, _db.now()))
         con.commit()
-        _emit({"ok": True, "worker": ns.worker}, ns.as_json)
+        _emit({"ok": True, "child_thread": ns.child_thread}, ns.as_json)
         return 0
-    if ns.op == "attempt":
+    if ns.op == "task-turn":
+        if ns.role == "worker":
+            ns.role = "child"
         usable = None
         if ns.not_usable:
             usable = 0
         elif ns.usable:
             usable = 1
         con.execute(
-            "INSERT OR IGNORE INTO attempts(task_id, turn_id, role, harness,"
+            "INSERT OR IGNORE INTO task_turns(task_id, turn_id, role, harness,"
             " model_observed, effort_observed, state, usable_output, stage)"
             " VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(task_id, turn_id) DO UPDATE SET"
             " state=excluded.state, role=excluded.role,"
-            " stage=COALESCE(excluded.stage,attempts.stage),"
-            " model_observed=COALESCE(excluded.model_observed,attempts.model_observed),"
-            " effort_observed=COALESCE(excluded.effort_observed,attempts.effort_observed),"
-            " usable_output=COALESCE(excluded.usable_output,attempts.usable_output)",
+            " stage=COALESCE(excluded.stage,task_turns.stage),"
+            " model_observed=COALESCE(excluded.model_observed,task_turns.model_observed),"
+            " effort_observed=COALESCE(excluded.effort_observed,task_turns.effort_observed),"
+            " usable_output=COALESCE(excluded.usable_output,task_turns.usable_output)",
             (ns.task, ns.turn, ns.role, ns.turn.split(":", 1)[0]
              if ":" in ns.turn else None, ns.model, ns.effort,
              ns.state, usable, ns.phase))
@@ -813,10 +840,10 @@ def _capture(con, ns) -> int:
 
 def _resolve_submission(con, given: str) -> str:
     """Accept a harness-prefixed id or a bare native id when it is unique."""
-    if con.execute("SELECT 1 FROM submissions WHERE native_id=?",
+    if con.execute("SELECT 1 FROM user_messages WHERE native_id=?",
                    (given,)).fetchone():
         return given
-    rows = con.execute("SELECT native_id FROM submissions WHERE native_id LIKE ?",
+    rows = con.execute("SELECT native_id FROM user_messages WHERE native_id LIKE ?",
                        ("%:" + given,)).fetchall()
     return rows[0]["native_id"] if len(rows) == 1 else given
 
@@ -929,42 +956,45 @@ def _judge(con, ns) -> int:
     from . import verdicts as _verdicts
     as_json = getattr(ns, "as_json", False)
     try:
-        origins = None if getattr(ns, "origin", None) and "all" in ns.origin \
-            else tuple(getattr(ns, "origin", None) or _moments.COUNTED_ORIGINS)
-        if ns.cmd == "moments":
+        # `human` is the schema-2 name for `user` (#65).
+        chosen = ["user" if c == "human" else c
+                  for c in getattr(ns, "created_by", None) or []]
+        created_by = None if "all" in chosen \
+            else tuple(chosen or _interventions.COUNTED)
+        if ns.cmd == "interventions":
             if ns.judge and not ns.unjudged:
                 raise ValueError("--judge needs --unjudged BEHAVIOR")
-            payload = _moments.select(
+            payload = _interventions.select(
                 con, since=_when(ns.since), until=_when(ns.until),
-                harness=ns.harness, project=ns.project, origins=origins,
+                harness=ns.harness, project=ns.project, created_by=created_by,
                 kinds=ns.kind, unjudged=ns.unjudged, attrs=_attrs(ns.attr),
                 limit=ns.limit, judge=ns.judge)
             if as_json:
                 _emit(payload, True)
             else:
                 counts = payload["counts"]
-                print(f"{counts['selected']} moments; in scope by origin: "
-                      + ", ".join(f"{k} {v}" for k, v in counts["by_origin"].items())
+                print(f"{counts['selected']} interventions; in scope by created_by: "
+                      + ", ".join(f"{k} {v}" for k, v in counts["by_created_by"].items())
                       + "; policy denials: "
                       + ", ".join(f"{k} {v}" for k, v in payload["policy_denials"].items()))
-                for m in payload["moments"]:
-                    print(f"{m['id']}  {m['kind']} {m['origin']} {m['at']} {m['project'] or ''}")
+                for m in payload["interventions"]:
+                    print(f"{m['id']}  {m['kind']} {m['created_by']} {m['at']} {m['project'] or ''}")
             return 0
-        if ns.cmd == "moment":
+        if ns.cmd == "intervention":
             ids = list(ns.ids)
             if ns.ids_from:
                 fh = sys.stdin if ns.ids_from == "-" else open(ns.ids_from, encoding="utf-8")
                 ids += [line.strip() for line in fh if line.strip()]
             if not ids:
-                print("no moment ids given", file=sys.stderr)
+                print("no intervention ids given", file=sys.stderr)
                 return 2
-            items = _moments.show(con, ids, turns_before=ns.turns_before,
+            items = _interventions.show(con, ids, turns_before=ns.turns_before,
                                   turns_after=ns.turns_after, items=ns.items,
                                   chars=ns.chars, text_chars=ns.text_chars)
             if as_json:
-                _emit({"moments": items}, True)
+                _emit({"interventions": items}, True)
             else:
-                print(_moments.render(items))
+                print(_interventions.render(items))
             return 3 if any(i["status"] != "ok" for i in items) else 0
         if ns.cmd == "verdict" and ns.op == "add":
             result = _verdicts.add(con, _json_lines(ns.file))
@@ -978,12 +1008,12 @@ def _judge(con, ns) -> int:
                 _emit({"verdicts": listed}, True)
             else:
                 for v in listed:
-                    print(f"{v['moment']}  {v['verdict']} {v['group'] or '-'}"
+                    print(f"{v['intervention']}  {v['verdict']} {v['group'] or '-'}"
                           f" {v['problem'] or ''}")
             return 0
         if ns.cmd == "verdict":
             groups = _verdicts.groups(con, ns.behavior, judge=ns.judge,
-                                      origins=origins)
+                                      created_by=created_by)
             if as_json:
                 _emit({"groups": groups}, True)
             else:
@@ -994,7 +1024,7 @@ def _judge(con, ns) -> int:
             report = _verdicts.recurrence(
                 con, ns.behavior, judge=ns.judge, since=_when(ns.since),
                 until=_when(ns.until), harness=ns.harness, project=ns.project,
-                attrs=_attrs(ns.attr), origins=origins)
+                attrs=_attrs(ns.attr), created_by=created_by)
             _emit(report, True) if as_json else print(_verdicts.render(report))
             return 0
         result = _verdicts.add_session_attributes(con, _json_lines(ns.file))
@@ -1125,8 +1155,8 @@ def _sessions(con, ns) -> int:
         payload["events"] = {r["family"]: r["n"] for r in con.execute(
             "SELECT family, COUNT(*) n FROM events WHERE session_key=?"
             " GROUP BY family", (ns.session,))}
-        payload["submissions"] = {r["kind"]: r["n"] for r in con.execute(
-            "SELECT kind, COUNT(*) n FROM submissions WHERE session_key=?"
+        payload["user_messages"] = {r["kind"]: r["n"] for r in con.execute(
+            "SELECT kind, COUNT(*) n FROM user_messages WHERE session_key=?"
             " GROUP BY kind", (ns.session,))}
         _emit(payload, True)
         return 0

@@ -75,14 +75,14 @@ DEFAULT_ROOT = os.path.expanduser("~/.local/share/durable-runner")
 LEGACY_ROOT = os.path.expanduser("~/.local/state/model-router")
 
 CAPABILITIES = [
-    ("router_ledger", True, "router jobs, invocations and readings copied read-only; usage stays numeric-only evidence on attempts, never native responses"),
+    ("router_ledger", True, "router jobs, invocations and readings copied read-only; usage stays numeric-only evidence on task turns, never native responses"),
     ("tool_calls", False, "no router tool-call import; native rollouts carry tool evidence"),
     ("tool_results", False, "no router tool-result import; native rollouts carry tool evidence"),
     ("read_evidence", False, "no file-read import from the router ledger"),
-    ("lifecycle_task", True, "invocation terminal_class maps onto attempt state; router job status stays outcome evidence only"),
-    ("human_input", False, "no submissions are synthesized from router rows"),
+    ("lifecycle_task", True, "invocation terminal_class maps onto task-turn state; router job status stays outcome evidence only"),
+    ("human_input", False, "no user messages are synthesized from router rows"),
     ("instruction_identity", False, "no instruction identity is inferred from router rows"),
-    ("workload_binding", True, "jobs map to tasks and invocations to attempts; worker sessions bind through session_assignments"),
+    ("workload_binding", True, "jobs map to tasks and invocations to task turns; child sessions bind through session_assignments"),
 ]
 
 # Closed router vocabularies, derived from Model Router's own contract
@@ -254,7 +254,7 @@ def sync(con: sqlite3.Connection, root: str | None = None,
          full: bool = False, source: str | None = None) -> dict:
     totals = {"harness": HARNESS, "sources": 0, "unchanged": 0,
               "responses_inserted": 0, "events_inserted": 0,
-              "submissions_inserted": 0, "malformed": 0, "failed": [],
+              "user_messages_inserted": 0, "malformed": 0, "failed": [],
               "jobs": 0, "invocations": 0, "bindings": 0, "readings": 0,
               "rollouts": 0}
     if root is None and source is None:
@@ -1135,14 +1135,14 @@ def _import_invocation(con: sqlite3.Connection, db_path: str, inv: dict,
     turn_id = f"router:{invocation_id}"
     if task_id != f"router:{request_id}":
         # Replace this invocation's old adapter-owned projection after upgrade.
-        con.execute("DELETE FROM attempts WHERE task_id=? AND turn_id=?",
+        con.execute("DELETE FROM task_turns WHERE task_id=? AND turn_id=?",
                     (f"router:{request_id}", turn_id))
     attempt = {
         "role": kind or "unknown",
         "harness": HARNESS,
         "session_key": _session_key_for(inv),
         "stage": stage,
-        "route_requested": requested_route,
+        "color_requested": requested_route,
         "policy_version": policy_version,
         "reason": reason,
         "model_observed": observed_model,
@@ -1158,19 +1158,19 @@ def _import_invocation(con: sqlite3.Connection, db_path: str, inv: dict,
         "usage_json": usage_projected,
     }
     row = con.execute(
-        "SELECT * FROM attempts WHERE task_id=? AND turn_id=?",
+        "SELECT * FROM task_turns WHERE task_id=? AND turn_id=?",
         (task_id, turn_id)).fetchone()
     if row is None:
         cols = ["task_id", "turn_id"] + list(attempt)
         con.execute(
-            f"INSERT INTO attempts({','.join(cols)})"
+            f"INSERT INTO task_turns({','.join(cols)})"
             f" VALUES({','.join('?' for _ in cols)})",
             (task_id, turn_id) + tuple(attempt[c] for c in attempt))
         return True
     diff = {c: v for c, v in attempt.items() if row[c] != v}
     if diff:
         con.execute(
-            f"UPDATE attempts SET {','.join(f'{c}=?' for c in diff)}"
+            f"UPDATE task_turns SET {','.join(f'{c}=?' for c in diff)}"
             " WHERE task_id=? AND turn_id=?",
             tuple(diff.values()) + (task_id, turn_id))
         return True
@@ -1233,7 +1233,7 @@ def _binding_key(con: sqlite3.Connection, inv: dict,
                        (task_id,)).fetchone():
         return None
     if con.execute(
-            "SELECT 1 FROM assignments a JOIN submissions s ON s.native_id=a.submission_native_id"
+            "SELECT 1 FROM assignments a JOIN user_messages s ON s.native_id=a.user_message_id"
             " WHERE s.session_key=? AND a.task_id<>?", (key, task_id)).fetchone():
         # Explicit submission ownership outranks a purported dedicated worker.
         # The attempt retains its expected session, exposing the unbound gap.
@@ -1364,8 +1364,8 @@ def _sync_rollouts(con: sqlite3.Connection, rollout_root: str, totals: dict,
         totals["rollouts"] += 1
         totals["responses_inserted"] += stats.get("responses_inserted", 0)
         totals["events_inserted"] += stats.get("events_inserted", 0)
-        totals["submissions_inserted"] += stats.get(
-            "submissions_inserted", 0)
+        totals["user_messages_inserted"] += stats.get(
+            "user_messages_inserted", 0)
         totals["malformed"] += stats.get("malformed", 0)
         if not stats.get("unchanged"):
             changed = True

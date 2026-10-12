@@ -25,12 +25,12 @@ class ImportTest(LedgerCase):
     def test_genuine_submissions_exclude_synthetic_and_scaffolding(self):
         self.sync("codex-mini.jsonl")
         rows = self.query(
-            "SELECT native_id FROM submissions WHERE is_genuine=1 ORDER BY 1")
+            "SELECT native_id FROM user_messages WHERE is_genuine=1 ORDER BY 1")
         self.assertEqual([r["native_id"] for r in rows],
                          ["codex:msg-mini-sub-01", "codex:msg-mini-sub-02"])
         # Synthetic reply and skill scaffolding are stored but not genuine.
         non = self.query(
-            "SELECT native_id FROM submissions WHERE is_genuine=0 ORDER BY 1")
+            "SELECT native_id FROM user_messages WHERE is_genuine=0 ORDER BY 1")
         self.assertEqual([r["native_id"] for r in non],
                          ["codex:msg-mini-skill-01", "codex:msg-mini-synthetic-01"])
 
@@ -78,5 +78,5 @@ class ImportTest(LedgerCase):
         errors = self.query("SELECT error FROM import_errors")
         self.assertEqual(len(errors), 2)
         # The valid submission survives alongside the quarantined lines.
-        subs = self.query("SELECT native_id FROM submissions")
+        subs = self.query("SELECT native_id FROM user_messages")
         self.assertEqual([r["native_id"] for r in subs], ["codex:msg-bad-sub-01"])

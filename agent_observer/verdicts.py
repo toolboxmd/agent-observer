@@ -1,10 +1,10 @@
-"""Judge verdicts on moments, and the recurrence report built from them.
+"""Judge verdicts on interventions, and the recurrence report built from them.
 
-An outside judge reads moments (agent_observer/moments.py) and writes one
-verdict per moment, behavior and judge: `yes`, `no` or `unclear`, with a
+An outside judge reads interventions (agent_observer/interventions.py) and writes one
+verdict per intervention, behavior and judge: `yes`, `no` or `unclear`, with a
 one-line problem and an optional group id for `yes`. A batch is validated
 whole and stored only when every line is valid. Re-adding the same
-moment, behavior and judge replaces the verdict, so grouping can run as a
+intervention, behavior and judge replaces the verdict, so grouping can run as a
 later pass.
 
 A problem recurs when its group appears in two or more sessions. Problem
@@ -17,11 +17,11 @@ import re
 import sqlite3
 
 from . import db as _db
-from . import moments as _moments
+from . import interventions as _interventions
 from . import privacy
 
 VERDICTS = ("yes", "no", "unclear")
-FIELDS = frozenset({"moment", "behavior", "judge", "verdict", "problem",
+FIELDS = frozenset({"intervention", "behavior", "judge", "verdict", "problem",
                     "group"})
 BEHAVIOR_RE = re.compile(r"^[a-z][a-z0-9_-]{0,39}$")
 JUDGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,79}$")
@@ -51,7 +51,7 @@ def _check(con, record, ev) -> str | None:
     extra = set(record) - FIELDS
     if extra:
         return f"unknown fields: {', '.join(sorted(extra))}"
-    for key in ("moment", "behavior", "judge", "verdict"):
+    for key in ("intervention", "behavior", "judge", "verdict"):
         if key not in record:
             return f"missing {key}"
     if not isinstance(record["behavior"], str) \
@@ -71,20 +71,30 @@ def _check(con, record, ev) -> str | None:
             return "group must match [a-z0-9][a-z0-9._-]*"
     elif problem is not None or group is not None:
         return "problem and group belong only to a yes verdict"
-    if _moments.resolve(con, record["moment"], ev) is None:
-        return "unknown moment"
+    if _interventions.resolve(con, record["intervention"], ev) is None:
+        return "unknown intervention"
     return None
 
 
+def _renamed(record):
+    """A verdict line written with the schema-2 key `moment` (#65)."""
+    if isinstance(record, dict) and "moment" in record \
+            and "intervention" not in record:
+        record = {("intervention" if k == "moment" else k): v
+                  for k, v in record.items()}
+    return record
+
+
 def add(con: sqlite3.Connection, records: list) -> dict:
-    ev = _moments.evidence(con)
+    records = [_renamed(r) for r in records]
+    ev = _interventions.evidence(con)
     errors, seen = [], set()
     for n, r in enumerate(records, 1):
         error = _check(con, r, ev)
         if error is None:
-            key = (r["moment"], r["behavior"], r["judge"])
+            key = (r["intervention"], r["behavior"], r["judge"])
             if key in seen:
-                error = "the same moment, behavior and judge appear twice"
+                error = "the same intervention, behavior and judge appear twice"
             seen.add(key)
         if error:
             errors.append({"line": n, "error": error})
@@ -94,15 +104,15 @@ def add(con: sqlite3.Connection, records: list) -> dict:
     stored = updated = 0
     now = _db.now()
     for r in records:
-        key = (r["moment"], r["behavior"], r["judge"])
+        key = (r["intervention"], r["behavior"], r["judge"])
         exists = con.execute(
-            "SELECT 1 FROM verdicts WHERE moment_id=? AND behavior=? AND"
+            "SELECT 1 FROM verdicts WHERE intervention_id=? AND behavior=? AND"
             " judge=?", key).fetchone()
         problem = r.get("problem")
         con.execute(
-            "INSERT INTO verdicts(moment_id, behavior, judge, verdict,"
+            "INSERT INTO verdicts(intervention_id, behavior, judge, verdict,"
             " problem, group_id, recorded_at) VALUES(?,?,?,?,?,?,?)"
-            " ON CONFLICT(moment_id, behavior, judge) DO UPDATE SET"
+            " ON CONFLICT(intervention_id, behavior, judge) DO UPDATE SET"
             " verdict=excluded.verdict, problem=excluded.problem,"
             " group_id=excluded.group_id, recorded_at=excluded.recorded_at",
             (*key, r["verdict"],
@@ -154,7 +164,7 @@ def add_session_attributes(con: sqlite3.Connection, records: list) -> dict:
 
 
 def _rows(con, behavior: str, judge=None) -> list:
-    sql = ("SELECT moment_id, judge, verdict, problem, group_id FROM verdicts"
+    sql = ("SELECT intervention_id, judge, verdict, problem, group_id FROM verdicts"
            " WHERE behavior=?")
     args = [behavior]
     if judge:
@@ -164,39 +174,39 @@ def _rows(con, behavior: str, judge=None) -> list:
 
 
 def _group_entries(rows, scope: dict) -> list:
-    """Groups of yes verdicts, largest first, from moments in scope."""
+    """Groups of yes verdicts, largest first, from interventions in scope."""
     groups: dict[str, list] = {}
     for r in rows:
-        moment = scope.get(r["moment_id"])
-        if moment is None or r["verdict"] != "yes" or not r["group_id"]:
+        intervention = scope.get(r["intervention_id"])
+        if intervention is None or r["verdict"] != "yes" or not r["group_id"]:
             continue
-        groups.setdefault(r["group_id"], []).append((moment, r))
+        groups.setdefault(r["group_id"], []).append((intervention, r))
     out = []
     for group, members in groups.items():
         members.sort(key=lambda m: (m[0]["ts"] or 0, m[0]["id"]))
         sessions = {m["session"] for m, _ in members}
-        by_origin: dict[str, int] = {}
+        by_created_by: dict[str, int] = {}
         for m, _ in members:
-            by_origin[m["origin"]] = by_origin.get(m["origin"], 0) + 1
+            by_created_by[m["created_by"]] = by_created_by.get(m["created_by"], 0) + 1
         out.append({"group": group, "problem": members[0][1]["problem"],
                     "occurrences": len(members), "repeats": len(members) - 1,
-                    "by_origin": by_origin,
+                    "by_created_by": by_created_by,
                     "sessions": len(sessions),
                     "hosts": sorted({m["harness"] for m, _ in members}),
                     "first_seen": members[0][0]["at"],
                     "last_seen": members[-1][0]["at"],
-                    "moments": [m["id"] for m, _ in members]})
+                    "interventions": [m["id"] for m, _ in members]})
     out.sort(key=lambda g: (-g["occurrences"], -g["sessions"],
                             g["first_seen"] or "", g["group"]))
     return out
 
 
 def groups(con: sqlite3.Connection, behavior: str, judge=None,
-           origins=_moments.COUNTED_ORIGINS) -> list:
+           created_by=_interventions.COUNTED) -> list:
     """Existing groups, so a judge reuses a group id for the same problem."""
-    found, _ = _moments._all(con)
+    found, _ = _interventions._all(con)
     scope = {m["id"]: m for m in found
-             if not origins or m["origin"] in origins}
+             if not created_by or m["created_by"] in created_by}
     out = []
     judges = sorted({r["judge"] for r in _rows(con, behavior, judge)})
     for name in judges:
@@ -208,37 +218,37 @@ def groups(con: sqlite3.Connection, behavior: str, judge=None,
 
 def listing(con: sqlite3.Connection, behavior: str, judge=None,
             verdict=None) -> list:
-    """Every stored verdict for a behavior with its moment's session, host
+    """Every stored verdict for a behavior with its intervention's session, host
     and time, oldest first; the grouping pass reads its problem lines here."""
-    found, _ = _moments._all(con)
+    found, _ = _interventions._all(con)
     scope = {m["id"]: m for m in found}
     out = []
     for r in _rows(con, behavior, judge):
         if verdict and r["verdict"] != verdict:
             continue
-        moment = scope.get(r["moment_id"])
-        out.append({"moment": r["moment_id"], "judge": r["judge"],
+        intervention = scope.get(r["intervention_id"])
+        out.append({"intervention": r["intervention_id"], "judge": r["judge"],
                     "verdict": r["verdict"], "problem": r["problem"],
                     "group": r["group_id"],
-                    "origin": moment["origin"] if moment else None,
-                    "session": moment["session"] if moment else None,
-                    "harness": moment["harness"] if moment else None,
-                    "at": moment["at"] if moment else None})
-    out.sort(key=lambda v: (v["at"] or "", v["moment"]))
+                    "created_by": intervention["created_by"] if intervention else None,
+                    "session": intervention["session"] if intervention else None,
+                    "harness": intervention["harness"] if intervention else None,
+                    "at": intervention["at"] if intervention else None})
+    out.sort(key=lambda v: (v["at"] or "", v["intervention"]))
     return out
 
 
 def recurrence(con: sqlite3.Connection, behavior: str, judge=None,
                since=None, until=None, harness=None, project=None,
-               attrs=None, origins=_moments.COUNTED_ORIGINS) -> dict:
-    """Recurrence over moments of the given origins. The default counts
+               attrs=None, created_by=_interventions.COUNTED) -> dict:
+    """Recurrence over interventions by the given creators. The default counts
     corrections from a person and from another agent together, with a
-    breakdown per origin; coverage still counts every origin in scope."""
-    selected = _moments.select(con, since=since, until=until,
+    breakdown per created_by value; coverage still counts every value in scope."""
+    selected = _interventions.select(con, since=since, until=until,
                                harness=harness, project=project,
-                               origins=origins, attrs=attrs)
-    scope = {m["id"]: m for m in selected["moments"]}
-    rows = [r for r in _rows(con, behavior, judge) if r["moment_id"] in scope]
+                               created_by=created_by, attrs=attrs)
+    scope = {m["id"]: m for m in selected["interventions"]}
+    rows = [r for r in _rows(con, behavior, judge) if r["intervention_id"] in scope]
     judges = sorted({r["judge"] for r in rows})
     if judge is None and len(judges) > 1:
         raise VerdictError(
@@ -246,38 +256,38 @@ def recurrence(con: sqlite3.Connection, behavior: str, judge=None,
             f" ({', '.join(judges)}); pass --judge")
     chosen = judge or (judges[0] if judges else None)
     rows = [r for r in rows if r["judge"] == chosen]
-    judged = {r["moment_id"] for r in rows}
-    unjudged = {o: 0 for o in _moments.ORIGINS}
+    judged = {r["intervention_id"] for r in rows}
+    unjudged = {o: 0 for o in _interventions.CREATED_BY}
     for m in scope.values():
         if m["id"] not in judged:
-            unjudged[m["origin"]] += 1
+            unjudged[m["created_by"]] += 1
     verdict_counts = {v: 0 for v in VERDICTS}
     for r in rows:
         verdict_counts[r["verdict"]] += 1
     entries = _group_entries(rows, scope)
-    by_origin = {}
-    for origin in (origins or _moments.ORIGINS):
+    by_created_by = {}
+    for origin in (created_by or _interventions.CREATED_BY):
         part = _group_entries(rows, {k: m for k, m in scope.items()
-                                     if m["origin"] == origin})
-        by_origin[origin] = {
+                                     if m["created_by"] == origin})
+        by_created_by[origin] = {
             "occurrences": sum(1 for r in rows if r["verdict"] == "yes"
-                               and scope[r["moment_id"]]["origin"] == origin),
+                               and scope[r["intervention_id"]]["created_by"] == origin),
             "problems": len(part),
             "recurring_problems": sum(1 for g in part if g["sessions"] >= 2),
             "repeats": sum(g["repeats"] for g in part)}
-    # Yes verdicts on moments outside the chosen origins (for example a
+    # Yes verdicts on interventions outside the chosen created_by values (for example a
     # parent agent correcting a worker) are reported apart, never mixed in.
     others: dict[str, dict] = {}
-    if origins:
-        every = {m["id"]: m for m in _moments.select(
+    if created_by:
+        every = {m["id"]: m for m in _interventions.select(
             con, since=since, until=until, harness=harness, project=project,
-            origins=None, attrs=attrs)["moments"]}
+            created_by=None, attrs=attrs)["interventions"]}
         for r in _rows(con, behavior, chosen):
-            moment = every.get(r["moment_id"])
-            if moment is None or moment["origin"] in origins \
+            intervention = every.get(r["intervention_id"])
+            if intervention is None or intervention["created_by"] in created_by \
                     or r["verdict"] != "yes":
                 continue
-            entry = others.setdefault(moment["origin"],
+            entry = others.setdefault(intervention["created_by"],
                                       {"occurrences": 0, "groups": set()})
             entry["occurrences"] += 1
             if r["group_id"]:
@@ -286,13 +296,13 @@ def recurrence(con: sqlite3.Connection, behavior: str, judge=None,
             entry["problems"] = len(entry.pop("groups"))
     return {
         "behavior": behavior, "judge": chosen,
-        "period": {"since": _moments._iso(since), "until": _moments._iso(until)},
+        "period": {"since": _interventions._iso(since), "until": _interventions._iso(until)},
         "filters": {"harness": harness, "project": project,
                     "attrs": attrs or {},
-                    "origins": list(origins) if origins else "all"},
-        "coverage": {"moments": len(scope), "judged": len(judged),
-                     "by_origin": selected["counts"]["by_origin"],
-                     "unjudged_by_origin": unjudged},
+                    "created_by": list(created_by) if created_by else "all"},
+        "coverage": {"interventions": len(scope), "judged": len(judged),
+                     "by_created_by": selected["counts"]["by_created_by"],
+                     "unjudged_by_created_by": unjudged},
         "verdicts": verdict_counts,
         "occurrences": verdict_counts["yes"],
         "ungrouped": sum(1 for r in rows
@@ -301,9 +311,9 @@ def recurrence(con: sqlite3.Connection, behavior: str, judge=None,
         "recurring_problems": sum(1 for g in entries if g["sessions"] >= 2),
         "repeats": sum(g["repeats"] for g in entries),
         "groups": entries,
-        "by_origin": by_origin,
+        "by_created_by": by_created_by,
         "policy_denials": selected["policy_denials"],
-        "other_origins": others,
+        "other_created_by": others,
     }
 
 
@@ -312,21 +322,21 @@ def render(report: dict) -> str:
     lines = [
         f"{report['behavior']} by {report['judge'] or 'no judge yet'}:"
         f" {report['occurrences']} yes in {cov['judged']} judged of"
-        f" {cov['moments']} moments",
+        f" {cov['interventions']} interventions",
         f"problems {report['problems']}, recurring (2+ sessions)"
         f" {report['recurring_problems']}, repeats {report['repeats']},"
         f" ungrouped {report['ungrouped']}",
-        "unjudged by origin: " + ", ".join(
-            f"{k} {v}" for k, v in cov["unjudged_by_origin"].items()),
+        "unjudged by created_by: " + ", ".join(
+            f"{k} {v}" for k, v in cov["unjudged_by_created_by"].items()),
         "policy denials (not corrections): " + ", ".join(
             f"{k} {v}" for k, v in report["policy_denials"].items()),
     ]
-    for origin, part in report.get("by_origin", {}).items():
+    for origin, part in report.get("by_created_by", {}).items():
         lines.append(f"  from {origin}: {part['occurrences']} yes,"
                      f" problems {part['problems']}, recurring"
                      f" {part['recurring_problems']}, repeats {part['repeats']}")
-    for origin, entry in sorted(report.get("other_origins", {}).items()):
-        lines.append(f"also {entry['occurrences']} yes on {origin} moments"
+    for origin, entry in sorted(report.get("other_created_by", {}).items()):
+        lines.append(f"also {entry['occurrences']} yes on {origin} interventions"
                      f" ({entry['problems']} problems), not counted above")
     for g in report["groups"]:
         lines.append(f"- {g['group']}: {g['occurrences']}x in {g['sessions']}"

@@ -287,7 +287,7 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
     paths = _resolve_source(source, root) if source else discover(root)
     totals = {"harness": HARNESS, "sources": 0, "unchanged": 0,
               "responses_inserted": 0, "events_inserted": 0,
-              "submissions_inserted": 0, "malformed": 0, "failed": []}
+              "user_messages_inserted": 0, "malformed": 0, "failed": []}
     ctx = _SyncCtx()
     if source is not None:
         # Source-scoped operation: build the containing-tree parent index
@@ -305,7 +305,7 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
         totals["sources"] += 1
         totals["unchanged"] += 1 if stats.get("unchanged") else 0
         for key in ("responses_inserted", "events_inserted",
-                    "submissions_inserted", "malformed"):
+                    "user_messages_inserted", "malformed"):
             totals[key] += stats.get(key, 0)
     return totals
 
@@ -841,7 +841,7 @@ def _force_child_synthetic(con: sqlite3.Connection, stats: dict | None,
     assert empty == ""
     try:
         cur = con.execute(
-            "UPDATE submissions SET kind='synthetic', is_genuine=0,"
+            "UPDATE user_messages SET kind='synthetic', is_genuine=0,"
             " text_excerpt='' WHERE session_key=? AND (kind!='synthetic'"
             " OR is_genuine!=0 OR text_excerpt!='')",
             (child_key,))
@@ -849,8 +849,8 @@ def _force_child_synthetic(con: sqlite3.Connection, stats: dict | None,
         return 0
     changed = cur.rowcount or 0
     if changed and stats is not None:
-        stats["submissions_updated"] = \
-            stats.get("submissions_updated", 0) + changed
+        stats["user_messages_updated"] = \
+            stats.get("user_messages_updated", 0) + changed
     return changed
 
 
@@ -1343,7 +1343,7 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     per operation); per-session code never scans sibling files.
     """
     stats = {"lines": 0, "responses_inserted": 0, "responses_duplicate": 0,
-             "submissions_inserted": 0, "events_inserted": 0,
+             "user_messages_inserted": 0, "events_inserted": 0,
              "events_duplicate": 0, "compactions": 0, "malformed": 0}
     updates_path = os.path.join(session_dir, "updates.jsonl")
     events_path = os.path.join(session_dir, "events.jsonl")
@@ -2133,31 +2133,31 @@ def _upsert_submission(con, r: _Reader, src, chat: dict, key: str,
     native_id = f"{HARNESS}:{r.native_sid}:prompt:{key}"
     existing = con.execute(
         "SELECT text_hash, text_excerpt, turn_id, kind, is_genuine"
-        " FROM submissions WHERE native_id=?", (native_id,)).fetchone()
+        " FROM user_messages WHERE native_id=?", (native_id,)).fetchone()
     digest = text_hash(full_text)
     if existing is None:
         cur = con.execute(
-            "INSERT OR IGNORE INTO submissions(native_id, source_id,"
+            "INSERT OR IGNORE INTO user_messages(native_id, source_id,"
             " session_key, turn_id, ordinal_num, ts, kind, text_hash,"
             " text_excerpt, is_genuine) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (native_id, src.source_id if src is not None else None,
              r.session_key, turn_id, entry["first"], entry["ts"], kind,
              digest, excerpt, is_genuine))
         if cur.rowcount:
-            r.stats["submissions_inserted"] += 1
+            r.stats["user_messages_inserted"] += 1
         return
     if digest != existing["text_hash"] \
             or (existing["text_excerpt"] or "") != excerpt \
             or existing["kind"] != kind \
             or (existing["is_genuine"] or 0) != is_genuine:
         con.execute(
-            "UPDATE submissions SET text_hash=?, text_excerpt=?, kind=?,"
+            "UPDATE user_messages SET text_hash=?, text_excerpt=?, kind=?,"
             " is_genuine=? WHERE native_id=?",
             (digest, excerpt, kind, is_genuine, native_id))
-        r.stats["submissions_updated"] = \
-            r.stats.get("submissions_updated", 0) + 1
+        r.stats["user_messages_updated"] = \
+            r.stats.get("user_messages_updated", 0) + 1
     if turn_id and not existing["turn_id"]:
-        con.execute("UPDATE submissions SET turn_id=? WHERE native_id=?",
+        con.execute("UPDATE user_messages SET turn_id=? WHERE native_id=?",
                     (turn_id, native_id))
 
 

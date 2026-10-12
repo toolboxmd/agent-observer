@@ -43,7 +43,7 @@ CAPABILITIES = [
     ("skill_file_reads", True, "reads under an installed Skill directory"),
     ("skill_invocation", True, "Skill tool calls name the skill"),
     ("compaction", True, "system compact_boundary records with trigger and pre-compaction tokens"),
-    ("lifecycle_task", True, "turn_duration records; interrupts as submissions of kind interrupt"),
+    ("lifecycle_task", True, "turn_duration records; interrupts as user messages of kind interrupt"),
     ("human_input", True, "typed prompts, mid-turn queued prompts, slash commands and interrupts told apart"),
     ("instruction_identity", True, "AgentsMD direction block from the SessionStart hook; versioned plugin paths read"),
     ("subagents", True, "subagent transcripts as child sessions of their parent"),
@@ -144,7 +144,7 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
     paths = [source] if source else discover(root)
     totals = {"harness": HARNESS, "sources": 0, "unchanged": 0,
               "responses_inserted": 0, "events_inserted": 0,
-              "submissions_inserted": 0, "malformed": 0, "failed": []}
+              "user_messages_inserted": 0, "malformed": 0, "failed": []}
     for path in paths:
         try:
             stats = import_claude_file(con, path, full=full)
@@ -154,7 +154,7 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
         totals["sources"] += 1
         totals["unchanged"] += 1 if stats.get("unchanged") else 0
         for key in ("responses_inserted", "events_inserted",
-                    "submissions_inserted", "malformed"):
+                    "user_messages_inserted", "malformed"):
             totals[key] += stats.get(key, 0)
     return totals
 
@@ -247,7 +247,7 @@ def import_claude_file(con: sqlite3.Connection, path: str,
                        full: bool = False) -> dict:
     stats = {"lines": 0, "responses_inserted": 0, "responses_duplicate": 0,
              "responses_updated": 0,
-             "submissions_inserted": 0, "events_inserted": 0,
+             "user_messages_inserted": 0, "events_inserted": 0,
              "events_duplicate": 0, "compactions": 0, "malformed": 0}
     src = JsonlSource(con, HARNESS, path, full=full)
     if (src.row["claude_usage_version"] != 1
@@ -306,7 +306,7 @@ def import_claude_file(con: sqlite3.Connection, path: str,
     if src.incremental and src.row["session_id"]:
         # Resume the turn the previous import ended in.
         row = con.execute(
-            "SELECT turn_id FROM submissions WHERE session_key=? AND kind='genuine'"
+            "SELECT turn_id FROM user_messages WHERE session_key=? AND kind='genuine'"
             " ORDER BY ts DESC LIMIT 1", (r.session_key,)).fetchone()
         r.turn = row["turn_id"] if row else None
     for ordinal, obj, line in src.records():
@@ -597,23 +597,23 @@ def _submission(r: _Reader, native_id, ordinal, ts, kind: str, text: str) -> Non
         is_main_session=r.agent_id is None and r.native_session is not None)
     genuine = 1 if kind == "genuine" else 0
     cur = r.con.execute(
-        "INSERT OR IGNORE INTO submissions(native_id, source_id, session_key,"
+        "INSERT OR IGNORE INTO user_messages(native_id, source_id, session_key,"
         " turn_id, ordinal_num, ts, kind, text_hash, text_excerpt, is_genuine)"
         " VALUES(?,?,?,?,?,?,?,?,?,?)",
         (f"{HARNESS}:{native_id}", r.src.source_id, r.session_key, r.turn, ordinal,
          ts, kind, text_hash(text), excerpt, genuine))
     if cur.rowcount:
-        r.stats["submissions_inserted"] += 1
+        r.stats["user_messages_inserted"] += 1
     elif r.src.privacy_stale:
         # Rule 3: a privacy version change corrects rows in place.
         r.con.execute(
-            "UPDATE submissions SET source_id=?, session_key=?, turn_id=?,"
+            "UPDATE user_messages SET source_id=?, session_key=?, turn_id=?,"
             " ordinal_num=?, ts=?, kind=?, text_hash=?, text_excerpt=?,"
             " is_genuine=? WHERE native_id=?",
             (r.src.source_id, r.session_key, r.turn, ordinal, ts, kind,
              text_hash(text), excerpt, genuine, f"{HARNESS}:{native_id}"))
-        r.stats["submissions_updated"] = \
-            r.stats.get("submissions_updated", 0) + 1
+        r.stats["user_messages_updated"] = \
+            r.stats.get("user_messages_updated", 0) + 1
 
 
 def _t3_actor(con, uuid: str) -> str | None:

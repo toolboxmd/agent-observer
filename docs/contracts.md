@@ -1,8 +1,17 @@
 # Contracts: ledger, adapters, capture, and query surface
 
-Versions: schema 2, event contract 2, capture contract 1, stored in
-`schema_meta`. A ledger with another schema version is refused; move it
-aside and sync again.
+Versions: schema 3, event contract 2, capture contract 1, stored in
+`schema_meta`. A schema-2 ledger migrates in place on its first read-write
+open (backup `<ledger>.schema-2.bak`, one transaction, rollback leaves
+schema 2): `submissions` to `user_messages`; `dispatches` to `delegations`
+(`owning_submission`, `worker_thread`, `worker_turn` to
+`owning_user_message`, `child_thread`, `child_turn`); `attempts` to
+`task_turns` (`route_requested` to `color_requested`, role `worker` to
+`child`); `assignments.submission_native_id` and `assignments.attempt` to
+`user_message_id` and `task_turn`; `verdicts.moment_id` to
+`intervention_id`. Read-only views under the three old table names with
+their schema-2 columns stay for one release. A ledger with any other
+schema version is refused; move it aside and sync again.
 
 ## Ledger
 
@@ -17,14 +26,14 @@ are committed.
 | `sessions` | `session_key` | `<harness>:<native session id>`: project directory, branch, client version, entrypoint, parent session, start and end, instruction identity. |
 | `turns` | `turn_id` | Harness turn or prompt boundary with observed model and effort, timing, state. |
 | `responses` | `response_id` | One usage-bearing model response: raw counters, `semantics`, harness total. |
-| `submissions` | `native_id` | User-role inputs with `kind` genuine, synthetic, scaffolding or interrupt. |
+| `user_messages` | `native_id` | User-role inputs with `kind` genuine, synthetic, scaffolding or interrupt. |
 | `events` | session_key, family, native_id | Operational events (families below). |
-| `tasks`, `assignments`, `session_assignments`, `dispatches`, `attempts`, `outcomes` | see capture | Workload ownership and outcomes. |
+| `tasks`, `assignments`, `session_assignments`, `delegations`, `task_turns`, `outcomes` | see capture | Workload ownership and outcomes. |
 | `t3_turn_origins`, `t3_threads`, `t3_links` | T3 message, thread, link ids | Chromeria turn origins, thread to native-session map with who opened each thread (`opened_by`: client, server or unknown), thread-tree links with PR snapshot state, mirrored read-only from T3 state. |
 | `t3_spawns`, `t3_messages` | T3 thread id, T3 message id | Child thread parent, depth and creation time; sender, target and time of each attributed `message_thread` delivery. Ids and times only. |
-| `verdicts` | moment id, behavior, judge | An outside judge's `yes`, `no` or `unclear` on one moment, with a redacted one-line problem and an optional group id for `yes`. |
+| `verdicts` | intervention id, behavior, judge | An outside judge's `yes`, `no` or `unclear` on one intervention, with a redacted one-line problem and an optional group id for `yes`. |
 | `session_attributes` | session_key, name | Attributes other tools supply (contextmd's `arm`), used only as report filters. |
-| `t3_outcome_provenance` (`router_outcome_provenance`) | task id | Last adapter-written outcome snapshot; a row that differs is human-owned and survives re-import. |
+| `t3_outcome_provenance` (`router_outcome_provenance`) | task id | Last adapter-written outcome snapshot; a row that differs is user-owned and survives re-import. |
 | `router_jobs`, `router_invocations`, `router_readings` | router ids | Model Router ledger rows, copied read-only. |
 | `agentsmd_versions` | AGENTS.md SHA-256 | Release map from the local AgentsMD tags. |
 | `import_errors` | none | Quarantined records; prior valid data is kept. |
@@ -41,7 +50,7 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
 `CAPABILITIES` (family, supported, detail) and
 `sync(con, root=None, full=False, source=None) -> dict` returning at least
 `harness`, `sources`, `unchanged`, `responses_inserted`, `events_inserted`,
-`submissions_inserted`, `malformed` and `failed` (list of
+`user_messages_inserted`, `malformed` and `failed` (list of
 `{path, error}`). It must:
 
 1. Read native records only, read-only. Never write a harness's files or
@@ -63,8 +72,8 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
    Unknown counters stay NULL, never zero.
 6. Ledger privacy, fail closed, implemented once in
    `agent_observer/privacy.py` (adapters keep no private copies):
-   `submissions.text_excerpt` is empty unless the submission is a genuine
-   human submission of the main session; then the human text up to the
+   `user_messages.text_excerpt` is empty unless the user message is a
+   genuine one typed by a person in the main session; then that text up to the
    first tag-like marker (`<` followed by a letter, `/` or `!`, or the
    first `<<<`), whitespace-collapsed, at most 300 characters. Assistant
    excerpts keep the last 400 characters of each assistant text block
@@ -181,27 +190,29 @@ The Skill is query-only: no agent runs capture commands. The CLI keeps
 them for Router ownership and explicit human use.
 
 - `create-task`: stable task identity with project, family, title, Issue link.
-- `assign`: binds one genuine submission to one task with attempt, phase, and
-  evidence. Every genuine submission needs a binding, including followups.
-  A submission with no binding is reported missing and never inherits the
-  prior task. Binding the same submission to several tasks with `--shared`
+- `assign`: binds one genuine user message to one task with task turn, phase,
+  and evidence. Every genuine user message needs a binding, including
+  followups. A user message with no binding is reported missing and never
+  inherits the prior task. Binding the same user message to several tasks
+  with `--shared`
   keeps the response joint; tokens are shown under each task as shared and
   never divided. Bindings without `--shared` to several tasks are reported
   as conflicting. Bare native ids resolve when unique.
 - `assign-session`: explicit whole-session binding with `--exclusive` and
-  dispatch evidence, only for a session dedicated to that task. Unknown
-  sessions and conflicts with prior submission/session ownership are refused.
-- `dispatch`: links an owning submission to a worker thread with requested
-  route, policy version, and reason. Requested route stays separate from the
-  observed model and effort on the attempt.
-- `attempt`: observed turn with role parent or worker, model, effort, timing,
+  delegation evidence, only for a session dedicated to that task. Unknown
+  sessions and conflicts with prior user-message/session ownership are refused.
+- `delegation` (old name `dispatch`): links an owning user message to a child
+  thread with requested model and effort, policy version, and reason. The
+  request stays separate from the observed model and effort on the task turn.
+- `task-turn` (old name `attempt`): observed turn with role parent or child
+  (`worker` is accepted as the old name for child), model, effort, timing,
   terminal state, and whether output was usable. Re-capture updates state and
   supplied model/effort/usable evidence without erasing omitted observations.
 - `outcome`: explicit acceptance state per task. A zero process exit never
   implies acceptance.
 - Router reads `observer_task_id` from task JSON, falling back to
   `router:<request-id>` when absent or invalid. Several jobs may map to one
-  task. Their attempts and dedicated sessions retain native invocation evidence;
+  task. Their task turns and dedicated sessions retain native invocation evidence;
   a shared planner session remains unbound. Reimport preserves explicit capture
   metadata/outcomes and replaces the same invocation's legacy adapter binding.
   Default discovery covers the configured `DURABLE_RUNNER_STATE_DIR`, current
@@ -209,7 +220,7 @@ them for Router ownership and explicit human use.
   deduplicated by canonical source path. Explicit `--root`/`--source` stays scoped.
 
 Outcome states: `complete`, `active`, `cancelled`, `failed`,
-`quota_blocked`, `crashed`, `unknown`. Crashed attempts with no usable output
+`quota_blocked`, `crashed`, `unknown`. Crashed task turns with no usable output
 are counted separately and excluded from useful-work comparisons.
 
 ## Query surface
@@ -220,7 +231,7 @@ are counted separately and excluded from useful-work comparisons.
   buckets over the sessions the task touches; per-model rows with native
   buckets and exact semantics; missing and conflicting
   assignments; crash count; explicit acceptance state; outcome with
-  candidate, proof, repairs and corrections; attempts; dispatches; active
+  candidate, proof, repairs and corrections; task turns; delegations; active
   work; snapshot identity with source cutoff and measured set; task-scoped
   diagnostics and time with session context labeled; native cost and
   sourced estimate with coverage. `total_cost` states one estimated
@@ -232,32 +243,32 @@ are counted separately and excluded from useful-work comparisons.
   sessions hold measured responses but nothing attributed or shared
   reports those sessions as `unbound_usage` instead of a silent
   `missing assignments: none`. Every command accepts `--json`.
-- `moments`, `moment show`, `verdict add|list|groups`, `recurrence`,
-  `session-attr add`: the judge interface (README "Judge moments").
-  Moment ids are `sub:<submission native id>` (genuine or interrupt
-  submissions, and synthetic ones that Chromeria records as agent-sent,
-  origin `agent`) and `ev:<session_key>/<family>/<native id>` (Codex
+- `interventions`, `intervention show`, `verdict add|list|groups`, `recurrence`,
+  `session-attr add`: the judge interface (README "Judge interventions").
+  Intervention ids are `sub:<user message native id>` (genuine or interrupt
+  user messages, and synthetic ones that Chromeria records as agent-sent,
+  created by `agent`) and `ev:<session_key>/<family>/<native id>` (Codex
   `turn_aborted` cancelled; a denied permission that is `user-rejected`
-  on Claude or kindless elsewhere). An interrupt submission within one
+  on Claude or kindless elsewhere). An interrupt user message within one
   second after a `user-rejected` denial in the same session is the same
-  act and no moment. `permission-rule` and `automode-blocked` denials are
-  `policy_denials`, never moments. Origin precedence: T3 turn origin
+  act and no intervention. `permission-rule` and `automode-blocked` denials are
+  `policy_denials`, never interventions. `created_by` precedence: T3 turn origin
   (Claude uuid), then V2 prompt origin by native session and text hash,
   then a headless entrypoint (`agent`); for interrupts and rejections a
   T3 child thread, or a top-level thread not opened by a person
   (`launched`: V2 `createdBy` agent or system, or no evidence; V1
   threads and V2 legacy imports take the first turn start's actor), is
-  `unknown`; then `user-rejected` (`human`), an
-  interactive entrypoint (`human`), and for interrupts and rejections a
-  top-level T3 thread (`human`); otherwise `unknown`. a batch naming one moment, behavior and judge twice is
-  rejected. Moment text and
+  `unknown`; then `user-rejected` (`user`), an
+  interactive entrypoint (`user`), and for interrupts and rejections a
+  top-level T3 thread (`user`); otherwise `unknown`. A batch naming one intervention, behavior and judge twice is
+  rejected. Intervention text and
   context are read from native logs on request, redacted, never stored.
-  `moment show` returns whole turns (`--turns-before`, `--turns-after`,
+  `intervention show` returns whole turns (`--turns-before`, `--turns-after`,
   `--items`, `--chars`, `--text-chars`) and echoes them as `window`.
-  `moments`, `recurrence` and `verdict groups` default to origins
-  `human` and `agent`; `recurrence` headline numbers combine them,
-  `by_origin` gives each alone, and yes verdicts outside the chosen
-  origins appear only under `other_origins`.
+  `interventions`, `recurrence` and `verdict groups` default to
+  `created_by` `user` and `agent`; `recurrence` headline numbers combine them,
+  `by_created_by` gives each alone, and yes verdicts outside the chosen
+  values appear only under `other_created_by`.
   A verdict batch is validated whole; `recurrence` counts a group as
   recurring when its yes verdicts span two or more sessions.
 - `publish --task ID|--session KEY [--prices schedule.json] --repo owner/name --pr N|--commit SHA`:
@@ -307,18 +318,18 @@ total. Responses must partition exactly; token sums are compared per
 counter semantics when the scope is mixed, so an absent mixed total is
 never treated as zero. A report never claims completeness from arithmetic alone; the
 `complete` flag requires zero missing and zero conflicting bindings and no
-recorded active work, missing native sessions/usage or unbound worker sessions.
-Captured dispatches without explicit worker ownership are coverage gaps too;
-the dispatch edge alone never assigns the worker's usage to the task.
-Conflicts between whole-session and submission ownership stay shared and incomplete.
-Active attempts, crashes and missing evidence stay visible alongside the
+recorded active work, missing native sessions/usage or unbound child sessions.
+Captured delegations without explicit child ownership are coverage gaps too;
+the delegation edge alone never assigns the child's usage to the task.
+Conflicts between whole-session and user-message ownership stay shared and incomplete.
+Active task turns, crashes and missing evidence stay visible alongside the
 arithmetic.
 
 ## Report identity, time and acceptance
 
 - `snapshot_id` is a SHA-256 over the selected task, sorted sessions,
   response counters with semantics and model/effort/turn, assignments,
-  outcome, attempts, dispatches, source cutoff, price schedule and coverage
+  outcome, task turns, delegations, source cutoff, price schedule and coverage
   evidence, including ownership that another task records in the same session. `source_cutoff`
   is the max native `imported_at` backing the scope. Repeats without
   ledger changes keep the identity; changed evidence changes it. The
@@ -326,7 +337,7 @@ arithmetic.
   unassigned response ids with the cutoff. No prompt or transcript
   content participates.
 - `acceptance_state` is explicit, defaulting to `unknown` when no outcome
-  row exists. Process success, zero exit or a successful attempt never
+  row exists. Process success, zero exit or a successful task turn never
   implies acceptance. The T3 adapter completes `origin='t3'` tasks whose
   thread tree links a PR snapshot with state `merged` (proof is the PR
   URL); every other PR state and Issue-only links stay an explicit
@@ -388,7 +399,7 @@ are account evidence and are never a cost estimate.
 ## Work phase and activity
 
 `phases` partitions attributed responses without duplication. It uses explicit
-submission `phase`, an exact-turn `capture attempt --phase` label when supplied,
+user-message `phase`, an exact-turn `capture task-turn --phase` label when supplied,
 or the recorded Router stage of a wholly owned dedicated session. Several
 stages in one scope produce `mixed`; absent/unknown labels stay `unclassified`.
 A turn-level phase labels the entire turn, not an invented transition within it.
@@ -443,7 +454,7 @@ re-read every sync; workload bindings are durable ledger rows.
   Grok or OpenCode session of its thread. V2 has no native turn ids, so a
   prompt takes its origin from a V2 user message with the same text hash
   in the same native session (mirrored for every driver; the Claude
-  import reclassifies by it, judge moments read it; Codex prompt text
+  import reclassifies by it, judge interventions read it; Codex prompt text
   matches V2 text, Grok and OpenCode prompt text does not, so their
   prompts stay without origin) (a run on another driver's provider
   thread is no evidence): `createdBy=user` from `web` or `mobile` is `genuine`, `agent` or `system` is `synthetic`, a hash sent by

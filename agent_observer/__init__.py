@@ -17,6 +17,6 @@ def _read_version() -> str:
 
 
 __version__ = _read_version()
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 EVENT_CONTRACT_VERSION = 2
 CAPTURE_CONTRACT_VERSION = 1

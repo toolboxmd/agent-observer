@@ -356,7 +356,7 @@ def _permission_seeking(session, events) -> list:
 def _human_corrections(con, session, events) -> list:
     out = []
     for row in con.execute(
-            "SELECT native_id, ts, kind, text_excerpt FROM submissions"
+            "SELECT native_id, ts, kind, text_excerpt FROM user_messages"
             " WHERE session_key=? AND kind IN ('genuine', 'interrupt') ORDER BY ts",
             (session["session_key"],)):
         if row["kind"] == "interrupt":
@@ -487,7 +487,7 @@ def _session_metrics(con, s) -> dict:
         usage_u = usage["u"] or 0
         by_semantics = None
     subs = {r["kind"]: r["n"] for r in con.execute(
-        "SELECT kind, COUNT(*) n FROM submissions WHERE session_key=? GROUP BY kind", (key,))}
+        "SELECT kind, COUNT(*) n FROM user_messages WHERE session_key=? GROUP BY kind", (key,))}
     reading = con.execute(
         "SELECT COUNT(*) n, COALESCE(SUM(size_bytes), 0) b FROM events WHERE session_key=?"
         " AND family IN ('read', 'skill_read')"
@@ -556,7 +556,7 @@ def _incident_turns(con, session_key: str, incident: dict) -> set:
             turn = row["turn_id"] if row else None
         else:
             row = con.execute(
-                "SELECT turn_id FROM submissions WHERE native_id=?",
+                "SELECT turn_id FROM user_messages WHERE native_id=?",
                 (ref,)).fetchone()
             turn = row["turn_id"] if row else None
             if turn is None:

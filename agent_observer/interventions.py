@@ -1,24 +1,24 @@
-"""Judge moments: where a person acted in a main session, in context.
+"""Judge interventions: where someone acted on an agent in a main session.
 
-Observer runs no model. It selects moments deterministically, gives an
+Observer runs no model. It selects interventions deterministically, gives an
 outside judge (an LLM) each one in context from the native logs, and
-stores the judge's verdicts (agent_observer/verdicts.py). A moment is one
+stores the judge's verdicts (agent_observer/verdicts.py). An intervention is one
 of:
 
-- prompt: a genuine submission (`sub:<submission native id>`);
-- interrupt: an interrupt submission, or a Codex `turn_aborted` event
+- prompt: a genuine user message (`sub:<user message native id>`);
+- interrupt: an interrupt user message, or a Codex `turn_aborted` event
   (`ev:<session_key>/<family>/<native id>`);
 - rejection: a denied permission that a person decided: Claude's
   `user-rejected`, or a denial without a kind on another harness.
 
 Hook and rule denials (Claude `permission-rule`) and auto-mode blocks are
-policy, never moments; they are counted separately.
+policy, never interventions; they are counted separately.
 
-`origin` says who acted, from evidence only: `human`, `agent` or
+`created_by` says who acted, from evidence only: `user`, `agent` or
 `unknown`. Chromeria turn and prompt origins outrank the session's
 entrypoint; nothing is guessed.
 
-Moment text and context are read on request and never stored; secrets
+Intervention text and context are read on request and never stored; secrets
 are redacted on the way out.
 """
 
@@ -33,10 +33,10 @@ from . import lookup, privacy
 from .ingest import iso_ts
 
 KINDS = ("prompt", "interrupt", "rejection")
-ORIGINS = ("human", "agent", "unknown")
+CREATED_BY = ("user", "agent", "unknown")
 # Origins whose corrections count toward the Objective (user decision,
 # 2026-10-12): a person's and another agent's. Unknown stays out.
-COUNTED_ORIGINS = ("human", "agent")
+COUNTED = ("user", "agent")
 # Session entrypoints that prove who typed: a terminal or desktop app is a
 # person, a headless run is an agent.
 INTERACTIVE_ENTRYPOINTS = frozenset({"cli", "Codex Desktop", "codex-tui"})
@@ -44,14 +44,14 @@ HEADLESS_ENTRYPOINTS = frozenset({"sdk-cli", "codex_exec"})
 POLICY_DENIALS = {"permission-rule": "hook_or_rule",
                   "automode-blocked": "automode"}
 DENIED = ("denied", "deny")
-# Context window: whole turns before and after the moment, and at most
+# Context window: whole turns before and after the intervention, and at most
 # DEFAULT_ITEMS agent messages and tool calls per turn. Judges vary these
 # to measure accuracy against context size.
 DEFAULT_TURNS_BEFORE = 1
 DEFAULT_TURNS_AFTER = 1
 DEFAULT_ITEMS = 8
 DEFAULT_CHARS = 2000
-# The person's own words (moment, previous and next prompt) get a separate,
+# The person's own words (intervention, previous and next prompt) get a separate,
 # larger limit: a judge must never lose them to the context limit.
 DEFAULT_TEXT_CHARS = 20000
 
@@ -68,7 +68,7 @@ def _iso(ts) -> str | None:
 
 
 class _Evidence:
-    """Chromeria origins and thread positions, loaded once per call."""
+    """Chromeria origin evidence and thread positions, loaded once per call."""
 
     def __init__(self, con: sqlite3.Connection):
         self.turns = self._pairs(
@@ -115,9 +115,9 @@ class _Evidence:
         return actor or self.prompts.get(f"{session_native}/{digest}")
 
 
-def _origin(kind: str, actor, entrypoint, thread: str, denial=None) -> str:
+def _created_by(kind: str, actor, entrypoint, thread: str, denial=None) -> str:
     if actor == "client":
-        return "human"
+        return "user"
     if actor == "server":
         return "agent"
     if entrypoint in HEADLESS_ENTRYPOINTS:
@@ -128,12 +128,12 @@ def _origin(kind: str, actor, entrypoint, thread: str, denial=None) -> str:
         # person.
         return "unknown"
     if kind == "rejection" and denial == "user-rejected":
-        return "human"
+        return "user"
     if entrypoint in INTERACTIVE_ENTRYPOINTS:
-        return "human"
+        return "user"
     if kind != "prompt" and thread == "root":
         # A stop in a thread a person opened is that person's.
-        return "human"
+        return "user"
     return "unknown"
 
 
@@ -158,15 +158,15 @@ def _scope(harness=None, project=None, attrs=None) -> tuple[str, list]:
     return " AND ".join(where), args
 
 
-def _base(row, moment_id: str, kind: str, ts, origin: str, thread: str) -> dict:
-    return {"id": moment_id, "kind": kind, "origin": origin, "thread": thread,
+def _base(row, intervention_id: str, kind: str, ts, created_by: str, thread: str) -> dict:
+    return {"id": intervention_id, "kind": kind, "created_by": created_by, "thread": thread,
             "ts": ts, "at": _iso(ts), "session": row["session_key"],
             "harness": row["harness"], "project": row["project_dir"]}
 
 
 def _from_submission(row, ev: _Evidence) -> dict | None:
-    """A moment for a genuine prompt, an interrupt, or a message another
-    agent sent (a synthetic submission Chromeria records as agent-sent);
+    """An intervention for a genuine prompt, an interrupt, or a message another
+    agent sent (a synthetic user message Chromeria records as agent-sent);
     None for other synthetic input such as reminders."""
     kind = "interrupt" if row["kind"] == "interrupt" else "prompt"
     thread = ev.thread(row["session_native"])
@@ -176,7 +176,7 @@ def _from_submission(row, ev: _Evidence) -> dict | None:
     if row["kind"] == "synthetic" and actor != "server":
         return None
     return _base(row, f"sub:{row['native_id']}", kind, row["ts"],
-                 _origin(kind, actor, row["entrypoint"], thread), thread)
+                 _created_by(kind, actor, row["entrypoint"], thread), thread)
 
 
 def _denial(row):
@@ -187,7 +187,7 @@ def _denial(row):
 
 
 def _event_kind(row) -> str | None:
-    """interrupt, rejection, policy:<bucket>, or None for no moment."""
+    """interrupt, rejection, policy:<bucket>, or None for no intervention."""
     if row["family"] == "lifecycle":
         return "interrupt"
     denial = _denial(row)
@@ -201,19 +201,19 @@ def _event_kind(row) -> str | None:
 
 def _from_event(row, ev: _Evidence, kind: str) -> dict:
     thread = ev.thread(row["session_native"])
-    moment = _base(row, f"ev:{row['session_key']}/{row['family']}/"
+    intervention = _base(row, f"ev:{row['session_key']}/{row['family']}/"
                         f"{row['native_id']}", kind, row["ts"],
-                   _origin(kind, None, row["entrypoint"], thread,
+                   _created_by(kind, None, row["entrypoint"], thread,
                            _denial(row)), thread)
     if kind == "rejection":
-        moment["tool"] = row["name"]
-    return moment
+        intervention["tool"] = row["name"]
+    return intervention
 
 
 _SUB_KINDS = "('genuine', 'interrupt', 'synthetic')"
 _SUB_SQL = ("SELECT u.native_id, u.kind, u.ts, u.text_hash, u.ordinal_num,"
             " u.source_id,"
-            f" {_SESSION_COLS} FROM submissions u"
+            f" {_SESSION_COLS} FROM user_messages u"
             " JOIN sessions s ON s.session_key = u.session_key")
 _EVENT_SQL = ("SELECT e.id, e.family, e.name, e.native_id, e.ts,"
               f" e.detail_json, {_SESSION_COLS} FROM events e"
@@ -224,9 +224,9 @@ _EVENT_WHERE = ("((e.family = 'lifecycle' AND e.name = 'turn_aborted'"
 
 
 # Claude writes a rejected tool call twice: the user-rejected denial and,
-# within the same second, an interrupt submission. One act, one moment.
+# within the same second, an interrupt submission. One act, one intervention.
 _ECHO_SQL = (
-    "SELECT u.native_id FROM submissions u JOIN events e"
+    "SELECT u.native_id FROM user_messages u JOIN events e"
     " ON e.session_key = u.session_key AND e.family = 'permission'"
     f" AND e.status IN ({','.join(repr(d) for d in DENIED)})"
     " AND json_extract(e.detail_json, '$.denial') = 'user-rejected'"
@@ -242,17 +242,17 @@ def _echoes(con, session_key=None) -> set:
 
 
 def _all(con, harness=None, project=None, attrs=None):
-    """(moments, policy denial rows) in scope, over all time."""
+    """(interventions, policy denial rows) in scope, over all time."""
     ev = _Evidence(con)
     where, args = _scope(harness, project, attrs)
     found, policy = [], []
     echoes = _echoes(con)
     for row in con.execute(f"{_SUB_SQL} WHERE u.kind IN {_SUB_KINDS}"
                            f" AND {where}", args):
-        moment = None if row["native_id"] in echoes \
+        intervention = None if row["native_id"] in echoes \
             else _from_submission(row, ev)
-        if moment is not None:
-            found.append(moment)
+        if intervention is not None:
+            found.append(intervention)
     for row in con.execute(f"{_EVENT_SQL} WHERE {_EVENT_WHERE} AND {where}",
                            args):
         kind = _event_kind(row)
@@ -282,12 +282,12 @@ def _first_activity(con, session_key=None) -> dict:
         _ACTIVITY_SQL + " GROUP BY session_key")}
 
 
-def _mark_opening(moment: dict, first: dict) -> dict:
-    """opening: nothing the agent did precedes the moment in its session,
+def _mark_opening(intervention: dict, first: dict) -> dict:
+    """opening: nothing the agent did precedes the intervention in its session,
     so it cannot correct that agent (a first prompt or brief)."""
-    start = first.get(moment["session"])
-    moment["opening"] = start is None or (moment["ts"] or 0) <= start
-    return moment
+    start = first.get(intervention["session"])
+    intervention["opening"] = start is None or (intervention["ts"] or 0) <= start
+    return intervention
 
 
 def _in_period(ts, since, until) -> bool:
@@ -296,7 +296,7 @@ def _in_period(ts, since, until) -> bool:
 
 
 def judged_ids(con, behavior: str, judge=None) -> set:
-    sql, args = "SELECT DISTINCT moment_id FROM verdicts WHERE behavior=?", \
+    sql, args = "SELECT DISTINCT intervention_id FROM verdicts WHERE behavior=?", \
         [behavior]
     if judge:
         sql += " AND judge=?"
@@ -305,31 +305,31 @@ def judged_ids(con, behavior: str, judge=None) -> set:
 
 
 def select(con: sqlite3.Connection, since=None, until=None, harness=None,
-           project=None, origins=COUNTED_ORIGINS, kinds=None, unjudged=None,
+           project=None, created_by=COUNTED, kinds=None, unjudged=None,
            attrs=None, limit=None, judge=None) -> dict:
-    """Moments in scope. Counts cover every origin and kind in scope, so
-    moments the filters leave out stay visible as numbers."""
+    """Interventions in scope. Counts cover every created_by value and kind in scope, so
+    interventions the filters leave out stay visible as numbers."""
     found, policy = _all(con, harness, project, attrs)
     found = [m for m in found if _in_period(m["ts"], since, until)]
-    by_origin = {o: 0 for o in ORIGINS}
+    by_created_by = {o: 0 for o in CREATED_BY}
     by_kind = {k: 0 for k in KINDS}
     for m in found:
-        by_origin[m["origin"]] += 1
+        by_created_by[m["created_by"]] += 1
         by_kind[m["kind"]] += 1
     denials = {bucket: 0 for bucket in POLICY_DENIALS.values()}
     for ts, bucket, _ in policy:
         if _in_period(ts, since, until):
             denials[bucket] += 1
     chosen = [m for m in found
-              if (not origins or m["origin"] in origins)
+              if (not created_by or m["created_by"] in created_by)
               and (not kinds or m["kind"] in kinds)]
     if unjudged:
         done = judged_ids(con, unjudged, judge)
         chosen = [m for m in chosen if m["id"] not in done]
     if limit:
         chosen = chosen[:limit]
-    return {"moments": chosen,
-            "counts": {"by_origin": by_origin, "by_kind": by_kind,
+    return {"interventions": chosen,
+            "counts": {"by_created_by": by_created_by, "by_kind": by_kind,
                        "selected": len(chosen)},
             "policy_denials": denials}
 
@@ -339,21 +339,21 @@ def evidence(con: sqlite3.Connection) -> _Evidence:
     return _Evidence(con)
 
 
-def resolve(con: sqlite3.Connection, moment_id, ev=None) -> dict | None:
-    """The moment named by an id, or None when it names no moment."""
-    if not isinstance(moment_id, str):
+def resolve(con: sqlite3.Connection, intervention_id, ev=None) -> dict | None:
+    """The intervention named by an id, or None when it names no intervention."""
+    if not isinstance(intervention_id, str):
         return None
     ev = ev or _Evidence(con)
-    if moment_id.startswith("sub:"):
+    if intervention_id.startswith("sub:"):
         row = con.execute(f"{_SUB_SQL} WHERE u.native_id = ? AND u.kind IN"
-                          f" {_SUB_KINDS}", (moment_id[4:],)).fetchone()
+                          f" {_SUB_KINDS}", (intervention_id[4:],)).fetchone()
         if row is None or row["native_id"] in _echoes(con, row["session_key"]):
             return None
-        moment = _from_submission(row, ev)
-        return None if moment is None else _mark_opening(
-            moment, _first_activity(con, row["session_key"]))
-    if moment_id.startswith("ev:"):
-        session, _, rest = moment_id[3:].partition("/")
+        intervention = _from_submission(row, ev)
+        return None if intervention is None else _mark_opening(
+            intervention, _first_activity(con, row["session_key"]))
+    if intervention_id.startswith("ev:"):
+        session, _, rest = intervention_id[3:].partition("/")
         family, _, native = rest.partition("/")
         if not (session and family and native):
             return None
@@ -498,20 +498,20 @@ _TIMELINE_FAMILIES = ("assistant_message", "tool_call", "permission",
 
 def _timeline(con, session_key: str, ev: _Evidence) -> list:
     """Ordered prompts (from a person or another agent), interrupts and
-    agent activity of one session. Every moment submission is a turn
+    agent activity of one session. Every intervention submission is a turn
     boundary."""
     items = []
     echoes = _echoes(con, session_key)
     for row in con.execute(
             f"{_SUB_SQL} WHERE u.session_key = ? AND u.kind IN {_SUB_KINDS}",
             (session_key,)):
-        moment = None if row["native_id"] in echoes \
+        intervention = None if row["native_id"] in echoes \
             else _from_submission(row, ev)
-        if moment is None:
+        if intervention is None:
             continue
-        items.append({"key": moment["id"], "ts": row["ts"],
+        items.append({"key": intervention["id"], "ts": row["ts"],
                       "ordinal": row["ordinal_num"], "boundary": True,
-                      "row": row, "what": "submission", "moment": moment})
+                      "row": row, "what": "submission", "intervention": intervention})
     for row in con.execute(
             "SELECT e.id, e.family, e.name, e.native_id, e.ts, e.ordinal_num,"
             f" e.status, e.detail_json, e.target, {_SESSION_COLS} FROM events e"
@@ -529,7 +529,7 @@ def _timeline(con, session_key: str, ev: _Evidence) -> list:
                       "ts": row["ts"], "ordinal": row["ordinal_num"],
                       "boundary": family == "lifecycle", "row": row,
                       "what": family,
-                      "moment": _from_event(row, ev, "interrupt")
+                      "intervention": _from_event(row, ev, "interrupt")
                       if family == "lifecycle" else None})
     items.sort(key=lambda i: (i["ts"] or 0, i["ordinal"] or 0))
     return items
@@ -573,14 +573,14 @@ def _excerpt(row) -> str:
 def _prompt(sources, item, chars) -> dict:
     """A turn boundary: a prompt (with its text and who sent it) or an
     interrupt."""
-    moment = item["moment"]
+    intervention = item["intervention"]
     if item["what"] != "submission":
         return {"id": item["key"], "kind": "interrupt",
-                "origin": moment["origin"] if moment else None,
+                "created_by": intervention["created_by"] if intervention else None,
                 "at": _iso(item["row"]["ts"])}
     status, text = _submission_text(sources, item["row"])
-    out = {"id": item["key"], "kind": moment["kind"],
-           "origin": moment["origin"], "at": _iso(item["row"]["ts"])}
+    out = {"id": item["key"], "kind": intervention["kind"],
+           "created_by": intervention["created_by"], "at": _iso(item["row"]["ts"])}
     if status == "ok":
         out["text"] = clip(text, chars)
     else:
@@ -594,7 +594,7 @@ def _turns(line, at: int, turns_before: int, turns_after: int, items: int):
     A turn runs from one boundary to the next. Before turns are
     (opening boundary or None at session start, kept activity, omitted
     count); after turns are (kept activity, omitted count, closing
-    boundary or None at session end), the first being the moment's own
+    boundary or None at session end), the first being the intervention's own
     turn. `items` keeps the last activity of a before turn and the first
     of an after turn."""
     bounds = [i for i, item in enumerate(line) if item["boundary"]]
@@ -626,15 +626,15 @@ def _turns(line, at: int, turns_before: int, turns_after: int, items: int):
     return before, after
 
 
-def show(con: sqlite3.Connection, moment_ids: list,
+def show(con: sqlite3.Connection, intervention_ids: list,
          turns_before=DEFAULT_TURNS_BEFORE, turns_after=DEFAULT_TURNS_AFTER,
          items=DEFAULT_ITEMS, chars=DEFAULT_CHARS,
          text_chars=DEFAULT_TEXT_CHARS) -> list[dict]:
-    """Each moment in context: its full text, and whole turns before and
+    """Each intervention in context: its full text, and whole turns before and
     after it (each a prompt from a person or agent plus the agent's
     messages and tool calls). The window is a parameter, echoed back, so a
-    judge can measure accuracy against context size. Status per moment is
-    ok, source_missing, source_changed, not_found or no_such_moment."""
+    judge can measure accuracy against context size. Status per intervention is
+    ok, source_missing, source_changed, not_found or no_such_intervention."""
     window = {"turns_before": turns_before, "turns_after": turns_after,
               "items": items, "chars": chars, "text_chars": text_chars}
     if min(window.values()) < 0:
@@ -643,18 +643,18 @@ def show(con: sqlite3.Connection, moment_ids: list,
     ev = _Evidence(con)
     timelines: dict[str, list] = {}
     out = []
-    for moment_id in moment_ids:
-        moment = resolve(con, moment_id, ev)
-        if moment is None:
-            out.append({"id": moment_id, "status": "no_such_moment"})
+    for intervention_id in intervention_ids:
+        intervention = resolve(con, intervention_id, ev)
+        if intervention is None:
+            out.append({"id": intervention_id, "status": "no_such_intervention"})
             continue
-        session = moment["session"]
+        session = intervention["session"]
         if session not in timelines:
             timelines[session] = _timeline(con, session, ev)
         line = timelines[session]
-        at = next(i for i, item in enumerate(line) if item["key"] == moment_id)
+        at = next(i for i, item in enumerate(line) if item["key"] == intervention_id)
         status, text = "ok", None
-        if moment_id.startswith("sub:"):
+        if intervention_id.startswith("sub:"):
             status, text = _submission_text(sources, line[at]["row"])
         else:
             row = line[at]["row"]
@@ -662,7 +662,7 @@ def show(con: sqlite3.Connection, moment_ids: list,
                                  (row["id"],)).fetchone()
             status = sources.get(source["source_id"])[0] if source else \
                 "source_missing"
-        item = dict(moment)
+        item = dict(intervention)
         item["status"] = status
         item["window"] = window
         if status != "ok":
@@ -698,10 +698,10 @@ def render(items: list[dict]) -> str:
     parts = []
     for item in items:
         lines = [f"== {item['id']} [{item['status']}]"]
-        if item["status"] == "no_such_moment":
+        if item["status"] == "no_such_intervention":
             parts.append(lines[0])
             continue
-        lines.append(f"{item['kind']} by {item['origin']} in {item['session']}"
+        lines.append(f"{item['kind']} by {item['created_by']} in {item['session']}"
                      f" ({item['harness']}, thread {item['thread']}) at"
                      f" {item['at']}")
         for turn in item.get("before", []):
@@ -709,7 +709,7 @@ def render(items: list[dict]) -> str:
                 lines.append(_render_prompt(turn["prompt"]))
             lines += [_render_entry(e) for e in turn["activity"]]
         if "text" in item:
-            lines += ["--- moment", item["text"]]
+            lines += ["--- intervention", item["text"]]
         for turn in item.get("after", []):
             lines += [_render_entry(e) for e in turn["activity"]]
             if turn["prompt"]:
@@ -719,7 +719,7 @@ def render(items: list[dict]) -> str:
 
 
 def _render_prompt(prompt: dict) -> str:
-    return (f"--- {prompt['kind']} by {prompt.get('origin') or 'unknown'}"
+    return (f"--- {prompt['kind']} by {prompt.get('created_by') or 'unknown'}"
             f"\n{prompt.get('text') or ''}").rstrip()
 
 

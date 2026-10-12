@@ -37,7 +37,7 @@ class ClaudeAdapterTest(LedgerCase):
 
     def test_human_input_kinds_are_told_apart(self):
         kinds = {r["native_id"]: r["kind"] for r in self.query(
-            "SELECT native_id, kind FROM submissions WHERE session_key=?", (MAIN,))}
+            "SELECT native_id, kind FROM user_messages WHERE session_key=?", (MAIN,))}
         self.assertEqual(kinds["claude:u-1"], "genuine")
         self.assertEqual(kinds["claude:q-1"], "genuine")
         self.assertEqual(kinds["claude:q-2"], "synthetic")
@@ -46,7 +46,7 @@ class ClaudeAdapterTest(LedgerCase):
         self.assertEqual(kinds["claude:u-int"], "interrupt")
         self.assertNotIn("claude:u-tr1", kinds)
         sub_kinds = {r["kind"] for r in self.query(
-            "SELECT kind FROM submissions WHERE session_key=?", (SUB,))}
+            "SELECT kind FROM user_messages WHERE session_key=?", (SUB,))}
         self.assertEqual(sub_kinds, {"synthetic"})
 
     def test_reads_skills_and_tool_joins(self):
@@ -126,7 +126,7 @@ class ClaudeMetadataTest(LedgerCase):
         # ...and no per-model counter value persists anywhere.
         blob = "".join(r["line_excerpt"] or "" for r in errors)
         blob += "".join(r["text_excerpt"] or "" for r in self.query(
-            "SELECT text_excerpt FROM submissions"))
+            "SELECT text_excerpt FROM user_messages"))
         blob += "".join(r["detail_json"] or "" for r in self.query(
             "SELECT detail_json FROM events"))
         for value in ("26343", "703577", "1.0082185", "46843"):
@@ -141,7 +141,7 @@ class ClaudeMetadataTest(LedgerCase):
             10 + 100 + 1000 + 50)
         # Existing behavior is intact: the genuine submission still imports.
         self.assertEqual(
-            self.query("SELECT kind FROM submissions"
+            self.query("SELECT kind FROM user_messages"
                        " WHERE native_id='claude:u-meta-1'")[0]["kind"],
             "genuine")
         # No metadata contents persist anywhere in the ledger.
@@ -176,7 +176,7 @@ class ClaudeContradictoryMarkersTest(LedgerCase):
         claude.import_claude_file(
             self.con, fixture("claude-contradictory.jsonl"))
         rows = {r["native_id"]: r for r in self.query(
-            "SELECT native_id, kind, text_excerpt FROM submissions")}
+            "SELECT native_id, kind, text_excerpt FROM user_messages")}
         # Contradictory scaffolding markers fail closed even with
         # origin.kind=human or promptSource=typed.
         self.assertEqual(rows["claude:u-contra-sys"]["kind"], "scaffolding")
@@ -199,7 +199,7 @@ class ClaudeContradictoryMarkersTest(LedgerCase):
                        "claude:u-contra-hook", "claude:q-contra-1"):
             self.assertEqual(rows[native]["text_excerpt"], "", native)
         blob = "".join(r["text_excerpt"] or "" for r in self.query(
-            "SELECT text_excerpt FROM submissions"))
+            "SELECT text_excerpt FROM user_messages"))
         blob += "".join(r["detail_json"] or "" for r in self.query(
             "SELECT detail_json FROM events"))
         blob += "".join(r["identity_json"] or "" for r in self.query(
@@ -233,9 +233,9 @@ class ClaudeQueueOperationTest(LedgerCase):
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["error"], "unsupported_schema")
         self.assertEqual(
-            self.query("SELECT COUNT(*) n FROM submissions")[0]["n"], 0)
+            self.query("SELECT COUNT(*) n FROM user_messages")[0]["n"], 0)
         blob = "".join(r["text_excerpt"] or "" for r in self.query(
-            "SELECT text_excerpt FROM submissions"))
+            "SELECT text_excerpt FROM user_messages"))
         blob += "".join(r["detail_json"] or "" for r in self.query(
             "SELECT detail_json FROM events"))
         blob += "".join(r["identity_json"] or "" for r in self.query(

@@ -118,7 +118,7 @@ class PhasePricingTest(CloseLoopCase):
         run(self.db,'capture','assign-session','--task','T','--session','codex:sess-fixture-mini-01',
             '--exclusive','--evidence','dedicated fixture')
         con=db.connect(self.db); self.addCleanup(con.close)
-        con.execute("INSERT INTO attempts(task_id,turn_id,role,harness,session_key,stage,state)"
+        con.execute("INSERT INTO task_turns(task_id,turn_id,role,harness,session_key,stage,state)"
                     " VALUES('T','router:inv','worker','router','codex:sess-fixture-mini-01',"
                     "'implementation_hard','complete')")
         con.commit()
@@ -129,7 +129,7 @@ class PhasePricingTest(CloseLoopCase):
         r=self._task_json('T')
         self.assertEqual([(p['phase'],p['usage']['total_tokens']) for p in r['phases']],
                          [('implementation',5500)])
-        con.execute("INSERT INTO attempts(task_id,turn_id,role,harness,session_key,stage,state)"
+        con.execute("INSERT INTO task_turns(task_id,turn_id,role,harness,session_key,stage,state)"
                     " VALUES('T','router:review','worker','router','codex:sess-fixture-mini-01',"
                     "'review_final','complete')")
         con.commit()

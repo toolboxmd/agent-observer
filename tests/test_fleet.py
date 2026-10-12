@@ -39,7 +39,7 @@ def add_session(con, harness, native_id, tokens, model="fixture-model",
         (f"{key}:r1", source_id, harness, key, 1, model, semantics,
          tokens, 0, 10, 0, tokens + 10))
     con.execute(
-        "INSERT INTO submissions(native_id, source_id, session_key, kind,"
+        "INSERT INTO user_messages(native_id, source_id, session_key, kind,"
         " text_hash, text_excerpt, is_genuine) VALUES(?,?,?,?,?,?,?)",
         (f"{key}:s1", source_id, key, "genuine", "abc", "secret prompt", 1))
     return key
@@ -402,10 +402,10 @@ class CliTest(LedgerCase):
 
 
 # Cross-machine recurrence (#59 review, after #61): each machine judges its
-# own moments; the fleet report combines judge groups without moment text.
+# own interventions; the fleet report combines judge groups without intervention text.
 from agent_observer import verdicts  # noqa: E402
 from agent_observer.adapters import claude  # noqa: E402
-from tests.test_moments import _line, _write  # noqa: E402
+from tests.test_interventions import _line, _write  # noqa: E402
 
 JUDGE = "opus-5.5/correction-v1"
 PROBLEM = "Deleted files without asking"
@@ -426,10 +426,10 @@ class FleetRecurrenceTest(LedgerCase):
         claude.sync(con, root=root)
         con.commit()
         verdicts.add(con, [
-            {"moment": f"sub:claude:{session}-u2", "behavior": "correction",
+            {"intervention": f"sub:claude:{session}-u2", "behavior": "correction",
              "judge": judge, "verdict": "yes", "problem": PROBLEM,
              "group": group},
-            {"moment": f"sub:claude:{session}-u1", "behavior": "correction",
+            {"intervention": f"sub:claude:{session}-u1", "behavior": "correction",
              "judge": judge, "verdict": "no"}])
         local = verdicts.recurrence(con, "correction")
         self.assertEqual((local["occurrences"], local["recurring_problems"]),
@@ -456,11 +456,11 @@ class FleetRecurrenceTest(LedgerCase):
         [group] = judged["groups"]
         self.assertEqual(group["group"], "destructive")
         self.assertEqual(group["problem"], PROBLEM)
-        self.assertEqual(group["by_origin"], {"human": 2})
+        self.assertEqual(group["by_created_by"], {"user": 2})
         self.assertEqual(group["sessions"], 2)
         self.assertEqual(group["machines"], ["bestia", "rocky"])
-        self.assertEqual(judged["coverage"]["judged_by_origin"]["human"], 4)
-        self.assertEqual(result["moments"]["by_origin"]["human"], 4)
+        self.assertEqual(judged["coverage"]["judged_by_created_by"]["user"], 4)
+        self.assertEqual(result["interventions"]["by_created_by"]["user"], 4)
         self.assertIn("destructive", fleet.render(result))
 
     def test_a_session_on_two_machines_counts_once(self):
@@ -473,14 +473,14 @@ class FleetRecurrenceTest(LedgerCase):
         [judged] = result["recurrence"]
         self.assertEqual((judged["occurrences"], judged["recurring_problems"]),
                          (1, 0))
-        self.assertEqual(result["moments"], alone["moments"])
-        self.assertEqual(result["moments"]["by_origin"]["human"], 2)
-        self.assertEqual(result["moments"]["by_kind"]["prompt"], 2)
+        self.assertEqual(result["interventions"], alone["interventions"])
+        self.assertEqual(result["interventions"]["by_created_by"]["user"], 2)
+        self.assertEqual(result["interventions"]["by_kind"]["prompt"], 2)
         self.assertEqual(judged["coverage"],
                          alone["recurrence"][0]["coverage"])
         self.assertEqual(judged["coverage"]["verdicts"],
                          {"yes": 1, "no": 1, "unclear": 0})
-        self.assertEqual(judged["coverage"]["judged_by_origin"]["human"], 2)
+        self.assertEqual(judged["coverage"]["judged_by_created_by"]["user"], 2)
 
     def test_different_judges_are_reported_apart_and_flagged(self):
         rocky = self.machine("rocky", "sess-r")
@@ -503,7 +503,7 @@ class FleetRecurrenceTest(LedgerCase):
         with self.assertRaises(ValueError):
             fleet.validate(bad)
         bad = json.loads(json.dumps(doc))
-        bad["judgments"][0]["groups"][0]["moments"][0]["origin"] = "robot"
+        bad["judgments"][0]["groups"][0]["interventions"][0]["created_by"] = "robot"
         with self.assertRaises(ValueError):
             fleet.validate(bad)
         for field in ("behavior", "judge"):
@@ -515,3 +515,311 @@ class FleetRecurrenceTest(LedgerCase):
         bad["judgments"][0]["groups"][0]["group"] += "\n"
         with self.assertRaises(ValueError):
             fleet.validate(bad)
+
+
+def to_schema_1(doc):
+    """The same evidence as a schema-2 machine (Observer 0.15.x) exported it."""
+    old = json.loads(json.dumps(doc))
+    old["schema"] = "agent-observer.fleet-export/1"
+    rename = {"user": "human"}
+
+    def counts(parts):
+        out = {}
+        for part, c in parts.items():
+            key = {"by_created_by": "by_origin",
+                   "judged_by_created_by": "judged_by_origin"}.get(part, part)
+            out[key] = {rename.get(k, k): v for k, v in c.items()}
+        return out
+    if "interventions" in old:
+        old["moments"] = {"sessions": {k: counts(v) for k, v in
+                                       old.pop("interventions")["sessions"].items()}}
+    for j in old.get("judgments", []):
+        j["sessions"] = {k: counts(v) for k, v in j["sessions"].items()}
+        for g in j["groups"]:
+            g["moments"] = [{"id": p["id"], "session": p["session"],
+                             "origin": rename.get(p["created_by"], p["created_by"]),
+                             "at": p["at"]} for p in g.pop("interventions")]
+        j["ungrouped"] = [{"id": p["id"], "session": p["session"],
+                           "origin": rename.get(p["created_by"], p["created_by"]),
+                           "at": p["at"]} for p in j["ungrouped"]]
+    return old
+
+
+class SchemaSwitchTest(FleetRecurrenceTest):
+    """During the switch some machines still export schema 1 (#65)."""
+
+    def test_exports_carry_the_new_schema(self):
+        doc = self.machine("rocky", "sess-r")
+        self.assertEqual(doc["schema"], "agent-observer.fleet-export/2")
+        self.assertIn("interventions", doc)
+
+    def test_a_schema_1_export_combines_like_its_schema_2_twin(self):
+        rocky = self.machine("rocky", "sess-r")
+        bestia = self.machine("bestia", "sess-b")
+        new = fleet.combine([rocky, bestia])
+        mixed = fleet.combine([rocky, to_schema_1(bestia)])
+        for key in ("interventions", "recurrence", "unmerged_behaviors"):
+            self.assertEqual(mixed[key], new[key], key)
+        old = to_schema_1(rocky)
+        self.assertNotIn("interventions", json.dumps(old))
+        stored = fleet._schema_only(fleet.validate(old))
+        self.assertEqual(stored["schema"], "agent-observer.fleet-export/2")
+        self.assertEqual(stored["judgments"], rocky["judgments"])
+
+
+class LegacyValidationTest(SchemaSwitchTest):
+    """Malformed schema-1 evidence is refused, never read as absent (#68)."""
+
+    def legacy(self):
+        return to_schema_1(self.machine("rocky", "sess-r"))
+
+    def test_malformed_legacy_evidence_is_refused(self):
+        cases = []
+        doc = self.legacy(); doc["judgments"] = {}; cases.append(doc)
+        doc = self.legacy(); doc["judgments"][0]["groups"] = None; cases.append(doc)
+        doc = self.legacy(); del doc["judgments"][0]["groups"]; cases.append(doc)
+        doc = self.legacy(); doc["moments"] = []; cases.append(doc)
+        doc = self.legacy(); doc["moments"]["sessions"] = None; cases.append(doc)
+        doc = self.legacy(); doc["judgments"][0]["ungrouped"] = {}; cases.append(doc)
+        for n, bad in enumerate(cases):
+            with self.assertRaises(ValueError, msg=f"case {n}"):
+                fleet.validate(bad)
+
+    def test_legacy_export_without_judge_evidence_stays_valid(self):
+        doc = self.legacy()
+        del doc["moments"], doc["judgments"]
+        self.assertEqual(fleet.validate(doc).get("judgments", []), [])
+
+    def test_refused_pull_keeps_the_stored_export(self):
+        store = os.path.join(self.tmp.name, "fleet")
+
+        def run_with(doc):
+            def run(argv, **kwargs):
+                return subprocess.CompletedProcess(argv, 0, json.dumps(doc), "")
+            return run
+        good = self.legacy()
+        fleet.pull("rocky", store, run=run_with(good))
+        path = os.path.join(store, "rocky.json")
+        before = open(path, "rb").read()
+        bad = json.loads(json.dumps(good))
+        bad["judgments"] = {}
+        with self.assertRaises(fleet.PullError):
+            fleet.pull("rocky", store, run=run_with(bad))
+        self.assertEqual(open(path, "rb").read(), before)
+
+
+def from_schema_2_to_1(doc):
+    """Exact inverse of the legacy translation, for round-trip checks."""
+    if doc.get("schema") != fleet.SCHEMA:
+        return doc
+    return to_schema_1(doc)
+
+
+class StrictLegacyTest(SchemaSwitchTest):
+    """Any malformed, unknown, colliding or lossy schema-1 evidence is
+    refused; anything accepted round-trips exactly (#68 round 3)."""
+
+    def legacy(self):
+        return to_schema_1(self.machine("rocky", "sess-r"))
+
+    def pull_twice(self, good, bad):
+        store = os.path.join(self.tmp.name, "fleet")
+
+        def run_with(doc):
+            def run(argv, **kwargs):
+                return subprocess.CompletedProcess(argv, 0, json.dumps(doc), "")
+            return run
+        fleet.pull("rocky", store, run=run_with(good))
+        path = os.path.join(store, "rocky.json")
+        before = open(path, "rb").read()
+        with self.assertRaises(fleet.PullError):
+            fleet.pull("rocky", store, run=run_with(bad))
+        self.assertEqual(open(path, "rb").read(), before)
+
+    def test_colliding_legacy_keys_are_refused_at_the_pull_boundary(self):
+        good = self.legacy()
+        key = next(iter(good["moments"]["sessions"]))
+        cases = []
+        bad = json.loads(json.dumps(good))
+        bad["moments"]["sessions"][key]["by_origin"]["user"] = 0
+        cases.append(bad)
+        bad = json.loads(json.dumps(good))
+        bad["moments"]["sessions"][key]["by_created_by"] = {"user": 0}
+        cases.append(bad)
+        bad = json.loads(json.dumps(good))
+        jkey = next(iter(bad["judgments"][0]["sessions"]))
+        bad["judgments"][0]["sessions"][jkey]["judged_by_origin"]["user"] = 0
+        cases.append(bad)
+        bad = json.loads(json.dumps(good))
+        bad["judgments"][0]["sessions"][jkey]["judged_by_created_by"] = {"user": 0}
+        cases.append(bad)
+        bad = json.loads(json.dumps(good))
+        bad["judgments"][0]["groups"][0]["moments"][0]["created_by"] = "user"
+        cases.append(bad)
+        for bad in cases:
+            self.pull_twice(good, bad)
+
+    def test_non_string_origin_is_a_value_error(self):
+        bad = self.legacy()
+        bad["judgments"][0]["groups"][0]["moments"][0]["origin"] = []
+        with self.assertRaises(ValueError):
+            fleet.validate(bad)
+
+    def test_any_mutation_is_preserved_exactly_or_refused(self):
+        good = self.legacy()
+        replacements = (None, True, -1, 0, 2 ** 60, "", "human", "user",
+                        "x\ny", [], {}, [1], {"user": 0})
+
+        def paths(node, at=()):
+            yield at
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    yield from paths(v, at + (k,))
+            elif isinstance(node, list):
+                for i, v in enumerate(node):
+                    yield from paths(v, at + (i,))
+
+        def mutated(path):
+            """Replace, delete or extend the node at path."""
+            for value in replacements:
+                doc = json.loads(json.dumps(good))
+                parent = doc
+                for step in path[:-1]:
+                    parent = parent[step]
+                if path:
+                    parent[path[-1]] = value
+                yield doc
+            if path and isinstance(path[-1], str):
+                doc = json.loads(json.dumps(good))
+                parent = doc
+                for step in path[:-1]:
+                    parent = parent[step]
+                del parent[path[-1]]
+                yield doc
+            node = good
+            for step in path:
+                node = node[step]
+            if isinstance(node, dict):
+                for extra in ("user", "human", "by_created_by", "created_by",
+                              "unknown_key"):
+                    if extra in node:
+                        continue
+                    doc = json.loads(json.dumps(good))
+                    target = doc
+                    for step in path:
+                        target = target[step]
+                    target[extra] = 0
+                    yield doc
+
+        checked = refused = 0
+        for path in list(paths(good)):
+            if path[:1] in (("sessions",), ("tasks",)):
+                continue  # not translated; covered by the schema-2 tests
+            for doc in mutated(path):
+                checked += 1
+                try:
+                    parsed = fleet.validate(json.loads(json.dumps(doc)))
+                except ValueError:
+                    refused += 1
+                    continue
+                self.assertEqual(from_schema_2_to_1(parsed), doc, path)
+        self.assertGreater(checked, 100)
+        self.assertGreater(refused, 0)
+
+
+class GatedWriteTest(FleetRecurrenceTest):
+    def test_the_written_file_is_validated_before_it_replaces_the_store(self):
+        # Corrupt the bytes between validation and the write: only a check
+        # of the written temp file can stop them replacing the store.
+        from unittest import mock
+        stdout = json.dumps(to_schema_1(self.machine("rocky", "sess-r")))
+        store = os.path.join(self.tmp.name, "fleet")
+
+        def run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, stdout, "")
+        fleet.pull("rocky", store, run=run)
+        path = os.path.join(store, "rocky.json")
+        before = open(path, "rb").read()
+        real = json.dumps
+
+        def truncated(obj, *args, **kwargs):
+            text = real(obj, *args, **kwargs)
+            return text[:len(text) // 2]
+        with mock.patch.object(fleet.json, "dumps", truncated):
+            with self.assertRaises(fleet.PullError):
+                fleet.pull("rocky", store, run=run)
+        self.assertEqual(open(path, "rb").read(), before)
+        self.assertEqual(sorted(os.listdir(store)), ["rocky.json"])
+
+
+def dumps_with_duplicate(node, path, key, value):
+    """JSON text of node with `key` repeated (second value `value`) in the
+    object at `path`; json.dumps cannot emit duplicate keys."""
+    def emit(n, at):
+        if isinstance(n, dict):
+            items = [f"{json.dumps(k)}:{emit(v, at + (k,))}" for k, v in n.items()]
+            if at == path:
+                items.append(f"{json.dumps(key)}:{json.dumps(value)}")
+            return "{" + ",".join(items) + "}"
+        if isinstance(n, list):
+            return "[" + ",".join(emit(v, at + (i,)) for i, v in enumerate(n)) + "]"
+        return json.dumps(n)
+    return emit(node, ())
+
+
+class DuplicateKeyTest(FleetRecurrenceTest):
+    """Duplicate JSON keys are refused at the read boundary (#68 round 4)."""
+
+    def test_raw_duplicate_keys_never_replace_the_stored_export(self):
+        good = to_schema_1(self.machine("rocky", "sess-r"))
+        key = next(iter(good["moments"]["sessions"]))
+        raws = [
+            dumps_with_duplicate(good, ("moments", "sessions", key, "by_origin"),
+                                 "human", 0),
+            dumps_with_duplicate(good, ("moments", "sessions", key),
+                                 "by_origin", {"human": 0}),
+            dumps_with_duplicate(good, (), "moments", {"sessions": {}}),
+        ]
+        store = os.path.join(self.tmp.name, "fleet")
+
+        def run_with(text):
+            def run(argv, **kwargs):
+                return subprocess.CompletedProcess(argv, 0, text, "")
+            return run
+        fleet.pull("rocky", store, run=run_with(json.dumps(good)))
+        path = os.path.join(store, "rocky.json")
+        before = open(path, "rb").read()
+        for raw in raws:
+            with self.assertRaises(fleet.PullError) as caught:
+                fleet.pull("rocky", store, run=run_with(raw))
+            self.assertIn("duplicate key", str(caught.exception))
+            self.assertEqual(open(path, "rb").read(), before)
+
+    def test_a_stored_file_with_duplicate_keys_is_skipped(self):
+        doc = self.machine("rocky", "sess-r")
+        store = os.path.join(self.tmp.name, "fleet")
+        os.makedirs(store)
+        with open(os.path.join(store, "rocky.json"), "w") as fh:
+            fh.write(dumps_with_duplicate(doc, (), "machine", "rocky"))
+        self.assertEqual(fleet.stored(store), [])
+
+    def test_every_duplicated_key_is_refused(self):
+        good = to_schema_1(self.machine("rocky", "sess-r"))
+
+        def objects(node, at=()):
+            if isinstance(node, dict):
+                yield at, node
+                for k, v in node.items():
+                    yield from objects(v, at + (k,))
+            elif isinstance(node, list):
+                for i, v in enumerate(node):
+                    yield from objects(v, at + (i,))
+        checked = 0
+        for at, node in objects(good):
+            for key, value in node.items():
+                for again in (value, 0, None):
+                    raw = dumps_with_duplicate(good, at, key, again)
+                    with self.assertRaises(ValueError, msg=(at, key)):
+                        fleet.validate(fleet.loads(raw))
+                    checked += 1
+        self.assertGreater(checked, 50)

@@ -5,34 +5,34 @@ corrections through Agent Observer. Observer runs no model. The judge runs
 anywhere it can call `agent-observer`, for example as a contextmd job.
 Copy the prompt and adapt it; Observer does not read this file.
 
-The judge works in two passes: pass 1 labels each moment, and pass 2
+The judge works in two passes: pass 1 labels each intervention, and pass 2
 groups the corrections. Use the same judge id in both passes, because a
-verdict's key is its moment, behavior and judge.
+verdict's key is its intervention, behavior and judge.
 
 ## Pass 1: label
 
 ```text
-You label moments where someone acted on a coding agent: a person, or
-another agent (a parent, reviewer or planner writing to a worker). The
-moment's `origin` says which.
+You label interventions where someone acted on a coding agent: a person, or
+another agent (a parent, reviewer or planner writing to a child). The
+intervention's `created_by` says which.
 Behavior: correction. Judge id: <model>/correction-v1.
 
 1. List your work:
-   agent-observer moments --since <date> --until <date> --unjudged correction --judge <judge id> --json
-2. Read moments in batches of about 10:
-   agent-observer moment show <id> <id> ... --json
-   Each moment has the person's full text (`text`) and whole turns around
+   agent-observer interventions --since <date> --until <date> --unjudged correction --judge <judge id> --json
+2. Read interventions in batches of about 10:
+   agent-observer intervention show <id> <id> ... --json
+   Each intervention has the person's full text (`text`) and whole turns around
    it: `before` (the turn it answers, opened by the previous prompt) and
    `after` (the agent's reply, closed by the next prompt). Add
    `--turns-before N --turns-after N` when one turn is not enough, and
    record the window you used in your judge id (for example
    `<model>/correction-v1@1x1`). A rejection has no text; its `tool`
    names the refused tool call.
-3. For each moment decide:
+3. For each intervention decide:
    - yes: the sender tells the agent that something it did, said or was
      about to do is wrong, unwanted or not what they asked. From another
-     agent this includes review findings that the worker must fix and a
-     parent re-sending an instruction the worker ignored. This includes
+     agent this includes review findings that the child must fix and a
+     parent re-sending an instruction the child ignored. This includes
      stopping it (an interrupt or a rejected tool call) when the context
      shows why, repeating an instruction the agent ignored, and complaints
      that the agent made the same mistake again.
@@ -42,8 +42,8 @@ Behavior: correction. Judge id: <model>/correction-v1.
      or by an unrelated request.
    - unclear: the context cannot tell, for example an interrupt with no
      later prompt and no visible reason.
-   A moment with `opening: true` came before anything the agent did in
-   its session (a first prompt or a worker's brief), so it cannot correct
+   An intervention with `opening: true` came before anything the agent did in
+   its session (a first prompt or a child's brief), so it cannot correct
    that agent. Read only its text (`--turns-before 0 --turns-after 0`):
    it is no unless the text itself says an earlier agent or attempt got
    something wrong (a retry brief naming the failure), which is yes.
@@ -57,8 +57,8 @@ Behavior: correction. Judge id: <model>/correction-v1.
    session's details ("ran 74 judges for step 0").
 4. Store each batch as JSON lines:
    agent-observer verdict add --json < batch.jsonl
-   {"moment": "<id>", "behavior": "correction", "judge": "<judge id>", "verdict": "yes", "problem": "<line>"}
-   {"moment": "<id>", "behavior": "correction", "judge": "<judge id>", "verdict": "no"}
+   {"intervention": "<id>", "behavior": "correction", "judge": "<judge id>", "verdict": "yes", "problem": "<line>"}
+   {"intervention": "<id>", "behavior": "correction", "judge": "<judge id>", "verdict": "no"}
    Observer stores a batch only when every line is valid. Fix the lines
    named in `errors` and send the batch again.
 ```
@@ -79,7 +79,7 @@ behaviors do not.
 2. Give each new group a short kebab-case id, for example
    `parallel-agents-without-approval`.
 3. Add each yes verdict again with its group:
-   {"moment": "<id>", "behavior": "correction", "judge": "<judge id>", "verdict": "yes", "problem": "<line>", "group": "<group id>"}
+   {"intervention": "<id>", "behavior": "correction", "judge": "<judge id>", "verdict": "yes", "problem": "<line>", "group": "<group id>"}
 ```
 
 ## Report
@@ -90,6 +90,6 @@ agent-observer recurrence --behavior correction --since <date> --until <date>
 
 The report counts the corrections, the problems, the problems that recur
 in two or more sessions, and the repeats per group, with first and last
-seen, sessions and hosts. It also shows how many moments are still
-unjudged, by origin, and the hook and rule denials, which never count as
+seen, sessions and hosts. It also shows how many interventions are still
+unjudged, by `created_by`, and the hook and rule denials, which never count as
 corrections.

@@ -77,14 +77,14 @@ class ReviewRegressions(CloseLoopCase):
         self.assertFalse(r['complete'])
         self.assertIsNone(r['estimated_cost']['estimated_cost_usd_total'])
         self.assertIsNone(r['native_cost']['total_usd'])
-        self.assertEqual(r['coverage']['unbound_dispatches'], ['codex:missing-worker'])
+        self.assertEqual(r['coverage']['unbound_delegations'], ['codex:missing-worker'])
 
     def test_dispatch_with_owned_native_session_has_no_ownership_gap(self):
         self._two_tasks()
         worker = 'codex:sess-fixture-mini-01'
         run(self.db, 'capture', 'dispatch', '--submission', 'msg-mini-sub-01', '--worker', worker)
         r = self._task_json('T-A')
-        self.assertEqual(r['coverage']['unbound_dispatches'], [])
+        self.assertEqual(r['coverage']['unbound_delegations'], [])
         self.assertTrue(r['complete'])
 
     def test_dispatch_resolves_unique_bare_native_id_but_not_ambiguous_id(self):
@@ -92,14 +92,14 @@ class ReviewRegressions(CloseLoopCase):
         worker = 'sess-fixture-mini-01'
         run(self.db, 'capture', 'dispatch', '--submission', 'msg-mini-sub-01', '--worker', worker)
         r = self._task_json('T-A')
-        self.assertEqual(r['coverage']['unbound_dispatches'], [])
+        self.assertEqual(r['coverage']['unbound_delegations'], [])
         self.assertTrue(r['complete'])
         con = self.connect()
         con.execute("INSERT INTO sessions(session_key,harness,native_id,updated_at)"
                     " VALUES(?,?,?,1)", ('claude:'+worker,'claude',worker))
         con.commit()
         r = self._task_json('T-A')
-        self.assertEqual(r['coverage']['unbound_dispatches'], [worker])
+        self.assertEqual(r['coverage']['unbound_delegations'], [worker])
         self.assertFalse(r['complete'])
 
     def connect(self):
