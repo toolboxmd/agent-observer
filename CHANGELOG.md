@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.15.1] - 2026-10-12
+
+### Changed
+
+- Read-only commands (`export`, `fleet`, `task`, `event`) open an idle ledger on SQLite builds that cannot open a WAL database read-only once its `-shm` file is gone, such as Apple's 3.43 behind macOS `/usr/bin/python3`; they fall back to a read-write open with `query_only` that never creates a ledger (#63)
+
 ## [0.15.0] - 2026-10-12
 
 ### Added
