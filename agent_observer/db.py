@@ -390,9 +390,10 @@ def _open_existing(path: str) -> sqlite3.Connection:
 
     `?mode=ro` comes first. Some SQLite builds (Apple's 3.43 behind macOS
     /usr/bin/python3) cannot open a WAL ledger read-only once the last
-    connection removed its -shm file (#63); they get a read-write open
-    that must find the file (`?mode=rw`) and refuses writes
-    (`query_only`), so SQLite can recreate -shm like any concurrent reader.
+    connection removed its -shm file (#63); for an idle ledger (no WAL
+    frames) they get a read-write open that must find the file
+    (`?mode=rw`) and refuses writes (`query_only`), so SQLite can recreate
+    -shm like any concurrent reader.
     """
     uri = Path(path).absolute().as_uri()
     con = sqlite3.connect(uri + "?mode=ro", uri=True)
@@ -406,12 +407,17 @@ def _open_existing(path: str) -> sqlite3.Connection:
         con.close()
         raise
     con.close()
-    if not os.path.isfile(path):
+    # The fallback only serves an idle ledger. With WAL frames present a
+    # read-write close could checkpoint them into the file, and a read-only
+    # command must not write, so it refuses instead.
+    wal = path + "-wal"
+    if not os.path.isfile(path) or (os.path.exists(wal)
+                                     and os.path.getsize(wal) > 0):
         raise refused
     try:
         con = sqlite3.connect(uri + "?mode=rw", uri=True)
     except sqlite3.Error:
-        raise refused from None
+        raise refused
     try:
         con.execute("PRAGMA query_only=ON")
         con.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
@@ -419,7 +425,7 @@ def _open_existing(path: str) -> sqlite3.Connection:
         # Report what the read-only open said, not the fallback's error
         # (for example "attempt to write a readonly database").
         con.close()
-        raise refused from None
+        raise refused
     return con
 
 

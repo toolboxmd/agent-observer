@@ -113,7 +113,7 @@ class IdleLedgerTest(unittest.TestCase):
 
         class Unreadable(sqlite3.Connection):
             def execute(self, *args, **kwargs):
-                raise sqlite3.OperationalError("unable to open database file")
+                raise sqlite3.OperationalError("ro probe refused")
 
         def probe_fails(target, *args, **kwargs):
             if isinstance(target, str) and target.endswith("?mode=ro"):
@@ -125,8 +125,35 @@ class IdleLedgerTest(unittest.TestCase):
                            return_value=True):
             with self.assertRaises(sqlite3.OperationalError) as caught:
                 db.connect_read_only(missing)
-        self.assertEqual(str(caught.exception), "unable to open database file")
+        self.assertEqual(str(caught.exception), "ro probe refused")
         self.assertFalse(os.path.exists(missing))
+
+    def test_no_fallback_while_the_wal_holds_frames(self):
+        # A reader's close can checkpoint a non-empty WAL into the ledger;
+        # a read-only command must refuse rather than write.
+        writer = sqlite3.connect(self.path)
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("INSERT INTO tasks(task_id, created_at) VALUES('t', 1)")
+        writer.commit()
+        self.assertGreater(os.path.getsize(self.path + "-wal"), 0)
+        before = _digest(self.path)
+        real = sqlite3.connect
+
+        class Unreadable(sqlite3.Connection):
+            def execute(self, *args, **kwargs):
+                raise sqlite3.OperationalError("ro probe refused")
+
+        def probe_fails(target, *args, **kwargs):
+            if isinstance(target, str) and target.endswith("?mode=ro"):
+                return real(":memory:", factory=Unreadable)
+            return real(target, *args, **kwargs)
+
+        with mock.patch("agent_observer.db.sqlite3.connect", probe_fails):
+            with self.assertRaises(sqlite3.OperationalError) as caught:
+                db.connect_read_only(self.path)
+        self.assertEqual(str(caught.exception), "ro probe refused")
+        self.assertEqual(_digest(self.path), before)
+        writer.close()
 
     def test_missing_ledger_is_never_created(self):
         missing = os.path.join(self.tmp.name, "absent.db")
