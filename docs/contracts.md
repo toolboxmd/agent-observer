@@ -395,9 +395,24 @@ or calls it.
 ## Chromeria/T3 attribution (`sync --harness t3`)
 
 T3 state is read from a live database copy or snapshot, never written:
-`$T3CODE_HOME/userdata/state.sqlite` (default `~/.t3`) opens read-only,
-and `sync --source` accepts an explicit state file. The mirror is a full
+`$T3CODE_HOME/userdata/chromeria-v2.sqlite` (default `~/.t3`) opens
+read-only when present, else `state.sqlite`, and `sync --source` accepts
+an explicit state file. Chromeria seeded the V2 file from `state.sqlite`,
+so it also holds the frozen V1 tables; legacy threads keep their V1 ids,
+so one read covers both without double counting. The mirror is a full
 re-read every sync; workload bindings are durable ledger rows.
+
+- Chromeria V2: thread payload `lineage` gives parent and root; V2 ids
+  carry no `sub.` prefix. `pullRequests` snapshots are PR links (a V2
+  snapshot replaces the V1 row for the same thread and PR). Each provider
+  thread's strong `nativeThreadRef.nativeId` is a native Claude, Codex,
+  Grok or OpenCode session of its thread. V2 has no native turn ids, so a
+  Claude prompt takes its origin from a V2 user message with the same
+  text hash in the same native session (a run on another driver's provider
+  thread is no evidence): `createdBy=user` from `web` or `mobile` is `genuine`, `agent` or `system` is `synthetic`, a hash sent by
+  both stays unknown, and uuid evidence outranks it. Legacy copies of V1
+  messages (`user` from `server`) are no evidence. Only hashes are
+  stored. Prompts classified at import keep their excerpt.
 
 - Turn origin: `thread.turn-start-requested` `actor_kind` (`client` human,
   `server` dispatch) joins the native Claude user-message uuid through
@@ -425,7 +440,10 @@ re-read every sync; workload bindings are durable ledger rows.
   `user` message whose first line is Chromeria's
   `[Message from <title> (thread <id>)]` records sender id, target thread
   and time; Chromeria adds that line only when the target is not the
-  sender's child. `thread-misuse` reads these two tables only.
+  sender's child. V2 children record their lineage parent and depth; a V2
+  agent message with a `senderThreadId` into a thread that is not the
+  sender's child records the same fields. `thread-misuse` reads these two
+  tables only and follows the recorded parents for chains.
 
 ## Codex model context across imports
 

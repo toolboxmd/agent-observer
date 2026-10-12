@@ -633,6 +633,19 @@ def _t3_actor(con, uuid: str) -> str | None:
     return _t3.turn_actor(con, uuid)
 
 
+def _t3_prompt_actor(con, native_session, text: str) -> str | None:
+    """The Chromeria V2 origin of a main-session prompt, by text hash.
+
+    V2 records no native turn ids, so T3 mirrors who sent each prompt per
+    native session and text hash. Unknown stays unknown.
+    """
+    try:
+        from . import t3 as _t3
+    except ImportError:
+        return None
+    return _t3.prompt_actor(con, native_session, text_hash(text))
+
+
 def _user_kind(r: _Reader, obj: dict, text: str) -> str:
     if obj.get("isSidechain") or r.agent_id:
         return "synthetic"
@@ -656,7 +669,8 @@ def _user_kind(r: _Reader, obj: dict, text: str) -> str:
         # synthetic when a dispatch sent it. Scaffolding and interrupt
         # verdicts above already failed closed, and unlisted records
         # (typed prompts, Router sdk-cli workers) fall through unchanged.
-        actor = _t3_actor(r.con, uuid)
+        actor = _t3_actor(r.con, uuid) \
+            or _t3_prompt_actor(r.con, r.native_session, text)
         if actor == "client":
             return "genuine"
         if actor == "server":

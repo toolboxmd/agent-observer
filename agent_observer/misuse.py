@@ -34,25 +34,34 @@ def role_of(thread_id: str) -> str | None:
     return match.group(1) if match else None
 
 
-def chain(thread_id: str) -> list:
+def _parent(thread_id: str, parents: dict | None) -> str | None:
+    """The mirrored parent (V2 lineage), else the one a ``sub.`` id names."""
+    if parents and thread_id in parents:
+        return parents[thread_id]
+    return parent_thread(thread_id)
+
+
+def chain(thread_id: str, parents: dict | None = None) -> list:
     """Every thread from the root down to ``thread_id``."""
     out = [thread_id]
-    parent = parent_thread(thread_id)
-    while parent is not None:
+    parent = _parent(thread_id, parents)
+    while parent is not None and parent not in out:
         out.append(parent)
-        parent = parent_thread(parent)
+        parent = _parent(parent, parents)
     return list(reversed(out))
 
 
-def relation(sender: str, target: str) -> str:
+def relation(sender: str, target: str, parents: dict | None = None) -> str:
     """How a message target relates to its sender in the spawn tree."""
-    if target == parent_thread(sender):
+    if target == _parent(sender, parents):
         return "child to parent"
-    if target in chain(sender):
+    sender_chain = chain(sender, parents)
+    target_chain = chain(target, parents)
+    if target in sender_chain:
         return "to ancestor"
-    if sender in chain(target):
+    if sender in target_chain:
         return "to grandchild or deeper"
-    if thread_root(sender) == thread_root(target):
+    if thread_root(sender_chain[0]) == thread_root(target_chain[0]):
         return "within tree"
     return "across trees"
 
@@ -80,6 +89,9 @@ def report(con: sqlite3.Connection, since: float | None = None,
     if not {"t3_spawns", "t3_messages"} <= _tables(con):
         out["imported"] = False
         return out
+    parents = {row["thread_id"]: row["parent_thread_id"]
+               for row in con.execute(
+                   "SELECT thread_id, parent_thread_id FROM t3_spawns")}
     for row in con.execute(
             "SELECT thread_id, depth, created_at FROM t3_spawns"
             " WHERE depth>? ORDER BY created_at, thread_id", (MAX_DEPTH,)):
@@ -93,7 +105,7 @@ def report(con: sqlite3.Connection, since: float | None = None,
             "role": role_of(row["thread_id"]),
             "created_at": row["created_at"],
             "chain": [{"thread_id": t, "role": role_of(t)}
-                      for t in chain(row["thread_id"])]})
+                      for t in chain(row["thread_id"], parents)]})
     for row in con.execute(
             "SELECT sender_thread_id, target_thread_id, sent_at"
             " FROM t3_messages ORDER BY sent_at, message_id"):
@@ -106,7 +118,7 @@ def report(con: sqlite3.Connection, since: float | None = None,
         out["cross_messages"].append({
             "sender": sender, "sender_role": role_of(sender),
             "target": target, "target_role": role_of(target),
-            "relation": relation(sender, target), "sent_at": row["sent_at"]})
+            "relation": relation(sender, target, parents), "sent_at": row["sent_at"]})
     return out
 
 
