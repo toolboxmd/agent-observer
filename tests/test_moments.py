@@ -105,6 +105,23 @@ def claude_tree(root):
               entrypoint="sdk-ts"),
         _line(s3, "user", "w2", "Delegated task finished.", 122,
               entrypoint="sdk-ts", promptSource="sdk"),
+        # A stop in a top-level Chromeria thread is a person.
+        _line(s3, "user", "w3", "[Request interrupted by user]", 123,
+              entrypoint="sdk-ts"),
+    ])
+    s4 = "sess-four"
+    _write(os.path.join(root, "proj", f"{s4}.jsonl"), [
+        _line(s4, "assistant", "d1",
+              _tool_use("toolu_cp", "Bash", {"command": "scp a bestia:"}), 180,
+              entrypoint="sdk-ts"),
+        # In a child thread an agent can stop or refuse too: unknown.
+        _line(s4, "user", "x1", _tool_result("toolu_cp", "rejected", True),
+              181, entrypoint="sdk-ts", toolDenialKind="user-rejected"),
+        _line(s4, "user", "x2", "[Request interrupted by user for tool use]",
+              181, entrypoint="sdk-ts"),
+        # Two seconds later is no longer the rejection's echo.
+        _line(s4, "user", "x3", "[Request interrupted by user]", 183,
+              entrypoint="sdk-ts"),
     ])
 
 
@@ -153,6 +170,9 @@ class MomentsCase(unittest.TestCase):
                           "sess-three"))
         self.con.execute("INSERT INTO t3_threads VALUES(?,?,?,?,?)",
                          ("th-child", "th-root", "codex", None, "cx-1"))
+        self.con.execute("INSERT INTO t3_threads VALUES(?,?,?,?,?)",
+                         ("th-child2", "th-root", "claudeAgent", None,
+                          "sess-four"))
         claude_tree(os.path.join(self.root, "claude"))
         claude.sync(self.con, root=os.path.join(self.root, "claude"))
         rollout = os.path.join(self.root, "codex", "rollout-cx-1.jsonl")
@@ -182,6 +202,9 @@ class SelectTest(MomentsCase):
             "ev:claude:sess-one/permission/toolu_edit": ("rejection", "human"),
             "sub:claude:v1": ("prompt", "agent"),
             "sub:claude:w1": ("prompt", "human"),
+            "sub:claude:w3": ("interrupt", "human"),
+            "ev:claude:sess-four/permission/toolu_cp": ("rejection", "unknown"),
+            "sub:claude:x3": ("interrupt", "unknown"),
             "sub:codex:msg-u1": ("prompt", "agent"),
             "ev:codex:cx-1/lifecycle/turn_aborted:t1": ("interrupt", "unknown"),
         }
@@ -195,9 +218,9 @@ class SelectTest(MomentsCase):
     def test_default_selects_human_moments_and_counts_the_rest(self):
         result = self.select()
         self.assertEqual({m["origin"] for m in result["moments"]}, {"human"})
-        self.assertEqual(len(result["moments"]), 6)
+        self.assertEqual(len(result["moments"]), 7)
         self.assertEqual(result["counts"]["by_origin"],
-                         {"human": 6, "agent": 2, "unknown": 1})
+                         {"human": 7, "agent": 2, "unknown": 3})
 
     def test_hook_and_rule_denials_are_counted_never_selected(self):
         result = self.select(origins=None)
@@ -218,14 +241,14 @@ class SelectTest(MomentsCase):
         self.assertEqual(set(self.ids(self.select(since=since, until=until))),
                          {"sub:claude:u3", "sub:claude:u4"})
         self.assertEqual(set(self.ids(self.select(kinds=["interrupt"]))),
-                         {"sub:claude:u3"})
+                         {"sub:claude:u3", "sub:claude:w3"})
 
     def test_session_attribute_filter(self):
         verdicts.add_session_attributes(self.con, [
             {"session": "claude:sess-three", "name": "arm", "value": "holdout"},
             {"session": "claude:sess-one", "name": "arm", "value": "served"}])
         self.assertEqual(set(self.ids(self.select(attrs={"arm": "holdout"}))),
-                         {"sub:claude:w1"})
+                         {"sub:claude:w1", "sub:claude:w3"})
 
 
 class ShowTest(MomentsCase):
@@ -332,11 +355,12 @@ class VerdictTest(MomentsCase):
                verdict("sub:claude:u1", "maybe"),
                {**verdict("sub:claude:u1", "no"), "extra": 1},
                verdict("sub:claude:u3", problem="two\nlines"),
-               verdict("sub:claude:u3", problem="ok", group="Bad Group")]
+               verdict("sub:claude:u3", problem="ok", group="Bad Group"),
+               verdict("sub:claude:u2", "no")]
         with self.assertRaises(verdicts.VerdictError) as caught:
             verdicts.add(self.con, bad)
         self.assertEqual([e["line"] for e in caught.exception.errors],
-                         [2, 3, 4, 5, 6, 7, 8])
+                         [2, 3, 4, 5, 6, 7, 8, 9])
         self.assertEqual(self.con.execute(
             "SELECT COUNT(*) FROM verdicts").fetchone()[0], 0)
 
@@ -364,6 +388,11 @@ class VerdictTest(MomentsCase):
         self.assertIn("sub:claude:u1", left)
         self.assertIn("sub:claude:u2",
                       self.ids(moments.select(self.con, unjudged="praise")))
+        # A second judge still gets the moment as work.
+        self.assertIn("sub:claude:u2", self.ids(moments.select(
+            self.con, unjudged="correction", judge="sol/v1")))
+        self.assertNotIn("sub:claude:u2", self.ids(moments.select(
+            self.con, unjudged="correction", judge=JUDGE)))
 
 
 class RecurrenceTest(MomentsCase):
@@ -386,8 +415,9 @@ class RecurrenceTest(MomentsCase):
     def test_groups_repeats_sessions_and_hosts(self):
         report = verdicts.recurrence(self.con, "correction")
         self.assertEqual(report["judge"], JUDGE)
-        self.assertEqual(report["occurrences"], 4)
-        self.assertEqual(report["ungrouped"], 1)
+        # The Codex interrupt is unknown origin: outside the default.
+        self.assertEqual(report["occurrences"], 3)
+        self.assertEqual(report["ungrouped"], 0)
         self.assertEqual(report["problems"], 2)
         self.assertEqual(report["recurring_problems"], 0)
         first = report["groups"][0]
@@ -400,9 +430,9 @@ class RecurrenceTest(MomentsCase):
         self.assertEqual(report["policy_denials"],
                          {"hook_or_rule": 1, "automode": 0})
         coverage = report["coverage"]
-        self.assertEqual(coverage["judged"], 7)
+        self.assertEqual(coverage["judged"], 6)
         self.assertEqual(coverage["unjudged_by_origin"],
-                         {"human": 0, "agent": 2, "unknown": 0})
+                         {"human": 1, "agent": 0, "unknown": 0})
 
     def test_problem_recurs_when_seen_in_two_sessions(self):
         verdicts.add(self.con, [verdict(
@@ -411,6 +441,16 @@ class RecurrenceTest(MomentsCase):
         report = verdicts.recurrence(self.con, "correction")
         self.assertEqual(report["recurring_problems"], 1)
         self.assertEqual(report["groups"][0]["sessions"], 2)
+
+    def test_only_human_moments_count_unless_asked(self):
+        verdicts.add(self.con, [verdict("sub:claude:v1",
+                                        problem="Agent brief", group="brief")])
+        report = verdicts.recurrence(self.con, "correction")
+        self.assertNotIn("brief", [g["group"] for g in report["groups"]])
+        self.assertEqual(report["occurrences"], 3)
+        every = verdicts.recurrence(self.con, "correction", origins=None)
+        self.assertIn("brief", [g["group"] for g in every["groups"]])
+        self.assertEqual(every["occurrences"], 5)
 
     def test_session_attribute_and_period_filters(self):
         verdicts.add_session_attributes(self.con, [
@@ -444,7 +484,7 @@ class CliTest(MomentsCase):
         code, out = self.run_cli("moments", "--json")
         self.assertEqual(code, 0)
         listed = json.loads(out)
-        self.assertEqual(len(listed["moments"]), 6)
+        self.assertEqual(len(listed["moments"]), 7)
         code, out = self.run_cli("moment", "show", "sub:claude:u2", "--json")
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)["moments"][0]["status"], "ok")

@@ -45,7 +45,7 @@ def _one_line(value, limit: int) -> bool:
         and "\n" not in value and "\r" not in value and len(value) <= limit
 
 
-def _check(con, record) -> str | None:
+def _check(con, record, ev) -> str | None:
     if not isinstance(record, dict):
         return "not a JSON object"
     extra = set(record) - FIELDS
@@ -71,14 +71,23 @@ def _check(con, record) -> str | None:
             return "group must match [a-z0-9][a-z0-9._-]*"
     elif problem is not None or group is not None:
         return "problem and group belong only to a yes verdict"
-    if _moments.resolve(con, record["moment"]) is None:
+    if _moments.resolve(con, record["moment"], ev) is None:
         return "unknown moment"
     return None
 
 
 def add(con: sqlite3.Connection, records: list) -> dict:
-    errors = [{"line": n, "error": e} for n, e in
-              ((n, _check(con, r)) for n, r in enumerate(records, 1)) if e]
+    ev = _moments.evidence(con)
+    errors, seen = [], set()
+    for n, r in enumerate(records, 1):
+        error = _check(con, r, ev)
+        if error is None:
+            key = (r["moment"], r["behavior"], r["judge"])
+            if key in seen:
+                error = "the same moment, behavior and judge appear twice"
+            seen.add(key)
+        if error:
+            errors.append({"line": n, "error": error})
     if errors:
         raise VerdictError(f"{len(errors)} invalid lines; nothing stored",
                            errors)
@@ -178,10 +187,12 @@ def _group_entries(rows, scope: dict) -> list:
     return out
 
 
-def groups(con: sqlite3.Connection, behavior: str, judge=None) -> list:
+def groups(con: sqlite3.Connection, behavior: str, judge=None,
+           origins=("human",)) -> list:
     """Existing groups, so a judge reuses a group id for the same problem."""
     found, _ = _moments._all(con)
-    scope = {m["id"]: m for m in found}
+    scope = {m["id"]: m for m in found
+             if not origins or m["origin"] in origins}
     out = []
     judges = sorted({r["judge"] for r in _rows(con, behavior, judge)})
     for name in judges:
@@ -205,6 +216,7 @@ def listing(con: sqlite3.Connection, behavior: str, judge=None,
         out.append({"moment": r["moment_id"], "judge": r["judge"],
                     "verdict": r["verdict"], "problem": r["problem"],
                     "group": r["group_id"],
+                    "origin": moment["origin"] if moment else None,
                     "session": moment["session"] if moment else None,
                     "harness": moment["harness"] if moment else None,
                     "at": moment["at"] if moment else None})
@@ -214,10 +226,12 @@ def listing(con: sqlite3.Connection, behavior: str, judge=None,
 
 def recurrence(con: sqlite3.Connection, behavior: str, judge=None,
                since=None, until=None, harness=None, project=None,
-               attrs=None) -> dict:
+               attrs=None, origins=("human",)) -> dict:
+    """Recurrence over moments of the given origins (default: a person
+    acted); coverage still counts every origin in scope."""
     selected = _moments.select(con, since=since, until=until,
                                harness=harness, project=project,
-                               origins=None, attrs=attrs)
+                               origins=origins, attrs=attrs)
     scope = {m["id"]: m for m in selected["moments"]}
     rows = [r for r in _rows(con, behavior, judge) if r["moment_id"] in scope]
     judges = sorted({r["judge"] for r in rows})
@@ -240,7 +254,8 @@ def recurrence(con: sqlite3.Connection, behavior: str, judge=None,
         "behavior": behavior, "judge": chosen,
         "period": {"since": _moments._iso(since), "until": _moments._iso(until)},
         "filters": {"harness": harness, "project": project,
-                    "attrs": attrs or {}},
+                    "attrs": attrs or {},
+                    "origins": list(origins) if origins else "all"},
         "coverage": {"moments": len(scope), "judged": len(judged),
                      "by_origin": selected["counts"]["by_origin"],
                      "unjudged_by_origin": unjudged},

@@ -105,13 +105,16 @@ def _origin(kind: str, actor, entrypoint, thread: str, denial=None) -> str:
         return "agent"
     if entrypoint in HEADLESS_ENTRYPOINTS:
         return "agent"
+    if kind != "prompt" and thread == "child":
+        # An agent can stop a child thread or answer its pending request,
+        # so a stop or refusal there is no evidence of a person.
+        return "unknown"
     if kind == "rejection" and denial == "user-rejected":
         return "human"
     if entrypoint in INTERACTIVE_ENTRYPOINTS:
         return "human"
     if kind != "prompt" and thread == "root":
-        # Only a person stops or refuses a top-level Chromeria thread; an
-        # agent can interrupt a child thread, so children stay unknown.
+        # Only a person stops or refuses a top-level Chromeria thread.
         return "human"
     return "unknown"
 
@@ -241,15 +244,18 @@ def _in_period(ts, since, until) -> bool:
     return (since is None or ts >= since) and (until is None or ts < until)
 
 
-def judged_ids(con, behavior: str) -> set:
-    return {r[0] for r in con.execute(
-        "SELECT DISTINCT moment_id FROM verdicts WHERE behavior=?",
-        (behavior,))}
+def judged_ids(con, behavior: str, judge=None) -> set:
+    sql, args = "SELECT DISTINCT moment_id FROM verdicts WHERE behavior=?", \
+        [behavior]
+    if judge:
+        sql += " AND judge=?"
+        args.append(judge)
+    return {r[0] for r in con.execute(sql, args)}
 
 
 def select(con: sqlite3.Connection, since=None, until=None, harness=None,
            project=None, origins=("human",), kinds=None, unjudged=None,
-           attrs=None, limit=None) -> dict:
+           attrs=None, limit=None, judge=None) -> dict:
     """Moments in scope. Counts cover every origin and kind in scope, so
     moments the filters leave out stay visible as numbers."""
     found, policy = _all(con, harness, project, attrs)
@@ -267,7 +273,7 @@ def select(con: sqlite3.Connection, since=None, until=None, harness=None,
               if (not origins or m["origin"] in origins)
               and (not kinds or m["kind"] in kinds)]
     if unjudged:
-        done = judged_ids(con, unjudged)
+        done = judged_ids(con, unjudged, judge)
         chosen = [m for m in chosen if m["id"] not in done]
     if limit:
         chosen = chosen[:limit]
@@ -277,11 +283,16 @@ def select(con: sqlite3.Connection, since=None, until=None, harness=None,
             "policy_denials": denials}
 
 
-def resolve(con: sqlite3.Connection, moment_id) -> dict | None:
+def evidence(con: sqlite3.Connection) -> _Evidence:
+    """Origin evidence to share across many resolve() calls."""
+    return _Evidence(con)
+
+
+def resolve(con: sqlite3.Connection, moment_id, ev=None) -> dict | None:
     """The moment named by an id, or None when it names no moment."""
     if not isinstance(moment_id, str):
         return None
-    ev = _Evidence(con)
+    ev = ev or _Evidence(con)
     if moment_id.startswith("sub:"):
         row = con.execute(f"{_SUB_SQL} WHERE u.native_id = ? AND u.kind IN"
                           " ('genuine', 'interrupt')",
@@ -518,10 +529,11 @@ def show(con: sqlite3.Connection, moment_ids: list, before=DEFAULT_BEFORE,
     and after it, and the human prompts around it. Status per moment is
     ok, source_missing, source_changed, not_found or no_such_moment."""
     sources = _Sources(con)
+    ev = _Evidence(con)
     timelines: dict[str, list] = {}
     out = []
     for moment_id in moment_ids:
-        moment = resolve(con, moment_id)
+        moment = resolve(con, moment_id, ev)
         if moment is None:
             out.append({"id": moment_id, "status": "no_such_moment"})
             continue

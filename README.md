@@ -232,12 +232,15 @@ an `origin`, which records who acted, from evidence only:
 
 - `human`: Chromeria recorded a person starting the turn or sending the
   prompt, the session ran in a terminal or desktop app (`cli`,
-  `Codex Desktop`, `codex-tui`), Claude reported `user-rejected`, or an
-  interrupt or rejection stopped a top-level Chromeria thread.
+  `Codex Desktop`, `codex-tui`), or an interrupt or rejection stopped a
+  top-level Chromeria thread or a session outside Chromeria (Claude's
+  `user-rejected` included).
 - `agent`: Chromeria recorded an agent or the server sending it, or the
   session ran headless (`sdk-cli`, `codex_exec`).
 - `unknown`: no evidence either way, for example a prompt in a delegated
-  child thread from before Chromeria V2.
+  child thread from before Chromeria V2, a Grok or OpenCode prompt (their
+  Chromeria text does not match the native prompt), or any interrupt or
+  rejection in a child thread, which an agent can cause.
 
 Hook and permission-rule denials and auto-mode blocks are policy, not a
 person. They are never moments and are counted as `policy_denials`.
@@ -271,8 +274,13 @@ Adding the same moment, behavior and judge again replaces the verdict,
 so grouping can run as a second pass. `recurrence` reports the yes
 verdicts, the problems (groups), the problems that recur in two or more
 sessions, and repeats per group, with first and last seen, sessions and
-hosts, plus judge coverage by origin and the policy denials. When more
-than one judge labeled the scope, it requires `--judge`.
+hosts, plus judge coverage by origin and the policy denials. It counts
+moments where a person acted (`--origin human`) unless `--origin` says
+otherwise. When more than one judge labeled the scope, it requires
+`--judge`. `moments --unjudged B --judge J` lists the work left for one
+judge; `verdict list` returns stored verdicts with their problem lines,
+which the grouping pass reads. A batch that names the same moment,
+behavior and judge twice is rejected.
 
 Moment text, problem lines and session attributes stay on this machine:
 `publish` never includes them.
@@ -409,7 +417,11 @@ mode 0700, and the database plus SQLite sidecars to mode 0600. It stores
 counters, identities, paths, hashes and short excerpts needed for the
 detectors; it never stores file contents, tool outputs or AgentsMD
 preference contents. `event show` reads those from the native logs on
-request and prints them without storing them. Only sanitized fixtures are committed to this
+request and prints them without storing them. Two tables hold free text
+that tools other than the harness write: `verdicts.problem`, a one-line
+problem an outside judge wrote after reading private session content
+(redacted for known secret shapes), and `session_attributes.value`.
+Both stay on this machine and are never published. Only sanitized fixtures are committed to this
 repository.
 
 Prompt excerpts are kept only for genuine human prompts in the main

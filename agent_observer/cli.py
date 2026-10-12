@@ -365,6 +365,8 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=list(_moments.KINDS))
     mo.add_argument("--unjudged", default=None, metavar="BEHAVIOR",
                     help="only moments without a verdict for BEHAVIOR")
+    mo.add_argument("--judge", default=None,
+                    help="with --unjudged: only verdicts by this judge count")
     mo.add_argument("--limit", type=int, default=None)
     mm = sub.add_parser("moment", help="read moments in context from the native logs")
     mmsub = mm.add_subparsers(dest="op", required=True)
@@ -392,10 +394,16 @@ def build_parser() -> argparse.ArgumentParser:
     vg = vdsub.add_parser("groups", help="list existing groups and their problem lines")
     vg.add_argument("--behavior", required=True)
     vg.add_argument("--judge", default=None)
+    vg.add_argument("--origin", action="append", default=None,
+                    choices=list(_moments.ORIGINS) + ["all"],
+                    help="moments counted (repeatable; default human)")
     vg.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     rc = sub.add_parser("recurrence", help="report problems that come back, from judge verdicts")
     rc.add_argument("--behavior", required=True)
     rc.add_argument("--judge", default=None)
+    rc.add_argument("--origin", action="append", default=None,
+                    choices=list(_moments.ORIGINS) + ["all"],
+                    help="moments counted (repeatable; default human)")
     _moment_scope(rc)
     sa = sub.add_parser("session-attr", help="store session attributes used as report filters")
     sasub = sa.add_subparsers(dest="op", required=True)
@@ -827,14 +835,14 @@ def _judge(con, ns) -> int:
     from . import verdicts as _verdicts
     as_json = getattr(ns, "as_json", False)
     try:
+        origins = None if getattr(ns, "origin", None) and "all" in ns.origin \
+            else tuple(getattr(ns, "origin", None) or ("human",))
         if ns.cmd == "moments":
-            origins = None if ns.origin and "all" in ns.origin \
-                else tuple(ns.origin or ("human",))
             payload = _moments.select(
                 con, since=_when(ns.since), until=_when(ns.until),
                 harness=ns.harness, project=ns.project, origins=origins,
                 kinds=ns.kind, unjudged=ns.unjudged, attrs=_attrs(ns.attr),
-                limit=ns.limit)
+                limit=ns.limit, judge=ns.judge)
             if as_json:
                 _emit(payload, True)
             else:
@@ -877,7 +885,8 @@ def _judge(con, ns) -> int:
                           f" {v['problem'] or ''}")
             return 0
         if ns.cmd == "verdict":
-            groups = _verdicts.groups(con, ns.behavior, judge=ns.judge)
+            groups = _verdicts.groups(con, ns.behavior, judge=ns.judge,
+                                      origins=origins)
             if as_json:
                 _emit({"groups": groups}, True)
             else:
@@ -888,7 +897,7 @@ def _judge(con, ns) -> int:
             report = _verdicts.recurrence(
                 con, ns.behavior, judge=ns.judge, since=_when(ns.since),
                 until=_when(ns.until), harness=ns.harness, project=ns.project,
-                attrs=_attrs(ns.attr))
+                attrs=_attrs(ns.attr), origins=origins)
             _emit(report, True) if as_json else print(_verdicts.render(report))
             return 0
         result = _verdicts.add_session_attributes(con, _json_lines(ns.file))

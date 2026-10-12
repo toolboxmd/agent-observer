@@ -569,8 +569,9 @@ def _import_prompt_origins(con: sqlite3.Connection,
     """Mirror V2 prompt origins per native session and text hash.
 
     A message joins the native session of its run's provider thread (any
-    driver: Claude import reclassifies by it, judge moments read it for
-    every harness), or every Claude session of its thread when the run
+    driver: Claude import reclassifies by it, judge moments read it;
+    Grok and OpenCode native prompt text differs from V2 text, so only
+    Claude and Codex hashes match), or every Claude session of its thread when the run
     names none. A hash sent by both a person and an agent in one session
     is dropped. Only hashes are stored; the text never leaves this
     function.
