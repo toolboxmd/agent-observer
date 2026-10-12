@@ -137,7 +137,8 @@ messages into a thread other than the sender's own child: 1
 ```
 
 Roles come from Prism's `<role>-<hex>` child id suffix and print
-`unknown` otherwise. The ledger keeps only thread and message ids and
+`unknown` otherwise, which includes every Chromeria V2 thread: V2 ids
+name no role. The ledger keeps only thread and message ids and
 times, never titles or message text. Both lists are evidence to inspect,
 not verdicts; replies a child sends its parent through `message_thread`
 appear as `child to parent`.
@@ -174,8 +175,10 @@ agent-observer dispatch-modes --planner <thread> --job owner/repo#N --since 2026
   has no session in the ledger (a Grok child, or a thread not yet synced),
   the job's tokens and cost print `unknown` and leave the mode's sample.
 
-Thread trees, turns and links come from T3's `state.sqlite`, read-only at
-report time; usage comes from the ledger, so run `sync` first.
+Thread trees, turns and links come from the V1 tables in T3's state
+database, read-only at report time, so `dispatch-modes` covers only
+threads from before Chromeria's V2 move on 2026-10-09. Usage comes from
+the ledger, so run `sync` first.
 
 ## Event content
 

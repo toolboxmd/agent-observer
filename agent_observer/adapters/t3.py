@@ -1,8 +1,13 @@
 """Chromeria/T3 Code attribution adapter: Issues and PRs from T3 state.
 
-Reads T3's ``state.sqlite`` strictly read-only (SQLite URI ``mode=ro``;
-never writes, never deletes) from ``$T3CODE_HOME/userdata/state.sqlite``
-(default ``~/.t3``) and maps it onto the existing workload tables:
+Reads T3 state strictly read-only (SQLite URI ``mode=ro``; never writes,
+never deletes) from ``$T3CODE_HOME/userdata`` (default ``~/.t3``):
+Chromeria V2's ``chromeria-v2.sqlite`` when present, else the V1
+``state.sqlite``. Chromeria seeded the V2 file from ``state.sqlite``, so it
+also holds the frozen V1 tables: one read covers history before the
+migration and V2 threads after it, and legacy threads keep their V1 ids
+in both, so every mirror row and binding is written once. It maps state
+onto the existing workload tables:
 
 - turn origin: ``orchestration_events`` ``thread.turn-start-requested``
   rows carry ``actor_kind`` ``client`` (a person typed the prompt) or
@@ -30,6 +35,17 @@ never writes, never deletes) from ``$T3CODE_HOME/userdata/state.sqlite``
   from exit codes (which are never read).
 - Ghostty bodies and unknown provider shapes are out of scope: their
   rows are skipped, never guessed.
+- Chromeria V2 (#53): ``orchestration_v2_projection_threads`` payload
+  ``lineage`` gives parent and root (V2 ids carry no ``sub.`` prefix) and
+  ``pullRequests`` the PR links; ``orchestration_v2_projection_provider_threads``
+  ``nativeThreadRef.nativeId`` maps a thread to each native Claude, Codex,
+  Grok or OpenCode session it ran. V2 has no native Claude turn ids, so
+  turn origin joins by prompt: a V2 user message whose text hash matches
+  a prompt in the same native Claude session marks it ``client``
+  (``createdBy=user`` from a client surface) or ``server`` (``agent`` or
+  ``system``). A hash both sides sent stays unknown. Only the hash is
+  stored. A ``senderThreadId`` message into a thread that is not the
+  sender's child is a cross-thread message.
 - spawns and cross-thread messages (#42): every ``sub.`` thread in
   ``projection_threads`` mirrors its parent, depth and creation time;
   every delivered message Chromeria prefixed with ``[Message from <title>
@@ -55,6 +71,7 @@ import re
 import sqlite3
 
 from .. import db, placement, privacy
+from ..ingest import text_hash
 
 # A PR head branch as T3 snapshots it; anything else is not stored.
 BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
@@ -71,6 +88,13 @@ CAPABILITIES = [
 ]
 
 STATE_RELATIVE = os.path.join("userdata", "state.sqlite")
+V2_RELATIVE = os.path.join("userdata", "chromeria-v2.sqlite")
+V2_THREADS = "orchestration_v2_projection_threads"
+V2_PROVIDER_THREADS = "orchestration_v2_projection_provider_threads"
+V2_MESSAGES = "orchestration_v2_projection_messages"
+V2_RUNS = "orchestration_v2_projection_runs"
+# V2 drivers whose nativeThreadRef is the ledger's native session id.
+V2_DRIVERS = ("claudeAgent", "codex", "grok", "opencode")
 RATES_RELATIVE = os.path.join("userdata", "usage-model-rates.json")
 TURN_START_EVENT = "thread.turn-start-requested"
 
@@ -93,9 +117,12 @@ def t3_home(root: str | None = None) -> str:
 
 
 def state_path(root: str | None = None, source: str | None = None) -> str:
-    """The T3 state database: explicit source file or the home default."""
+    """The T3 state database: explicit source, else Chromeria V2, else V1."""
     if source:
         return source
+    v2 = os.path.join(t3_home(root), V2_RELATIVE)
+    if os.path.exists(v2):
+        return v2
     return os.path.join(t3_home(root), STATE_RELATIVE)
 
 
@@ -146,6 +173,12 @@ def _ensure_tables(con: sqlite3.Connection) -> None:
         " target_thread_id TEXT NOT NULL,"
         " sent_at TEXT)")
     con.execute(
+        "CREATE TABLE IF NOT EXISTS t3_prompt_origins("
+        " native_session TEXT NOT NULL,"
+        " text_hash TEXT NOT NULL,"
+        " actor_kind TEXT NOT NULL,"
+        " PRIMARY KEY (native_session, text_hash))")
+    con.execute(
         "CREATE TABLE IF NOT EXISTS checkouts("
         " root TEXT PRIMARY KEY,"
         " repository TEXT NOT NULL,"
@@ -178,6 +211,27 @@ def turn_actor(con: sqlite3.Connection, message_id: str) -> str | None:
     except (KeyError, TypeError, IndexError):
         return None
     return actor if actor in ACTORS else None
+
+
+def prompt_actor(con: sqlite3.Connection, native_session,
+                 digest: str) -> str | None:
+    """The V2 origin of a prompt by native Claude session and text hash.
+
+    Missing table, unknown session or hash read as None, never as a
+    guessed origin.
+    """
+    if not isinstance(native_session, str) or not native_session:
+        return None
+    try:
+        row = con.execute(
+            "SELECT actor_kind FROM t3_prompt_origins"
+            " WHERE native_session=? AND text_hash=?",
+            (native_session, digest)).fetchone()
+    except sqlite3.DatabaseError:
+        return None
+    if row is None:
+        return None
+    return row[0] if row[0] in ACTORS else None
 
 
 def thread_root(thread_id: str) -> str:
@@ -215,8 +269,38 @@ def spawn_depth(thread_id: str) -> int:
     return depth
 
 
+def _lineage_parent(thread_id: str, lineage: dict) -> str | None:
+    """A thread's parent: V2 lineage when T3 recorded one, else its id."""
+    entry = lineage.get(thread_id)
+    if entry is not None:
+        return entry["parent"]
+    return parent_thread(thread_id)
+
+
+def _lineage_root(thread_id: str, lineage: dict) -> str:
+    """A thread's tree root: V2 lineage when T3 recorded one, else its id."""
+    entry = lineage.get(thread_id)
+    if entry is not None:
+        return entry["root"] or thread_id
+    return thread_root(thread_id)
+
+
+def _lineage_depth(thread_id: str, lineage: dict) -> int:
+    depth, seen = 0, {thread_id}
+    parent = _lineage_parent(thread_id, lineage)
+    while parent is not None and parent not in seen:
+        depth += 1
+        seen.add(parent)
+        parent = _lineage_parent(parent, lineage)
+    return depth
+
+
+# Chromeria V2 thread ids nest encoded parent ids and pass 200 characters.
+MAX_ID = 500
+
+
 def _valid_id(value) -> str | None:
-    if not isinstance(value, str) or not value or len(value) > 200:
+    if not isinstance(value, str) or not value or len(value) > MAX_ID:
         return None
     if any(ord(c) < 32 for c in value):
         return None
@@ -262,14 +346,18 @@ def sync(con: sqlite3.Connection, root: str | None = None,
         totals["failed"].append({"path": path, "error": str(exc)})
         return totals
     try:
+        lineage = _v2_lineage(native)
+        totals["v2_threads"] = len(lineage)
         _import_turn_origins(con, native, path, totals)
-        threads = _import_threads(con, native, totals)
-        links = _import_links(con, native, totals)
-        _import_spawns(con, native, totals)
-        _import_messages(con, native, totals)
-        totals["submissions_reclassified"] = _backfill_submissions(con)
+        threads = _import_threads(con, native, totals, lineage)
+        links = _import_links(con, native, totals, lineage)
+        _import_spawns(con, native, totals, lineage)
+        _import_messages(con, native, totals, lineage)
+        _import_prompt_origins(con, native, totals)
+        totals["submissions_reclassified"] = _backfill_submissions(con) \
+            + _backfill_prompt_origins(con)
         totals["responses_retouched"] = _retouch_response_turns(con)
-        bound = _bind_trees(con, threads, links)
+        bound = _bind_trees(con, threads, links, lineage)
         totals["tasks"] = bound["tasks"]
         totals["sessions_bound"] = bound["sessions_bound"]
         totals["outcomes"] = _write_outcomes(con, links)
@@ -400,6 +488,142 @@ def _import_turn_origins(con: sqlite3.Connection, native: sqlite3.Connection,
     return mapped
 
 
+def _v2_lineage(native: sqlite3.Connection) -> dict:
+    """V2 thread id -> parent, root, creation time and PR link payloads.
+
+    Empty when the database has no V2 tables (a V1 ``state.sqlite``).
+    """
+    out: dict = {}
+    if V2_THREADS not in _tables(native):
+        return out
+    try:
+        rows = native.execute(
+            "SELECT thread_id, created_at,"
+            " json_extract(payload_json, '$.lineage') AS lineage,"
+            " json_extract(payload_json, '$.pullRequests') AS prs"
+            f" FROM {V2_THREADS}").fetchall()
+    except sqlite3.DatabaseError:
+        return out
+    for row in rows:
+        thread_id = _valid_id(row["thread_id"])
+        if thread_id is None:
+            continue
+        parent = root = None
+        prs: list = []
+        try:
+            lineage = json.loads(row["lineage"]) if row["lineage"] else None
+            if isinstance(row["prs"], str):
+                prs = json.loads(row["prs"])
+        except (ValueError, TypeError):
+            lineage = None
+        if isinstance(lineage, dict):
+            parent = _valid_id(lineage.get("parentThreadId"))
+            root = _valid_id(lineage.get("rootThreadId"))
+        out[thread_id] = {
+            "parent": parent if parent != thread_id else None,
+            "root": root or (None if parent else thread_id),
+            "created_at": row["created_at"]
+            if isinstance(row["created_at"], str) else None,
+            "prs": prs if isinstance(prs, list) else []}
+    # A child whose lineage names no root inherits its parent's.
+    for thread_id, entry in out.items():
+        if entry["root"] is None:
+            entry["root"] = _lineage_root(entry["parent"], out) \
+                if entry["parent"] not in (None, thread_id) else thread_id
+    return out
+
+
+def _v2_native_ref(payload_json, driver) -> str | None:
+    """The native session id of one V2 provider thread, or None."""
+    try:
+        payload = json.loads(payload_json or "{}")
+    except (ValueError, TypeError):
+        return None
+    ref = payload.get("nativeThreadRef") if isinstance(payload, dict) else None
+    if not isinstance(ref, dict) or ref.get("strength") != "strong":
+        return None
+    if (ref.get("driver") or driver) not in V2_DRIVERS:
+        return None
+    return _valid_id(ref.get("nativeId"))
+
+
+def _prompt_actor_of(created_by, source) -> str | None:
+    """V2 message authorship as a turn origin; unknown stays None.
+
+    Chromeria's legacy import labels every copied V1 user message
+    ``createdBy=user`` from ``server``; that is no human evidence.
+    """
+    if created_by == "user" and isinstance(source, str) and source \
+            and source != "server":
+        return "client"
+    if created_by in ("agent", "system"):
+        return "server"
+    return None
+
+
+def _import_prompt_origins(con: sqlite3.Connection,
+                           native: sqlite3.Connection, totals: dict) -> None:
+    """Mirror V2 prompt origins per native Claude session and text hash.
+
+    A message joins the native session of its run's provider thread, or
+    every Claude session of its thread when the run names none. A hash
+    sent by both a person and an agent in one session is dropped. Only
+    hashes are stored; the text never leaves this function.
+    """
+    tables = _tables(native)
+    if not {V2_MESSAGES, V2_PROVIDER_THREADS} <= tables:
+        return
+    try:
+        providers = native.execute(
+            "SELECT provider_thread_id, thread_id, provider, payload_json"
+            f" FROM {V2_PROVIDER_THREADS}").fetchall()
+        runs = {} if V2_RUNS not in tables else {
+            r["run_id"]: r["provider_thread_id"] for r in native.execute(
+                f"SELECT run_id, provider_thread_id FROM {V2_RUNS}")}
+        messages = native.execute(
+            "SELECT thread_id, run_id,"
+            " json_extract(payload_json, '$.createdBy') AS created_by,"
+            " json_extract(payload_json, '$.creationSource') AS source,"
+            " json_extract(payload_json, '$.text') AS text"
+            f" FROM {V2_MESSAGES} WHERE role='user'").fetchall()
+    except sqlite3.DatabaseError:
+        return
+    by_provider: dict[str, str] = {}
+    by_thread: dict[str, list] = {}
+    for row in providers:
+        if (row["provider"] or "") != "claudeAgent":
+            continue
+        session = _v2_native_ref(row["payload_json"], row["provider"])
+        if session is None:
+            continue
+        by_provider[row["provider_thread_id"]] = session
+        by_thread.setdefault(row["thread_id"], []).append(session)
+    seen: dict[tuple, set] = {}
+    for row in messages:
+        actor = _prompt_actor_of(row["created_by"], row["source"])
+        if actor is None or not isinstance(row["text"], str) \
+                or not row["text"]:
+            continue
+        provider = runs.get(row["run_id"])
+        sessions = [by_provider[provider]] if provider in by_provider \
+            else by_thread.get(row["thread_id"], [])
+        digest = text_hash(row["text"])
+        for session in sessions:
+            seen.setdefault((session, digest), set()).add(actor)
+    con.execute("DELETE FROM t3_prompt_origins")
+    stored = 0
+    for (session, digest), actors in sorted(seen.items()):
+        if len(actors) != 1:
+            continue
+        con.execute(
+            "INSERT INTO t3_prompt_origins(native_session, text_hash,"
+            " actor_kind) VALUES(?,?,?)", (session, digest, actors.pop()))
+        stored += 1
+    totals["prompt_origins"] = stored
+    if V2_RUNS in tables:
+        totals["v2_runs"] = len(runs)
+
+
 def _cursor_session(adapter_key, cursor: dict) -> str | None:
     """The native session id inside a resume cursor, or None."""
     if not isinstance(cursor, dict):
@@ -414,19 +638,23 @@ def _cursor_session(adapter_key, cursor: dict) -> str | None:
 
 
 def _import_threads(con: sqlite3.Connection, native: sqlite3.Connection,
-                    totals: dict) -> dict:
-    """Mirror thread to native-session rows. Returns thread -> sessions."""
+                    totals: dict, lineage: dict | None = None) -> dict:
+    """Mirror thread to native-session rows. Returns thread -> sessions.
+
+    ``t3_threads`` keeps one row per thread (the latest V2 provider
+    thread, else the V1 cursor); the returned map holds every native
+    session a thread ran, which is what binding uses.
+    """
+    lineage = lineage or {}
     result: dict[str, list] = {}
-    if "provider_session_runtime" not in _tables(native):
-        totals["threads"] = 0
-        return result
-    try:
-        rows = native.execute(
-            "SELECT thread_id, provider_name, adapter_key,"
-            " resume_cursor_json FROM provider_session_runtime").fetchall()
-    except sqlite3.DatabaseError:
-        totals["threads"] = 0
-        return result
+    rows = []
+    if "provider_session_runtime" in _tables(native):
+        try:
+            rows = native.execute(
+                "SELECT thread_id, provider_name, adapter_key,"
+                " resume_cursor_json FROM provider_session_runtime").fetchall()
+        except sqlite3.DatabaseError:
+            rows = []
     seen = 0
     for row in rows:
         thread_id = _valid_id(row["thread_id"])
@@ -452,20 +680,72 @@ def _import_threads(con: sqlite3.Connection, native: sqlite3.Connection,
             " root_thread_id=excluded.root_thread_id,"
             " provider=excluded.provider, adapter_key=excluded.adapter_key,"
             " native_session=excluded.native_session",
-            (thread_id, thread_root(thread_id),
+            (thread_id, _lineage_root(thread_id, lineage),
              provider if isinstance(provider, str) else None,
              row["adapter_key"]
              if isinstance(row["adapter_key"], str) else None,
              native_session))
         result.setdefault(thread_id, []).append(native_session)
         seen += 1
+    if V2_PROVIDER_THREADS in _tables(native):
+        try:
+            v2_rows = native.execute(
+                "SELECT thread_id, provider, payload_json"
+                f" FROM {V2_PROVIDER_THREADS} WHERE thread_id IS NOT NULL"
+                " ORDER BY updated_at, provider_thread_id").fetchall()
+        except sqlite3.DatabaseError:
+            v2_rows = []
+        for row in v2_rows:
+            thread_id = _valid_id(row["thread_id"])
+            native_session = _v2_native_ref(row["payload_json"],
+                                            row["provider"])
+            if thread_id is None or native_session is None:
+                totals["malformed"] += 1
+                continue
+            con.execute(
+                "INSERT INTO t3_threads(thread_id, root_thread_id, provider,"
+                " adapter_key, native_session) VALUES(?,?,?,?,?)"
+                " ON CONFLICT(thread_id) DO UPDATE SET"
+                " root_thread_id=excluded.root_thread_id,"
+                " provider=excluded.provider,"
+                " adapter_key=excluded.adapter_key,"
+                " native_session=excluded.native_session",
+                (thread_id, _lineage_root(thread_id, lineage), row["provider"],
+                 row["provider"], native_session))
+            sessions = result.setdefault(thread_id, [])
+            if native_session not in sessions:
+                sessions.append(native_session)
+            seen += 1
     totals["threads"] = seen
     return result
 
 
+def _pr_link(thread_id, host, repository, number, url, source, linked_at,
+             snapshot) -> dict | None:
+    valid = _valid_link(host, repository, number, url)
+    if thread_id is None or valid is None:
+        return None
+    host, repository, number, url = valid
+    state = head = None
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("state"), str):
+        state = snapshot["state"][:32] or None
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("headBranch"), str) \
+            and BRANCH_RE.match(snapshot["headBranch"]):
+        head = snapshot["headBranch"]
+    return {"thread_id": thread_id, "kind": "pr", "host": host,
+            "repository": repository, "number": number, "url": url,
+            "source": source if source in LINK_SOURCES else None,
+            "state": state, "head_branch": head,
+            "linked_at": linked_at if isinstance(linked_at, str) else None}
+
+
 def _import_links(con: sqlite3.Connection, native: sqlite3.Connection,
-                  totals: dict) -> list:
-    """Mirror PR and Issue links with PR snapshot state."""
+                  totals: dict, lineage: dict | None = None) -> list:
+    """Mirror PR and Issue links with PR snapshot state.
+
+    V2 thread ``pullRequests`` follow the frozen V1 rows; for the same
+    thread and PR the V2 snapshot wins, so each link is written once.
+    """
     links = []
     tables = _tables(native)
     if "projection_thread_pull_requests" in tables:
@@ -477,32 +757,27 @@ def _import_links(con: sqlite3.Connection, native: sqlite3.Connection,
         except sqlite3.DatabaseError:
             rows = []
         for row in rows:
-            thread_id = _valid_id(row["thread_id"])
-            valid = _valid_link(row["host"], row["repository"],
-                                row["number"], row["url"])
-            if thread_id is None or valid is None:
-                totals["malformed"] += 1
-                continue
-            host, repository, number, url = valid
-            state = head = None
             try:
                 snapshot = json.loads(row["snapshot_json"] or "{}")
             except (ValueError, TypeError):
                 snapshot = None
-            if isinstance(snapshot, dict) and isinstance(
-                    snapshot.get("state"), str):
-                state = snapshot["state"][:32] or None
-            if isinstance(snapshot, dict) and isinstance(snapshot.get("headBranch"), str) \
-                    and BRANCH_RE.match(snapshot["headBranch"]):
-                head = snapshot["headBranch"]
-            source = row["source"]
-            links.append({"thread_id": thread_id, "kind": "pr",
-                          "host": host, "repository": repository,
-                          "number": number, "url": url,
-                          "source": source if source in LINK_SOURCES else None,
-                          "state": state, "head_branch": head,
-                          "linked_at": row["linked_at"]
-                          if isinstance(row["linked_at"], str) else None})
+            link = _pr_link(_valid_id(row["thread_id"]), row["host"],
+                            row["repository"], row["number"], row["url"],
+                            row["source"], row["linked_at"], snapshot)
+            if link is None:
+                totals["malformed"] += 1
+                continue
+            links.append(link)
+    for thread_id, entry in sorted((lineage or {}).items()):
+        for pr in entry["prs"]:
+            link = _pr_link(thread_id, *(
+                pr.get(k) if isinstance(pr, dict) else None
+                for k in ("host", "repository", "number", "url", "source",
+                          "linkedAt", "snapshot")))
+            if link is None:
+                totals["malformed"] += 1
+                continue
+            links.append(link)
     if "fork_thread_issue_links" in tables:
         try:
             rows = native.execute(
@@ -525,6 +800,11 @@ def _import_links(con: sqlite3.Connection, native: sqlite3.Connection,
                           "source": source if source in LINK_SOURCES else None,
                           "state": None, "linked_at": row["linked_at"]
                           if isinstance(row["linked_at"], str) else None})
+    unique: dict[tuple, dict] = {}
+    for link in links:
+        unique[(link["thread_id"], link["kind"], link["repository"],
+                link["number"])] = link
+    links = list(unique.values())
     for link in links:
         con.execute(
             "INSERT INTO t3_links(thread_id, kind, host, repository, number,"
@@ -542,9 +822,24 @@ def _import_links(con: sqlite3.Connection, native: sqlite3.Connection,
 
 
 def _import_spawns(con: sqlite3.Connection, native: sqlite3.Connection,
-                   totals: dict) -> None:
-    """Mirror every child thread's parent, depth and creation time."""
+                   totals: dict, lineage: dict | None = None) -> None:
+    """Mirror every child thread's parent, depth and creation time.
+
+    V1 ``sub.`` ids carry their parent; V2 children carry it in lineage.
+    """
+    lineage = lineage or {}
     totals["spawns"] = 0
+    for thread_id, entry in sorted(lineage.items()):
+        if entry["parent"] is None:
+            continue
+        con.execute(
+            "INSERT INTO t3_spawns(thread_id, parent_thread_id, depth,"
+            " created_at) VALUES(?,?,?,?) ON CONFLICT(thread_id) DO UPDATE"
+            " SET parent_thread_id=excluded.parent_thread_id,"
+            " depth=excluded.depth, created_at=excluded.created_at",
+            (thread_id, entry["parent"], _lineage_depth(thread_id, lineage),
+             entry["created_at"]))
+        totals["spawns"] += 1
     if "projection_threads" not in _tables(native):
         return
     try:
@@ -554,6 +849,8 @@ def _import_spawns(con: sqlite3.Connection, native: sqlite3.Connection,
     except sqlite3.DatabaseError:
         return
     for row in rows:
+        if row["thread_id"] in lineage:
+            continue
         thread_id = _valid_id(row["thread_id"])
         parent = parent_thread(thread_id) if thread_id else None
         if parent is None:
@@ -570,7 +867,7 @@ def _import_spawns(con: sqlite3.Connection, native: sqlite3.Connection,
 
 
 def _import_messages(con: sqlite3.Connection, native: sqlite3.Connection,
-                     totals: dict) -> None:
+                     totals: dict, lineage: dict | None = None) -> None:
     """Mirror attributed message_thread deliveries: ids and time only.
 
     Chromeria prefixes a delivery only when the target is not the
@@ -578,7 +875,10 @@ def _import_messages(con: sqlite3.Connection, native: sqlite3.Connection,
     Only the whole first line, the attribution, is read, so a title of
     any length parses; the body never leaves T3.
     """
+    lineage = lineage or {}
     totals["messages"] = 0
+    if V2_MESSAGES in _tables(native):
+        _import_v2_messages(con, native, totals, lineage)
     if "projection_thread_messages" not in _tables(native):
         return
     try:
@@ -609,6 +909,82 @@ def _import_messages(con: sqlite3.Connection, native: sqlite3.Connection,
         totals["messages"] += 1
 
 
+def _import_v2_messages(con: sqlite3.Connection, native: sqlite3.Connection,
+                        totals: dict, lineage: dict) -> None:
+    """Mirror V2 ``senderThreadId`` deliveries not into the sender's child.
+
+    V2 records the sender directly instead of an attribution line; the
+    same rule applies: a parent briefing its own child is not listed.
+    Only agent-sent messages count; Chromeria's own system notices (a
+    stale child, a finished task) are not deliveries.
+    """
+    try:
+        rows = native.execute(
+            "SELECT message_id, thread_id, created_at,"
+            " json_extract(payload_json, '$.senderThreadId') AS sender"
+            f" FROM {V2_MESSAGES} WHERE role='user'"
+            " AND json_extract(payload_json, '$.createdBy')='agent'"
+            " AND json_extract(payload_json, '$.senderThreadId') IS NOT NULL"
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return
+    for row in rows:
+        message_id = _valid_id(row["message_id"])
+        target = _valid_id(row["thread_id"])
+        sender = _valid_id(row["sender"])
+        if message_id is None or target is None or sender is None:
+            totals["malformed"] += 1
+            continue
+        if sender == target or _lineage_parent(target, lineage) == sender:
+            continue
+        con.execute(
+            "INSERT INTO t3_messages(message_id, sender_thread_id,"
+            " target_thread_id, sent_at) VALUES(?,?,?,?)"
+            " ON CONFLICT(message_id) DO NOTHING",
+            (message_id, sender, target,
+             row["created_at"] if isinstance(row["created_at"], str)
+             else None))
+        totals["messages"] += 1
+
+
+def _reclassify(con: sqlite3.Connection, native_id: str, sub,
+                actor: str) -> bool:
+    """Move one submission to its T3 origin; True when it changed."""
+    want = "genuine" if actor == "client" else "synthetic"
+    if sub["kind"] == want and (want == "synthetic" or sub["turn_id"]):
+        return False
+    con.execute(
+        "UPDATE submissions SET kind=?, is_genuine=? WHERE native_id=?",
+        (want, 1 if want == "genuine" else 0, native_id))
+    if want == "genuine" and not sub["turn_id"]:
+        con.execute("UPDATE submissions SET turn_id=? WHERE native_id=?",
+                    (native_id, native_id))
+    return True
+
+
+def _backfill_prompt_origins(con: sqlite3.Connection) -> int:
+    """Reclassify main-session Claude prompts from V2 prompt origins.
+
+    Same rules as the turn-uuid backfill; a prompt with uuid evidence
+    keeps that verdict.
+    """
+    try:
+        rows = con.execute(
+            "SELECT s.native_id, s.kind, s.turn_id, o.actor_kind"
+            " FROM submissions s JOIN t3_prompt_origins o"
+            " ON s.session_key='claude:' || o.native_session"
+            " AND s.text_hash=o.text_hash"
+            " WHERE s.kind IN ('synthetic', 'genuine')"
+            " AND NOT EXISTS (SELECT 1 FROM t3_turn_origins t"
+            " WHERE s.native_id='claude:' || t.message_id)").fetchall()
+    except sqlite3.DatabaseError:
+        return 0
+    return sum(1 for row in rows
+               if row["actor_kind"] in ACTORS
+               and _reclassify(con, row["native_id"], row,
+                               row["actor_kind"]))
+
+
 def _backfill_submissions(con: sqlite3.Connection) -> int:
     """Reclassify imported Claude submissions from T3 turn evidence.
 
@@ -635,17 +1011,8 @@ def _backfill_submissions(con: sqlite3.Connection) -> int:
             continue
         if sub is None or sub["kind"] not in ("synthetic", "genuine"):
             continue
-        want = "genuine" if origin["actor_kind"] == "client" else "synthetic"
-        if sub["kind"] == want and (want == "synthetic" or sub["turn_id"]):
-            continue
-        con.execute(
-            "UPDATE submissions SET kind=?, is_genuine=? WHERE native_id=?",
-            (want, 1 if want == "genuine" else 0, native_id))
-        if want == "genuine" and not sub["turn_id"]:
-            con.execute(
-                "UPDATE submissions SET turn_id=? WHERE native_id=?",
-                (native_id, native_id))
-        retouched += 1
+        if _reclassify(con, native_id, sub, origin["actor_kind"]):
+            retouched += 1
     return retouched
 
 
@@ -731,7 +1098,7 @@ def _tree_sessions(con: sqlite3.Connection, threads: dict,
                             native_id == native_session
                             or native_id.startswith(native_session + ":")):
                         keys.add(sess_row["session_key"])
-                    elif harness in ("codex", "opencode") \
+                    elif harness in ("codex", "opencode", "grok") \
                             and native_id == native_session:
                         keys.add(sess_row["session_key"])
             try:
@@ -754,8 +1121,9 @@ def _task_id(repository: str, number: int) -> str:
 
 
 def _bind_trees(con: sqlite3.Connection, threads: dict,
-                links: list) -> dict:
+                links: list, lineage: dict | None = None) -> dict:
     """Create repo#N tasks and bind every tree session to every tree link."""
+    lineage = lineage or {}
     roots: dict[str, list[str]] = {}
     for row in con.execute(
             "SELECT thread_id, root_thread_id FROM t3_threads").fetchall():
@@ -763,13 +1131,14 @@ def _bind_trees(con: sqlite3.Connection, threads: dict,
     # Threads that only appear in links (retired runtime rows) still
     # form trees so their links attribute any sessions found by uuid.
     for link in links:
-        root = thread_root(link["thread_id"])
+        root = _lineage_root(link["thread_id"], lineage)
         roots.setdefault(root, [])
         if link["thread_id"] not in roots[root]:
             roots[root].append(link["thread_id"])
     tree_links: dict[str, list] = {}
     for link in links:
-        tree_links.setdefault(thread_root(link["thread_id"]), []).append(link)
+        tree_links.setdefault(_lineage_root(link["thread_id"], lineage),
+                              []).append(link)
     sessions = _tree_sessions(con, threads, roots)
     tasks = 0
     bound = 0
@@ -799,7 +1168,7 @@ def _bind_trees(con: sqlite3.Connection, threads: dict,
     # drop T3-made bindings its links no longer back (an unlinked or
     # changed PR). Trees absent from this read keep their history, and
     # bindings made outside this adapter are never touched.
-    present = {thread_root(t) for t in threads} | set(tree_links)
+    present = {_lineage_root(t, lineage) for t in threads} | set(tree_links)
     for root in sorted(present):
         for row in con.execute(
                 "SELECT session_key, task_id FROM session_assignments"

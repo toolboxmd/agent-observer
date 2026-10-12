@@ -334,7 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="owner/repo#N PR or Issue the job delivers (repeatable)")
     dm.add_argument("--since", default=None, help="job start, ISO date or epoch seconds")
     dm.add_argument("--until", default=None, help="job start, ISO date or epoch seconds")
-    dm.add_argument("--t3-state", default=None, help="T3 state.sqlite (default ~/.t3)")
+    dm.add_argument("--t3-state", default=None, help="T3 state database (default ~/.t3 chromeria-v2.sqlite, else state.sqlite)")
     dm.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
     ev = sub.add_parser("event", help="show the full content behind ledger events")
@@ -704,7 +704,8 @@ def _sync(con, ns) -> int:
                 if key == "failed":
                     row["failed"] = list(row.get("failed") or []) + value
                 elif key in ("sources", "unchanged", "threads",
-                             "turns_mapped", "links", "malformed"):
+                             "turns_mapped", "links", "malformed",
+                             "v2_threads", "v2_runs", "prompt_origins"):
                     # Mirror sizes, not deltas: the refresh re-reads the
                     # same state, so the larger reading wins.
                     row[key] = max(row.get(key) or 0, value or 0) \

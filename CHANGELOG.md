@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.13.0] - 2026-10-12
+
+### Added
+
+- Import Chromeria V2 threads, lineage, PR links, messages and prompt origins from chromeria-v2.sqlite (#53)
+
 ## [0.12.1] - 2026-10-10
 
 ### Fixed
