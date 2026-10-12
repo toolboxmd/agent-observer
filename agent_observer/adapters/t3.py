@@ -95,6 +95,8 @@ V2_MESSAGES = "orchestration_v2_projection_messages"
 V2_RUNS = "orchestration_v2_projection_runs"
 # V2 drivers whose nativeThreadRef is the ledger's native session id.
 V2_DRIVERS = ("claudeAgent", "codex", "grok", "opencode")
+# Chromeria surfaces where a person types; any other source is no evidence.
+CLIENT_SOURCES = ("web", "mobile")
 RATES_RELATIVE = os.path.join("userdata", "usage-model-rates.json")
 TURN_START_EVENT = "thread.turn-start-requested"
 
@@ -509,13 +511,14 @@ def _v2_lineage(native: sqlite3.Connection) -> dict:
         if thread_id is None:
             continue
         parent = root = None
-        prs: list = []
         try:
             lineage = json.loads(row["lineage"]) if row["lineage"] else None
-            if isinstance(row["prs"], str):
-                prs = json.loads(row["prs"])
         except (ValueError, TypeError):
             lineage = None
+        try:
+            prs = json.loads(row["prs"]) if isinstance(row["prs"], str) else []
+        except (ValueError, TypeError):
+            prs = []
         if isinstance(lineage, dict):
             parent = _valid_id(lineage.get("parentThreadId"))
             root = _valid_id(lineage.get("rootThreadId"))
@@ -550,11 +553,11 @@ def _v2_native_ref(payload_json, driver) -> str | None:
 def _prompt_actor_of(created_by, source) -> str | None:
     """V2 message authorship as a turn origin; unknown stays None.
 
+    Only ``createdBy=user`` from a known client surface is a person.
     Chromeria's legacy import labels every copied V1 user message
     ``createdBy=user`` from ``server``; that is no human evidence.
     """
-    if created_by == "user" and isinstance(source, str) and source \
-            and source != "server":
+    if created_by == "user" and source in CLIENT_SOURCES:
         return "client"
     if created_by in ("agent", "system"):
         return "server"
@@ -590,6 +593,7 @@ def _import_prompt_origins(con: sqlite3.Connection,
         return
     by_provider: dict[str, str] = {}
     by_thread: dict[str, list] = {}
+    known = {row["provider_thread_id"] for row in providers}
     for row in providers:
         if (row["provider"] or "") != "claudeAgent":
             continue
@@ -605,8 +609,14 @@ def _import_prompt_origins(con: sqlite3.Connection,
                 or not row["text"]:
             continue
         provider = runs.get(row["run_id"])
-        sessions = [by_provider[provider]] if provider in by_provider \
-            else by_thread.get(row["thread_id"], [])
+        if provider in by_provider:
+            sessions = [by_provider[provider]]
+        elif provider in known:
+            # A run on a Codex, Grok or OpenCode provider thread says
+            # nothing about the thread's Claude sessions.
+            continue
+        else:
+            sessions = by_thread.get(row["thread_id"], [])
         digest = text_hash(row["text"])
         for session in sessions:
             seen.setdefault((session, digest), set()).add(actor)

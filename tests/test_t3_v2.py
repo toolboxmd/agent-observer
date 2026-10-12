@@ -29,9 +29,11 @@ GRAND = ("thread:provider:claudeAgent:native-thread:provider-thread%3Aprovider"
 CL2 = "c1aude-5e55-2000-000000000001"
 CX9 = "01a1c0de-0000-7000-8000-000000000009"
 GK1 = "01a1960c-0000-7000-8000-000000000001"
+CX8 = "01a1c0de-0000-7000-8000-000000000008"
+ODD = "thread:delegated-task:command%3Amcp%3Afixture%3Adelegate-task%3Aodd-1"
 PR5 = "https://github.com/example/beta/pull/5"
-P1, P2, P3, P4, P5, P6 = ("u22222222-0000-4000-8000-00000000000%d" % n
-                          for n in (1, 2, 3, 4, 5, 6))
+P1, P2, P3, P4, P5, P6, P7 = ("u22222222-0000-4000-8000-00000000000%d" % n
+                              for n in (1, 2, 3, 4, 5, 6, 7))
 
 V2_TABLES = """
 CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT PRIMARY KEY,
@@ -65,13 +67,14 @@ def write_v2(path, legacy=True):
     native.executescript(V2_TABLES)
 
     def thread(tid, created, parent=None, root=None, prs=(), by="agent",
-               source="mcp"):
+               source="mcp", raw_prs=None):
         lineage = None if parent is None else {
             "parentThreadId": parent, "relationshipToParent": "subagent",
             "rootThreadId": root}
         payload = {"id": tid, "createdBy": by, "creationSource": source,
                    "title": "Fixture title never stored",
-                   "lineage": lineage, "pullRequests": list(prs),
+                   "lineage": lineage,
+                   "pullRequests": list(prs) if raw_prs is None else raw_prs,
                    "createdAt": created}
         native.execute(
             "INSERT INTO orchestration_v2_projection_threads(thread_id,"
@@ -94,7 +97,8 @@ def write_v2(path, legacy=True):
                                              "strength": "strong"}}),
              driver))
 
-    def message(mid, tid, at, text, by, source, sender=None, ordinal=1):
+    def message(mid, tid, at, text, by, source, sender=None, ordinal=1,
+                provider_thread=None):
         run_id = f"run:{tid}:{ordinal}"
         payload = {"id": mid, "threadId": tid, "runId": run_id,
                    "role": "user", "createdBy": by, "creationSource": source,
@@ -110,7 +114,8 @@ def write_v2(path, legacy=True):
             "INSERT OR IGNORE INTO orchestration_v2_projection_runs(run_id,"
             " thread_id, ordinal, provider, provider_thread_id, status,"
             " requested_at, payload_json) VALUES(?,?,?,?,?,?,?,?)",
-            (run_id, tid, ordinal, "claudeAgent", None, "completed", at,
+            (run_id, tid, ordinal, "claudeAgent", provider_thread,
+             "completed", at,
              json.dumps({"id": run_id, "userMessageId": mid})))
 
     pr5 = {"host": "github.com", "repository": "example/beta", "number": 5,
@@ -132,6 +137,18 @@ def write_v2(path, legacy=True):
             ordinal=3)
     message("vm4", ROOT, "2026-10-10T08:50:00Z", "yes", "agent", "provider",
             ordinal=4)
+    # The same text from an agent in a Codex run of the same thread is no
+    # evidence about the Claude session's prompt.
+    provider_thread(ROOT, "codex", CX8, "2026-10-10T08:00:30Z")
+    message("vm7", ROOT, "2026-10-10T08:02:00Z", "please build it", "agent",
+            "provider", ordinal=6,
+            provider_thread="provider-thread:" + ROOT + ":" + CX8)
+    # A client surface outside the known human ones is not a person.
+    message("vm8", ROOT, "2026-10-10T08:03:00Z", "automated surface prompt",
+            "user", "automation", ordinal=7)
+    # A malformed pullRequests value must not lose the thread's lineage.
+    thread(ODD, "2026-10-10T08:15:00Z", parent=ROOT, root=ROOT,
+           raw_prs="not-a-list")
     # The parent's brief to its own child: not a cross-thread message.
     message("vm5", CHILD, "2026-10-10T08:10:01Z", "child brief", "agent",
             "mcp", sender=ROOT)
@@ -165,6 +182,8 @@ def v2_transcript(path):
         fh.write(user_line(P5, "unmatched prompt with an image",
                            session=CL2) + "\n")
         fh.write(user_line(P6, "child report", session=CL2) + "\n")
+        fh.write(user_line(P7, "automated surface prompt", session=CL2)
+                 + "\n")
     return path
 
 
@@ -246,6 +265,7 @@ class ChromeriaV2Test(LedgerCase):
         self.assertEqual(kinds["claude:" + P4]["kind"], "synthetic")
         self.assertEqual(kinds["claude:" + P5]["kind"], "synthetic")
         self.assertEqual(kinds["claude:" + P6]["kind"], "synthetic")
+        self.assertEqual(kinds["claude:" + P7]["kind"], "synthetic")
         # Responses after the genuine prompt join its turn.
         turn = self.query("SELECT turn_id FROM responses WHERE"
                           " response_id='claude:resp-b1'")[0]["turn_id"]
@@ -274,6 +294,7 @@ class ChromeriaV2Test(LedgerCase):
         self.assertEqual(spawns[CHILD], (ROOT, 1))
         self.assertEqual(spawns[GRAND], (CHILD, 2))
         self.assertEqual(spawns[SUB], (T1, 1))
+        self.assertEqual(spawns[ODD], (ROOT, 1))
         messages = {r["message_id"]: (r["sender_thread_id"],
                                       r["target_thread_id"])
                     for r in self.query("SELECT * FROM t3_messages")}

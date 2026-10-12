@@ -408,8 +408,8 @@ re-read every sync; workload bindings are durable ledger rows.
   thread's strong `nativeThreadRef.nativeId` is a native Claude, Codex,
   Grok or OpenCode session of its thread. V2 has no native turn ids, so a
   Claude prompt takes its origin from a V2 user message with the same
-  text hash in the same native session: `createdBy=user` from a client
-  surface is `genuine`, `agent` or `system` is `synthetic`, a hash sent by
+  text hash in the same native session (a run on another driver's provider
+  thread is no evidence): `createdBy=user` from `web` or `mobile` is `genuine`, `agent` or `system` is `synthetic`, a hash sent by
   both stays unknown, and uuid evidence outranks it. Legacy copies of V1
   messages (`user` from `server`) are no evidence. Only hashes are
   stored. Prompts classified at import keep their excerpt.
