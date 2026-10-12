@@ -103,8 +103,8 @@ class MigrationTest(unittest.TestCase):
 
     def test_failed_migration_leaves_schema_2_untouched(self):
         real = db._MIGRATION_3
-        broken = real[:3] + ("ALTER TABLE no_such_table RENAME TO boom",) \
-            + real[3:]
+        broken = real[:3] + (("sql", "INSERT INTO schema_meta(key)"
+                                      " VALUES(NULL)"),) + real[3:]
         with mock.patch.object(db, "_MIGRATION_3", broken):
             con = db.connect(self.path)
             with self.assertRaises(sqlite3.Error):
@@ -243,3 +243,45 @@ class OldNamesTest(InterventionsCase):
             "SELECT role FROM task_turns").fetchone()[0], "child")
         self.assertEqual(self.con.execute(
             "SELECT task_turn FROM assignments").fetchone()[0], "a9")
+
+
+RELEASED = ("v0.2.0", "v0.3.0", "v0.8.0", "v0.9.0", "v0.12.1", "v0.13.1",
+            "v0.15.1")
+
+
+class ReleasedLedgerTest(unittest.TestCase):
+    """Every released schema-2 shape migrates (#68 round 5). Each fixture
+    was written by that release's own code: 0.2.0 to 0.13.x have no
+    verdicts or session_attributes table."""
+
+    def test_every_released_schema_2_ledger_migrates_and_stays_usable(self):
+        for tag in RELEASED:
+            with self.subTest(tag=tag), tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "observer.db")
+                con = sqlite3.connect(path)
+                with open(fixture(f"ledger-schema-2-{tag}.sql"),
+                          encoding="utf-8") as fh:
+                    con.executescript(fh.read())
+                had_verdicts = con.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='verdicts'"
+                ).fetchone() is not None
+                con.close()
+                con = db.connect(path)
+                db.init_db(con)
+                self.assertEqual(version(path), "3")
+                for table, count in (("user_messages", 2), ("delegations", 1),
+                                     ("task_turns", 2), ("assignments", 1),
+                                     ("tasks", 1), ("outcomes", 1),
+                                     ("verdicts", 1 if had_verdicts else 0)):
+                    self.assertEqual(con.execute(
+                        f"SELECT COUNT(*) FROM {table}").fetchone()[0],
+                        count, (tag, table))
+                self.assertEqual({r[0] for r in con.execute(
+                    "SELECT role FROM task_turns")}, {"parent", "child"})
+                verdicts.add(con, [{"intervention": "sub:claude:u1",
+                                    "behavior": "correction", "judge": "j/v1",
+                                    "verdict": "no"}])
+                self.assertEqual(interventions.select(
+                    con, created_by=None)["counts"]["selected"], 2)
+                self.assertEqual(version(path + ".schema-2.bak"), "2")
+                con.close()

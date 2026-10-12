@@ -473,25 +473,51 @@ def connect(path: str) -> sqlite3.Connection:
     return con
 
 
-# Schema 2 -> 3 (#65): unified terms. Each statement keeps every row;
+# Schema 2 -> 3 (#65): unified terms. Every release since 0.2.0 wrote
+# schema 2, and they differ: before 0.14 there is no verdicts or
+# session_attributes table. Each step runs only when the ledger has what
+# it renames; tables a release lacks are created afterwards by SCHEMA_SQL.
 # SQLite renames foreign-key references along with the tables.
 _MIGRATION_3 = (
-    "DROP INDEX IF EXISTS idx_submissions_session",
-    "ALTER TABLE submissions RENAME TO user_messages",
-    "ALTER TABLE assignments RENAME COLUMN submission_native_id"
-    " TO user_message_id",
-    "ALTER TABLE assignments RENAME COLUMN attempt TO task_turn",
-    "ALTER TABLE dispatches RENAME TO delegations",
-    "ALTER TABLE delegations RENAME COLUMN owning_submission"
-    " TO owning_user_message",
-    "ALTER TABLE delegations RENAME COLUMN worker_thread TO child_thread",
-    "ALTER TABLE delegations RENAME COLUMN worker_turn TO child_turn",
-    "ALTER TABLE attempts RENAME TO task_turns",
-    "ALTER TABLE task_turns RENAME COLUMN route_requested TO color_requested",
-    "UPDATE task_turns SET role='child' WHERE role='worker'",
-    "ALTER TABLE verdicts RENAME COLUMN moment_id TO intervention_id",
-    "UPDATE schema_meta SET value='3' WHERE key='schema_version'",
+    ("sql", "DROP INDEX IF EXISTS idx_submissions_session"),
+    ("rename_table", "submissions", "user_messages"),
+    ("rename_column", "assignments", "submission_native_id", "user_message_id"),
+    ("rename_column", "assignments", "attempt", "task_turn"),
+    ("rename_table", "dispatches", "delegations"),
+    ("rename_column", "delegations", "owning_submission", "owning_user_message"),
+    ("rename_column", "delegations", "worker_thread", "child_thread"),
+    ("rename_column", "delegations", "worker_turn", "child_turn"),
+    ("rename_table", "attempts", "task_turns"),
+    ("rename_column", "task_turns", "route_requested", "color_requested"),
+    ("update", "task_turns", "UPDATE task_turns SET role='child'"
+     " WHERE role='worker'"),
+    ("rename_column", "verdicts", "moment_id", "intervention_id"),
+    ("sql", "UPDATE schema_meta SET value='3' WHERE key='schema_version'"),
 )
+
+
+def _has_table(con: sqlite3.Connection, name: str) -> bool:
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
+                       " AND name=?", (name,)).fetchone() is not None
+
+
+def _run_step(con: sqlite3.Connection, step: tuple) -> None:
+    kind = step[0]
+    if kind == "sql":
+        con.execute(step[1])
+    elif kind == "rename_table":
+        if _has_table(con, step[1]):
+            con.execute(f"ALTER TABLE {step[1]} RENAME TO {step[2]}")
+    elif kind == "rename_column":
+        if _has_table(con, step[1]) and step[2] in {
+                r[1] for r in con.execute(f"PRAGMA table_info({step[1]})")}:
+            con.execute(f"ALTER TABLE {step[1]} RENAME COLUMN {step[2]}"
+                        f" TO {step[3]}")
+    elif kind == "update":
+        if _has_table(con, step[1]):
+            con.execute(step[2])
+    else:
+        raise ValueError(f"unknown migration step: {kind}")
 
 
 def _main_file(con: sqlite3.Connection) -> str | None:
@@ -541,8 +567,8 @@ def _migrate_to_3(con: sqlite3.Connection) -> None:
                 return
             if path:
                 _backup_once(path)
-            for statement in _MIGRATION_3:
-                con.execute(statement)
+            for step in _MIGRATION_3:
+                _run_step(con, step)
         except BaseException:
             con.execute("ROLLBACK")
             raise
