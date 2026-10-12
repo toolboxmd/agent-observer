@@ -1,23 +1,19 @@
 # Objective
 
-Make routine agent work on this Mac measurable across Codex, Claude Code,
-OpenCode, and Grok Build, so routing and workflow decisions can use reproducible
-evidence from real tasks.
+Make routine agent work on rocky, cavallo and bestia, each running its own
+Observer, measurable across Codex, Claude Code, OpenCode, Grok Build and
+Chromeria V2, so routing and workflow decisions use reproducible real-task
+evidence. Transcripts stay on their machine; only aggregates travel.
 
-The Objective is complete when:
+Done when:
+- Native records durably cover usage and available tool, skill, read,
+  compaction and execution events.
+- Explicit task and worker ownership ties them to outcomes, commits and PRs
+  without double counting; gaps stay visible.
+- One local CLI lets people and agents inspect tasks, compare suitable work
+  and trace repeated operations; optional GitHub summaries show aggregates.
+- Recorded tokens reconcile with native evidence and a separate
+  verifier; real work on each machine shows coverage.
 
-- Native records provide a durable account of usage and available tool,
-  skill, read, compaction, and execution events without a runtime dependency
-  on ccusage.
-- Explicit task and worker ownership connects that account to outcomes,
-  commits, and PRs without double counting. Missing evidence stays visible.
-- People and agents can inspect tasks, compare suitable work, and investigate
-  repeated operations through one local CLI. Optional GitHub summaries expose
-  the same aggregate evidence beside the work.
-- Recorded token totals reconcile against native evidence and a separate
-  verifier. Deterministic checks and ordinary work on this Mac demonstrate
-  the claimed capture coverage and useful diagnostics.
-
-Remote machines, browser chat, automatic improvement experiments, and automatic
-routing or workflow changes are outside this milestone. Crashes without usable
-output are counted separately and excluded from useful-work comparisons.
+Out of scope: browser chat; automating improvement experiments, routing or
+workflow changes.

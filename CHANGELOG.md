@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.13.1] - 2026-10-12
+
+### Changed
+
+- Objective covers rocky, cavallo and bestia, each with its own Observer, with Chromeria V2 as a first-class source; transcripts stay on their machine and only aggregates travel; wording cut to fit the 1,500-character cap (#55)
+
 ## [0.13.0] - 2026-10-12
 
 ### Added
