@@ -257,8 +257,31 @@ def _all(con, harness=None, project=None, attrs=None):
             policy.append((row["ts"], kind[len("policy:"):]))
         else:
             found.append(_from_event(row, ev, kind))
+    first = _first_activity(con)
+    for m in found:
+        _mark_opening(m, first)
     found.sort(key=lambda m: (m["ts"] or 0, m["id"]))
     return found, policy
+
+
+_ACTIVITY_SQL = ("SELECT session_key, MIN(ts) FROM events WHERE family IN"
+                 " ('assistant_message', 'tool_call')")
+
+
+def _first_activity(con, session_key=None) -> dict:
+    if session_key:
+        return {r[0]: r[1] for r in con.execute(
+            _ACTIVITY_SQL + " AND session_key = ?", (session_key,))}
+    return {r[0]: r[1] for r in con.execute(
+        _ACTIVITY_SQL + " GROUP BY session_key")}
+
+
+def _mark_opening(moment: dict, first: dict) -> dict:
+    """opening: nothing the agent did precedes the moment in its session,
+    so it cannot correct that agent (a first prompt or brief)."""
+    start = first.get(moment["session"])
+    moment["opening"] = start is None or (moment["ts"] or 0) <= start
+    return moment
 
 
 def _in_period(ts, since, until) -> bool:
@@ -320,7 +343,9 @@ def resolve(con: sqlite3.Connection, moment_id, ev=None) -> dict | None:
                           f" {_SUB_KINDS}", (moment_id[4:],)).fetchone()
         if row is None or row["native_id"] in _echoes(con, row["session_key"]):
             return None
-        return _from_submission(row, ev)
+        moment = _from_submission(row, ev)
+        return None if moment is None else _mark_opening(
+            moment, _first_activity(con, row["session_key"]))
     if moment_id.startswith("ev:"):
         session, _, rest = moment_id[3:].partition("/")
         family, _, native = rest.partition("/")
@@ -335,7 +360,8 @@ def resolve(con: sqlite3.Connection, moment_id, ev=None) -> dict | None:
         kind = _event_kind(row)
         if kind is None or kind.startswith("policy:"):
             return None
-        return _from_event(row, ev, kind)
+        return _mark_opening(_from_event(row, ev, kind),
+                             _first_activity(con, session))
     return None
 
 

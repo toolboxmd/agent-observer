@@ -268,7 +268,9 @@ agent-observer session-attr add --json < arms.jsonl     # {"session": "claude:<i
 ```
 
 `moments` lists the selected moments and counts every moment in scope by
-origin and kind, so filtered moments stay visible as numbers. `moment show`
+origin and kind, so filtered moments stay visible as numbers. A moment
+marked `opening` comes before anything the agent did in its session (a
+first prompt, a worker's brief), so it cannot correct that agent. `moment show`
 reads each moment from the native log: its full text (including text
 inside Chromeria wrapper tags) and whole turns around it. A turn is a
 prompt or interrupt (with its `origin`) plus the agent's messages and

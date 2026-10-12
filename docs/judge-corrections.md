@@ -42,6 +42,11 @@ Behavior: correction. Judge id: <model>/correction-v1.
      or by an unrelated request.
    - unclear: the context cannot tell, for example an interrupt with no
      later prompt and no visible reason.
+   A moment with `opening: true` came before anything the agent did in
+   its session (a first prompt or a worker's brief), so it cannot correct
+   that agent. Read only its text (`--turns-before 0 --turns-after 0`):
+   it is no unless the text itself says an earlier agent or attempt got
+   something wrong (a retry brief naming the failure), which is yes.
    Not understanding the agent is yes only when the person says the
    explanation itself failed ("I don't understand a word", "talk
    simpler", "still don't get it" after a re-explanation). A first plain

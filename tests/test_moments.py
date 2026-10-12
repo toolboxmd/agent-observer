@@ -233,6 +233,15 @@ class SelectTest(MomentsCase):
         self.assertEqual(found["sub:claude:u1"]["thread"], "none")
         self.assertEqual(found["sub:claude:y2"]["thread"], "launched")
 
+    def test_opening_marks_moments_before_any_agent_activity(self):
+        found = self.ids(self.select(origins=None))
+        self.assertTrue(found["sub:claude:u1"]["opening"])
+        self.assertTrue(found["sub:codex:msg-u1"]["opening"])
+        self.assertFalse(found["sub:claude:u2"]["opening"])
+        self.assertFalse(found["sub:claude:w2"]["opening"])
+        self.assertTrue(moments.show(self.con, ["sub:claude:u1"])[0]["opening"])
+        self.assertFalse(moments.show(self.con, ["sub:claude:u2"])[0]["opening"])
+
     def test_default_selects_human_and_agent_moments_and_counts_the_rest(self):
         # Corrections from a person and from another agent both count
         # (user decision, 2026-10-12); unknown origin stays out.
