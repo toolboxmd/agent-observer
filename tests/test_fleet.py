@@ -1,0 +1,211 @@
+"""Fleet evidence across machines (#56): export, pull and combined report.
+
+Each machine keeps its own ledger and transcripts; only aggregates leave
+it. Fixtures are fabricated ledgers; the "secret" strings stand for the
+free text, paths and branch names that must never reach an export.
+"""
+
+import json
+import os
+import stat
+import subprocess
+import sys
+
+from agent_observer import db, fleet
+from tests.helpers import LedgerCase
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SECRETS = ("secret-title", "/Users/secret", "feat/secret-branch",
+           "secret prompt", "secret task title", "file:///secret")
+
+
+def add_session(con, harness, native_id, tokens, model="fixture-model",
+                semantics="codex:input_includes_cached,output_includes_reasoning"):
+    con.execute(
+        "INSERT INTO sources(harness, path, sha256, imported_at)"
+        " VALUES(?,?,?,?)", (harness, f"/Users/secret/{native_id}.jsonl",
+                             "x", 1791600000.0))
+    source_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+    key = f"{harness}:{native_id}"
+    db.upsert_session(con, key, harness, native_id, source_id,
+                      project_dir="/Users/secret/proj",
+                      git_branch="feat/secret-branch", title="secret-title",
+                      started_at=1791600000.0, ended_at=1791600100.0)
+    con.execute(
+        "INSERT INTO responses(response_id, source_id, harness, session_key,"
+        " ordinal_num, model, semantics, input_tokens, cached_input_tokens,"
+        " output_tokens, reasoning_output_tokens, total_tokens)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (f"{key}:r1", source_id, harness, key, 1, model, semantics,
+         tokens, 0, 10, 0, tokens + 10))
+    con.execute(
+        "INSERT INTO submissions(native_id, source_id, session_key, kind,"
+        " text_hash, text_excerpt, is_genuine) VALUES(?,?,?,?,?,?,?)",
+        (f"{key}:s1", source_id, key, "genuine", "abc", "secret prompt", 1))
+    return key
+
+
+def add_task(con, task_id, key, url, project, state="complete"):
+    con.execute(
+        "INSERT INTO tasks(task_id, project, title, issue_url, origin,"
+        " created_at) VALUES(?,?,?,?,?,?)",
+        (task_id, project, "secret task title", url, "t3", 1791600000.0))
+    con.execute(
+        "INSERT INTO session_assignments(session_key, task_id, evidence,"
+        " created_at) VALUES(?,?,?,?)", (key, task_id, "fixture", 1.0))
+    con.execute(
+        "INSERT INTO outcomes(task_id, acceptance_state, proof_ref,"
+        " updated_at) VALUES(?,?,?,?)", (task_id, state, url, 1.0))
+
+
+class ExportTest(LedgerCase):
+    def test_export_holds_aggregates_only(self):
+        key = add_session(self.con, "codex", "s-one", 100)
+        add_task(self.con, "o/r#1", key, "https://github.com/o/r/pull/1",
+                 "o/r")
+        other = add_session(self.con, "claude", "s-two", 50,
+                            semantics="claude:input_excludes_cache")
+        add_task(self.con, "local-task", other, "file:///secret",
+                 "not a repo", state="unknown")
+        self.con.commit()
+        doc = fleet.export(self.con, machine="rocky")
+        dumped = json.dumps(doc)
+        for secret in SECRETS:
+            self.assertNotIn(secret, dumped)
+        self.assertEqual(doc["schema"], fleet.SCHEMA)
+        self.assertEqual(doc["machine"], "rocky")
+        sessions = {s["session_key"]: s for s in doc["sessions"]}
+        self.assertEqual(sessions[key]["usage"][0]["total_tokens"], 110)
+        self.assertEqual(sessions[key]["harness"], "codex")
+        tasks = {t["task_id"]: t for t in doc["tasks"]}
+        self.assertEqual(tasks["o/r#1"]["issue_url"],
+                         "https://github.com/o/r/pull/1")
+        self.assertEqual(tasks["o/r#1"]["project"], "o/r")
+        self.assertEqual(tasks["o/r#1"]["acceptance_state"], "complete")
+        self.assertEqual(tasks["o/r#1"]["sessions"], [key])
+        self.assertIsNone(tasks["local-task"]["issue_url"])
+        self.assertIsNone(tasks["local-task"]["project"])
+
+    def test_machine_names_are_slugs(self):
+        with self.assertRaises(ValueError):
+            fleet.export(self.con, machine="../etc")
+        self.assertEqual(fleet.machine_name("Rocky.local"), "rocky")
+
+
+def _doc(machine, sessions, tasks=()):
+    """A minimal valid export document."""
+    return {"schema": fleet.SCHEMA, "machine": machine,
+            "observer_version": "0.0.0", "exported_at": "2026-10-12T12:00:00Z",
+            "ledger_synced_at": "2026-10-12T11:00:00Z",
+            "sessions": [{"session_key": k, "harness": "codex",
+                          "usage": [{"harness": "codex", "model": "m",
+                                     "effort": None, "semantics": "s1",
+                                     "responses": 1, "total_tokens": t}]}
+                         for k, t in sessions],
+            "tasks": list(tasks)}
+
+
+def _task(task_id, sessions, state="complete"):
+    return {"task_id": task_id, "project": "o/r", "issue_url": None,
+            "origin": "t3", "acceptance_state": state, "sessions": sessions}
+
+
+class ReportTest(LedgerCase):
+    def test_combines_machines_counting_each_session_once(self):
+        rocky = _doc("rocky", [("codex:a", 100), ("codex:dup", 40)],
+                     [_task("o/r#1", ["codex:a", "codex:dup"]),
+                      _task("o/r#9", ["codex:a"])])
+        bestia = _doc("bestia", [("codex:b", 7), ("codex:dup", 40)],
+                      [_task("o/r#1", ["codex:b", "codex:dup"],
+                             state="unknown")])
+        result = fleet.combine([rocky, bestia],
+                               expect=["rocky", "cavallo", "bestia"])
+        self.assertEqual(result["missing"], ["cavallo"])
+        self.assertEqual(result["duplicate_sessions"],
+                         [{"session_key": "codex:dup",
+                           "machines": ["bestia", "rocky"]}])
+        # 100 + 40 + 7: the duplicated session counts once.
+        self.assertEqual(result["totals"]["s1"]["total_tokens"], 147)
+        self.assertEqual(result["totals"]["s1"]["sessions"], 3)
+        task = result["tasks"][0]
+        self.assertEqual(task["task_id"], "o/r#1")
+        # Whole sessions touching the task, each once: 100 + 40 + 7.
+        self.assertEqual(task["session_usage"]["s1"]["total_tokens"], 147)
+        self.assertEqual(task["sessions"], 3)
+        # codex:a also belongs to o/r#9, so it is shared, not exclusive.
+        self.assertEqual(task["shared_sessions"], 1)
+        self.assertEqual(task["missing_sessions"], [])
+        self.assertEqual(sorted(task["machines"]),
+                         ["bestia", "rocky"])
+        self.assertEqual(task["acceptance_states"],
+                         {"bestia": "unknown", "rocky": "complete"})
+
+    def test_task_sessions_missing_from_every_export_stay_visible(self):
+        rocky = _doc("rocky", [("codex:a", 5)],
+                     [_task("o/r#2", ["codex:a", "codex:gone"])])
+        task = fleet.combine([rocky])["tasks"][0]
+        self.assertEqual(task["session_usage"]["s1"]["total_tokens"], 5)
+        self.assertEqual(task["missing_sessions"], ["codex:gone"])
+
+    def test_unknown_tokens_stay_visible(self):
+        doc = _doc("rocky", [("codex:a", None), ("codex:b", 5)])
+        totals = fleet.combine([doc])["totals"]["s1"]
+        self.assertEqual(totals["total_tokens"], 5)
+        self.assertEqual(totals["unknown_counts"], {"total_tokens": 1})
+
+    def test_rejects_invalid_documents(self):
+        for bad in ({"schema": "other"}, {**_doc("rocky", []), "machine": "a/b"},
+                    {**_doc("rocky", []), "sessions": "x"}):
+            with self.assertRaises(ValueError):
+                fleet.validate(bad)
+
+
+class PullTest(LedgerCase):
+    def run_fake(self, stdout, code=0):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, code, stdout, "boom")
+        return run, calls
+
+    def test_pull_stores_a_validated_export(self):
+        store = os.path.join(self.tmp.name, "fleet")
+        run, calls = self.run_fake(json.dumps(_doc("bestia", [("codex:b", 7)])))
+        result = fleet.pull("bestia", store, run=run)
+        self.assertEqual(result["machine"], "bestia")
+        self.assertEqual(calls[0][0], "ssh")
+        self.assertEqual(calls[0][-2:], ["bestia", "agent-observer export"])
+        path = os.path.join(store, "bestia.json")
+        self.assertEqual(json.load(open(path))["machine"], "bestia")
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        self.assertEqual([d["machine"] for d in fleet.stored(store)],
+                         ["bestia"])
+
+    def test_failed_or_invalid_pull_writes_nothing(self):
+        store = os.path.join(self.tmp.name, "fleet")
+        for stdout, code in (("", 255), ("not json", 0),
+                             (json.dumps({"schema": "other"}), 0)):
+            run, _ = self.run_fake(stdout, code)
+            with self.assertRaises(fleet.PullError):
+                fleet.pull("cavallo", store, run=run)
+        self.assertEqual(fleet.stored(store), [])
+
+
+class CliTest(LedgerCase):
+    def test_export_and_report_commands(self):
+        add_session(self.con, "codex", "s-one", 100)
+        self.con.commit()
+        env = {**os.environ, "AGENT_OBSERVER_MACHINE": "rocky"}
+        out = subprocess.run(
+            [sys.executable, "-m", "agent_observer", "--db", self.db_path,
+             "export"], cwd=REPO, env=env, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout)["machine"], "rocky")
+        report = subprocess.run(
+            [sys.executable, "-m", "agent_observer", "--db", self.db_path,
+             "--json", "fleet", "report", "--expect", "rocky,bestia"],
+            cwd=REPO, env=env, capture_output=True, text=True)
+        # A missing machine is a visible, non-zero result.
+        self.assertEqual(report.returncode, 3, report.stderr)
+        self.assertEqual(json.loads(report.stdout)["missing"], ["bestia"])

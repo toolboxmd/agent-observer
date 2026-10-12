@@ -19,3 +19,5 @@
 - Policy denial: a tool call refused by a hook, a permission rule or auto mode; never a moment or a correction.
 - Verdict: an outside judge's yes, no or unclear on one moment for one behavior, with a problem line and group for yes.
 - Recurring problem: a verdict group whose yes verdicts span two or more sessions.
+- Machine export: one machine's aggregate document (session usage by model and counter semantics, task outcomes and session keys); never transcripts, prompts, titles or paths. _Avoid_: dump, backup.
+- Fleet report: machine exports combined, each session counted once, with missing machines and doubly reported sessions listed.

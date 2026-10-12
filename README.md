@@ -405,6 +405,34 @@ whole session. It rejects existing ownership conflicts. Do not use it for a
 conversation that has served, or will serve, other tasks. The installed
 Observer Skill owns the complete capture and delivery procedure.
 
+## Several machines
+
+Each machine runs its own Observer over its own ledger. Transcripts stay on
+their machine; only aggregates travel.
+
+```sh
+agent-observer export                      # this machine's export, JSON on stdout
+agent-observer fleet pull bestia cavallo   # fetch their exports over SSH
+agent-observer fleet report --expect rocky,cavallo,bestia
+```
+
+`export` writes session usage by model and counter semantics, plus each task's
+outcome, GitHub identifiers and session keys. It never includes prompts,
+assistant text, excerpts, titles, local paths or branch names. `fleet pull`
+runs `agent-observer export` on each host over SSH (`--remote-command` when
+the CLI is not on the remote PATH). It stores the result as
+`fleet/<machine>.json` beside the ledger, mode 600, and stores nothing when
+SSH fails or the output is not an export. Machine names come from
+`$AGENT_OBSERVER_MACHINE` or the short hostname.
+
+`fleet report` combines this machine's live export with the stored ones. Each
+session counts once. Sessions found on several machines, and machines
+expected with `--expect` but absent, are listed and make the exit status 3.
+Each machine shows its export and ledger sync times, so stale evidence is
+visible. A task's combined usage is the whole sessions touching it, each once,
+with the number it shares with other tasks. Exact per-task attribution stays
+with `task show` on each machine. Nothing pulls on a schedule.
+
 ## GitHub summaries
 
 `publish --task T-42 --repo o/r --pr 7` renders one aggregate comment

@@ -5,6 +5,7 @@
 ### Added
 
 - Judge moments: `moments`, `moment show`, `verdict add|list|groups`, `recurrence` and `session-attr add` select every moment where a person or another agent acted on an agent, give an outside LLM judge each one with a configurable window of whole turns from the native logs, store its verdicts and report recurring problems for people and agents combined and apart; hook and rule denials are counted separately and Chromeria prompt origins now cover Codex as well as Claude (#60)
+- Combine evidence across machines: export, fleet pull and fleet report; transcripts stay on their machine, only aggregates travel (#56)
 
 ## [0.13.1] - 2026-10-12
 
