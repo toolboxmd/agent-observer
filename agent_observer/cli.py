@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 
 from . import CAPTURE_CONTRACT_VERSION, EVENT_CONTRACT_VERSION, SCHEMA_VERSION
@@ -414,6 +415,22 @@ def build_parser() -> argparse.ArgumentParser:
     saa = sasub.add_parser("add", help="store JSON lines {session, name, value}")
     saa.add_argument("--file", default="-", help="JSON lines file, or - for stdin")
     saa.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
+    ex = sub.add_parser("export", help="print this machine's aggregate fleet export (JSON)")
+    ex.add_argument("--machine", default=None,
+                    help="machine name (default $AGENT_OBSERVER_MACHINE or the short hostname)")
+    fl = sub.add_parser("fleet", help="combine aggregate evidence across machines")
+    flsub = fl.add_subparsers(dest="op", required=True)
+    fp = flsub.add_parser("pull", help="fetch other machines' exports over SSH")
+    fp.add_argument("hosts", nargs="+", help="SSH host names")
+    fp.add_argument("--remote-command", default=None,
+                    help="command printing the remote export (default: agent-observer export)")
+    fp.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
+    fr = flsub.add_parser("report", help="combine this machine's export with pulled ones")
+    fr.add_argument("--expect", default=None,
+                    help="comma-separated machines that must be present")
+    fr.add_argument("--task", default=None, help="only this task")
+    fr.add_argument("--machine", default=None, help="this machine's name")
+    fr.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     tr = sub.add_parser("trace", help="inspect the execution timeline")
     tr.add_argument("--task", default=None)
     tr.add_argument("--turn", default=None)
@@ -425,14 +442,20 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+READ_ONLY = ("task", "publish", "claims", "thread-misuse", "dispatch-modes",
+             "event", "export", "fleet")
+
+
 def main(argv=None) -> int:
     ap = build_parser()
     ns = ap.parse_args(argv)
+    if ns.cmd == "fleet" and ns.op == "pull":
+        return _fleet_pull(ns)
     try:
-        con = _db.connect_read_only(ns.db) if ns.cmd in ("task", "publish", "claims", "thread-misuse", "dispatch-modes", "event") else _con(ns.db)
+        con = _db.connect_read_only(ns.db) if ns.cmd in READ_ONLY else _con(ns.db)
     except (RuntimeError, sqlite3.Error) as exc:
         print(str(exc), file=sys.stderr)
-        if ns.cmd in ("task", "publish", "claims", "thread-misuse", "dispatch-modes", "event"):
+        if ns.cmd in READ_ONLY:
             print("Task reports, claim audits and event lookups require an existing ledger; run agent-observer sync first.", file=sys.stderr)
             if os.path.exists(ns.db):
                 print("If a read-only sandbox prevents access, consume a coordinator-exported task JSON instead.", file=sys.stderr)
@@ -548,6 +571,19 @@ def main(argv=None) -> int:
         if ns.cmd == "event":
             return _event_show(con, ns)
 
+        if ns.cmd == "export":
+            from . import fleet as _fleet
+            try:
+                doc = _fleet.export(con, machine=ns.machine)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            print(json.dumps(doc, sort_keys=True))
+            return 0
+
+        if ns.cmd == "fleet":
+            return _fleet_report(con, ns)
+
         if ns.cmd == "trace":
             if ns.capabilities:
                 caps = {"capabilities": _report.capabilities(),
@@ -573,6 +609,53 @@ def main(argv=None) -> int:
     finally:
         con.close()
     return 2
+
+
+def _fleet_pull(ns) -> int:
+    from . import fleet as _fleet
+    directory = _fleet.store_dir(ns.db)
+    results, failed = [], 0
+    for host in ns.hosts:
+        try:
+            results.append(_fleet.pull(
+                host, directory, ns.remote_command or _fleet.REMOTE_COMMAND))
+        except (_fleet.PullError, OSError, subprocess.SubprocessError) as exc:
+            failed += 1
+            results.append({"host": host, "error": str(exc)})
+    if ns.as_json:
+        print(json.dumps({"_view": "fleet-pull", "pulled": results}, indent=2))
+    else:
+        for r in results:
+            print(f"{r['host']}: failed: {r['error']}" if "error" in r else
+                  f"{r['host']}: stored {r['machine']} ({r['sessions']}"
+                  f" sessions, {r['tasks']} tasks, exported {r['exported_at']})"
+                  + (f"; warning: {r['warning']}" if r.get("warning") else ""))
+    return 1 if failed else 0
+
+
+def _fleet_report(con, ns) -> int:
+    from . import fleet as _fleet
+    try:
+        local = _fleet.export(con, machine=ns.machine)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    stored = _fleet.stored(_fleet.store_dir(ns.db))
+    docs = [local] + [d for d in stored if d["machine"] != local["machine"]]
+    expect = [m.strip() for m in (ns.expect or "").split(",") if m.strip()]
+    result = _fleet.combine(docs, expect=expect)
+    # A stored export under this machine's own name is never combined;
+    # say so instead of dropping it silently.
+    result["skipped_stored"] = [d["machine"] for d in stored
+                                if d["machine"] == local["machine"]]
+    if ns.task:
+        result["tasks"] = [t for t in result["tasks"] if t["task_id"] == ns.task]
+    if ns.as_json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(_fleet.render(result))
+    # Missing machines and doubly reported sessions are visible failures.
+    return 3 if result["missing"] or result["duplicate_sessions"] else 0
 
 
 def _event_show(con, ns) -> int:

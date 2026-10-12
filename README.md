@@ -405,6 +405,58 @@ whole session. It rejects existing ownership conflicts. Do not use it for a
 conversation that has served, or will serve, other tasks. The installed
 Observer Skill owns the complete capture and delivery procedure.
 
+## Several machines
+
+Each machine runs its own Observer over its own ledger. Transcripts stay on
+their machine; only aggregates travel.
+
+```sh
+agent-observer export                      # this machine's export, JSON on stdout
+agent-observer fleet pull bestia cavallo   # fetch their exports over SSH
+agent-observer fleet report --expect rocky,cavallo,bestia
+```
+
+`export` writes session usage by model and counter semantics, plus each task's
+outcome, GitHub identifiers and session keys. It never includes prompts,
+assistant text, excerpts, titles, local paths or branch names. Task ids travel
+only when they are identifiers such as `owner/repo#12` or `T-42`; a free-text
+id stays home and is counted in `withheld_tasks`. Judge evidence (see Judge
+moments) travels as counts and identifiers, per session: moments by origin
+and kind and policy denials, and per behavior and judge the verdict counts
+and judged moments by origin; plus each group's id, the judge's one-line problem and its
+judged-yes moments (id, session key, origin, time). Moment and transcript
+text never leave the machine; the problem line is the judge's own words,
+redacted for known secret shapes. `fleet pull`
+runs `agent-observer export` on each host over SSH (`--remote-command` when
+the CLI is not on the remote PATH). It stores the result as
+`fleet/<machine>.json` beside the ledger, mode 600. It stores nothing when SSH
+fails or any field of the output fails validation, and warns when a host
+reports a machine name other than its own. Machine names come from
+`$AGENT_OBSERVER_MACHINE` or the short hostname.
+
+The machines are your own, reached over SSH keys you control. Validation
+guards against corrupt or buggy exports: every field is type- and
+range-checked, strings that could break report lines are refused, and `pull`
+stores only an export it can render. It does not make a hostile host safe to
+pull from.
+
+`fleet report` combines this machine's live export with the stored ones. Each
+session counts once. Sessions found on several machines, and machines
+expected with `--expect` but absent, are listed and make the exit status 3.
+Each machine shows its export and ledger sync times, so stale evidence is
+visible. A task's combined usage is the whole sessions touching it, each once,
+with the number it shares with other tasks. Exact per-task attribution stays
+with `task show` on each machine. Recurrence combines across machines:
+groups with the same id under the same judge (a shared judge run grouped
+them) merge, and a problem that
+appears in one session on each of two machines recurs. A behavior judged
+by different judges on different machines is reported per judge and
+listed under `unmerged_behaviors`. One rule covers every combined count:
+a session reported by several machines contributes its usage, moments,
+denials, verdicts and judged moments once, from the first of those machines
+by name. Headline numbers count human and agent
+moments, as `recurrence` does. Nothing pulls on a schedule.
+
 ## GitHub summaries
 
 `publish --task T-42 --repo o/r --pr 7` renders one aggregate comment
