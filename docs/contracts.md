@@ -245,7 +245,8 @@ are counted separately and excluded from useful-work comparisons.
   (Claude uuid), then V2 prompt origin by native session and text hash,
   then a headless entrypoint (`agent`); for interrupts and rejections a
   T3 child thread, or a top-level thread not opened by a person
-  (`launched`: V2 `createdBy` agent or system, or no evidence), is
+  (`launched`: V2 `createdBy` agent or system, or no evidence; V1
+  threads and V2 legacy imports take the first turn start's actor), is
   `unknown`; then `user-rejected` (`human`), an
   interactive entrypoint (`human`), and for interrupts and rejections a
   top-level T3 thread (`human`); otherwise `unknown`. a batch naming one moment, behavior and judge twice is

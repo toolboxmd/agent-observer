@@ -168,6 +168,14 @@ def write_v2(path, legacy=True):
                by="system", source="server")
         message("lm1", T1, "2026-09-27T10:00:00Z", "dispatched followup",
                 "user", "server")
+        native.execute(
+            "CREATE TABLE orchestration_v2_legacy_imports(thread_id TEXT"
+            " PRIMARY KEY, source_updated_at TEXT NOT NULL,"
+            " shell_imported_at TEXT NOT NULL)")
+        for tid in (T1, SUB):
+            native.execute(
+                "INSERT INTO orchestration_v2_legacy_imports VALUES(?,?,?)",
+                (tid, "2026-09-27T09:00:00Z", "2026-10-08T00:00:00Z"))
     native.commit()
     native.close()
     return path
@@ -290,6 +298,10 @@ class ChromeriaV2Test(LedgerCase):
             "SELECT thread_id, opened_by FROM t3_threads")}
         self.assertEqual(opened[ROOT], "client")
         self.assertEqual(opened[CHILD], "server")
+        # Chromeria's legacy import marks every V1 thread system-created;
+        # that is no evidence, so the first turn start decides.
+        self.assertEqual(opened[T1], "client")
+        self.assertIsNone(opened[SUB])
 
     def test_prompt_origins_cover_every_driver(self):
         # Judge moments (#60) need the origin of Codex, Grok and OpenCode

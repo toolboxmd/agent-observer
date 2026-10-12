@@ -93,6 +93,7 @@ V2_THREADS = "orchestration_v2_projection_threads"
 V2_PROVIDER_THREADS = "orchestration_v2_projection_provider_threads"
 V2_MESSAGES = "orchestration_v2_projection_messages"
 V2_RUNS = "orchestration_v2_projection_runs"
+V2_LEGACY_IMPORTS = "orchestration_v2_legacy_imports"
 # V2 drivers whose nativeThreadRef is the ledger's native session id.
 V2_DRIVERS = ("claudeAgent", "codex", "grok", "opencode")
 # Chromeria surfaces where a person types; any other source is no evidence.
@@ -513,6 +514,13 @@ def _v2_lineage(native: sqlite3.Connection) -> dict:
             f" FROM {V2_THREADS}").fetchall()
     except sqlite3.DatabaseError:
         return out
+    legacy = set()
+    if V2_LEGACY_IMPORTS in _tables(native):
+        try:
+            legacy = {r[0] for r in native.execute(
+                f"SELECT thread_id FROM {V2_LEGACY_IMPORTS}")}
+        except sqlite3.DatabaseError:
+            legacy = set()
     for row in rows:
         thread_id = _valid_id(row["thread_id"])
         if thread_id is None:
@@ -535,7 +543,10 @@ def _v2_lineage(native: sqlite3.Connection) -> dict:
             "created_at": row["created_at"]
             if isinstance(row["created_at"], str) else None,
             "prs": prs if isinstance(prs, list) else [],
-            "opened_by": _prompt_actor_of(row["created_by"], row["source"])}
+            # Chromeria's legacy import marks every V1 thread created by
+            # the system from the server: no evidence of who opened it.
+            "opened_by": None if thread_id in legacy
+            else _prompt_actor_of(row["created_by"], row["source"])}
     # A child whose lineage names no root inherits its parent's.
     for thread_id, entry in out.items():
         if entry["root"] is None:
@@ -667,6 +678,17 @@ def _import_threads(con: sqlite3.Connection, native: sqlite3.Connection,
     """
     lineage = lineage or {}
     result: dict[str, list] = {}
+    # Without V2 creation evidence (V1 threads, legacy imports), the first
+    # turn start says who opened the thread.
+    first_turn = {}
+    for r in con.execute(
+            "SELECT thread_id, actor_kind FROM t3_turn_origins"
+            " ORDER BY occurred_at DESC"):
+        first_turn[r["thread_id"]] = r["actor_kind"]
+
+    def opened_by(thread_id):
+        evidence = (lineage.get(thread_id) or {}).get("opened_by")
+        return evidence or first_turn.get(thread_id)
     rows = []
     if "provider_session_runtime" in _tables(native):
         try:
@@ -705,7 +727,7 @@ def _import_threads(con: sqlite3.Connection, native: sqlite3.Connection,
              provider if isinstance(provider, str) else None,
              row["adapter_key"]
              if isinstance(row["adapter_key"], str) else None,
-             native_session, (lineage.get(thread_id) or {}).get("opened_by")))
+             native_session, opened_by(thread_id)))
         result.setdefault(thread_id, []).append(native_session)
         seen += 1
     if V2_PROVIDER_THREADS in _tables(native):
@@ -733,8 +755,7 @@ def _import_threads(con: sqlite3.Connection, native: sqlite3.Connection,
                 " native_session=excluded.native_session,"
                 " opened_by=excluded.opened_by",
                 (thread_id, _lineage_root(thread_id, lineage), row["provider"],
-                 row["provider"], native_session,
-                 (lineage.get(thread_id) or {}).get("opened_by")))
+                 row["provider"], native_session, opened_by(thread_id)))
             sessions = result.setdefault(thread_id, [])
             if native_session not in sessions:
                 sessions.append(native_session)

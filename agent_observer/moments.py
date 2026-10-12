@@ -82,10 +82,15 @@ class _Evidence:
         # person-like position.
         self.threads: dict[str, str] = {}
         rank = {"root": 0, "launched": 1, "child": 2}
+        # A ledger synced before opened_by existed reads every top-level
+        # thread as launched (no evidence), never as person-opened.
+        opened = "opened_by" if "opened_by" in {
+            r[1] for r in self._rows(con, "PRAGMA table_info(t3_threads)")} \
+            else "NULL"
         for session, position in self._rows(
                 con, "SELECT native_session,"
                      " CASE WHEN thread_id != root_thread_id THEN 'child'"
-                     " WHEN opened_by = 'client' THEN 'root'"
+                     f" WHEN {opened} = 'client' THEN 'root'"
                      " ELSE 'launched' END FROM t3_threads"):
             if rank[position] >= rank.get(self.threads.get(session), -1):
                 self.threads[session] = position
@@ -507,8 +512,10 @@ def _timeline(con, session_key: str, ev: _Evidence) -> list:
                       "ordinal": row["ordinal_num"], "boundary": True,
                       "row": row, "what": "submission", "moment": moment})
     for row in con.execute(
-            "SELECT id, family, name, native_id, ts, ordinal_num, status,"
-            " detail_json, target FROM events WHERE session_key=? AND family"
+            "SELECT e.id, e.family, e.name, e.native_id, e.ts, e.ordinal_num,"
+            f" e.status, e.detail_json, e.target, {_SESSION_COLS} FROM events e"
+            " JOIN sessions s ON s.session_key = e.session_key"
+            " WHERE e.session_key=? AND e.family"
             f" IN ({','.join('?' * len(_TIMELINE_FAMILIES))})",
             (session_key, *_TIMELINE_FAMILIES)):
         family = row["family"]
@@ -520,7 +527,9 @@ def _timeline(con, session_key: str, ev: _Evidence) -> list:
         items.append({"key": f"ev:{session_key}/{family}/{row['native_id']}",
                       "ts": row["ts"], "ordinal": row["ordinal_num"],
                       "boundary": family == "lifecycle", "row": row,
-                      "what": family, "moment": None})
+                      "what": family,
+                      "moment": _from_event(row, ev, "interrupt")
+                      if family == "lifecycle" else None})
     items.sort(key=lambda i: (i["ts"] or 0, i["ordinal"] or 0))
     return items
 
@@ -582,9 +591,11 @@ def _turns(line, at: int, turns_before: int, turns_after: int, items: int):
     """Index ranges of whole turns around position `at`.
 
     A turn runs from one boundary to the next. Before turns are
-    (opening boundary or None at session start, activity); after turns
-    are (activity, closing boundary or None at session end), the first
-    being the moment's own turn."""
+    (opening boundary or None at session start, kept activity, omitted
+    count); after turns are (kept activity, omitted count, closing
+    boundary or None at session end), the first being the moment's own
+    turn. `items` keeps the last activity of a before turn and the first
+    of an after turn."""
     bounds = [i for i, item in enumerate(line) if item["boundary"]]
     earlier = [i for i in bounds if i < at]
     later = [i for i in bounds if i > at]
@@ -596,18 +607,21 @@ def _turns(line, at: int, turns_before: int, turns_after: int, items: int):
         span = [i for i in range(first, stop) if not line[i]["boundary"]]
         if opening is None and not span:
             continue
-        before.append((opening, span[-items:] if items else []))
+        kept = span[-items:] if items else []
+        before.append((opening, kept, len(span) - len(kept)))
     before = before[-turns_before:] if turns_before else []
     after = []
     edge = at
     for closing in later[:turns_after] if turns_after else []:
         span = list(range(edge + 1, closing))
-        after.append((span[:items] if items else [], closing))
+        kept = span[:items] if items else []
+        after.append((kept, len(span) - len(kept), closing))
         edge = closing
     if turns_after and len(after) < turns_after:
         span = list(range(edge + 1, len(line)))
         if span or not after:
-            after.append((span[:items] if items else [], None))
+            kept = span[:items] if items else []
+            after.append((kept, len(span) - len(kept), None))
     return before, after
 
 
@@ -622,6 +636,8 @@ def show(con: sqlite3.Connection, moment_ids: list,
     ok, source_missing, source_changed, not_found or no_such_moment."""
     window = {"turns_before": turns_before, "turns_after": turns_after,
               "items": items, "chars": chars, "text_chars": text_chars}
+    if min(window.values()) < 0:
+        raise ValueError("window values must be 0 or more")
     sources = _Sources(con)
     ev = _Evidence(con)
     timelines: dict[str, list] = {}
@@ -654,8 +670,8 @@ def show(con: sqlite3.Connection, moment_ids: list,
         if text is not None:
             item["text"] = clip(text, text_chars)
         before, after = _turns(line, at, turns_before, turns_after, items)
-        spans = [i for _, span in before for i in span] + \
-            [i for span, _ in after for i in span]
+        spans = [i for _, span, _ in before for i in span] + \
+            [i for span, _, _ in after for i in span]
         ids = [line[i]["row"]["id"] for i in spans
                if line[i]["what"] in ("assistant_message", "tool_call")]
         contents = {c["id"]: c for c in lookup.show(con, ids)} if ids else {}
@@ -666,12 +682,13 @@ def show(con: sqlite3.Connection, moment_ids: list,
         item["before"] = [
             {"prompt": None if opening is None
              else _prompt(sources, line[opening], text_chars),
-             "activity": activity(span)} for opening, span in before]
+             "activity": activity(span), "omitted": omitted}
+            for opening, span, omitted in before]
         item["after"] = [
-            {"activity": activity(span),
+            {"activity": activity(span), "omitted": omitted,
              "prompt": None if closing is None
              else _prompt(sources, line[closing], text_chars)}
-            for span, closing in after]
+            for span, omitted, closing in after]
         out.append(item)
     return out
 

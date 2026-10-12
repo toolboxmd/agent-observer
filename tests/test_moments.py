@@ -108,6 +108,9 @@ def claude_tree(root):
         # A stop in a top-level Chromeria thread is a person.
         _line(s3, "user", "w3", "[Request interrupted by user]", 123,
               entrypoint="sdk-ts"),
+        # Synthetic input with no agent evidence (a reminder): no moment.
+        _line(s3, "user", "w4", "Background task finished.", 124,
+              entrypoint="sdk-ts", promptSource="sdk"),
     ])
     s4 = "sess-four"
     _write(os.path.join(root, "proj", f"{s4}.jsonl"), [
@@ -232,6 +235,18 @@ class SelectTest(MomentsCase):
                          "child")
         self.assertEqual(found["sub:claude:u1"]["thread"], "none")
         self.assertEqual(found["sub:claude:y2"]["thread"], "launched")
+        self.assertNotIn("sub:claude:w4", found)
+
+    def test_ledger_without_opened_by_stays_conservative(self):
+        # A ledger synced before opened_by existed: top-level threads read
+        # as launched, children stay children, nothing turns human.
+        self.con.execute("ALTER TABLE t3_threads DROP COLUMN opened_by")
+        found = self.ids(self.select(origins=None))
+        self.assertEqual(found["sub:claude:w3"]["thread"], "launched")
+        self.assertEqual(found["sub:claude:w3"]["origin"], "unknown")
+        self.assertEqual(
+            found["ev:claude:sess-four/permission/toolu_cp"]["origin"],
+            "unknown")
 
     def test_opening_marks_moments_before_any_agent_activity(self):
         found = self.ids(self.select(origins=None))
@@ -329,6 +344,20 @@ class ShowTest(MomentsCase):
         self.assertEqual([a["text"] for a in few["before"][0]["activity"]],
                          ["Done, I also deleted build."])
 
+    def test_window_edges(self):
+        [rejection] = self.show("ev:claude:sess-four/permission/toolu_cp")
+        [turn] = rejection["before"]
+        self.assertIsNone(turn["prompt"])  # activity before any prompt
+        self.assertEqual(turn["activity"][0]["tool"], "Bash")
+        [brief] = self.show("sub:codex:msg-u1")
+        self.assertEqual(brief["after"][0]["prompt"]["kind"], "interrupt")
+        self.assertEqual(brief["after"][0]["prompt"]["origin"], "unknown")
+        [few] = self.show("sub:claude:u2", items=1)
+        self.assertEqual(few["before"][0]["omitted"], 2)
+        self.assertEqual(few["after"][0]["omitted"], 0)
+        with self.assertRaises(ValueError):
+            self.show("sub:claude:u2", turns_before=-1)
+
     def test_agent_message_is_a_moment_with_its_source(self):
         [item] = self.show("sub:claude:w2")
         self.assertEqual(item["origin"], "agent")
@@ -355,7 +384,8 @@ class ShowTest(MomentsCase):
         self.assertEqual(turn["prompt"]["origin"], "agent")
         self.assertEqual([b["text"] for b in turn["activity"]],
                          ["Reading the brief."])
-        self.assertEqual(interrupt["after"], [{"activity": [], "prompt": None}])
+        [own] = interrupt["after"]  # the session ends after the interrupt
+        self.assertEqual((own["activity"], own["prompt"]), ([], None))
 
     def test_limits_clip_long_fields_and_item_counts(self):
         [item] = self.show("sub:claude:u2", items=1, chars=10)
@@ -585,6 +615,8 @@ class CliTest(MomentsCase):
         self.assertEqual(json.loads(out)["occurrences"], 1)
         code, out = self.run_cli("recurrence", "--behavior", "correction")
         self.assertIn("destructive-without-approval", out)
+        code, _ = self.run_cli("moments", "--judge", JUDGE, "--json")
+        self.assertEqual(code, 2)
         code, out = self.run_cli(
             "session-attr", "add", "--json",
             stdin='{"session": "claude:sess-one", "name": "arm", "value": "served"}')

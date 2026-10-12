@@ -248,7 +248,11 @@ out.
   child thread from before Chromeria V2, a Grok or OpenCode prompt (their
   Chromeria text does not match the native prompt), or any interrupt or
   rejection in a child thread or in a top-level thread an agent launched
-  (`thread` `child` or `launched`), which an agent can cause. Codex
+  (`thread` `child` or `launched`), which an agent can cause. A
+  top-level thread counts as person-opened from Chromeria V2's
+  `createdBy`, or, for V1 threads and V2's legacy imports of them, from
+  who started its first turn; a ledger not synced since that evidence
+  existed reads every top-level thread as `launched`. Codex
   prompt origins come from Chromeria V2 only, so older Codex child
   prompts stay `unknown`.
 
@@ -281,7 +285,7 @@ closed by the next prompt. The window is a parameter, echoed back as
 labeled sample: `--turns-before 0 --turns-after 0` is the moment alone,
 the default `1`/`1` adds the turn it answers and the agent's reply, and
 larger values add more turns. `--items` caps agent messages and tool
-calls per turn, `--chars` cuts each of them, and `--text-chars` (default
+calls per turn (each turn reports how many it `omitted`), `--chars` cuts each of them, and `--text-chars` (default
 20,000) bounds prompt text separately, so a context limit never cuts the
 person's words. Its statuses match `event show`,
 plus `no_such_moment`; the exit status is 3 when any moment is not `ok`.

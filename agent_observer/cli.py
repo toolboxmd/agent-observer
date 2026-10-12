@@ -374,15 +374,15 @@ def build_parser() -> argparse.ArgumentParser:
     ms.add_argument("ids", nargs="*", help="moment ids from moments --json")
     ms.add_argument("--ids-from", default=None, metavar="FILE",
                     help="read moment ids, one per line, from FILE or - for stdin")
-    ms.add_argument("--turns-before", type=int, default=_moments.DEFAULT_TURNS_BEFORE,
+    ms.add_argument("--turns-before", type=_nonnegative, default=_moments.DEFAULT_TURNS_BEFORE,
                     help="whole turns before the moment (0 = the moment alone)")
-    ms.add_argument("--turns-after", type=int, default=_moments.DEFAULT_TURNS_AFTER,
+    ms.add_argument("--turns-after", type=_nonnegative, default=_moments.DEFAULT_TURNS_AFTER,
                     help="whole turns after the moment, the first being its own")
-    ms.add_argument("--items", type=int, default=_moments.DEFAULT_ITEMS,
+    ms.add_argument("--items", type=_nonnegative, default=_moments.DEFAULT_ITEMS,
                     help="at most this many agent messages and tool calls per turn")
-    ms.add_argument("--chars", type=int, default=_moments.DEFAULT_CHARS,
+    ms.add_argument("--chars", type=_nonnegative, default=_moments.DEFAULT_CHARS,
                     help="cut each agent message, tool input and output to about this many characters")
-    ms.add_argument("--text-chars", type=int, default=_moments.DEFAULT_TEXT_CHARS,
+    ms.add_argument("--text-chars", type=_nonnegative, default=_moments.DEFAULT_TEXT_CHARS,
                     help="cut the person's own text (moment, previous and next prompt) to about this many characters")
     ms.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     vd = sub.add_parser("verdict", help="store and list judge verdicts on moments")
@@ -804,6 +804,13 @@ def _when(value):
         return None
     from .ingest import iso_ts
     return float(value) if str(value).replace(".", "").isdigit() else iso_ts(value)
+
+
+def _nonnegative(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return number
 
 
 def _json_lines(path: str) -> list:
