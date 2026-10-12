@@ -421,9 +421,9 @@ outcome, GitHub identifiers and session keys. It never includes prompts,
 assistant text, excerpts, titles, local paths or branch names. Task ids travel
 only when they are identifiers such as `owner/repo#12` or `T-42`; a free-text
 id stays home and is counted in `withheld_tasks`. Judge evidence (see Judge
-moments) travels as counts and identifiers: moments by origin and kind,
-policy denials, and per behavior and judge the verdict counts, judged moments
-by origin, and each group's id, the judge's one-line problem and its
+moments) travels as counts and identifiers, per session: moments by origin
+and kind and policy denials, and per behavior and judge the verdict counts
+and judged moments by origin; plus each group's id, the judge's one-line problem and its
 judged-yes moments (id, session key, origin, time). Moment and transcript
 text never leave the machine; the problem line is the judge's own words,
 redacted for known secret shapes. `fleet pull`
@@ -448,10 +448,13 @@ visible. A task's combined usage is the whole sessions touching it, each once,
 with the number it shares with other tasks. Exact per-task attribution stays
 with `task show` on each machine. Recurrence combines across machines:
 groups with the same id under the same judge (a shared judge run grouped
-them) merge, a moment reported twice counts once, and a problem that
+them) merge, and a problem that
 appears in one session on each of two machines recurs. A behavior judged
 by different judges on different machines is reported per judge and
-listed under `unmerged_behaviors`. Headline numbers count human and agent
+listed under `unmerged_behaviors`. One rule covers every combined count:
+a session reported by several machines contributes its usage, moments,
+denials, verdicts and judged moments once, from the first of those machines
+by name. Headline numbers count human and agent
 moments, as `recurrence` does. Nothing pulls on a schedule.
 
 ## GitHub summaries

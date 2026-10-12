@@ -464,11 +464,23 @@ class FleetRecurrenceTest(LedgerCase):
         self.assertIn("destructive", fleet.render(result))
 
     def test_a_session_on_two_machines_counts_once(self):
+        # One rule for every count: a session reported by several machines
+        # contributes its evidence once, so coverage matches recurrence.
         rocky = self.machine("rocky", "sess-x")
         copy = self.machine("bestia", "sess-x")
-        [judged] = fleet.combine([rocky, copy])["recurrence"]
+        alone = fleet.combine([rocky])
+        result = fleet.combine([rocky, copy])
+        [judged] = result["recurrence"]
         self.assertEqual((judged["occurrences"], judged["recurring_problems"]),
                          (1, 0))
+        self.assertEqual(result["moments"], alone["moments"])
+        self.assertEqual(result["moments"]["by_origin"]["human"], 2)
+        self.assertEqual(result["moments"]["by_kind"]["prompt"], 2)
+        self.assertEqual(judged["coverage"],
+                         alone["recurrence"][0]["coverage"])
+        self.assertEqual(judged["coverage"]["verdicts"],
+                         {"yes": 1, "no": 1, "unclear": 0})
+        self.assertEqual(judged["coverage"]["judged_by_origin"]["human"], 2)
 
     def test_different_judges_are_reported_apart_and_flagged(self):
         rocky = self.machine("rocky", "sess-r")
@@ -492,5 +504,14 @@ class FleetRecurrenceTest(LedgerCase):
             fleet.validate(bad)
         bad = json.loads(json.dumps(doc))
         bad["judgments"][0]["groups"][0]["moments"][0]["origin"] = "robot"
+        with self.assertRaises(ValueError):
+            fleet.validate(bad)
+        for field in ("behavior", "judge"):
+            bad = json.loads(json.dumps(doc))
+            bad["judgments"][0][field] += "\n"
+            with self.assertRaises(ValueError):
+                fleet.validate(bad)
+        bad = json.loads(json.dumps(doc))
+        bad["judgments"][0]["groups"][0]["group"] += "\n"
         with self.assertRaises(ValueError):
             fleet.validate(bad)

@@ -259,7 +259,8 @@ def _all(con, harness=None, project=None, attrs=None):
         if kind is None:
             continue
         if kind.startswith("policy:"):
-            policy.append((row["ts"], kind[len("policy:"):]))
+            policy.append((row["ts"], kind[len("policy:"):],
+                           row["session_key"]))
         else:
             found.append(_from_event(row, ev, kind))
     first = _first_activity(con)
@@ -316,7 +317,7 @@ def select(con: sqlite3.Connection, since=None, until=None, harness=None,
         by_origin[m["origin"]] += 1
         by_kind[m["kind"]] += 1
     denials = {bucket: 0 for bucket in POLICY_DENIALS.values()}
-    for ts, bucket in policy:
+    for ts, bucket, _ in policy:
         if _in_period(ts, since, until):
             denials[bucket] += 1
     chosen = [m for m in found
