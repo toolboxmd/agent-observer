@@ -842,6 +842,8 @@ def _judge(con, ns) -> int:
         origins = None if getattr(ns, "origin", None) and "all" in ns.origin \
             else tuple(getattr(ns, "origin", None) or ("human",))
         if ns.cmd == "moments":
+            if ns.judge and not ns.unjudged:
+                raise ValueError("--judge needs --unjudged BEHAVIOR")
             payload = _moments.select(
                 con, since=_when(ns.since), until=_when(ns.until),
                 harness=ns.harness, project=ns.project, origins=origins,

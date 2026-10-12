@@ -123,6 +123,16 @@ def claude_tree(root):
         _line(s4, "user", "x3", "[Request interrupted by user]", 183,
               entrypoint="sdk-ts"),
     ])
+    s5 = "sess-five"
+    _write(os.path.join(root, "proj", f"{s5}.jsonl"), [
+        _line(s5, "assistant", "e1",
+              _tool_use("toolu_lx", "Bash", {"command": "make deploy"}), 240,
+              entrypoint="sdk-ts"),
+        _line(s5, "user", "y1", _tool_result("toolu_lx", "rejected", True),
+              241, entrypoint="sdk-ts", toolDenialKind="user-rejected"),
+        _line(s5, "user", "y2", "[Request interrupted by user]", 245,
+              entrypoint="sdk-ts"),
+    ])
 
 
 def codex_rollout(path):
@@ -165,14 +175,17 @@ class MomentsCase(unittest.TestCase):
                          ("w2", "th-root", "server", None))
         self.con.execute("INSERT INTO t3_prompt_origins VALUES(?,?,?)",
                          ("cx-1", text_hash(BRIEF), "server"))
-        self.con.execute("INSERT INTO t3_threads VALUES(?,?,?,?,?)",
-                         ("th-root", "th-root", "claudeAgent", None,
-                          "sess-three"))
-        self.con.execute("INSERT INTO t3_threads VALUES(?,?,?,?,?)",
-                         ("th-child", "th-root", "codex", None, "cx-1"))
-        self.con.execute("INSERT INTO t3_threads VALUES(?,?,?,?,?)",
-                         ("th-child2", "th-root", "claudeAgent", None,
-                          "sess-four"))
+        threads = "INSERT INTO t3_threads(thread_id, root_thread_id,"\
+            " provider, native_session, opened_by) VALUES(?,?,?,?,?)"
+        self.con.execute(threads, ("th-root", "th-root", "claudeAgent",
+                                   "sess-three", "client"))
+        self.con.execute(threads, ("th-child", "th-root", "codex", "cx-1",
+                                   "server"))
+        self.con.execute(threads, ("th-child2", "th-root", "claudeAgent",
+                                   "sess-four", "server"))
+        # A top-level thread an agent launched: its stops prove no person.
+        self.con.execute(threads, ("th-launch", "th-launch", "claudeAgent",
+                                   "sess-five", "server"))
         claude_tree(os.path.join(self.root, "claude"))
         claude.sync(self.con, root=os.path.join(self.root, "claude"))
         rollout = os.path.join(self.root, "codex", "rollout-cx-1.jsonl")
@@ -207,6 +220,8 @@ class SelectTest(MomentsCase):
             "sub:claude:w3": ("interrupt", "human"),
             "ev:claude:sess-four/permission/toolu_cp": ("rejection", "unknown"),
             "sub:claude:x3": ("interrupt", "unknown"),
+            "ev:claude:sess-five/permission/toolu_lx": ("rejection", "unknown"),
+            "sub:claude:y2": ("interrupt", "unknown"),
             "sub:codex:msg-u1": ("prompt", "agent"),
             "ev:codex:cx-1/lifecycle/turn_aborted:t1": ("interrupt", "unknown"),
         }
@@ -216,13 +231,14 @@ class SelectTest(MomentsCase):
         self.assertEqual(found["ev:codex:cx-1/lifecycle/turn_aborted:t1"]["thread"],
                          "child")
         self.assertEqual(found["sub:claude:u1"]["thread"], "none")
+        self.assertEqual(found["sub:claude:y2"]["thread"], "launched")
 
     def test_default_selects_human_moments_and_counts_the_rest(self):
         result = self.select()
         self.assertEqual({m["origin"] for m in result["moments"]}, {"human"})
         self.assertEqual(len(result["moments"]), 7)
         self.assertEqual(result["counts"]["by_origin"],
-                         {"human": 7, "agent": 3, "unknown": 3})
+                         {"human": 7, "agent": 3, "unknown": 5})
 
     def test_hook_and_rule_denials_are_counted_never_selected(self):
         result = self.select(origins=None)

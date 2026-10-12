@@ -237,15 +237,18 @@ moments are opt-in and reported apart.
 - `human`: Chromeria recorded a person starting the turn or sending the
   prompt, the session ran in a terminal or desktop app (`cli`,
   `Codex Desktop`, `codex-tui`), or an interrupt or rejection stopped a
-  top-level Chromeria thread or a session outside Chromeria (Claude's
-  `user-rejected` included).
+  top-level Chromeria thread that a person opened, or a session outside
+  Chromeria (Claude's `user-rejected` included).
 - `agent`: Chromeria recorded an agent or the server sending it, or the
   session ran headless (`sdk-cli`, `codex_exec`). Other synthetic input,
   such as reminders, is no moment.
 - `unknown`: no evidence either way, for example a prompt in a delegated
   child thread from before Chromeria V2, a Grok or OpenCode prompt (their
   Chromeria text does not match the native prompt), or any interrupt or
-  rejection in a child thread, which an agent can cause.
+  rejection in a child thread or in a top-level thread an agent launched
+  (`thread` `child` or `launched`), which an agent can cause. Codex
+  prompt origins come from Chromeria V2 only, so older Codex child
+  prompts stay `unknown`.
 
 Hook and permission-rule denials and auto-mode blocks are policy, not a
 person. They are never moments and are counted as `policy_denials`.

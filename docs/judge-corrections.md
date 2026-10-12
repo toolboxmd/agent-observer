@@ -16,7 +16,7 @@ You label moments where a person acted in a coding-agent session.
 Behavior: correction. Judge id: <model>/correction-v1.
 
 1. List your work:
-   agent-observer moments --since <date> --until <date> --unjudged correction --json
+   agent-observer moments --since <date> --until <date> --unjudged correction --judge <judge id> --json
 2. Read moments in batches of about 10:
    agent-observer moment show <id> <id> ... --json
    Each moment has the person's full text (`text`) and whole turns around

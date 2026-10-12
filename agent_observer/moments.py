@@ -73,13 +73,18 @@ class _Evidence:
         self.prompts = self._pairs(
             con, "SELECT native_session || '/' || text_hash, actor_kind"
                  " FROM t3_prompt_origins")
+        # Thread position: root (a top-level thread a person opened),
+        # launched (top-level, opened by an agent or without evidence), or
+        # child. A session seen in several threads takes the least
+        # person-like position.
         self.threads: dict[str, str] = {}
+        rank = {"root": 0, "launched": 1, "child": 2}
         for session, position in self._rows(
                 con, "SELECT native_session,"
-                     " CASE WHEN thread_id = root_thread_id THEN 'root'"
-                     " ELSE 'child' END FROM t3_threads"):
-            # A session seen in any child thread counts as a child.
-            if self.threads.get(session) != "child":
+                     " CASE WHEN thread_id != root_thread_id THEN 'child'"
+                     " WHEN opened_by = 'client' THEN 'root'"
+                     " ELSE 'launched' END FROM t3_threads"):
+            if rank[position] >= rank.get(self.threads.get(session), -1):
                 self.threads[session] = position
 
     @staticmethod
@@ -109,16 +114,17 @@ def _origin(kind: str, actor, entrypoint, thread: str, denial=None) -> str:
         return "agent"
     if entrypoint in HEADLESS_ENTRYPOINTS:
         return "agent"
-    if kind != "prompt" and thread == "child":
-        # An agent can stop a child thread or answer its pending request,
-        # so a stop or refusal there is no evidence of a person.
+    if kind != "prompt" and thread in ("child", "launched"):
+        # An agent can stop a thread it spawned or launched, or answer its
+        # pending request, so a stop or refusal there is no evidence of a
+        # person.
         return "unknown"
     if kind == "rejection" and denial == "user-rejected":
         return "human"
     if entrypoint in INTERACTIVE_ENTRYPOINTS:
         return "human"
     if kind != "prompt" and thread == "root":
-        # Only a person stops or refuses a top-level Chromeria thread.
+        # A stop in a thread a person opened is that person's.
         return "human"
     return "unknown"
 

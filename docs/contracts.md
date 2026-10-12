@@ -20,7 +20,7 @@ are committed.
 | `submissions` | `native_id` | User-role inputs with `kind` genuine, synthetic, scaffolding or interrupt. |
 | `events` | session_key, family, native_id | Operational events (families below). |
 | `tasks`, `assignments`, `session_assignments`, `dispatches`, `attempts`, `outcomes` | see capture | Workload ownership and outcomes. |
-| `t3_turn_origins`, `t3_threads`, `t3_links` | T3 message, thread, link ids | Chromeria turn origins, thread to native-session map, thread-tree links with PR snapshot state, mirrored read-only from T3 state. |
+| `t3_turn_origins`, `t3_threads`, `t3_links` | T3 message, thread, link ids | Chromeria turn origins, thread to native-session map with who opened each thread (`opened_by`: client, server or unknown), thread-tree links with PR snapshot state, mirrored read-only from T3 state. |
 | `t3_spawns`, `t3_messages` | T3 thread id, T3 message id | Child thread parent, depth and creation time; sender, target and time of each attributed `message_thread` delivery. Ids and times only. |
 | `verdicts` | moment id, behavior, judge | An outside judge's `yes`, `no` or `unclear` on one moment, with a redacted one-line problem and an optional group id for `yes`. |
 | `session_attributes` | session_key, name | Attributes other tools supply (contextmd's `arm`), used only as report filters. |
@@ -244,7 +244,9 @@ are counted separately and excluded from useful-work comparisons.
   `policy_denials`, never moments. Origin precedence: T3 turn origin
   (Claude uuid), then V2 prompt origin by native session and text hash,
   then a headless entrypoint (`agent`); for interrupts and rejections a
-  T3 child thread is `unknown`; then `user-rejected` (`human`), an
+  T3 child thread, or a top-level thread not opened by a person
+  (`launched`: V2 `createdBy` agent or system, or no evidence), is
+  `unknown`; then `user-rejected` (`human`), an
   interactive entrypoint (`human`), and for interrupts and rejections a
   top-level T3 thread (`human`); otherwise `unknown`. `recurrence` and
   `verdict groups` count `human` moments unless `--origin` says

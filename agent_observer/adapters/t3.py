@@ -160,6 +160,10 @@ def _ensure_tables(con: sqlite3.Connection) -> None:
         " state TEXT,"
         " linked_at TEXT,"
         " PRIMARY KEY (thread_id, kind, repository, number))")
+    if "opened_by" not in {r["name"] for r in con.execute("PRAGMA table_info(t3_threads)")}:
+        # Who created the thread: client (a person), server (an agent or
+        # the system), or NULL without evidence (V1 threads).
+        con.execute("ALTER TABLE t3_threads ADD COLUMN opened_by TEXT")
     if "head_branch" not in {r["name"] for r in con.execute("PRAGMA table_info(t3_links)")}:
         con.execute("ALTER TABLE t3_links ADD COLUMN head_branch TEXT")
     con.execute(
@@ -491,7 +495,8 @@ def _import_turn_origins(con: sqlite3.Connection, native: sqlite3.Connection,
 
 
 def _v2_lineage(native: sqlite3.Connection) -> dict:
-    """V2 thread id -> parent, root, creation time and PR link payloads.
+    """V2 thread id -> parent, root, creation time, PR link payloads and
+    who opened it (client, server or None, as for prompt origins).
 
     Empty when the database has no V2 tables (a V1 ``state.sqlite``).
     """
@@ -501,6 +506,8 @@ def _v2_lineage(native: sqlite3.Connection) -> dict:
     try:
         rows = native.execute(
             "SELECT thread_id, created_at,"
+            " json_extract(payload_json, '$.createdBy') AS created_by,"
+            " json_extract(payload_json, '$.creationSource') AS source,"
             " json_extract(payload_json, '$.lineage') AS lineage,"
             " json_extract(payload_json, '$.pullRequests') AS prs"
             f" FROM {V2_THREADS}").fetchall()
@@ -527,7 +534,8 @@ def _v2_lineage(native: sqlite3.Connection) -> dict:
             "root": root or (None if parent else thread_id),
             "created_at": row["created_at"]
             if isinstance(row["created_at"], str) else None,
-            "prs": prs if isinstance(prs, list) else []}
+            "prs": prs if isinstance(prs, list) else [],
+            "opened_by": _prompt_actor_of(row["created_by"], row["source"])}
     # A child whose lineage names no root inherits its parent's.
     for thread_id, entry in out.items():
         if entry["root"] is None:
@@ -687,16 +695,17 @@ def _import_threads(con: sqlite3.Connection, native: sqlite3.Connection,
         provider = row["provider_name"]
         con.execute(
             "INSERT INTO t3_threads(thread_id, root_thread_id, provider,"
-            " adapter_key, native_session) VALUES(?,?,?,?,?)"
+            " adapter_key, native_session, opened_by) VALUES(?,?,?,?,?,?)"
             " ON CONFLICT(thread_id) DO UPDATE SET"
             " root_thread_id=excluded.root_thread_id,"
             " provider=excluded.provider, adapter_key=excluded.adapter_key,"
-            " native_session=excluded.native_session",
+            " native_session=excluded.native_session,"
+            " opened_by=excluded.opened_by",
             (thread_id, _lineage_root(thread_id, lineage),
              provider if isinstance(provider, str) else None,
              row["adapter_key"]
              if isinstance(row["adapter_key"], str) else None,
-             native_session))
+             native_session, (lineage.get(thread_id) or {}).get("opened_by")))
         result.setdefault(thread_id, []).append(native_session)
         seen += 1
     if V2_PROVIDER_THREADS in _tables(native):
@@ -716,14 +725,16 @@ def _import_threads(con: sqlite3.Connection, native: sqlite3.Connection,
                 continue
             con.execute(
                 "INSERT INTO t3_threads(thread_id, root_thread_id, provider,"
-                " adapter_key, native_session) VALUES(?,?,?,?,?)"
+                " adapter_key, native_session, opened_by) VALUES(?,?,?,?,?,?)"
                 " ON CONFLICT(thread_id) DO UPDATE SET"
                 " root_thread_id=excluded.root_thread_id,"
                 " provider=excluded.provider,"
                 " adapter_key=excluded.adapter_key,"
-                " native_session=excluded.native_session",
+                " native_session=excluded.native_session,"
+                " opened_by=excluded.opened_by",
                 (thread_id, _lineage_root(thread_id, lineage), row["provider"],
-                 row["provider"], native_session))
+                 row["provider"], native_session,
+                 (lineage.get(thread_id) or {}).get("opened_by")))
             sessions = result.setdefault(thread_id, [])
             if native_session not in sessions:
                 sessions.append(native_session)

@@ -281,6 +281,16 @@ class ChromeriaV2Test(LedgerCase):
                          "please build it")
         self.assertEqual(kinds["claude:" + P2]["kind"], "synthetic")
 
+    def test_threads_record_who_opened_them(self):
+        # Judge moments (#60): only a person-opened top-level thread makes
+        # a stop or refusal there human evidence.
+        claude.import_claude_file(self.con, self.transcript)
+        t3_adapter.sync(self.con, source=self.v2_path)
+        opened = {r["thread_id"]: r["opened_by"] for r in self.query(
+            "SELECT thread_id, opened_by FROM t3_threads")}
+        self.assertEqual(opened[ROOT], "client")
+        self.assertEqual(opened[CHILD], "server")
+
     def test_prompt_origins_cover_every_driver(self):
         # Judge moments (#60) need the origin of Codex, Grok and OpenCode
         # prompts too; the Claude session's prompt stays without evidence.
