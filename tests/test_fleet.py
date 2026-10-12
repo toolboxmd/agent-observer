@@ -399,3 +399,98 @@ class CliTest(LedgerCase):
         self.assertEqual(pull.returncode, 1)
         self.assertIn("nohost.invalid", pull.stdout)
         self.assertFalse(os.path.exists(missing))
+
+
+# Cross-machine recurrence (#59 review, after #61): each machine judges its
+# own moments; the fleet report combines judge groups without moment text.
+from agent_observer import verdicts  # noqa: E402
+from agent_observer.adapters import claude  # noqa: E402
+from tests.test_moments import _line, _write  # noqa: E402
+
+JUDGE = "opus-5.5/correction-v1"
+PROBLEM = "Deleted files without asking"
+
+
+class FleetRecurrenceTest(LedgerCase):
+    def machine(self, name, session, judge=JUDGE, group="destructive"):
+        """One isolated ledger with one human correction judged yes."""
+        root = os.path.join(self.tmp.name, name)
+        _write(os.path.join(root, "proj", f"{session}.jsonl"), [
+            _line(session, "user", f"{session}-u1", "please add the cache", 0),
+            _line(session, "assistant", f"{session}-a1",
+                  [{"type": "text", "text": "Done, I deleted build."}], 1),
+            _line(session, "user", f"{session}-u2",
+                  "no, secret prompt: never delete build", 2)])
+        con = db.connect(os.path.join(root, "observer.db"))
+        db.init_db(con)
+        claude.sync(con, root=root)
+        con.commit()
+        verdicts.add(con, [
+            {"moment": f"sub:claude:{session}-u2", "behavior": "correction",
+             "judge": judge, "verdict": "yes", "problem": PROBLEM,
+             "group": group},
+            {"moment": f"sub:claude:{session}-u1", "behavior": "correction",
+             "judge": judge, "verdict": "no"}])
+        local = verdicts.recurrence(con, "correction")
+        self.assertEqual((local["occurrences"], local["recurring_problems"]),
+                         (1, 0))
+        doc = fleet.export(con, machine=name)
+        con.close()
+        return json.loads(json.dumps(doc))
+
+    def test_a_problem_recurs_only_across_machines(self):
+        rocky = self.machine("rocky", "sess-r")
+        bestia = self.machine("bestia", "sess-b")
+        text = json.dumps([rocky, bestia])
+        self.assertNotIn("secret prompt", text)
+        self.assertNotIn("please add the cache", text)
+        self.assertIn(PROBLEM, text)  # the judge's line travels
+        result = fleet.combine([rocky, bestia])
+        [judged] = result["recurrence"]
+        self.assertEqual((judged["behavior"], judged["judge"]),
+                         ("correction", JUDGE))
+        self.assertEqual(judged["machines"], ["bestia", "rocky"])
+        self.assertEqual(
+            (judged["occurrences"], judged["problems"],
+             judged["recurring_problems"], judged["repeats"]), (2, 1, 1, 1))
+        [group] = judged["groups"]
+        self.assertEqual(group["group"], "destructive")
+        self.assertEqual(group["problem"], PROBLEM)
+        self.assertEqual(group["by_origin"], {"human": 2})
+        self.assertEqual(group["sessions"], 2)
+        self.assertEqual(group["machines"], ["bestia", "rocky"])
+        self.assertEqual(judged["coverage"]["judged_by_origin"]["human"], 4)
+        self.assertEqual(result["moments"]["by_origin"]["human"], 4)
+        self.assertIn("destructive", fleet.render(result))
+
+    def test_a_session_on_two_machines_counts_once(self):
+        rocky = self.machine("rocky", "sess-x")
+        copy = self.machine("bestia", "sess-x")
+        [judged] = fleet.combine([rocky, copy])["recurrence"]
+        self.assertEqual((judged["occurrences"], judged["recurring_problems"]),
+                         (1, 0))
+
+    def test_different_judges_are_reported_apart_and_flagged(self):
+        rocky = self.machine("rocky", "sess-r")
+        bestia = self.machine("bestia", "sess-b", judge="sol/correction-v1")
+        result = fleet.combine([rocky, bestia])
+        self.assertEqual([(j["judge"], j["machines"], j["recurring_problems"])
+                          for j in result["recurrence"]],
+                         [(JUDGE, ["rocky"], 0),
+                          ("sol/correction-v1", ["bestia"], 0)])
+        self.assertEqual(result["unmerged_behaviors"],
+                         [{"behavior": "correction",
+                           "judges": [JUDGE, "sol/correction-v1"]}])
+
+    def test_pulled_judgments_survive_storage_and_are_validated(self):
+        doc = self.machine("rocky", "sess-r")
+        kept = fleet._schema_only(fleet.validate(doc))
+        self.assertEqual(kept["judgments"], doc["judgments"])
+        bad = json.loads(json.dumps(doc))
+        bad["judgments"][0]["groups"][0]["problem"] = "two\nlines"
+        with self.assertRaises(ValueError):
+            fleet.validate(bad)
+        bad = json.loads(json.dumps(doc))
+        bad["judgments"][0]["groups"][0]["moments"][0]["origin"] = "robot"
+        with self.assertRaises(ValueError):
+            fleet.validate(bad)

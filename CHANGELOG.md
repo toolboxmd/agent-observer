@@ -4,7 +4,7 @@
 
 ### Added
 
-- Combine evidence across machines: export, fleet pull and fleet report; transcripts stay on their machine, only aggregates travel (#56)
+- Combine evidence across machines: export, fleet pull and fleet report, including judge recurrence merged across machines by judge and group; transcripts and moment text stay on their machine, only aggregates and the judge's one-line problems travel (#56)
 
 ## [0.14.0] - 2026-10-12
 

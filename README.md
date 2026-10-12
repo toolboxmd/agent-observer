@@ -420,7 +420,13 @@ agent-observer fleet report --expect rocky,cavallo,bestia
 outcome, GitHub identifiers and session keys. It never includes prompts,
 assistant text, excerpts, titles, local paths or branch names. Task ids travel
 only when they are identifiers such as `owner/repo#12` or `T-42`; a free-text
-id stays home and is counted in `withheld_tasks`. `fleet pull`
+id stays home and is counted in `withheld_tasks`. Judge evidence (see Judge
+moments) travels as counts and identifiers: moments by origin and kind,
+policy denials, and per behavior and judge the verdict counts, judged moments
+by origin, and each group's id, the judge's one-line problem and its
+judged-yes moments (id, session key, origin, time). Moment and transcript
+text never leave the machine; the problem line is the judge's own words,
+redacted for known secret shapes. `fleet pull`
 runs `agent-observer export` on each host over SSH (`--remote-command` when
 the CLI is not on the remote PATH). It stores the result as
 `fleet/<machine>.json` beside the ledger, mode 600. It stores nothing when SSH
@@ -440,7 +446,13 @@ expected with `--expect` but absent, are listed and make the exit status 3.
 Each machine shows its export and ledger sync times, so stale evidence is
 visible. A task's combined usage is the whole sessions touching it, each once,
 with the number it shares with other tasks. Exact per-task attribution stays
-with `task show` on each machine. Nothing pulls on a schedule.
+with `task show` on each machine. Recurrence combines across machines:
+groups with the same id under the same judge (a shared judge run grouped
+them) merge, a moment reported twice counts once, and a problem that
+appears in one session on each of two machines recurs. A behavior judged
+by different judges on different machines is reported per judge and
+listed under `unmerged_behaviors`. Headline numbers count human and agent
+moments, as `recurrence` does. Nothing pulls on a schedule.
 
 ## GitHub summaries
 
