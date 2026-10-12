@@ -606,3 +606,147 @@ class LegacyValidationTest(SchemaSwitchTest):
         with self.assertRaises(fleet.PullError):
             fleet.pull("rocky", store, run=run_with(bad))
         self.assertEqual(open(path, "rb").read(), before)
+
+
+def from_schema_2_to_1(doc):
+    """Exact inverse of the legacy translation, for round-trip checks."""
+    if doc.get("schema") != fleet.SCHEMA:
+        return doc
+    return to_schema_1(doc)
+
+
+class StrictLegacyTest(SchemaSwitchTest):
+    """Any malformed, unknown, colliding or lossy schema-1 evidence is
+    refused; anything accepted round-trips exactly (#68 round 3)."""
+
+    def legacy(self):
+        return to_schema_1(self.machine("rocky", "sess-r"))
+
+    def pull_twice(self, good, bad):
+        store = os.path.join(self.tmp.name, "fleet")
+
+        def run_with(doc):
+            def run(argv, **kwargs):
+                return subprocess.CompletedProcess(argv, 0, json.dumps(doc), "")
+            return run
+        fleet.pull("rocky", store, run=run_with(good))
+        path = os.path.join(store, "rocky.json")
+        before = open(path, "rb").read()
+        with self.assertRaises(fleet.PullError):
+            fleet.pull("rocky", store, run=run_with(bad))
+        self.assertEqual(open(path, "rb").read(), before)
+
+    def test_colliding_legacy_keys_are_refused_at_the_pull_boundary(self):
+        good = self.legacy()
+        key = next(iter(good["moments"]["sessions"]))
+        cases = []
+        bad = json.loads(json.dumps(good))
+        bad["moments"]["sessions"][key]["by_origin"]["user"] = 0
+        cases.append(bad)
+        bad = json.loads(json.dumps(good))
+        bad["moments"]["sessions"][key]["by_created_by"] = {"user": 0}
+        cases.append(bad)
+        bad = json.loads(json.dumps(good))
+        jkey = next(iter(bad["judgments"][0]["sessions"]))
+        bad["judgments"][0]["sessions"][jkey]["judged_by_origin"]["user"] = 0
+        cases.append(bad)
+        bad = json.loads(json.dumps(good))
+        bad["judgments"][0]["sessions"][jkey]["judged_by_created_by"] = {"user": 0}
+        cases.append(bad)
+        bad = json.loads(json.dumps(good))
+        bad["judgments"][0]["groups"][0]["moments"][0]["created_by"] = "user"
+        cases.append(bad)
+        for bad in cases:
+            self.pull_twice(good, bad)
+
+    def test_non_string_origin_is_a_value_error(self):
+        bad = self.legacy()
+        bad["judgments"][0]["groups"][0]["moments"][0]["origin"] = []
+        with self.assertRaises(ValueError):
+            fleet.validate(bad)
+
+    def test_any_mutation_is_preserved_exactly_or_refused(self):
+        good = self.legacy()
+        replacements = (None, True, -1, 0, 2 ** 60, "", "human", "user",
+                        "x\ny", [], {}, [1], {"user": 0})
+
+        def paths(node, at=()):
+            yield at
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    yield from paths(v, at + (k,))
+            elif isinstance(node, list):
+                for i, v in enumerate(node):
+                    yield from paths(v, at + (i,))
+
+        def mutated(path):
+            """Replace, delete or extend the node at path."""
+            for value in replacements:
+                doc = json.loads(json.dumps(good))
+                parent = doc
+                for step in path[:-1]:
+                    parent = parent[step]
+                if path:
+                    parent[path[-1]] = value
+                yield doc
+            if path and isinstance(path[-1], str):
+                doc = json.loads(json.dumps(good))
+                parent = doc
+                for step in path[:-1]:
+                    parent = parent[step]
+                del parent[path[-1]]
+                yield doc
+            node = good
+            for step in path:
+                node = node[step]
+            if isinstance(node, dict):
+                for extra in ("user", "human", "by_created_by", "created_by",
+                              "unknown_key"):
+                    if extra in node:
+                        continue
+                    doc = json.loads(json.dumps(good))
+                    target = doc
+                    for step in path:
+                        target = target[step]
+                    target[extra] = 0
+                    yield doc
+
+        checked = refused = 0
+        for path in list(paths(good)):
+            if path[:1] in (("sessions",), ("tasks",)):
+                continue  # not translated; covered by the schema-2 tests
+            for doc in mutated(path):
+                checked += 1
+                try:
+                    parsed = fleet.validate(json.loads(json.dumps(doc)))
+                except ValueError:
+                    refused += 1
+                    continue
+                self.assertEqual(from_schema_2_to_1(parsed), doc, path)
+        self.assertGreater(checked, 100)
+        self.assertGreater(refused, 0)
+
+
+class GatedWriteTest(FleetRecurrenceTest):
+    def test_the_written_file_is_validated_before_it_replaces_the_store(self):
+        # Corrupt the bytes between validation and the write: only a check
+        # of the written temp file can stop them replacing the store.
+        from unittest import mock
+        stdout = json.dumps(to_schema_1(self.machine("rocky", "sess-r")))
+        store = os.path.join(self.tmp.name, "fleet")
+
+        def run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, stdout, "")
+        fleet.pull("rocky", store, run=run)
+        path = os.path.join(store, "rocky.json")
+        before = open(path, "rb").read()
+        real = json.dumps
+
+        def truncated(obj, *args, **kwargs):
+            text = real(obj, *args, **kwargs)
+            return text[:len(text) // 2]
+        with mock.patch.object(fleet.json, "dumps", truncated):
+            with self.assertRaises(fleet.PullError):
+                fleet.pull("rocky", store, run=run)
+        self.assertEqual(open(path, "rb").read(), before)
+        self.assertEqual(sorted(os.listdir(store)), ["rocky.json"])

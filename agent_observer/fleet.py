@@ -285,67 +285,113 @@ def _valid_judgment(entry) -> bool:
     return all(_valid_point(m) for m in ungrouped)
 
 
+# Schema-1 vocabulary (#65). The parser accepts exactly these keys at each
+# level and renames them one to one, so nothing can collide or be lost.
+_LEGACY_TOP = frozenset({"schema", "machine", "observer_version",
+                         "exported_at", "ledger_synced_at", "sessions",
+                         "tasks", "withheld_tasks", "moments", "judgments"})
+_LEGACY_ORIGINS = {"human": "user", "agent": "agent", "unknown": "unknown"}
+_LEGACY_MOMENT_PARTS = {"by_origin": ("by_created_by", _LEGACY_ORIGINS),
+                        "by_kind": ("by_kind", {k: k for k in
+                                                _interventions.KINDS}),
+                        "policy_denials": ("policy_denials", {
+                            b: b for b in
+                            _interventions.POLICY_DENIALS.values()})}
+_LEGACY_JUDGED_PARTS = {"verdicts": ("verdicts", {v: v for v in
+                                                   _verdicts.VERDICTS}),
+                        "judged_by_origin": ("judged_by_created_by",
+                                             _LEGACY_ORIGINS)}
+_LEGACY_JUDGMENT = frozenset({"behavior", "judge", "sessions", "groups",
+                              "ungrouped"})
+_LEGACY_GROUP = frozenset({"group", "problem", "moments"})
+_LEGACY_POINT = frozenset({"id", "session", "origin", "at"})
+
+
+def _keys(value, allowed, what, required=None) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError(f"invalid legacy {what}")
+    unknown = set(value) - set(allowed)
+    if unknown:
+        raise ValueError(f"unknown legacy {what} fields:"
+                         f" {', '.join(sorted(map(str, unknown)))}")
+    missing = set(required if required is not None else allowed) - set(value)
+    if missing:
+        raise ValueError(f"missing legacy {what} fields:"
+                         f" {', '.join(sorted(missing))}")
+    return value
+
+
+def _legacy_counts(value, parts: dict, what: str) -> dict:
+    """{session: {part: {key: count}}} renamed one to one, or ValueError."""
+    if not isinstance(value, dict):
+        raise ValueError(f"invalid legacy {what} counts")
+    out = {}
+    for session, per in value.items():
+        _keys(per, parts, f"{what} counts", required=())
+        renamed = {}
+        for part, counts in per.items():
+            name, vocabulary = parts[part]
+            _keys(counts, vocabulary, f"{what} {part}", required=())
+            if not all(_count(v) for v in counts.values()):
+                raise ValueError(f"invalid legacy {what} {part} count")
+            renamed[name] = {vocabulary[k]: v for k, v in counts.items()}
+        out[session] = renamed
+    return out
+
+
+def _legacy_points(value, what: str) -> list:
+    if not isinstance(value, list):
+        raise ValueError(f"invalid legacy {what}")
+    out = []
+    for point in value:
+        _keys(point, _LEGACY_POINT, what)
+        origin = point["origin"]
+        if not isinstance(origin, str) or origin not in _LEGACY_ORIGINS:
+            raise ValueError(f"invalid legacy {what} origin")
+        out.append({"id": point["id"], "session": point["session"],
+                    "created_by": _LEGACY_ORIGINS[origin], "at": point["at"]})
+    return out
+
+
 def _from_legacy(doc: dict) -> dict:
-    """A schema-1 export in schema-2 terms: moments become interventions,
-    origin becomes created_by and `human` becomes `user`.
+    """Parse a schema-1 export into schema-2 terms, or raise ValueError.
 
-    Judge evidence is optional (exports from before #60 carry none), but
-    when present it must have its schema-1 shape: a malformed value is
-    refused here with a specific error, never translated into absent
-    evidence that would let `pull` replace a good stored export. Values
-    inside are then checked by `validate` like any schema-2 export."""
-    who = {"human": "user"}
-    parts = {"by_origin": "by_created_by",
-             "judged_by_origin": "judged_by_created_by"}
-
-    def counts(value, what):
-        if not isinstance(value, dict) or not all(
-                isinstance(c, dict) and all(isinstance(x, dict)
-                                            for x in c.values())
-                for c in value.values()):
-            raise ValueError(f"invalid legacy {what} counts")
-        return {key: {parts.get(part, part): {who.get(k, k): v
-                                               for k, v in c.items()}
-                      for part, c in per.items()}
-                for key, per in value.items()}
-
-    def points(value, what):
-        if not isinstance(value, list) or not all(
-                isinstance(p, dict) and "origin" in p for p in value):
-            raise ValueError(f"invalid legacy {what}")
-        return [{**{k: v for k, v in p.items() if k != "origin"},
-                 "created_by": who.get(p["origin"], p["origin"])}
-                for p in value]
-
+    Exactly the schema-1 vocabulary is accepted at every level: moments
+    become interventions, origin becomes created_by, `human` becomes
+    `user`, each renamed one to one. Anything unknown, missing, ill-typed
+    or colliding is refused with a specific error, never dropped, so an
+    accepted export translates back to the same document. Judge evidence
+    stays optional (exports from before #60 carry none). Values that pass
+    through unchanged are then checked by `validate`."""
+    _keys(doc, _LEGACY_TOP, "export",
+          required=("schema", "machine", "sessions", "tasks"))
     new = {k: v for k, v in doc.items() if k not in ("moments", "judgments")}
     new["schema"] = SCHEMA
     if "moments" in doc:
-        moments = doc["moments"]
-        if not isinstance(moments, dict):
-            raise ValueError("invalid legacy moment counts")
-        new["interventions"] = {"sessions": counts(
-            moments.get("sessions"), "moment")}
+        moments = _keys(doc["moments"], {"sessions"}, "moments")
+        new["interventions"] = {"sessions": _legacy_counts(
+            moments["sessions"], _LEGACY_MOMENT_PARTS, "moment")}
     if "judgments" in doc:
         if not isinstance(doc["judgments"], list):
             raise ValueError("invalid legacy judgments")
         judgments = []
         for j in doc["judgments"]:
-            if not isinstance(j, dict) or not isinstance(j.get("groups"), list):
+            _keys(j, _LEGACY_JUDGMENT, "judgment")
+            if not isinstance(j["groups"], list):
                 raise ValueError("invalid legacy judgment groups")
             groups = []
             for g in j["groups"]:
-                if not isinstance(g, dict):
-                    raise ValueError("invalid legacy judgment groups")
-                groups.append({**{k: v for k, v in g.items()
-                                  if k != "moments"},
-                               "interventions": points(g.get("moments"),
-                                                       "group moments")})
-            judgments.append({**j,
-                              "sessions": counts(j.get("sessions"),
-                                                 "judgment"),
-                              "groups": groups,
-                              "ungrouped": points(j.get("ungrouped"),
-                                                  "ungrouped moments")})
+                _keys(g, _LEGACY_GROUP, "judgment group")
+                groups.append({"group": g["group"], "problem": g["problem"],
+                               "interventions": _legacy_points(
+                                   g["moments"], "group moments")})
+            judgments.append({
+                "behavior": j["behavior"], "judge": j["judge"],
+                "sessions": _legacy_counts(j["sessions"],
+                                           _LEGACY_JUDGED_PARTS, "judgment"),
+                "groups": groups,
+                "ungrouped": _legacy_points(j["ungrouped"],
+                                            "ungrouped moments")})
         new["judgments"] = judgments
     return new
 
@@ -459,6 +505,16 @@ def stored(directory: str) -> list:
     return docs
 
 
+def _storable(text: str) -> dict:
+    """An export as it may be stored: parsed, validated (schema-1 exports
+    translated strictly), reduced to schema fields, and reportable. A
+    document that validates but cannot be reported is refused here, not
+    discovered by every later fleet report."""
+    doc = _schema_only(validate(json.loads(text)))
+    render(combine([doc])).encode("utf-8")
+    return doc
+
+
 def pull(host: str, directory: str, command: str = REMOTE_COMMAND,
          run=subprocess.run) -> dict:
     """Fetch ``host``'s export over SSH and store it as <machine>.json."""
@@ -469,21 +525,27 @@ def pull(host: str, directory: str, command: str = REMOTE_COMMAND,
         raise PullError(f"{host}: ssh exit {proc.returncode}:"
                         f" {(proc.stderr or '').strip()[-300:]}")
     try:
-        doc = _schema_only(validate(json.loads(proc.stdout)))
-        # Store only what a report can print and serialize: a document
-        # that passes validation but cannot be reported is refused here,
-        # not discovered by every later fleet report.
-        render(combine([doc])).encode("utf-8")
+        doc = _storable(proc.stdout)
         text = json.dumps(doc)
     except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
         raise PullError(f"{host}: {type(exc).__name__}: {exc}") from None
+    # The single write point: the bytes on disk replace the stored export
+    # only after they parse and validate in full, so a refused or partial
+    # pull always leaves the previous export as it was.
     os.makedirs(directory, mode=0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
         os.chmod(tmp, 0o600)
+        with open(tmp, encoding="utf-8") as fh:
+            written = _storable(fh.read())
+        if written != doc:
+            raise ValueError("the written export differs from the validated one")
         os.replace(tmp, os.path.join(directory, doc["machine"] + ".json"))
+    except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
+        os.remove(tmp)
+        raise PullError(f"{host}: {type(exc).__name__}: {exc}") from None
     except BaseException:
         if os.path.exists(tmp):
             os.remove(tmp)
