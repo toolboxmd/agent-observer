@@ -75,7 +75,7 @@ def _usage(models: list) -> list:
 
 
 def _task_id(value) -> str | None:
-    if not isinstance(value, str) or not TASK_ID_RE.match(value):
+    if not isinstance(value, str) or not TASK_ID_RE.fullmatch(value):
         return None
     return value
 
@@ -83,7 +83,7 @@ def _task_id(value) -> str | None:
 def export(con: sqlite3.Connection, machine: str | None = None) -> dict:
     """One aggregate document for this machine's ledger."""
     machine = machine or machine_name()
-    if not MACHINE_RE.match(machine):
+    if not MACHINE_RE.fullmatch(machine):
         raise ValueError(f"invalid machine name: {machine!r}")
     by_session: dict[str, list] = {}
     for row in con.execute("SELECT * FROM responses"):
@@ -153,7 +153,7 @@ def validate(doc) -> dict:
     if not isinstance(doc, dict) or doc.get("schema") != SCHEMA:
         raise ValueError("not an Agent Observer fleet export")
     if not isinstance(doc.get("machine"), str) \
-            or not MACHINE_RE.match(doc["machine"]):
+            or not MACHINE_RE.fullmatch(doc["machine"]):
         raise ValueError(f"invalid machine name: {doc.get('machine')!r}")
     for key in ("sessions", "tasks"):
         if not isinstance(doc.get(key), list) \
@@ -221,7 +221,7 @@ def pull(host: str, directory: str, command: str = REMOTE_COMMAND,
     result = {"host": host, "machine": doc["machine"],
               "exported_at": doc.get("exported_at"),
               "sessions": len(doc["sessions"]), "tasks": len(doc["tasks"])}
-    if doc["machine"] != host.split(".")[0].lower():
+    if doc["machine"] != host.rsplit("@", 1)[-1].split(".")[0].lower():
         result["warning"] = (f"{host} reported machine {doc['machine']!r};"
                              f" stored as {doc['machine']}.json")
     return result
@@ -317,6 +317,8 @@ def combine(docs: list, expect: list | None = None) -> dict:
             "session_usage": usage})
     present = [d["machine"] for d in docs]
     return {"machines": machines,
+            "withheld_tasks": {d["machine"]: d.get("withheld_tasks") or 0
+                               for d in docs},
             "missing": [m for m in (expect or []) if m not in present],
             "duplicate_sessions": [{"session_key": k, "machines": v}
                                    for k, v in sorted(duplicates.items())],
@@ -356,7 +358,11 @@ def render(result: dict) -> str:
     for d in result["duplicate_sessions"]:
         lines.append(f"- {d['session_key']}: {', '.join(d['machines'])}")
     lines.append(f"tokens, each session once: {_tokens(result['totals'])}")
-    lines.append(f"tasks: {len(result['tasks'])}")
+    withheld = {m: n for m, n in result["withheld_tasks"].items() if n}
+    lines.append(f"tasks: {len(result['tasks'])}" + (
+        "; free-text ids kept home: " + ", ".join(
+            f"{m} {n}" for m, n in sorted(withheld.items()))
+        if withheld else ""))
     for t in result["tasks"]:
         states = ", ".join(f"{m}={s}" for m, s in
                            sorted(t["acceptance_states"].items()))

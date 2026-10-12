@@ -90,6 +90,7 @@ class ExportTest(LedgerCase):
         key = add_session(self.con, "codex", "s-three", 5)
         add_task(self.con, "fix the secret login bug", key, None, None)
         add_task(self.con, "T-42", key, None, None)
+        add_task(self.con, "T-43\n", key, None, None)
         self.con.execute("UPDATE sessions SET parent_session_key=?,"
                          " agentsmd_version=? WHERE session_key=?",
                          ("codex:parent", "16.1.1", key))
@@ -97,7 +98,7 @@ class ExportTest(LedgerCase):
         doc = fleet.export(self.con, machine="rocky")
         self.assertNotIn("secret login", json.dumps(doc))
         self.assertEqual([t["task_id"] for t in doc["tasks"]], ["T-42"])
-        self.assertEqual(doc["withheld_tasks"], 1)
+        self.assertEqual(doc["withheld_tasks"], 2)
         session = doc["sessions"][0]
         self.assertEqual(session["parent_session_key"], "codex:parent")
         self.assertEqual(session["agentsmd_version"], "16.1.1")
@@ -118,7 +119,7 @@ def _doc(machine, sessions, tasks=()):
                                      "effort": None, "semantics": "s1",
                                      "responses": 1, "total_tokens": t}]}
                          for k, t in sessions],
-            "tasks": list(tasks)}
+            "tasks": list(tasks), "withheld_tasks": 0}
 
 
 def _task(task_id, sessions, state="complete"):
@@ -151,6 +152,7 @@ class ReportTest(LedgerCase):
         # codex:a also belongs to o/r#9, so it is shared, not exclusive.
         self.assertEqual(task["shared_sessions"], 1)
         self.assertEqual(task["missing_sessions"], [])
+        self.assertEqual(result["withheld_tasks"], {"bestia": 0, "rocky": 0})
         self.assertEqual(sorted(task["machines"]),
                          ["bestia", "rocky"])
         self.assertEqual(task["acceptance_states"],
@@ -190,6 +192,7 @@ class ReportTest(LedgerCase):
         session = good["sessions"][0]
         group = session["usage"][0]
         for bad in ({"schema": "other"}, {**good, "machine": "a/b"},
+                    {**good, "machine": "rocky\n"},
                     {**good, "sessions": "x"},
                     {**good, "sessions": [{**session, "usage": "x"}]},
                     {**good, "sessions": [{**session, "session_key": ["x"]}]},
@@ -229,6 +232,9 @@ class PullTest(LedgerCase):
             self.assertNotIn("warning",
                              fleet.pull("bestia.tailnet.ts.net", store,
                                         run=run))
+            run, _ = self.run_fake(json.dumps(_doc("bestia", [])))
+            self.assertNotIn("warning",
+                             fleet.pull("luke@bestia", store, run=run))
         path = os.path.join(store, "bestia.json")
         self.assertEqual(json.load(open(path))["machine"], "bestia")
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
