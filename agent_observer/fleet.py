@@ -107,9 +107,9 @@ def export(con: sqlite3.Connection, machine: str | None = None) -> dict:
         tasks.append({
             "task_id": task_id,
             "project": project if isinstance(project, str)
-            and _REPO_RE.match(project) else None,
+            and _REPO_RE.fullmatch(project) else None,
             "issue_url": url if isinstance(url, str)
-            and _GITHUB_URL_RE.match(url) else None,
+            and _GITHUB_URL_RE.fullmatch(url) else None,
             "origin": task["origin"],
             "acceptance_state": states.get(task_id) or "unknown",
             "sessions": sorted(report.task_sessions(con, task_id))})
@@ -120,8 +120,13 @@ def export(con: sqlite3.Connection, machine: str | None = None) -> dict:
             "sessions": sessions, "tasks": tasks, "withheld_tasks": withheld}
 
 
+def _clean(value) -> bool:
+    """A string with no control characters: safe to print one per line."""
+    return isinstance(value, str) and not any(ord(c) < 32 for c in value)
+
+
 def _text_or_none(value) -> bool:
-    return value is None or isinstance(value, str)
+    return value is None or _clean(value)
 
 
 def _count_or_none(value) -> bool:
@@ -140,7 +145,7 @@ def _valid_group(group) -> bool:
         return False
     unknown = group.get("unknown_counts")
     return unknown is None or (isinstance(unknown, dict) and all(
-        isinstance(k, str) and _count_or_none(v) for k, v in unknown.items()))
+        _clean(k) and _count_or_none(v) for k, v in unknown.items()))
 
 
 def validate(doc) -> dict:
@@ -159,17 +164,23 @@ def validate(doc) -> dict:
         if not isinstance(doc.get(key), list) \
                 or not all(isinstance(x, dict) for x in doc[key]):
             raise ValueError(f"invalid {key} list")
+    if not all(_text_or_none(doc.get(k)) for k in
+               ("observer_version", "exported_at", "ledger_synced_at")):
+        raise ValueError("invalid export header")
+    withheld = doc.get("withheld_tasks", 0)
+    if not _count_or_none(withheld) or (withheld or 0) < 0:
+        raise ValueError("invalid withheld_tasks count")
     for session in doc["sessions"]:
-        if not isinstance(session.get("session_key"), str) \
+        if not _clean(session.get("session_key")) \
                 or not isinstance(session.get("usage", []), list) \
                 or not all(_valid_group(g) for g in session.get("usage", [])):
             raise ValueError("invalid session entry")
     for task in doc["tasks"]:
         sessions = task.get("sessions", [])
-        if not isinstance(task.get("task_id"), str) \
+        if _task_id(task.get("task_id")) is None \
                 or not _text_or_none(task.get("acceptance_state")) \
                 or not isinstance(sessions, list) \
-                or not all(isinstance(k, str) for k in sessions):
+                or not all(_clean(k) for k in sessions):
             raise ValueError("invalid task entry")
     return doc
 

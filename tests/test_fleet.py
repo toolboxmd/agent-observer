@@ -86,6 +86,15 @@ class ExportTest(LedgerCase):
         self.assertIsNone(tasks["local-task"]["issue_url"])
         self.assertIsNone(tasks["local-task"]["project"])
 
+    def test_export_drops_project_and_url_with_trailing_newline(self):
+        key = add_session(self.con, "codex", "s-four", 5)
+        add_task(self.con, "T-50", key, "https://github.com/o/r/pull/1\n",
+                 "o/r\n")
+        self.con.commit()
+        task = fleet.export(self.con, machine="rocky")["tasks"][0]
+        self.assertIsNone(task["project"])
+        self.assertIsNone(task["issue_url"])
+
     def test_free_text_task_ids_and_session_fields_stay_home(self):
         key = add_session(self.con, "codex", "s-three", 5)
         add_task(self.con, "fix the secret login bug", key, None, None)
@@ -165,6 +174,12 @@ class ReportTest(LedgerCase):
         self.assertEqual(task["session_usage"]["s1"]["total_tokens"], 5)
         self.assertEqual(task["missing_sessions"], ["codex:gone"])
 
+    def test_text_report_shows_withheld_task_counts(self):
+        doc = {**_doc("cavallo", []), "withheld_tasks": 4}
+        text = fleet.render(fleet.combine([doc, _doc("rocky", [])]))
+        self.assertIn("tasks: 0; free-text ids kept home: cavallo 4",
+                      text.splitlines())
+
     def test_real_unknown_counts_are_carried_not_recounted(self):
         rows = [{"harness": "codex", "model": "m", "effort": None,
                  "semantics": "s1", "is_overlap": 0,
@@ -193,6 +208,15 @@ class ReportTest(LedgerCase):
         group = session["usage"][0]
         for bad in ({"schema": "other"}, {**good, "machine": "a/b"},
                     {**good, "machine": "rocky\n"},
+                    {**good, "withheld_tasks": "3\n- fake line"},
+                    {**good, "withheld_tasks": -1},
+                    {**good, "observer_version": "1\n- fake"},
+                    {**good, "sessions": [{**session, "session_key": "a\nb"}]},
+                    {**good, "sessions": [{**session, "usage": [
+                        {**group, "semantics": "s\n- fake"}]}]},
+                    {**good, "tasks": [{**good["tasks"][0], "task_id": "T-1\n"}]},
+                    {**good, "tasks": [{**good["tasks"][0],
+                                        "acceptance_state": "ok\n- fake"}]},
                     {**good, "sessions": "x"},
                     {**good, "sessions": [{**session, "usage": "x"}]},
                     {**good, "sessions": [{**session, "session_key": ["x"]}]},
