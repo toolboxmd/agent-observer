@@ -400,12 +400,26 @@ def _open_existing(path: str) -> sqlite3.Connection:
         # SQLite opens lazily: the refusal surfaces on the first statement.
         con.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
         return con
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        refused = exc
+    except sqlite3.Error:
         con.close()
-        if not os.path.isfile(path):
-            raise
-    con = sqlite3.connect(uri + "?mode=rw", uri=True)
-    con.execute("PRAGMA query_only=ON")
+        raise
+    con.close()
+    if not os.path.isfile(path):
+        raise refused
+    try:
+        con = sqlite3.connect(uri + "?mode=rw", uri=True)
+    except sqlite3.Error:
+        raise refused from None
+    try:
+        con.execute("PRAGMA query_only=ON")
+        con.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
+    except sqlite3.Error:
+        # Report what the read-only open said, not the fallback's error
+        # (for example "attempt to write a readonly database").
+        con.close()
+        raise refused from None
     return con
 
 

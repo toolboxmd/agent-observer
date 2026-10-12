@@ -31,6 +31,13 @@ class IdleLedgerTest(unittest.TestCase):
         db.init_db(con)
         con.commit()
         con.close()
+        # Reach the idle state on every build: Apple's SQLite keeps empty
+        # -wal and -shm files after the last close, newer builds remove them.
+        if os.path.exists(self.path + "-wal"):
+            self.assertEqual(os.path.getsize(self.path + "-wal"), 0)
+            os.remove(self.path + "-wal")
+        if os.path.exists(self.path + "-shm"):
+            os.remove(self.path + "-shm")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -97,6 +104,29 @@ class IdleLedgerTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.tmp.name,
                                                      "absent.db")))
         self.assertEqual(_digest(self.path), before)
+
+    def test_fallback_never_creates_a_ledger(self):
+        # A ledger moved away between the read-only probe and the reopen
+        # must stay missing, and the original read-only error is reported.
+        real = sqlite3.connect
+        missing = os.path.join(self.tmp.name, "moved.db")
+
+        class Unreadable(sqlite3.Connection):
+            def execute(self, *args, **kwargs):
+                raise sqlite3.OperationalError("unable to open database file")
+
+        def probe_fails(target, *args, **kwargs):
+            if isinstance(target, str) and target.endswith("?mode=ro"):
+                return real(":memory:", factory=Unreadable)
+            return real(target, *args, **kwargs)
+
+        with mock.patch("agent_observer.db.sqlite3.connect", probe_fails), \
+                mock.patch("agent_observer.db.os.path.isfile",
+                           return_value=True):
+            with self.assertRaises(sqlite3.OperationalError) as caught:
+                db.connect_read_only(missing)
+        self.assertEqual(str(caught.exception), "unable to open database file")
+        self.assertFalse(os.path.exists(missing))
 
     def test_missing_ledger_is_never_created(self):
         missing = os.path.join(self.tmp.name, "absent.db")
