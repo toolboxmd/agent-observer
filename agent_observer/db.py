@@ -385,9 +385,33 @@ def _harden_path(path: str) -> None:
             pass
 
 
+def _open_existing(path: str) -> sqlite3.Connection:
+    """Open an existing ledger for reading; never create one.
+
+    `?mode=ro` comes first. Some SQLite builds (Apple's 3.43 behind macOS
+    /usr/bin/python3) cannot open a WAL ledger read-only once the last
+    connection removed its -shm file (#63); they get a read-write open
+    that must find the file (`?mode=rw`) and refuses writes
+    (`query_only`), so SQLite can recreate -shm like any concurrent reader.
+    """
+    uri = Path(path).absolute().as_uri()
+    con = sqlite3.connect(uri + "?mode=ro", uri=True)
+    try:
+        # SQLite opens lazily: the refusal surfaces on the first statement.
+        con.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
+        return con
+    except sqlite3.OperationalError:
+        con.close()
+        if not os.path.isfile(path):
+            raise
+    con = sqlite3.connect(uri + "?mode=rw", uri=True)
+    con.execute("PRAGMA query_only=ON")
+    return con
+
+
 def connect_read_only(path: str) -> sqlite3.Connection:
     """Read one consistent existing ledger snapshot without migration or chmod."""
-    con = sqlite3.connect(Path(path).absolute().as_uri() + "?mode=ro", uri=True)
+    con = _open_existing(path)
     con.row_factory = sqlite3.Row
     try:
         con.execute("BEGIN")
