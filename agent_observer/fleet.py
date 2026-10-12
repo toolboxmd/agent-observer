@@ -30,6 +30,7 @@ import socket
 import sqlite3
 import subprocess
 import tempfile
+import unicodedata
 
 from . import __version__, report
 from .publish import _GITHUB_URL_RE, _REPO_RE
@@ -121,17 +122,23 @@ def export(con: sqlite3.Connection, machine: str | None = None) -> dict:
 
 
 def _clean(value) -> bool:
-    """A string with no control characters: safe to print one per line."""
-    return isinstance(value, str) and not any(ord(c) < 32 for c in value)
+    """A string safe to print one per line: no control, format or line
+    separator characters (ASCII or Unicode)."""
+    return isinstance(value, str) and not any(
+        unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in value)
 
 
 def _text_or_none(value) -> bool:
     return value is None or _clean(value)
 
 
+def _count(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) \
+        and value >= 0
+
+
 def _count_or_none(value) -> bool:
-    return value is None or (isinstance(value, int)
-                             and not isinstance(value, bool))
+    return value is None or _count(value)
 
 
 def _valid_group(group) -> bool:
@@ -145,7 +152,7 @@ def _valid_group(group) -> bool:
         return False
     unknown = group.get("unknown_counts")
     return unknown is None or (isinstance(unknown, dict) and all(
-        _clean(k) and _count_or_none(v) for k, v in unknown.items()))
+        _clean(k) and _count(v) for k, v in unknown.items()))
 
 
 def validate(doc) -> dict:
@@ -167,8 +174,7 @@ def validate(doc) -> dict:
     if not all(_text_or_none(doc.get(k)) for k in
                ("observer_version", "exported_at", "ledger_synced_at")):
         raise ValueError("invalid export header")
-    withheld = doc.get("withheld_tasks", 0)
-    if not _count_or_none(withheld) or (withheld or 0) < 0:
+    if not _count_or_none(doc.get("withheld_tasks")):
         raise ValueError("invalid withheld_tasks count")
     for session in doc["sessions"]:
         if not _clean(session.get("session_key")) \

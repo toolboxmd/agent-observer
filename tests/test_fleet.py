@@ -227,9 +227,27 @@ class ReportTest(LedgerCase):
                     {**good, "sessions": [{**session, "usage": [
                         {**group, "unknown_counts": ["x"]}]}]},
                     {**good, "tasks": [{**good["tasks"][0], "sessions": "abc"}]},
-                    {**good, "tasks": [{**good["tasks"][0], "task_id": 7}]}):
-            with self.assertRaises(ValueError):
-                fleet.validate(bad)
+                    {**good, "tasks": [{**good["tasks"][0], "task_id": 7}]},
+                    # A stored null or negative count must never reach _add.
+                    {**good, "sessions": [{**session, "usage": [
+                        {**group, "unknown_counts": {"total_tokens": None}}]}]},
+                    {**good, "sessions": [{**session, "usage": [
+                        {**group, "unknown_counts": {"total_tokens": -1}}]}]},
+                    {**good, "sessions": [{**session, "usage": [
+                        {**group, "total_tokens": -5}]}]},
+                    # Line, format and C1 control characters, not just ASCII.
+                    *({**good, "sessions": [{**session, "usage": [
+                        {**group, "semantics": "s" + ch + "x"}]}]}
+                      for ch in ("\x7f", "\x85", "\u2028", "\u202e"))):
+            with self.subTest(bad=json.dumps(bad, ensure_ascii=True)[:300]):
+                with self.assertRaises(ValueError):
+                    fleet.validate(bad)
+
+    def test_validated_documents_always_combine(self):
+        # The promise behind validate: anything it accepts reports.
+        good = _doc("rocky", [("codex:a", None)], [_task("T-1", ["codex:a"])])
+        good["sessions"][0]["usage"][0]["unknown_counts"] = {"total_tokens": 1}
+        fleet.render(fleet.combine([fleet.validate(good)]))
 
 
 class PullTest(LedgerCase):
