@@ -202,6 +202,8 @@ class SelectTest(MomentsCase):
             "ev:claude:sess-one/permission/toolu_edit": ("rejection", "human"),
             "sub:claude:v1": ("prompt", "agent"),
             "sub:claude:w1": ("prompt", "human"),
+            # A Chromeria server turn: another agent wrote to this session.
+            "sub:claude:w2": ("prompt", "agent"),
             "sub:claude:w3": ("interrupt", "human"),
             "ev:claude:sess-four/permission/toolu_cp": ("rejection", "unknown"),
             "sub:claude:x3": ("interrupt", "unknown"),
@@ -220,7 +222,7 @@ class SelectTest(MomentsCase):
         self.assertEqual({m["origin"] for m in result["moments"]}, {"human"})
         self.assertEqual(len(result["moments"]), 7)
         self.assertEqual(result["counts"]["by_origin"],
-                         {"human": 7, "agent": 2, "unknown": 3})
+                         {"human": 7, "agent": 3, "unknown": 3})
 
     def test_hook_and_rule_denials_are_counted_never_selected(self):
         result = self.select(origins=None)
@@ -262,19 +264,46 @@ class ShowTest(MomentsCase):
         self.assertTrue(item["text"].startswith("no, you deleted the build"))
         self.assertGreater(len(item["text"]), 300)
         self.assertNotIn(TOKEN, item["text"])
-        self.assertEqual(item["previous_prompt"]["text"], "please add the cache")
-        self.assertEqual(item["previous_prompt"]["id"], "sub:claude:u1")
-        before = item["before"]
-        self.assertEqual([b["type"] for b in before],
+        [turn] = item["before"]
+        self.assertEqual(turn["prompt"]["text"], "please add the cache")
+        self.assertEqual(turn["prompt"]["id"], "sub:claude:u1")
+        self.assertEqual(turn["prompt"]["origin"], "human")
+        activity = turn["activity"]
+        self.assertEqual([b["type"] for b in activity],
                          ["assistant", "tool", "assistant"])
-        self.assertEqual(before[1]["tool"], "Bash")
-        self.assertIn("rm -rf build", before[1]["input"])
-        self.assertIn("removed build/", before[1]["output"])
-        self.assertEqual(before[2]["text"], "Done, I also deleted build.")
-        self.assertEqual([a["text"] for a in item["after"]],
+        self.assertEqual(activity[1]["tool"], "Bash")
+        self.assertIn("rm -rf build", activity[1]["input"])
+        self.assertIn("removed build/", activity[1]["output"])
+        self.assertEqual(activity[2]["text"], "Done, I also deleted build.")
+        [after] = item["after"]
+        self.assertEqual([a["text"] for a in after["activity"]],
                          ["Sorry, restoring build now."])
-        self.assertEqual(item["next_prompt"]["id"], "sub:claude:u3")
-        self.assertEqual(item["next_prompt"]["kind"], "interrupt")
+        self.assertEqual(after["prompt"]["id"], "sub:claude:u3")
+        self.assertEqual(after["prompt"]["kind"], "interrupt")
+
+    def test_context_window_is_a_parameter(self):
+        [bare] = self.show("sub:claude:u2", turns_before=0, turns_after=0)
+        self.assertEqual((bare["before"], bare["after"]), ([], []))
+        self.assertTrue(bare["text"].startswith("no, you deleted"))
+        self.assertEqual(bare["window"]["turns_before"], 0)
+        [wide] = self.show("sub:claude:u4", turns_before=3, turns_after=2)
+        self.assertEqual([t["prompt"]["id"] for t in wide["before"]],
+                         ["sub:claude:u1", "sub:claude:u2", "sub:claude:u3"])
+        self.assertEqual([a["text"] for a in wide["before"][1]["activity"]],
+                         ["Sorry, restoring build now."])
+        self.assertEqual(len(wide["after"]), 1)  # the session ends
+        [two] = self.show("sub:claude:u2", turns_after=2)
+        self.assertEqual([t["prompt"]["id"] for t in two["after"]],
+                         ["sub:claude:u3", "sub:claude:u4"])
+        [few] = self.show("sub:claude:u2", items=1)
+        self.assertEqual([a["text"] for a in few["before"][0]["activity"]],
+                         ["Done, I also deleted build."])
+
+    def test_agent_message_is_a_moment_with_its_source(self):
+        [item] = self.show("sub:claude:w2")
+        self.assertEqual(item["origin"], "agent")
+        self.assertEqual(item["text"], "Delegated task finished.")
+        self.assertEqual(item["before"][0]["prompt"]["origin"], "human")
 
     def test_wrapped_prompt_keeps_the_text_inside_chromeria_tags(self):
         [item] = self.show("sub:claude:w1")
@@ -287,19 +316,21 @@ class ShowTest(MomentsCase):
         self.assertEqual(rejection["status"], "ok")
         self.assertEqual(rejection["kind"], "rejection")
         self.assertEqual(rejection["tool"], "Edit")
-        self.assertEqual([a["text"] for a in rejection["after"]],
+        self.assertEqual([a["text"] for a in rejection["after"][0]["activity"]],
                          ["Understood, leaving a.py alone."])
         [interrupt] = self.show("ev:codex:cx-1/lifecycle/turn_aborted:t1")
         self.assertEqual(interrupt["status"], "ok")
-        self.assertEqual(interrupt["previous_prompt"]["text"], BRIEF)
-        self.assertEqual([b["text"] for b in interrupt["before"]],
+        [turn] = interrupt["before"]
+        self.assertEqual(turn["prompt"]["text"], BRIEF)
+        self.assertEqual(turn["prompt"]["origin"], "agent")
+        self.assertEqual([b["text"] for b in turn["activity"]],
                          ["Reading the brief."])
-        self.assertIsNone(interrupt["next_prompt"])
+        self.assertEqual(interrupt["after"], [{"activity": [], "prompt": None}])
 
     def test_limits_clip_long_fields_and_item_counts(self):
-        [item] = self.show("sub:claude:u2", before=1, chars=10)
-        self.assertEqual(len(item["before"]), 1)
-        self.assertIn("chars cut", item["before"][0]["text"])
+        [item] = self.show("sub:claude:u2", items=1, chars=10)
+        self.assertEqual(len(item["before"][0]["activity"]), 1)
+        self.assertIn("chars cut", item["before"][0]["activity"][0]["text"])
         # The person's own words are never cut by the context limit.
         self.assertGreater(len(item["text"]), 300)
         self.assertNotIn("chars cut", item["text"])
@@ -448,6 +479,7 @@ class RecurrenceTest(MomentsCase):
         report = verdicts.recurrence(self.con, "correction")
         self.assertNotIn("brief", [g["group"] for g in report["groups"]])
         self.assertEqual(report["occurrences"], 3)
+        self.assertEqual(report["other_origins"]["agent"]["occurrences"], 1)
         every = verdicts.recurrence(self.con, "correction", origins=None)
         self.assertIn("brief", [g["group"] for g in every["groups"]])
         self.assertEqual(every["occurrences"], 5)

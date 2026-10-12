@@ -250,6 +250,25 @@ def recurrence(con: sqlite3.Connection, behavior: str, judge=None,
     for r in rows:
         verdict_counts[r["verdict"]] += 1
     entries = _group_entries(rows, scope)
+    # Yes verdicts on moments outside the chosen origins (for example a
+    # parent agent correcting a worker) are reported apart, never mixed in.
+    others: dict[str, dict] = {}
+    if origins:
+        every = {m["id"]: m for m in _moments.select(
+            con, since=since, until=until, harness=harness, project=project,
+            origins=None, attrs=attrs)["moments"]}
+        for r in _rows(con, behavior, chosen):
+            moment = every.get(r["moment_id"])
+            if moment is None or moment["origin"] in origins \
+                    or r["verdict"] != "yes":
+                continue
+            entry = others.setdefault(moment["origin"],
+                                      {"occurrences": 0, "groups": set()})
+            entry["occurrences"] += 1
+            if r["group_id"]:
+                entry["groups"].add(r["group_id"])
+        for entry in others.values():
+            entry["problems"] = len(entry.pop("groups"))
     return {
         "behavior": behavior, "judge": chosen,
         "period": {"since": _moments._iso(since), "until": _moments._iso(until)},
@@ -268,6 +287,7 @@ def recurrence(con: sqlite3.Connection, behavior: str, judge=None,
         "repeats": sum(g["repeats"] for g in entries),
         "groups": entries,
         "policy_denials": selected["policy_denials"],
+        "other_origins": others,
     }
 
 
@@ -285,6 +305,9 @@ def render(report: dict) -> str:
         "policy denials (not corrections): " + ", ".join(
             f"{k} {v}" for k, v in report["policy_denials"].items()),
     ]
+    for origin, entry in sorted(report.get("other_origins", {}).items()):
+        lines.append(f"also {entry['occurrences']} yes on {origin} moments"
+                     f" ({entry['problems']} problems), not counted above")
     for g in report["groups"]:
         lines.append(f"- {g['group']}: {g['occurrences']}x in {g['sessions']}"
                      f" sessions ({', '.join(g['hosts'])}), {g['first_seen']}"

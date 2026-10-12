@@ -19,9 +19,13 @@ Behavior: correction. Judge id: <model>/correction-v1.
    agent-observer moments --since <date> --until <date> --unjudged correction --json
 2. Read moments in batches of about 10:
    agent-observer moment show <id> <id> ... --json
-   Each moment has the person's full text (`text`), the agent activity
-   before and after it, and the previous and next prompt. A rejection has
-   no text; its `tool` names the refused tool call.
+   Each moment has the person's full text (`text`) and whole turns around
+   it: `before` (the turn it answers, opened by the previous prompt) and
+   `after` (the agent's reply, closed by the next prompt). Add
+   `--turns-before N --turns-after N` when one turn is not enough, and
+   record the window you used in your judge id (for example
+   `<model>/correction-v1@1x1`). A rejection has no text; its `tool`
+   names the refused tool call.
 3. For each moment decide:
    - yes: the person tells the agent that something it did, said or was
      about to do is wrong, unwanted or not what they asked. This includes

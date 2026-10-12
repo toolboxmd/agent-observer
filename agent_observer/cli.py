@@ -374,8 +374,12 @@ def build_parser() -> argparse.ArgumentParser:
     ms.add_argument("ids", nargs="*", help="moment ids from moments --json")
     ms.add_argument("--ids-from", default=None, metavar="FILE",
                     help="read moment ids, one per line, from FILE or - for stdin")
-    ms.add_argument("--before", type=int, default=_moments.DEFAULT_BEFORE)
-    ms.add_argument("--after", type=int, default=_moments.DEFAULT_AFTER)
+    ms.add_argument("--turns-before", type=int, default=_moments.DEFAULT_TURNS_BEFORE,
+                    help="whole turns before the moment (0 = the moment alone)")
+    ms.add_argument("--turns-after", type=int, default=_moments.DEFAULT_TURNS_AFTER,
+                    help="whole turns after the moment, the first being its own")
+    ms.add_argument("--items", type=int, default=_moments.DEFAULT_ITEMS,
+                    help="at most this many agent messages and tool calls per turn")
     ms.add_argument("--chars", type=int, default=_moments.DEFAULT_CHARS,
                     help="cut each agent message, tool input and output to about this many characters")
     ms.add_argument("--text-chars", type=int, default=_moments.DEFAULT_TEXT_CHARS,
@@ -862,7 +866,8 @@ def _judge(con, ns) -> int:
             if not ids:
                 print("no moment ids given", file=sys.stderr)
                 return 2
-            items = _moments.show(con, ids, before=ns.before, after=ns.after,
+            items = _moments.show(con, ids, turns_before=ns.turns_before,
+                                  turns_after=ns.turns_after, items=ns.items,
                                   chars=ns.chars, text_chars=ns.text_chars)
             if as_json:
                 _emit({"moments": items}, True)

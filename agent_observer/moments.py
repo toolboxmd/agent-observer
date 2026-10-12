@@ -41,8 +41,12 @@ HEADLESS_ENTRYPOINTS = frozenset({"sdk-cli", "codex_exec"})
 POLICY_DENIALS = {"permission-rule": "hook_or_rule",
                   "automode-blocked": "automode"}
 DENIED = ("denied", "deny")
-DEFAULT_BEFORE = 8
-DEFAULT_AFTER = 8
+# Context window: whole turns before and after the moment, and at most
+# DEFAULT_ITEMS agent messages and tool calls per turn. Judges vary these
+# to measure accuracy against context size.
+DEFAULT_TURNS_BEFORE = 1
+DEFAULT_TURNS_AFTER = 1
+DEFAULT_ITEMS = 8
 DEFAULT_CHARS = 2000
 # The person's own words (moment, previous and next prompt) get a separate,
 # larger limit: a judge must never lose them to the context limit.
@@ -146,12 +150,17 @@ def _base(row, moment_id: str, kind: str, ts, origin: str, thread: str) -> dict:
             "harness": row["harness"], "project": row["project_dir"]}
 
 
-def _from_submission(row, ev: _Evidence) -> dict:
-    kind = "prompt" if row["kind"] == "genuine" else "interrupt"
+def _from_submission(row, ev: _Evidence) -> dict | None:
+    """A moment for a genuine prompt, an interrupt, or a message another
+    agent sent (a synthetic submission Chromeria records as agent-sent);
+    None for other synthetic input such as reminders."""
+    kind = "interrupt" if row["kind"] == "interrupt" else "prompt"
     thread = ev.thread(row["session_native"])
     actor = ev.prompt_actor(row["harness"], row["native_id"],
                             row["session_native"], row["text_hash"]) \
         if kind == "prompt" else None
+    if row["kind"] == "synthetic" and actor != "server":
+        return None
     return _base(row, f"sub:{row['native_id']}", kind, row["ts"],
                  _origin(kind, actor, row["entrypoint"], thread), thread)
 
@@ -187,7 +196,9 @@ def _from_event(row, ev: _Evidence, kind: str) -> dict:
     return moment
 
 
+_SUB_KINDS = "('genuine', 'interrupt', 'synthetic')"
 _SUB_SQL = ("SELECT u.native_id, u.kind, u.ts, u.text_hash, u.ordinal_num,"
+            " u.source_id,"
             f" {_SESSION_COLS} FROM submissions u"
             " JOIN sessions s ON s.session_key = u.session_key")
 _EVENT_SQL = ("SELECT e.id, e.family, e.name, e.native_id, e.ts,"
@@ -222,10 +233,12 @@ def _all(con, harness=None, project=None, attrs=None):
     where, args = _scope(harness, project, attrs)
     found, policy = [], []
     echoes = _echoes(con)
-    for row in con.execute(f"{_SUB_SQL} WHERE u.kind IN ('genuine',"
-                           f" 'interrupt') AND {where}", args):
-        if row["native_id"] not in echoes:
-            found.append(_from_submission(row, ev))
+    for row in con.execute(f"{_SUB_SQL} WHERE u.kind IN {_SUB_KINDS}"
+                           f" AND {where}", args):
+        moment = None if row["native_id"] in echoes \
+            else _from_submission(row, ev)
+        if moment is not None:
+            found.append(moment)
     for row in con.execute(f"{_EVENT_SQL} WHERE {_EVENT_WHERE} AND {where}",
                            args):
         kind = _event_kind(row)
@@ -295,8 +308,7 @@ def resolve(con: sqlite3.Connection, moment_id, ev=None) -> dict | None:
     ev = ev or _Evidence(con)
     if moment_id.startswith("sub:"):
         row = con.execute(f"{_SUB_SQL} WHERE u.native_id = ? AND u.kind IN"
-                          " ('genuine', 'interrupt')",
-                          (moment_id[4:],)).fetchone()
+                          f" {_SUB_KINDS}", (moment_id[4:],)).fetchone()
         if row is None or row["native_id"] in _echoes(con, row["session_key"]):
             return None
         return _from_submission(row, ev)
@@ -443,19 +455,22 @@ _TIMELINE_FAMILIES = ("assistant_message", "tool_call", "permission",
                       "lifecycle")
 
 
-def _timeline(con, session_key: str) -> list:
-    """Ordered prompts, interrupts and agent activity of one session."""
+def _timeline(con, session_key: str, ev: _Evidence) -> list:
+    """Ordered prompts (from a person or another agent), interrupts and
+    agent activity of one session. Every moment submission is a turn
+    boundary."""
     items = []
     echoes = _echoes(con, session_key)
     for row in con.execute(
-            "SELECT native_id, kind, ts, ordinal_num, source_id FROM"
-            " submissions WHERE session_key=? AND kind IN ('genuine',"
-            " 'interrupt')", (session_key,)):
-        if row["native_id"] in echoes:
+            f"{_SUB_SQL} WHERE u.session_key = ? AND u.kind IN {_SUB_KINDS}",
+            (session_key,)):
+        moment = None if row["native_id"] in echoes \
+            else _from_submission(row, ev)
+        if moment is None:
             continue
-        items.append({"key": f"sub:{row['native_id']}", "ts": row["ts"],
+        items.append({"key": moment["id"], "ts": row["ts"],
                       "ordinal": row["ordinal_num"], "boundary": True,
-                      "row": row, "what": "submission"})
+                      "row": row, "what": "submission", "moment": moment})
     for row in con.execute(
             "SELECT id, family, name, native_id, ts, ordinal_num, status,"
             " detail_json, target FROM events WHERE session_key=? AND family"
@@ -470,7 +485,7 @@ def _timeline(con, session_key: str) -> list:
         items.append({"key": f"ev:{session_key}/{family}/{row['native_id']}",
                       "ts": row["ts"], "ordinal": row["ordinal_num"],
                       "boundary": family == "lifecycle", "row": row,
-                      "what": family})
+                      "what": family, "moment": None})
     items.sort(key=lambda i: (i["ts"] or 0, i["ordinal"] or 0))
     return items
 
@@ -511,10 +526,16 @@ def _excerpt(row) -> str:
 
 
 def _prompt(sources, item, chars) -> dict:
-    row = item["row"]
-    status, text = _submission_text(sources, row)
-    out = {"id": item["key"], "kind": "prompt" if row["kind"] == "genuine"
-           else "interrupt", "at": _iso(row["ts"])}
+    """A turn boundary: a prompt (with its text and who sent it) or an
+    interrupt."""
+    moment = item["moment"]
+    if item["what"] != "submission":
+        return {"id": item["key"], "kind": "interrupt",
+                "origin": moment["origin"] if moment else None,
+                "at": _iso(item["row"]["ts"])}
+    status, text = _submission_text(sources, item["row"])
+    out = {"id": item["key"], "kind": moment["kind"],
+           "origin": moment["origin"], "at": _iso(item["row"]["ts"])}
     if status == "ok":
         out["text"] = clip(text, chars)
     else:
@@ -522,12 +543,50 @@ def _prompt(sources, item, chars) -> dict:
     return out
 
 
-def show(con: sqlite3.Connection, moment_ids: list, before=DEFAULT_BEFORE,
-         after=DEFAULT_AFTER, chars=DEFAULT_CHARS,
+def _turns(line, at: int, turns_before: int, turns_after: int, items: int):
+    """Index ranges of whole turns around position `at`.
+
+    A turn runs from one boundary to the next. Before turns are
+    (opening boundary or None at session start, activity); after turns
+    are (activity, closing boundary or None at session end), the first
+    being the moment's own turn."""
+    bounds = [i for i, item in enumerate(line) if item["boundary"]]
+    earlier = [i for i in bounds if i < at]
+    later = [i for i in bounds if i > at]
+    before = []
+    starts = ([None] if (not earlier or earlier[0] > 0) else []) + earlier
+    for n, opening in enumerate(starts):
+        first = 0 if opening is None else opening + 1
+        stop = starts[n + 1] if n + 1 < len(starts) else at
+        span = [i for i in range(first, stop) if not line[i]["boundary"]]
+        if opening is None and not span:
+            continue
+        before.append((opening, span[-items:] if items else []))
+    before = before[-turns_before:] if turns_before else []
+    after = []
+    edge = at
+    for closing in later[:turns_after] if turns_after else []:
+        span = list(range(edge + 1, closing))
+        after.append((span[:items] if items else [], closing))
+        edge = closing
+    if turns_after and len(after) < turns_after:
+        span = list(range(edge + 1, len(line)))
+        if span or not after:
+            after.append((span[:items] if items else [], None))
+    return before, after
+
+
+def show(con: sqlite3.Connection, moment_ids: list,
+         turns_before=DEFAULT_TURNS_BEFORE, turns_after=DEFAULT_TURNS_AFTER,
+         items=DEFAULT_ITEMS, chars=DEFAULT_CHARS,
          text_chars=DEFAULT_TEXT_CHARS) -> list[dict]:
-    """Each moment in context: its full text, the agent activity before
-    and after it, and the human prompts around it. Status per moment is
+    """Each moment in context: its full text, and whole turns before and
+    after it (each a prompt from a person or agent plus the agent's
+    messages and tool calls). The window is a parameter, echoed back, so a
+    judge can measure accuracy against context size. Status per moment is
     ok, source_missing, source_changed, not_found or no_such_moment."""
+    window = {"turns_before": turns_before, "turns_after": turns_after,
+              "items": items, "chars": chars, "text_chars": text_chars}
     sources = _Sources(con)
     ev = _Evidence(con)
     timelines: dict[str, list] = {}
@@ -539,7 +598,7 @@ def show(con: sqlite3.Connection, moment_ids: list, before=DEFAULT_BEFORE,
             continue
         session = moment["session"]
         if session not in timelines:
-            timelines[session] = _timeline(con, session)
+            timelines[session] = _timeline(con, session, ev)
         line = timelines[session]
         at = next(i for i, item in enumerate(line) if item["key"] == moment_id)
         status, text = "ok", None
@@ -553,41 +612,31 @@ def show(con: sqlite3.Connection, moment_ids: list, before=DEFAULT_BEFORE,
                 "source_missing"
         item = dict(moment)
         item["status"] = status
+        item["window"] = window
         if status != "ok":
             out.append(item)
             continue
         if text is not None:
             item["text"] = clip(text, text_chars)
-        start = at
-        while start > 0 and not line[start - 1]["boundary"]:
-            start -= 1
-        end = at + 1
-        while end < len(line) and not line[end]["boundary"]:
-            end += 1
-        prior = line[start:at][-before:] if before else []
-        later = line[at + 1:end][:after] if after else []
-        ids = [i["row"]["id"] for i in prior + later
-               if i["what"] in ("assistant_message", "tool_call")]
+        before, after = _turns(line, at, turns_before, turns_after, items)
+        spans = [i for _, span in before for i in span] + \
+            [i for span, _ in after for i in span]
+        ids = [line[i]["row"]["id"] for i in spans
+               if line[i]["what"] in ("assistant_message", "tool_call")]
         contents = {c["id"]: c for c in lookup.show(con, ids)} if ids else {}
-        item["before"] = [_agent_item(i, contents.get(i["row"]["id"], {}),
-                                      chars)
-                          for i in prior if i["what"] != "submission"]
-        item["after"] = [_agent_item(i, contents.get(i["row"]["id"], {}),
-                                     chars)
-                         for i in later if i["what"] != "submission"]
-        previous = next((line[i] for i in range(start - 1, -1, -1)
-                         if line[i]["what"] == "submission"
-                         and line[i]["row"]["kind"] == "genuine"), None)
-        following = line[end] if end < len(line) else None
-        item["previous_prompt"] = _prompt(sources, previous, text_chars) \
-            if previous else None
-        if following is None:
-            item["next_prompt"] = None
-        elif following["what"] == "submission":
-            item["next_prompt"] = _prompt(sources, following, text_chars)
-        else:
-            item["next_prompt"] = {"id": following["key"], "kind": "interrupt",
-                                   "at": _iso(following["row"]["ts"])}
+
+        def activity(span):
+            return [_agent_item(line[i], contents.get(line[i]["row"]["id"], {}),
+                                chars) for i in span]
+        item["before"] = [
+            {"prompt": None if opening is None
+             else _prompt(sources, line[opening], text_chars),
+             "activity": activity(span)} for opening, span in before]
+        item["after"] = [
+            {"activity": activity(span),
+             "prompt": None if closing is None
+             else _prompt(sources, line[closing], text_chars)}
+            for span, closing in after]
         out.append(item)
     return out
 
@@ -602,20 +651,23 @@ def render(items: list[dict]) -> str:
         lines.append(f"{item['kind']} by {item['origin']} in {item['session']}"
                      f" ({item['harness']}, thread {item['thread']}) at"
                      f" {item['at']}")
-        if item.get("previous_prompt"):
-            lines += ["--- previous prompt",
-                      item["previous_prompt"].get("text") or ""]
-        for entry in item.get("before", []):
-            lines.append(_render_entry(entry))
+        for turn in item.get("before", []):
+            if turn["prompt"]:
+                lines.append(_render_prompt(turn["prompt"]))
+            lines += [_render_entry(e) for e in turn["activity"]]
         if "text" in item:
             lines += ["--- moment", item["text"]]
-        for entry in item.get("after", []):
-            lines.append(_render_entry(entry))
-        if item.get("next_prompt"):
-            lines += ["--- next " + item["next_prompt"]["kind"],
-                      item["next_prompt"].get("text") or ""]
+        for turn in item.get("after", []):
+            lines += [_render_entry(e) for e in turn["activity"]]
+            if turn["prompt"]:
+                lines.append(_render_prompt(turn["prompt"]))
         parts.append("\n".join(lines))
     return "\n\n".join(parts)
+
+
+def _render_prompt(prompt: dict) -> str:
+    return (f"--- {prompt['kind']} by {prompt.get('origin') or 'unknown'}"
+            f"\n{prompt.get('text') or ''}").rstrip()
 
 
 def _render_entry(entry: dict) -> str:

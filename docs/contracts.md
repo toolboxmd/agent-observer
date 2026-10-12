@@ -235,7 +235,8 @@ are counted separately and excluded from useful-work comparisons.
 - `moments`, `moment show`, `verdict add|list|groups`, `recurrence`,
   `session-attr add`: the judge interface (README "Judge moments").
   Moment ids are `sub:<submission native id>` (genuine or interrupt
-  submissions) and `ev:<session_key>/<family>/<native id>` (Codex
+  submissions, and synthetic ones that Chromeria records as agent-sent,
+  origin `agent`) and `ev:<session_key>/<family>/<native id>` (Codex
   `turn_aborted` cancelled; a denied permission that is `user-rejected`
   on Claude or kindless elsewhere). An interrupt submission within one
   second after a `user-rejected` denial in the same session is the same
@@ -250,6 +251,10 @@ are counted separately and excluded from useful-work comparisons.
   otherwise; a batch naming one moment, behavior and judge twice is
   rejected. Moment text and
   context are read from native logs on request, redacted, never stored.
+  `moment show` returns whole turns (`--turns-before`, `--turns-after`,
+  `--items`, `--chars`, `--text-chars`) and echoes them as `window`.
+  `recurrence` reports yes verdicts outside its origins only under
+  `other_origins`.
   A verdict batch is validated whole; `recurrence` counts a group as
   recurring when its yes verdicts span two or more sessions.
 - `publish --task ID|--session KEY [--prices schedule.json] --repo owner/name --pr N|--commit SHA`:

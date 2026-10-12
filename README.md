@@ -226,9 +226,13 @@ an outside LLM judge and stores the judge's answers; it never runs a
 model itself. [docs/judge-corrections.md](docs/judge-corrections.md) is
 a reference judge prompt for corrections.
 
-A moment is one point in a main session where a person acted: a
-`prompt`, an `interrupt`, or a `rejection` of a tool call. Each moment has
-an `origin`, which records who acted, from evidence only:
+A moment is one point in a main session where someone acted on the
+agent: a `prompt`, an `interrupt`, or a `rejection` of a tool call. Its
+`origin` is the source label: who acted, from evidence only. A message
+another agent sent (a parent's brief, a reviewer's findings, a child's
+report) is a `prompt` moment with origin `agent` when Chromeria records
+it as agent-sent. Selection and reports default to `human`; agent
+moments are opt-in and reported apart.
 
 - `human`: Chromeria recorded a person starting the turn or sending the
   prompt, the session ran in a terminal or desktop app (`cli`,
@@ -236,7 +240,8 @@ an `origin`, which records who acted, from evidence only:
   top-level Chromeria thread or a session outside Chromeria (Claude's
   `user-rejected` included).
 - `agent`: Chromeria recorded an agent or the server sending it, or the
-  session ran headless (`sdk-cli`, `codex_exec`).
+  session ran headless (`sdk-cli`, `codex_exec`). Other synthetic input,
+  such as reminders, is no moment.
 - `unknown`: no evidence either way, for example a prompt in a delegated
   child thread from before Chromeria V2, a Grok or OpenCode prompt (their
   Chromeria text does not match the native prompt), or any interrupt or
@@ -259,12 +264,19 @@ agent-observer session-attr add --json < arms.jsonl     # {"session": "claude:<i
 
 `moments` lists the selected moments and counts every moment in scope by
 origin and kind, so filtered moments stay visible as numbers. `moment show`
-reads each moment from the native log: the person's full text (including
-text inside Chromeria wrapper tags), the agent's messages and tool calls
-before and after it, and the previous and next prompt. `--before`,
-`--after` and `--chars` bound the agent context; `--text-chars` (default
-20,000) bounds the person's own text separately, so a context limit never
-cuts it. Its statuses match `event show`,
+reads each moment from the native log: its full text (including text
+inside Chromeria wrapper tags) and whole turns around it. A turn is a
+prompt or interrupt (with its `origin`) plus the agent's messages and
+tool calls up to the next one. `before` lists turns oldest first, each
+opened by its prompt; `after` lists the moment's own turn first, each
+closed by the next prompt. The window is a parameter, echoed back as
+`window`, so a judge can measure its accuracy against context size on a
+labeled sample: `--turns-before 0 --turns-after 0` is the moment alone,
+the default `1`/`1` adds the turn it answers and the agent's reply, and
+larger values add more turns. `--items` caps agent messages and tool
+calls per turn, `--chars` cuts each of them, and `--text-chars` (default
+20,000) bounds prompt text separately, so a context limit never cuts the
+person's words. Its statuses match `event show`,
 plus `no_such_moment`; the exit status is 3 when any moment is not `ok`.
 
 A verdict is `yes`, `no` or `unclear` for one moment, behavior and judge;
@@ -280,7 +292,9 @@ otherwise. When more than one judge labeled the scope, it requires
 `--judge`. `moments --unjudged B --judge J` lists the work left for one
 judge; `verdict list` returns stored verdicts with their problem lines,
 which the grouping pass reads. A batch that names the same moment,
-behavior and judge twice is rejected.
+behavior and judge twice is rejected. Yes verdicts on moments outside
+the reported origins appear only in `other_origins` (for example agent
+corrections of a worker), never in the headline numbers.
 
 Moment text, problem lines and session attributes stay on this machine:
 `publish` never includes them.
