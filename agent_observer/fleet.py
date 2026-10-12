@@ -499,10 +499,25 @@ def stored(directory: str) -> list:
             continue
         try:
             with open(os.path.join(directory, name), encoding="utf-8") as fh:
-                docs.append(validate(json.load(fh)))
+                docs.append(validate(loads(fh.read())))
         except (OSError, ValueError):
             continue
     return docs
+
+
+def _unique_keys(pairs: list) -> dict:
+    seen = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key in fleet export: {key!r}")
+        seen[key] = value
+    return seen
+
+
+def loads(text: str):
+    """Decode a fleet export, refusing duplicate object keys: the default
+    decoder keeps the last value and would silently drop evidence."""
+    return json.loads(text, object_pairs_hook=_unique_keys)
 
 
 def _storable(text: str) -> dict:
@@ -510,7 +525,7 @@ def _storable(text: str) -> dict:
     translated strictly), reduced to schema fields, and reportable. A
     document that validates but cannot be reported is refused here, not
     discovered by every later fleet report."""
-    doc = _schema_only(validate(json.loads(text)))
+    doc = _schema_only(validate(loads(text)))
     render(combine([doc])).encode("utf-8")
     return doc
 

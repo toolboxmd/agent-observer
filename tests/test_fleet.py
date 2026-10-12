@@ -750,3 +750,76 @@ class GatedWriteTest(FleetRecurrenceTest):
                 fleet.pull("rocky", store, run=run)
         self.assertEqual(open(path, "rb").read(), before)
         self.assertEqual(sorted(os.listdir(store)), ["rocky.json"])
+
+
+def dumps_with_duplicate(node, path, key, value):
+    """JSON text of node with `key` repeated (second value `value`) in the
+    object at `path`; json.dumps cannot emit duplicate keys."""
+    def emit(n, at):
+        if isinstance(n, dict):
+            items = [f"{json.dumps(k)}:{emit(v, at + (k,))}" for k, v in n.items()]
+            if at == path:
+                items.append(f"{json.dumps(key)}:{json.dumps(value)}")
+            return "{" + ",".join(items) + "}"
+        if isinstance(n, list):
+            return "[" + ",".join(emit(v, at + (i,)) for i, v in enumerate(n)) + "]"
+        return json.dumps(n)
+    return emit(node, ())
+
+
+class DuplicateKeyTest(FleetRecurrenceTest):
+    """Duplicate JSON keys are refused at the read boundary (#68 round 4)."""
+
+    def test_raw_duplicate_keys_never_replace_the_stored_export(self):
+        good = to_schema_1(self.machine("rocky", "sess-r"))
+        key = next(iter(good["moments"]["sessions"]))
+        raws = [
+            dumps_with_duplicate(good, ("moments", "sessions", key, "by_origin"),
+                                 "human", 0),
+            dumps_with_duplicate(good, ("moments", "sessions", key),
+                                 "by_origin", {"human": 0}),
+            dumps_with_duplicate(good, (), "moments", {"sessions": {}}),
+        ]
+        store = os.path.join(self.tmp.name, "fleet")
+
+        def run_with(text):
+            def run(argv, **kwargs):
+                return subprocess.CompletedProcess(argv, 0, text, "")
+            return run
+        fleet.pull("rocky", store, run=run_with(json.dumps(good)))
+        path = os.path.join(store, "rocky.json")
+        before = open(path, "rb").read()
+        for raw in raws:
+            with self.assertRaises(fleet.PullError) as caught:
+                fleet.pull("rocky", store, run=run_with(raw))
+            self.assertIn("duplicate key", str(caught.exception))
+            self.assertEqual(open(path, "rb").read(), before)
+
+    def test_a_stored_file_with_duplicate_keys_is_skipped(self):
+        doc = self.machine("rocky", "sess-r")
+        store = os.path.join(self.tmp.name, "fleet")
+        os.makedirs(store)
+        with open(os.path.join(store, "rocky.json"), "w") as fh:
+            fh.write(dumps_with_duplicate(doc, (), "machine", "rocky"))
+        self.assertEqual(fleet.stored(store), [])
+
+    def test_every_duplicated_key_is_refused(self):
+        good = to_schema_1(self.machine("rocky", "sess-r"))
+
+        def objects(node, at=()):
+            if isinstance(node, dict):
+                yield at, node
+                for k, v in node.items():
+                    yield from objects(v, at + (k,))
+            elif isinstance(node, list):
+                for i, v in enumerate(node):
+                    yield from objects(v, at + (i,))
+        checked = 0
+        for at, node in objects(good):
+            for key, value in node.items():
+                for again in (value, 0, None):
+                    raw = dumps_with_duplicate(good, at, key, again)
+                    with self.assertRaises(ValueError, msg=(at, key)):
+                        fleet.validate(fleet.loads(raw))
+                    checked += 1
+        self.assertGreater(checked, 50)
