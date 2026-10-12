@@ -274,9 +274,13 @@ class ShowTest(MomentsCase):
         self.assertIsNone(interrupt["next_prompt"])
 
     def test_limits_clip_long_fields_and_item_counts(self):
-        [item] = self.show("sub:claude:u2", before=1, chars=40)
+        [item] = self.show("sub:claude:u2", before=1, chars=10)
         self.assertEqual(len(item["before"]), 1)
-        self.assertEqual(item["before"][0]["text"], "Done, I also deleted build.")
+        self.assertIn("chars cut", item["before"][0]["text"])
+        # The person's own words are never cut by the context limit.
+        self.assertGreater(len(item["text"]), 300)
+        self.assertNotIn("chars cut", item["text"])
+        [item] = self.show("sub:claude:u2", text_chars=40)
         self.assertLessEqual(len(item["text"]), 40 + 40)
         self.assertIn("chars cut", item["text"])
 
@@ -335,6 +339,17 @@ class VerdictTest(MomentsCase):
                          [2, 3, 4, 5, 6, 7, 8])
         self.assertEqual(self.con.execute(
             "SELECT COUNT(*) FROM verdicts").fetchone()[0], 0)
+
+    def test_list_shows_each_verdict_with_its_moment(self):
+        verdicts.add(self.con, [
+            verdict("sub:claude:u2", problem="Deleted files without asking"),
+            verdict("sub:claude:u4", "no")])
+        listed = verdicts.listing(self.con, "correction", verdict="yes")
+        self.assertEqual([(v["moment"], v["problem"], v["group"], v["session"])
+                          for v in listed],
+                         [("sub:claude:u2", "Deleted files without asking",
+                           None, "claude:sess-one")])
+        self.assertEqual(len(verdicts.listing(self.con, "correction")), 2)
 
     def test_problem_lines_are_redacted(self):
         verdicts.add(self.con, [verdict("sub:claude:u2",
@@ -443,6 +458,11 @@ class CliTest(MomentsCase):
                                  stdin='{"moment": "x"}')
         self.assertEqual(code, 2)
         self.assertEqual(json.loads(out)["errors"][0]["line"], 1)
+        code, out = self.run_cli("verdict", "list", "--behavior",
+                                 "correction", "--verdict", "yes", "--json")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(out)["verdicts"][0]["moment"],
+                         "sub:claude:u2")
         code, out = self.run_cli("recurrence", "--behavior", "correction",
                                  "--json")
         self.assertEqual(code, 0)

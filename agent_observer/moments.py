@@ -44,6 +44,9 @@ DENIED = ("denied", "deny")
 DEFAULT_BEFORE = 8
 DEFAULT_AFTER = 8
 DEFAULT_CHARS = 2000
+# The person's own words (moment, previous and next prompt) get a separate,
+# larger limit: a judge must never lose them to the context limit.
+DEFAULT_TEXT_CHARS = 20000
 
 
 def iso_to_ts(value):
@@ -509,7 +512,8 @@ def _prompt(sources, item, chars) -> dict:
 
 
 def show(con: sqlite3.Connection, moment_ids: list, before=DEFAULT_BEFORE,
-         after=DEFAULT_AFTER, chars=DEFAULT_CHARS) -> list[dict]:
+         after=DEFAULT_AFTER, chars=DEFAULT_CHARS,
+         text_chars=DEFAULT_TEXT_CHARS) -> list[dict]:
     """Each moment in context: its full text, the agent activity before
     and after it, and the human prompts around it. Status per moment is
     ok, source_missing, source_changed, not_found or no_such_moment."""
@@ -541,7 +545,7 @@ def show(con: sqlite3.Connection, moment_ids: list, before=DEFAULT_BEFORE,
             out.append(item)
             continue
         if text is not None:
-            item["text"] = clip(text, chars)
+            item["text"] = clip(text, text_chars)
         start = at
         while start > 0 and not line[start - 1]["boundary"]:
             start -= 1
@@ -563,12 +567,12 @@ def show(con: sqlite3.Connection, moment_ids: list, before=DEFAULT_BEFORE,
                          if line[i]["what"] == "submission"
                          and line[i]["row"]["kind"] == "genuine"), None)
         following = line[end] if end < len(line) else None
-        item["previous_prompt"] = _prompt(sources, previous, chars) \
+        item["previous_prompt"] = _prompt(sources, previous, text_chars) \
             if previous else None
         if following is None:
             item["next_prompt"] = None
         elif following["what"] == "submission":
-            item["next_prompt"] = _prompt(sources, following, chars)
+            item["next_prompt"] = _prompt(sources, following, text_chars)
         else:
             item["next_prompt"] = {"id": following["key"], "kind": "interrupt",
                                    "at": _iso(following["row"]["ts"])}

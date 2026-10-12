@@ -33,6 +33,10 @@ Behavior: correction. Judge id: <model>/correction-v1.
      followed by "continue" or by an unrelated request.
    - unclear: the context cannot tell, for example an interrupt with no
      later prompt and no visible reason.
+   Not understanding the agent is yes only when the person says the
+   explanation itself failed ("I don't understand a word", "talk
+   simpler", "still don't get it" after a re-explanation). A first plain
+   "i don't get it" that asks for clarification is no.
    For yes, write `problem`: one line of at most 200 characters naming the
    agent's behavior in general terms that would match the same mistake in
    another session ("Started many agents without approval"), not the
@@ -54,9 +58,8 @@ symptoms of one behavior belong together; the same words about different
 behaviors do not.
 
 1. Read every yes verdict and its problem line:
-   agent-observer recurrence --behavior correction --judge <judge id> --json
-   (`ungrouped` counts the corrections without a group), and the groups
-   that already exist:
+   agent-observer verdict list --behavior correction --judge <judge id> --verdict yes --json
+   and the groups that already exist:
    agent-observer verdict groups --behavior correction --judge <judge id> --json
    Reuse an existing group id when it fits.
 2. Give each new group a short kebab-case id, for example

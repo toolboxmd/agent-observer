@@ -228,7 +228,7 @@ are counted separately and excluded from useful-work comparisons.
   sessions hold measured responses but nothing attributed or shared
   reports those sessions as `unbound_usage` instead of a silent
   `missing assignments: none`. Every command accepts `--json`.
-- `moments`, `moment show`, `verdict add|groups`, `recurrence`,
+- `moments`, `moment show`, `verdict add|list|groups`, `recurrence`,
   `session-attr add`: the judge interface (README "Judge moments").
   Moment ids are `sub:<submission native id>` (genuine or interrupt
   submissions) and `ev:<session_key>/<family>/<native id>` (Codex

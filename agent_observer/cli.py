@@ -375,13 +375,20 @@ def build_parser() -> argparse.ArgumentParser:
     ms.add_argument("--before", type=int, default=_moments.DEFAULT_BEFORE)
     ms.add_argument("--after", type=int, default=_moments.DEFAULT_AFTER)
     ms.add_argument("--chars", type=int, default=_moments.DEFAULT_CHARS,
-                    help="cut each text field to about this many characters")
+                    help="cut each agent message, tool input and output to about this many characters")
+    ms.add_argument("--text-chars", type=int, default=_moments.DEFAULT_TEXT_CHARS,
+                    help="cut the person's own text (moment, previous and next prompt) to about this many characters")
     ms.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     vd = sub.add_parser("verdict", help="store and list judge verdicts on moments")
     vdsub = vd.add_subparsers(dest="op", required=True)
     va = vdsub.add_parser("add", help="store JSON-line verdicts; the batch is all or nothing")
     va.add_argument("--file", default="-", help="JSON lines file, or - for stdin")
     va.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
+    vl = vdsub.add_parser("list", help="list stored verdicts with their moments")
+    vl.add_argument("--behavior", required=True)
+    vl.add_argument("--judge", default=None)
+    vl.add_argument("--verdict", default=None, choices=["yes", "no", "unclear"])
+    vl.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     vg = vdsub.add_parser("groups", help="list existing groups and their problem lines")
     vg.add_argument("--behavior", required=True)
     vg.add_argument("--judge", default=None)
@@ -848,7 +855,7 @@ def _judge(con, ns) -> int:
                 print("no moment ids given", file=sys.stderr)
                 return 2
             items = _moments.show(con, ids, before=ns.before, after=ns.after,
-                                  chars=ns.chars)
+                                  chars=ns.chars, text_chars=ns.text_chars)
             if as_json:
                 _emit({"moments": items}, True)
             else:
@@ -858,6 +865,16 @@ def _judge(con, ns) -> int:
             result = _verdicts.add(con, _json_lines(ns.file))
             _emit(result, True) if as_json else print(
                 f"stored {result['stored']}, updated {result['updated']}")
+            return 0
+        if ns.cmd == "verdict" and ns.op == "list":
+            listed = _verdicts.listing(con, ns.behavior, judge=ns.judge,
+                                       verdict=ns.verdict)
+            if as_json:
+                _emit({"verdicts": listed}, True)
+            else:
+                for v in listed:
+                    print(f"{v['moment']}  {v['verdict']} {v['group'] or '-'}"
+                          f" {v['problem'] or ''}")
             return 0
         if ns.cmd == "verdict":
             groups = _verdicts.groups(con, ns.behavior, judge=ns.judge)

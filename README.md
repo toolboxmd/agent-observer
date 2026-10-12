@@ -248,6 +248,7 @@ interrupt in the same second; that is one moment.
 agent-observer moments --since 2026-09-14 --unjudged correction --json   # default --origin human
 agent-observer moment show sub:claude:<uuid> ev:codex:<id>/lifecycle/turn_aborted:<turn> --json
 agent-observer verdict add --json < verdicts.jsonl
+agent-observer verdict list --behavior correction --verdict yes --json
 agent-observer verdict groups --behavior correction --json
 agent-observer recurrence --behavior correction --since 2026-09-14 [--attr arm=holdout]
 agent-observer session-attr add --json < arms.jsonl     # {"session": "claude:<id>", "name": "arm", "value": "holdout"}
@@ -258,7 +259,9 @@ origin and kind, so filtered moments stay visible as numbers. `moment show`
 reads each moment from the native log: the person's full text (including
 text inside Chromeria wrapper tags), the agent's messages and tool calls
 before and after it, and the previous and next prompt. `--before`,
-`--after` and `--chars` bound the size. Its statuses match `event show`,
+`--after` and `--chars` bound the agent context; `--text-chars` (default
+20,000) bounds the person's own text separately, so a context limit never
+cuts it. Its statuses match `event show`,
 plus `no_such_moment`; the exit status is 3 when any moment is not `ok`.
 
 A verdict is `yes`, `no` or `unclear` for one moment, behavior and judge;

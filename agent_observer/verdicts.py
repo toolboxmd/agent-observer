@@ -191,6 +191,27 @@ def groups(con: sqlite3.Connection, behavior: str, judge=None) -> list:
     return out
 
 
+def listing(con: sqlite3.Connection, behavior: str, judge=None,
+            verdict=None) -> list:
+    """Every stored verdict for a behavior with its moment's session, host
+    and time, oldest first; the grouping pass reads its problem lines here."""
+    found, _ = _moments._all(con)
+    scope = {m["id"]: m for m in found}
+    out = []
+    for r in _rows(con, behavior, judge):
+        if verdict and r["verdict"] != verdict:
+            continue
+        moment = scope.get(r["moment_id"])
+        out.append({"moment": r["moment_id"], "judge": r["judge"],
+                    "verdict": r["verdict"], "problem": r["problem"],
+                    "group": r["group_id"],
+                    "session": moment["session"] if moment else None,
+                    "harness": moment["harness"] if moment else None,
+                    "at": moment["at"] if moment else None})
+    out.sort(key=lambda v: (v["at"] or "", v["moment"]))
+    return out
+
+
 def recurrence(con: sqlite3.Connection, behavior: str, judge=None,
                since=None, until=None, harness=None, project=None,
                attrs=None) -> dict:
