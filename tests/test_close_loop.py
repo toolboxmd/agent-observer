@@ -530,6 +530,6 @@ class IntegratedCostEvidenceTest(CloseLoopCase):
                     '--turn', 'codex:aaa', '--role', 'parent', '--state', state,
                     *(['--model', 'gpt-6-astra'] if state == 'active' else []))
             self.assertEqual(r.returncode, 0, r.stderr)
-        attempt = self._task_json('T-A')['attempts'][0]
+        attempt = self._task_json('T-A')['task_turns'][0]
         self.assertEqual(attempt['state'], 'complete')
         self.assertEqual(attempt['model_observed'], 'gpt-6-astra')

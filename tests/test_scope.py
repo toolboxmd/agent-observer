@@ -47,22 +47,22 @@ class ScopeTest(LedgerCase):
             "SELECT session_key FROM responses WHERE turn_id=?",
             ("codex:turn-scope-child",))[0]["session_key"]
         self.con.execute(
-            "INSERT INTO submissions(native_id, source_id, session_key,"
+            "INSERT INTO user_messages(native_id, source_id, session_key,"
             " turn_id, ordinal_num, text_hash, text_excerpt, is_genuine)"
             " VALUES(?,?,?,?,?,?,?,?)",
             ("worker-sub-scope-c1", None, child_session,
              "codex:turn-scope-child", 3, "hash", "worker submission", 1))
         self.con.execute(
-            "INSERT INTO assignments(submission_native_id, task_id,"
+            "INSERT INTO assignments(user_message_id, task_id,"
             " created_at) VALUES(?,?,?)",
             ("codex:msg-scope-sub-p1", "T-P", db.now()))
         self.con.execute(
-            "INSERT INTO assignments(submission_native_id, task_id,"
+            "INSERT INTO assignments(user_message_id, task_id,"
             " created_at) VALUES(?,?,?)",
             ("worker-sub-scope-c1", "T-P", db.now()))
         self.con.execute(
-            "INSERT INTO dispatches(owning_submission, worker_thread,"
-            " worker_turn, requested_model, created_at)"
+            "INSERT INTO delegations(owning_user_message, child_thread,"
+            " child_turn, requested_model, created_at)"
             " VALUES(?,?,?,?,?)",
             ("codex:msg-scope-sub-p1", "thread-fixture-scope-child",
              "turn-scope-child", "gpt-6-fixture", db.now()))
@@ -70,4 +70,4 @@ class ScopeTest(LedgerCase):
         rep = report.task_report(self.con, "T-P")
         self.assertEqual(rep["attributed"]["total_tokens"], 4950)
         self.assertEqual(rep["attributed"]["responses"], 4)
-        self.assertEqual(len(rep["dispatches"]), 1)
+        self.assertEqual(len(rep["delegations"]), 1)

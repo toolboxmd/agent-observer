@@ -18,7 +18,7 @@ LEGACY = "codex: sess-fixture-legacy-01".replace(" ", "")
 def _excerpts(case, extra=""):
     return "".join(
         r["text_excerpt"] or "" for r in case.query(
-            "SELECT text_excerpt FROM submissions" + extra))
+            "SELECT text_excerpt FROM user_messages" + extra))
 
 
 class CodexFallbackTest(LedgerCase):
@@ -133,7 +133,7 @@ class CodexFallbackTest(LedgerCase):
             self.query("SELECT COUNT(*) n FROM responses"
                        " WHERE response_id='codex:resp-shape-001'")[0]["n"], 1)
         self.assertEqual(
-            self.query("SELECT COUNT(*) n FROM submissions"
+            self.query("SELECT COUNT(*) n FROM user_messages"
                        " WHERE native_id='codex:msg-shape-sub-01'")[0]["n"], 1)
         self.assertEqual(
             self.query("SELECT COUNT(*) n FROM import_errors")[0]["n"], 5)
@@ -148,7 +148,7 @@ class CodexExcerptTest(LedgerCase):
     def test_only_genuine_input_keeps_an_excerpt(self):
         self.sync("codex-secrets.jsonl")
         rows = {r["native_id"]: r for r in self.query(
-            "SELECT native_id, kind, text_excerpt FROM submissions")}
+            "SELECT native_id, kind, text_excerpt FROM user_messages")}
         genuine = rows["codex:msg-secret-sub-01"]
         self.assertEqual(genuine["kind"], "genuine")
         self.assertEqual(len(genuine["text_excerpt"]), 300)
@@ -247,7 +247,7 @@ class ClaudeStreamingTest(LedgerCase):
             self.query("SELECT total_tokens t FROM responses"
                        " WHERE response_id='claude:msg-sh-1'")[0]["t"], 10)
         self.assertEqual(
-            self.query("SELECT kind FROM submissions"
+            self.query("SELECT kind FROM user_messages"
                        " WHERE native_id='claude:u-sh-1'")[0]["kind"],
             "genuine")
         self.assertEqual(
@@ -267,7 +267,7 @@ class ClaudeExcerptTest(LedgerCase):
         claude.import_claude_file(
             self.con, fixture("claude-secrets-side.jsonl"))
         rows = {r["native_id"]: r for r in self.query(
-            "SELECT native_id, kind, text_excerpt FROM submissions")}
+            "SELECT native_id, kind, text_excerpt FROM user_messages")}
         self.assertEqual(rows["claude:u-sec-1"]["kind"], "genuine")
         self.assertEqual(len(rows["claude:u-sec-1"]["text_excerpt"]), 300)
         self.assertEqual(rows["claude:u-sec-int"]["kind"], "interrupt")

@@ -1,7 +1,7 @@
-"""Judge moments (#60): deterministic selection, context, verdicts, recurrence.
+"""Judge interventions (#60): deterministic selection, context, verdicts, recurrence.
 
-Observer runs no model. It selects the moments where a person acted,
-hands a judge each moment in context from the native logs, stores the
+Observer runs no model. It selects the interventions where a person acted,
+hands a judge each intervention in context from the native logs, stores the
 judge's verdicts and reports recurrence from them.
 """
 
@@ -13,7 +13,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-from agent_observer import cli, db, moments, verdicts
+from agent_observer import cli, db, interventions, verdicts
 from agent_observer.adapters import claude, codex
 from agent_observer.adapters import t3 as t3_adapter
 from agent_observer.ingest import text_hash
@@ -82,7 +82,7 @@ def claude_tree(root):
         _line(s1, "user", "r3", _tool_result("toolu_edit", "rejected", True),
               12, toolDenialKind="user-rejected"),
         # Claude records every rejection a second time as an interrupt;
-        # it is the same act and never a second moment.
+        # it is the same act and never a second intervention.
         _line(s1, "user", "u5", "[Request interrupted by user for tool use]",
               12),
         _line(s1, "assistant", "a7",
@@ -108,7 +108,7 @@ def claude_tree(root):
         # A stop in a top-level Chromeria thread is a person.
         _line(s3, "user", "w3", "[Request interrupted by user]", 123,
               entrypoint="sdk-ts"),
-        # Synthetic input with no agent evidence (a reminder): no moment.
+        # Synthetic input with no agent evidence (a reminder): no intervention.
         _line(s3, "user", "w4", "Background task finished.", 124,
               entrypoint="sdk-ts", promptSource="sdk"),
     ])
@@ -163,7 +163,7 @@ def codex_rollout(path):
     ])
 
 
-class MomentsCase(unittest.TestCase):
+class InterventionsCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = self.tmp.name
@@ -201,26 +201,26 @@ class MomentsCase(unittest.TestCase):
         self.tmp.cleanup()
 
     def select(self, **kw):
-        return moments.select(self.con, **kw)
+        return interventions.select(self.con, **kw)
 
     def ids(self, result):
-        return {m["id"]: m for m in result["moments"]}
+        return {m["id"]: m for m in result["interventions"]}
 
 
-class SelectTest(MomentsCase):
+class SelectTest(InterventionsCase):
     def test_every_origin_is_classified_from_evidence(self):
-        found = self.ids(self.select(origins=None))
+        found = self.ids(self.select(created_by=None))
         expected = {
-            "sub:claude:u1": ("prompt", "human"),
-            "sub:claude:u2": ("prompt", "human"),
-            "sub:claude:u3": ("interrupt", "human"),
-            "sub:claude:u4": ("prompt", "human"),
-            "ev:claude:sess-one/permission/toolu_edit": ("rejection", "human"),
+            "sub:claude:u1": ("prompt", "user"),
+            "sub:claude:u2": ("prompt", "user"),
+            "sub:claude:u3": ("interrupt", "user"),
+            "sub:claude:u4": ("prompt", "user"),
+            "ev:claude:sess-one/permission/toolu_edit": ("rejection", "user"),
             "sub:claude:v1": ("prompt", "agent"),
-            "sub:claude:w1": ("prompt", "human"),
+            "sub:claude:w1": ("prompt", "user"),
             # A Chromeria server turn: another agent wrote to this session.
             "sub:claude:w2": ("prompt", "agent"),
-            "sub:claude:w3": ("interrupt", "human"),
+            "sub:claude:w3": ("interrupt", "user"),
             "ev:claude:sess-four/permission/toolu_cp": ("rejection", "unknown"),
             "sub:claude:x3": ("interrupt", "unknown"),
             "ev:claude:sess-five/permission/toolu_lx": ("rejection", "unknown"),
@@ -228,7 +228,7 @@ class SelectTest(MomentsCase):
             "sub:codex:msg-u1": ("prompt", "agent"),
             "ev:codex:cx-1/lifecycle/turn_aborted:t1": ("interrupt", "unknown"),
         }
-        self.assertEqual({k: (v["kind"], v["origin"]) for k, v in found.items()},
+        self.assertEqual({k: (v["kind"], v["created_by"]) for k, v in found.items()},
                          expected)
         self.assertEqual(found["sub:claude:w1"]["thread"], "root")
         self.assertEqual(found["ev:codex:cx-1/lifecycle/turn_aborted:t1"]["thread"],
@@ -241,34 +241,34 @@ class SelectTest(MomentsCase):
         # A ledger synced before opened_by existed: top-level threads read
         # as launched, children stay children, nothing turns human.
         self.con.execute("ALTER TABLE t3_threads DROP COLUMN opened_by")
-        found = self.ids(self.select(origins=None))
+        found = self.ids(self.select(created_by=None))
         self.assertEqual(found["sub:claude:w3"]["thread"], "launched")
-        self.assertEqual(found["sub:claude:w3"]["origin"], "unknown")
+        self.assertEqual(found["sub:claude:w3"]["created_by"], "unknown")
         self.assertEqual(
-            found["ev:claude:sess-four/permission/toolu_cp"]["origin"],
+            found["ev:claude:sess-four/permission/toolu_cp"]["created_by"],
             "unknown")
 
     def test_opening_marks_moments_before_any_agent_activity(self):
-        found = self.ids(self.select(origins=None))
+        found = self.ids(self.select(created_by=None))
         self.assertTrue(found["sub:claude:u1"]["opening"])
         self.assertTrue(found["sub:codex:msg-u1"]["opening"])
         self.assertFalse(found["sub:claude:u2"]["opening"])
         self.assertFalse(found["sub:claude:w2"]["opening"])
-        self.assertTrue(moments.show(self.con, ["sub:claude:u1"])[0]["opening"])
-        self.assertFalse(moments.show(self.con, ["sub:claude:u2"])[0]["opening"])
+        self.assertTrue(interventions.show(self.con, ["sub:claude:u1"])[0]["opening"])
+        self.assertFalse(interventions.show(self.con, ["sub:claude:u2"])[0]["opening"])
 
     def test_default_selects_human_and_agent_moments_and_counts_the_rest(self):
         # Corrections from a person and from another agent both count
         # (user decision, 2026-10-12); unknown origin stays out.
         result = self.select()
-        self.assertEqual({m["origin"] for m in result["moments"]},
-                         {"human", "agent"})
-        self.assertEqual(len(result["moments"]), 10)
-        self.assertEqual(result["counts"]["by_origin"],
-                         {"human": 7, "agent": 3, "unknown": 5})
+        self.assertEqual({m["created_by"] for m in result["interventions"]},
+                         {"user", "agent"})
+        self.assertEqual(len(result["interventions"]), 10)
+        self.assertEqual(result["counts"]["by_created_by"],
+                         {"user": 7, "agent": 3, "unknown": 5})
 
     def test_hook_and_rule_denials_are_counted_never_selected(self):
-        result = self.select(origins=None)
+        result = self.select(created_by=None)
         self.assertNotIn("ev:claude:sess-one/permission/toolu_hook",
                          self.ids(result))
         self.assertEqual(result["policy_denials"],
@@ -276,18 +276,18 @@ class SelectTest(MomentsCase):
 
     def test_scope_filters(self):
         self.assertEqual(
-            set(self.ids(self.select(origins=None, harness="codex"))),
+            set(self.ids(self.select(created_by=None, harness="codex"))),
             {"sub:codex:msg-u1", "ev:codex:cx-1/lifecycle/turn_aborted:t1"})
         self.assertEqual(
-            set(self.ids(self.select(project="beta", origins=None))),
+            set(self.ids(self.select(project="beta", created_by=None))),
             {"sub:codex:msg-u1", "ev:codex:cx-1/lifecycle/turn_aborted:t1"})
-        since = moments.iso_to_ts("2026-10-01T10:00:06Z")
-        until = moments.iso_to_ts("2026-10-01T10:00:09Z")
+        since = interventions.iso_to_ts("2026-10-01T10:00:06Z")
+        until = interventions.iso_to_ts("2026-10-01T10:00:09Z")
         self.assertEqual(set(self.ids(self.select(since=since, until=until,
-                                                  origins=("human",)))),
+                                                  created_by=("user",)))),
                          {"sub:claude:u3", "sub:claude:u4"})
         self.assertEqual(set(self.ids(self.select(kinds=["interrupt"],
-                                                  origins=("human",)))),
+                                                  created_by=("user",)))),
                          {"sub:claude:u3", "sub:claude:w3"})
 
     def test_session_attribute_filter(self):
@@ -298,9 +298,9 @@ class SelectTest(MomentsCase):
                          {"sub:claude:w1", "sub:claude:w2", "sub:claude:w3"})
 
 
-class ShowTest(MomentsCase):
+class ShowTest(InterventionsCase):
     def show(self, *ids, **kw):
-        return moments.show(self.con, list(ids), **kw)
+        return interventions.show(self.con, list(ids), **kw)
 
     def test_correction_in_context_with_full_redacted_text(self):
         [item] = self.show("sub:claude:u2")
@@ -312,7 +312,7 @@ class ShowTest(MomentsCase):
         [turn] = item["before"]
         self.assertEqual(turn["prompt"]["text"], "please add the cache")
         self.assertEqual(turn["prompt"]["id"], "sub:claude:u1")
-        self.assertEqual(turn["prompt"]["origin"], "human")
+        self.assertEqual(turn["prompt"]["created_by"], "user")
         activity = turn["activity"]
         self.assertEqual([b["type"] for b in activity],
                          ["assistant", "tool", "assistant"])
@@ -351,7 +351,7 @@ class ShowTest(MomentsCase):
         self.assertEqual(turn["activity"][0]["tool"], "Bash")
         [brief] = self.show("sub:codex:msg-u1")
         self.assertEqual(brief["after"][0]["prompt"]["kind"], "interrupt")
-        self.assertEqual(brief["after"][0]["prompt"]["origin"], "unknown")
+        self.assertEqual(brief["after"][0]["prompt"]["created_by"], "unknown")
         [few] = self.show("sub:claude:u2", items=1)
         self.assertEqual(few["before"][0]["omitted"], 2)
         self.assertEqual(few["after"][0]["omitted"], 0)
@@ -360,15 +360,15 @@ class ShowTest(MomentsCase):
 
     def test_agent_message_is_a_moment_with_its_source(self):
         [item] = self.show("sub:claude:w2")
-        self.assertEqual(item["origin"], "agent")
+        self.assertEqual(item["created_by"], "agent")
         self.assertEqual(item["text"], "Delegated task finished.")
-        self.assertEqual(item["before"][0]["prompt"]["origin"], "human")
+        self.assertEqual(item["before"][0]["prompt"]["created_by"], "user")
 
     def test_wrapped_prompt_keeps_the_text_inside_chromeria_tags(self):
         [item] = self.show("sub:claude:w1")
         self.assertIn("<t3_code_instructions>", item["text"])
         self.assertIn("stop starting new agents", item["text"])
-        self.assertEqual(item["origin"], "human")
+        self.assertEqual(item["created_by"], "user")
 
     def test_rejection_and_codex_interrupt(self):
         [rejection] = self.show("ev:claude:sess-one/permission/toolu_edit")
@@ -381,7 +381,7 @@ class ShowTest(MomentsCase):
         self.assertEqual(interrupt["status"], "ok")
         [turn] = interrupt["before"]
         self.assertEqual(turn["prompt"]["text"], BRIEF)
-        self.assertEqual(turn["prompt"]["origin"], "agent")
+        self.assertEqual(turn["prompt"]["created_by"], "agent")
         self.assertEqual([b["text"] for b in turn["activity"]],
                          ["Reading the brief."])
         [own] = interrupt["after"]  # the session ends after the interrupt
@@ -400,8 +400,8 @@ class ShowTest(MomentsCase):
 
     def test_unknown_and_malformed_ids(self):
         self.assertEqual(self.show("sub:claude:nope")[0]["status"],
-                         "no_such_moment")
-        self.assertEqual(self.show("bogus")[0]["status"], "no_such_moment")
+                         "no_such_intervention")
+        self.assertEqual(self.show("bogus")[0]["status"], "no_such_intervention")
 
     def test_missing_log_reports_source_missing(self):
         os.remove(os.path.join(self.root, "claude", "proj", "sess-one.jsonl"))
@@ -413,9 +413,9 @@ class ShowTest(MomentsCase):
 JUDGE = "opus-5.5/correction-v1"
 
 
-def verdict(moment, value="yes", problem=None, group=None, judge=JUDGE,
+def verdict(intervention, value="yes", problem=None, group=None, judge=JUDGE,
             behavior="correction"):
-    record = {"moment": moment, "behavior": behavior, "judge": judge,
+    record = {"intervention": intervention, "behavior": behavior, "judge": judge,
               "verdict": value}
     if problem is not None:
         record["problem"] = problem
@@ -424,7 +424,7 @@ def verdict(moment, value="yes", problem=None, group=None, judge=JUDGE,
     return record
 
 
-class VerdictTest(MomentsCase):
+class VerdictTest(InterventionsCase):
     def test_batch_is_stored_and_regrouped_in_place(self):
         out = verdicts.add(self.con, [
             verdict("sub:claude:u2", problem="Deleted files without asking"),
@@ -460,7 +460,7 @@ class VerdictTest(MomentsCase):
             verdict("sub:claude:u2", problem="Deleted files without asking"),
             verdict("sub:claude:u4", "no")])
         listed = verdicts.listing(self.con, "correction", verdict="yes")
-        self.assertEqual([(v["moment"], v["problem"], v["group"], v["session"])
+        self.assertEqual([(v["intervention"], v["problem"], v["group"], v["session"])
                           for v in listed],
                          [("sub:claude:u2", "Deleted files without asking",
                            None, "claude:sess-one")])
@@ -474,19 +474,19 @@ class VerdictTest(MomentsCase):
 
     def test_unjudged_lists_only_moments_without_a_verdict(self):
         verdicts.add(self.con, [verdict("sub:claude:u2", "no")])
-        left = self.ids(moments.select(self.con, unjudged="correction"))
+        left = self.ids(interventions.select(self.con, unjudged="correction"))
         self.assertNotIn("sub:claude:u2", left)
         self.assertIn("sub:claude:u1", left)
         self.assertIn("sub:claude:u2",
-                      self.ids(moments.select(self.con, unjudged="praise")))
-        # A second judge still gets the moment as work.
-        self.assertIn("sub:claude:u2", self.ids(moments.select(
+                      self.ids(interventions.select(self.con, unjudged="praise")))
+        # A second judge still gets the intervention as work.
+        self.assertIn("sub:claude:u2", self.ids(interventions.select(
             self.con, unjudged="correction", judge="sol/v1")))
-        self.assertNotIn("sub:claude:u2", self.ids(moments.select(
+        self.assertNotIn("sub:claude:u2", self.ids(interventions.select(
             self.con, unjudged="correction", judge=JUDGE)))
 
 
-class RecurrenceTest(MomentsCase):
+class RecurrenceTest(InterventionsCase):
     def setUp(self):
         super().setUp()
         verdicts.add(self.con, [
@@ -522,11 +522,11 @@ class RecurrenceTest(MomentsCase):
                          {"hook_or_rule": 1, "automode": 0})
         coverage = report["coverage"]
         self.assertEqual(coverage["judged"], 6)
-        self.assertEqual(coverage["unjudged_by_origin"],
-                         {"human": 1, "agent": 3, "unknown": 0})
-        self.assertEqual(report["by_origin"]["human"]["occurrences"], 3)
-        self.assertEqual(report["by_origin"]["agent"]["occurrences"], 0)
-        self.assertEqual(report["other_origins"]["unknown"]["occurrences"], 1)
+        self.assertEqual(coverage["unjudged_by_created_by"],
+                         {"user": 1, "agent": 3, "unknown": 0})
+        self.assertEqual(report["by_created_by"]["user"]["occurrences"], 3)
+        self.assertEqual(report["by_created_by"]["agent"]["occurrences"], 0)
+        self.assertEqual(report["other_created_by"]["unknown"]["occurrences"], 1)
 
     def test_problem_recurs_when_seen_in_two_sessions(self):
         verdicts.add(self.con, [verdict(
@@ -544,18 +544,18 @@ class RecurrenceTest(MomentsCase):
             group="destructive-without-approval")])
         report = verdicts.recurrence(self.con, "correction")
         self.assertEqual(report["occurrences"], 4)
-        self.assertEqual(report["by_origin"]["human"]["occurrences"], 3)
-        self.assertEqual(report["by_origin"]["agent"]["occurrences"], 1)
-        self.assertEqual(report["by_origin"]["agent"]["problems"], 1)
+        self.assertEqual(report["by_created_by"]["user"]["occurrences"], 3)
+        self.assertEqual(report["by_created_by"]["agent"]["occurrences"], 1)
+        self.assertEqual(report["by_created_by"]["agent"]["problems"], 1)
         first = report["groups"][0]
-        self.assertEqual(first["by_origin"], {"human": 2, "agent": 1})
+        self.assertEqual(first["by_created_by"], {"user": 2, "agent": 1})
         self.assertEqual(first["sessions"], 2)
         self.assertEqual(report["recurring_problems"], 1)
-        self.assertEqual(report["by_origin"]["human"]["recurring_problems"], 0)
-        human = verdicts.recurrence(self.con, "correction", origins=("human",))
+        self.assertEqual(report["by_created_by"]["user"]["recurring_problems"], 0)
+        human = verdicts.recurrence(self.con, "correction", created_by=("user",))
         self.assertEqual(human["occurrences"], 3)
-        self.assertEqual(human["other_origins"]["agent"]["occurrences"], 1)
-        every = verdicts.recurrence(self.con, "correction", origins=None)
+        self.assertEqual(human["other_created_by"]["agent"]["occurrences"], 1)
+        every = verdicts.recurrence(self.con, "correction", created_by=None)
         self.assertEqual(every["occurrences"], 5)
 
     def test_session_attribute_and_period_filters(self):
@@ -576,7 +576,7 @@ class RecurrenceTest(MomentsCase):
         self.assertEqual(report["occurrences"], 1)
 
 
-class CliTest(MomentsCase):
+class CliTest(InterventionsCase):
     def run_cli(self, *argv, stdin=None):
         out = io.StringIO()
         with redirect_stdout(out), mock.patch("sys.stdin",
@@ -587,13 +587,13 @@ class CliTest(MomentsCase):
 
     def test_judge_round_trip_through_json_commands(self):
         self.con.commit()
-        code, out = self.run_cli("moments", "--json")
+        code, out = self.run_cli("interventions", "--json")
         self.assertEqual(code, 0)
         listed = json.loads(out)
-        self.assertEqual(len(listed["moments"]), 10)
-        code, out = self.run_cli("moment", "show", "sub:claude:u2", "--json")
+        self.assertEqual(len(listed["interventions"]), 10)
+        code, out = self.run_cli("intervention", "show", "sub:claude:u2", "--json")
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out)["moments"][0]["status"], "ok")
+        self.assertEqual(json.loads(out)["interventions"][0]["status"], "ok")
         lines = "\n".join(json.dumps(v) for v in [
             verdict("sub:claude:u2", problem="Deleted files without asking",
                     group="destructive-without-approval")])
@@ -601,13 +601,13 @@ class CliTest(MomentsCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(json.loads(out)["stored"], 1)
         code, out = self.run_cli("verdict", "add", "--json",
-                                 stdin='{"moment": "x"}')
+                                 stdin='{"intervention": "x"}')
         self.assertEqual(code, 2)
         self.assertEqual(json.loads(out)["errors"][0]["line"], 1)
         code, out = self.run_cli("verdict", "list", "--behavior",
                                  "correction", "--verdict", "yes", "--json")
         self.assertEqual(code, 0, out)
-        self.assertEqual(json.loads(out)["verdicts"][0]["moment"],
+        self.assertEqual(json.loads(out)["verdicts"][0]["intervention"],
                          "sub:claude:u2")
         code, out = self.run_cli("recurrence", "--behavior", "correction",
                                  "--json")
@@ -615,7 +615,7 @@ class CliTest(MomentsCase):
         self.assertEqual(json.loads(out)["occurrences"], 1)
         code, out = self.run_cli("recurrence", "--behavior", "correction")
         self.assertIn("destructive-without-approval", out)
-        code, _ = self.run_cli("moments", "--judge", JUDGE, "--json")
+        code, _ = self.run_cli("interventions", "--judge", JUDGE, "--json")
         self.assertEqual(code, 2)
         code, out = self.run_cli(
             "session-attr", "add", "--json",

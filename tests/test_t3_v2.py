@@ -206,7 +206,7 @@ class ChromeriaV2Test(LedgerCase):
 
     def kinds(self):
         return {r["native_id"]: dict(r) for r in self.query(
-            "SELECT native_id, kind, turn_id, text_excerpt FROM submissions")}
+            "SELECT native_id, kind, turn_id, text_excerpt FROM user_messages")}
 
     def _session(self, harness, native_id):
         self.con.execute(

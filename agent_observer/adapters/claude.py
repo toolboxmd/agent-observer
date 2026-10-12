@@ -306,7 +306,7 @@ def import_claude_file(con: sqlite3.Connection, path: str,
     if src.incremental and src.row["session_id"]:
         # Resume the turn the previous import ended in.
         row = con.execute(
-            "SELECT turn_id FROM submissions WHERE session_key=? AND kind='genuine'"
+            "SELECT turn_id FROM user_messages WHERE session_key=? AND kind='genuine'"
             " ORDER BY ts DESC LIMIT 1", (r.session_key,)).fetchone()
         r.turn = row["turn_id"] if row else None
     for ordinal, obj, line in src.records():
@@ -597,7 +597,7 @@ def _submission(r: _Reader, native_id, ordinal, ts, kind: str, text: str) -> Non
         is_main_session=r.agent_id is None and r.native_session is not None)
     genuine = 1 if kind == "genuine" else 0
     cur = r.con.execute(
-        "INSERT OR IGNORE INTO submissions(native_id, source_id, session_key,"
+        "INSERT OR IGNORE INTO user_messages(native_id, source_id, session_key,"
         " turn_id, ordinal_num, ts, kind, text_hash, text_excerpt, is_genuine)"
         " VALUES(?,?,?,?,?,?,?,?,?,?)",
         (f"{HARNESS}:{native_id}", r.src.source_id, r.session_key, r.turn, ordinal,
@@ -607,7 +607,7 @@ def _submission(r: _Reader, native_id, ordinal, ts, kind: str, text: str) -> Non
     elif r.src.privacy_stale:
         # Rule 3: a privacy version change corrects rows in place.
         r.con.execute(
-            "UPDATE submissions SET source_id=?, session_key=?, turn_id=?,"
+            "UPDATE user_messages SET source_id=?, session_key=?, turn_id=?,"
             " ordinal_num=?, ts=?, kind=?, text_hash=?, text_excerpt=?,"
             " is_genuine=? WHERE native_id=?",
             (r.src.source_id, r.session_key, r.turn, ordinal, ts, kind,

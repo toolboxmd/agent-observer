@@ -998,10 +998,10 @@ def _reclassify(con: sqlite3.Connection, native_id: str, sub,
     if sub["kind"] == want and (want == "synthetic" or sub["turn_id"]):
         return False
     con.execute(
-        "UPDATE submissions SET kind=?, is_genuine=? WHERE native_id=?",
+        "UPDATE user_messages SET kind=?, is_genuine=? WHERE native_id=?",
         (want, 1 if want == "genuine" else 0, native_id))
     if want == "genuine" and not sub["turn_id"]:
-        con.execute("UPDATE submissions SET turn_id=? WHERE native_id=?",
+        con.execute("UPDATE user_messages SET turn_id=? WHERE native_id=?",
                     (native_id, native_id))
     return True
 
@@ -1015,7 +1015,7 @@ def _backfill_prompt_origins(con: sqlite3.Connection) -> int:
     try:
         rows = con.execute(
             "SELECT s.native_id, s.kind, s.turn_id, o.actor_kind"
-            " FROM submissions s JOIN t3_prompt_origins o"
+            " FROM user_messages s JOIN t3_prompt_origins o"
             " ON s.session_key='claude:' || o.native_session"
             " AND s.text_hash=o.text_hash"
             " WHERE s.kind IN ('synthetic', 'genuine')"
@@ -1049,7 +1049,7 @@ def _backfill_submissions(con: sqlite3.Connection) -> int:
         native_id = f"claude:{origin['message_id']}"
         try:
             sub = con.execute(
-                "SELECT kind, turn_id FROM submissions WHERE native_id=?",
+                "SELECT kind, turn_id FROM user_messages WHERE native_id=?",
                 (native_id,)).fetchone()
         except sqlite3.DatabaseError:
             continue
@@ -1072,7 +1072,7 @@ def _retouch_response_turns(con: sqlite3.Connection) -> int:
     try:
         genuine = con.execute(
             "SELECT session_key, source_id, ordinal_num, turn_id"
-            " FROM submissions WHERE is_genuine=1 AND turn_id IS NOT NULL"
+            " FROM user_messages WHERE is_genuine=1 AND turn_id IS NOT NULL"
             " AND session_key LIKE 'claude:%'").fetchall()
     except sqlite3.DatabaseError:
         return 0
@@ -1147,7 +1147,7 @@ def _tree_sessions(con: sqlite3.Connection, threads: dict,
                         keys.add(sess_row["session_key"])
             try:
                 for row in con.execute(
-                        "SELECT DISTINCT s.session_key FROM submissions s"
+                        "SELECT DISTINCT s.session_key FROM user_messages s"
                         " JOIN t3_turn_origins o ON s.native_id="
                         "'claude:' || o.message_id"
                         " WHERE o.thread_id=?", (thread_id,)):

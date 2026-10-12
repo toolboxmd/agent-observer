@@ -87,7 +87,7 @@ class GrokAdapterTest(LedgerCase):
 
     def test_submissions_genuine_synthetic_and_open(self):
         kinds = {r["native_id"]: (r["kind"], r["turn_id"]) for r in self.query(
-            "SELECT native_id, kind, turn_id FROM submissions"
+            "SELECT native_id, kind, turn_id FROM user_messages"
             " WHERE session_key=?", (S1,))}
         self.assertEqual(kinds[f"{S1}:prompt:0"], ("genuine", f"{S1}:p-aaa"))
         self.assertEqual(kinds[f"{S1}:prompt:1"], ("genuine", f"{S1}:p-bbb"))
@@ -96,7 +96,7 @@ class GrokAdapterTest(LedgerCase):
         # Prompt 4 has chunks but no completion yet: kept, unbound.
         self.assertEqual(kinds[f"{S1}:prompt:4"], ("genuine", None))
         genuine = self.query(
-            "SELECT is_genuine FROM submissions WHERE native_id=?",
+            "SELECT is_genuine FROM user_messages WHERE native_id=?",
             (f"{S1}:prompt:2",))[0]
         self.assertEqual(genuine["is_genuine"], 0)
 
@@ -224,7 +224,7 @@ class GrokAdapterTest(LedgerCase):
             (f"{sid}:p-eee",))[0]
         self.assertEqual(row["total_tokens"], 770)
         bound = self.query(
-            "SELECT turn_id FROM submissions WHERE native_id=?",
+            "SELECT turn_id FROM user_messages WHERE native_id=?",
             (f"{sid}:prompt:4",))[0]
         self.assertEqual(bound["turn_id"], f"{sid}:p-eee")
         repeat = grok.sync(self.con, root=tmp)
@@ -379,7 +379,7 @@ class GrokAdapterTest(LedgerCase):
 
     def test_excerpt_first_marker_truncation_and_empty_for_non_genuine(self):
         rows = {r["native_id"]: r for r in self.query(
-            "SELECT native_id, kind, is_genuine, text_excerpt FROM submissions"
+            "SELECT native_id, kind, is_genuine, text_excerpt FROM user_messages"
             " WHERE session_key=?", (S1,))}
         # Spec rule 1: the fixture prompts start with a tag-like marker, so
         # genuine human text keeps nothing after it. Classification still
@@ -424,7 +424,7 @@ class GrokAdapterTest(LedgerCase):
         con = self._isolated_con("dupid")
         grok.sync(con, root=tmp)
         subs = {r["native_id"]: r["turn_id"] for r in con.execute(
-            "SELECT native_id, turn_id FROM submissions"
+            "SELECT native_id, turn_id FROM user_messages"
             " WHERE session_key=?", (S1,))}
         self.assertEqual(subs[f"{S1}:prompt:0"], f"{S1}:p-aaa")
         self.assertEqual(subs[f"{S1}:prompt:1"], f"{S1}:p-bbb")
@@ -499,7 +499,7 @@ class GrokAdapterTest(LedgerCase):
         sid = "01fixture1-aaaa-4b5c-8d6e-000000000001"
         sdir = os.path.join(tmp, "%2Fredacted%2Frepo", sid)
         before_subs = self.query(
-            "SELECT COUNT(*) n FROM submissions WHERE session_key=?",
+            "SELECT COUNT(*) n FROM user_messages WHERE session_key=?",
             (S1,))[0]["n"]
         probe_text = ("should never persist sk-fake-secret-999"
                       " INSTALLED BODY probe")
@@ -523,7 +523,7 @@ class GrokAdapterTest(LedgerCase):
         # No submission/response/event for the unsupported method payload.
         self.assertEqual(
             con.execute(
-                "SELECT COUNT(*) n FROM submissions WHERE native_id=?",
+                "SELECT COUNT(*) n FROM user_messages WHERE native_id=?",
                 (f"{S1}:prompt:99",)).fetchone()["n"], 0)
         for table, col, val in self._all_text_values(con):
             self.assertNotIn("sk-fake-secret-999", val,
@@ -572,7 +572,7 @@ class GrokAdapterTest(LedgerCase):
         grok.sync(con, root=tmp)
         rows = {r["native_id"]: r for r in con.execute(
             "SELECT native_id, kind, is_genuine, text_excerpt, turn_id"
-            " FROM submissions")}
+            " FROM user_messages")}
         # Without chat evidence every prompt stays provisional/non-genuine.
         self.assertTrue(rows)
         for nid, row in rows.items():
@@ -587,7 +587,7 @@ class GrokAdapterTest(LedgerCase):
         second = grok.sync(con, root=tmp)
         after = {r["native_id"]: r for r in con.execute(
             "SELECT native_id, kind, is_genuine, text_excerpt, turn_id"
-            " FROM submissions")}
+            " FROM user_messages")}
         self.assertEqual(len(after), n_before)
         self.assertEqual(after[f"{S1}:prompt:0"]["kind"], "genuine")
         self.assertEqual(after[f"{S1}:prompt:0"]["is_genuine"], 1)
@@ -614,7 +614,7 @@ class GrokAdapterTest(LedgerCase):
         con = self._isolated_con("badchat")
         grok.sync(con, root=tmp)
         rows = {r["native_id"]: r for r in con.execute(
-            "SELECT native_id, kind, is_genuine, text_excerpt FROM submissions")}
+            "SELECT native_id, kind, is_genuine, text_excerpt FROM user_messages")}
         for row in rows.values():
             self.assertEqual(row["is_genuine"], 0)
             self.assertEqual(row["text_excerpt"], "")
@@ -626,7 +626,7 @@ class GrokAdapterTest(LedgerCase):
         grok.sync(con, root=tmp)
         after = {r["native_id"]: r for r in con.execute(
             "SELECT native_id, kind, is_genuine, text_excerpt, turn_id"
-            " FROM submissions")}
+            " FROM user_messages")}
         self.assertEqual(len(after), n_before)
         self.assertEqual(after[f"{S1}:prompt:1"]["kind"], "genuine")
         self.assertEqual(after[f"{S1}:prompt:1"]["is_genuine"], 1)
@@ -706,7 +706,7 @@ class GrokAdapterTest(LedgerCase):
                 self.assertNotIn(sentinel, val,
                                  f"{table}.{col} leaks unterminated block")
             row = con.execute(
-                "SELECT kind, is_genuine, text_excerpt FROM submissions"
+                "SELECT kind, is_genuine, text_excerpt FROM user_messages"
                 " WHERE native_id=?", (f"{S1}:prompt:{_idx}",)).fetchone()
             self.assertIsNotNone(row)
             self.assertEqual(row["kind"], "genuine")
@@ -772,7 +772,7 @@ class GrokAdapterTest(LedgerCase):
         grok.sync(con, root=tmp)
         before = {r["native_id"]: r for r in con.execute(
             "SELECT native_id, kind, is_genuine, text_excerpt, turn_id"
-            " FROM submissions")}
+            " FROM user_messages")}
         self.assertTrue(before)
         for row in before.values():
             self.assertEqual(row["is_genuine"], 0)
@@ -792,7 +792,7 @@ class GrokAdapterTest(LedgerCase):
         grok.sync(con, root=tmp)
         after = {r["native_id"]: r for r in con.execute(
             "SELECT native_id, kind, is_genuine, text_excerpt, turn_id"
-            " FROM submissions")}
+            " FROM user_messages")}
         self.assertEqual(len(after), n_before)
         self.assertEqual(after[f"{S1}:prompt:0"]["kind"], "genuine")
         self.assertEqual(after[f"{S1}:prompt:0"]["is_genuine"], 1)
@@ -1209,7 +1209,7 @@ class GrokAdapterTest(LedgerCase):
         con = self._isolated_con("excerpt")
         grok.sync(con, root=tmp)
         row = con.execute(
-            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            "SELECT kind, is_genuine, text_excerpt FROM user_messages"
             " WHERE native_id=?", (f"{S1}:prompt:30",)).fetchone()
         self.assertEqual(row["kind"], "genuine")
         self.assertEqual(row["is_genuine"], 1)
@@ -1221,7 +1221,7 @@ class GrokAdapterTest(LedgerCase):
             self.assertNotIn("GEN-SENTINEL-qqq", val,
                              f"{table}.{col} leaks post-marker text")
         wide = con.execute(
-            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            "SELECT kind, is_genuine, text_excerpt FROM user_messages"
             " WHERE native_id=?", (f"{S1}:prompt:31",)).fetchone()
         self.assertEqual(wide["kind"], "genuine")
         self.assertEqual(wide["is_genuine"], 1)
@@ -1300,7 +1300,7 @@ class GrokAdapterTest(LedgerCase):
         grok.sync(con, root=tmp)
         key = f"grok:{sid}"
         row = con.execute(
-            "SELECT kind, is_genuine, text_excerpt, turn_id FROM submissions"
+            "SELECT kind, is_genuine, text_excerpt, turn_id FROM user_messages"
             " WHERE session_key=?", (key,)).fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row["kind"], "synthetic")
@@ -1328,7 +1328,7 @@ class GrokAdapterTest(LedgerCase):
         grok.sync(con, root=tmp)
         nid = f"{S1}:prompt:3"
         before = con.execute(
-            "SELECT text_hash, text_excerpt, kind, is_genuine FROM submissions"
+            "SELECT text_hash, text_excerpt, kind, is_genuine FROM user_messages"
             " WHERE native_id=?", (nid,)).fetchone()
         n_errors = con.execute(
             "SELECT COUNT(*) n FROM import_errors").fetchone()["n"]
@@ -1359,9 +1359,9 @@ class GrokAdapterTest(LedgerCase):
         grok.sync(con, root=tmp, full=True)
         after = con.execute(
             "SELECT text_hash, text_excerpt, kind, is_genuine, turn_id"
-            " FROM submissions WHERE native_id=?", (nid,)).fetchone()
+            " FROM user_messages WHERE native_id=?", (nid,)).fetchone()
         self.assertEqual(
-            con.execute("SELECT COUNT(*) n FROM submissions"
+            con.execute("SELECT COUNT(*) n FROM user_messages"
                         " WHERE native_id=?", (nid,)).fetchone()["n"], 1)
         self.assertNotEqual(after["text_hash"], before["text_hash"])
         self.assertEqual(after["text_excerpt"], "Rewritten human leading")
@@ -1376,13 +1376,13 @@ class GrokAdapterTest(LedgerCase):
         os.remove(os.path.join(sdir, "chat_history.jsonl"))
         grok.sync(con, root=tmp)
         downgraded = con.execute(
-            "SELECT text_hash, text_excerpt, kind, is_genuine FROM submissions"
+            "SELECT text_hash, text_excerpt, kind, is_genuine FROM user_messages"
             " WHERE native_id=?", (nid,)).fetchone()
         self.assertEqual(downgraded["kind"], "unknown")
         self.assertEqual(downgraded["is_genuine"], 0)
         self.assertEqual(downgraded["text_excerpt"], "")
         self.assertEqual(
-            con.execute("SELECT COUNT(*) n FROM submissions"
+            con.execute("SELECT COUNT(*) n FROM user_messages"
                         " WHERE native_id=?", (nid,)).fetchone()["n"], 1)
         con.close()
 
@@ -1396,13 +1396,13 @@ class GrokAdapterTest(LedgerCase):
         grok.sync(con, root=tmp)
         before = {table: con.execute(
             f"SELECT COUNT(*) n FROM {table}").fetchone()["n"]
-            for table in ("submissions", "events", "import_errors",
+            for table in ("user_messages", "events", "import_errors",
                           "responses")}
         errors_before = sorted(
             (r["error"], r["ordinal_num"]) for r in con.execute(
                 "SELECT error, ordinal_num FROM import_errors"))
         con.execute(
-            "UPDATE submissions SET text_hash='0000000000000000',"
+            "UPDATE user_messages SET text_hash='0000000000000000',"
             " text_excerpt='STALE-EXCERPT', kind='unknown', is_genuine=0"
             " WHERE native_id=?", (f"{S1}:prompt:0",))
         con.execute(
@@ -1419,11 +1419,11 @@ class GrokAdapterTest(LedgerCase):
         stats = grok.import_grok_session(con, session_dir)
         after = {table: con.execute(
             f"SELECT COUNT(*) n FROM {table}").fetchone()["n"]
-            for table in ("submissions", "events", "import_errors",
+            for table in ("user_messages", "events", "import_errors",
                           "responses")}
         self.assertEqual(after, before)
         sub = con.execute(
-            "SELECT text_hash, text_excerpt, kind, is_genuine FROM submissions"
+            "SELECT text_hash, text_excerpt, kind, is_genuine FROM user_messages"
             " WHERE native_id=?", (f"{S1}:prompt:0",)).fetchone()
         self.assertEqual(sub["kind"], "genuine")
         self.assertEqual(sub["is_genuine"], 1)
@@ -1503,7 +1503,7 @@ class GrokAdapterTest(LedgerCase):
         self.assertEqual(selected, privacy.PRIVACY_VERSION)
         before = {table: con.execute(
             f"SELECT COUNT(*) n FROM {table}").fetchone()["n"]
-            for table in ("sessions", "submissions", "events",
+            for table in ("sessions", "user_messages", "events",
                           "import_errors", "responses", "sources")}
         errors_before = sorted(
             (r["harness"], r["source_path"], r["ordinal_num"], r["error"],
@@ -1513,7 +1513,7 @@ class GrokAdapterTest(LedgerCase):
         stats = grok.import_grok_session(con, session_dir)
         after = {table: con.execute(
             f"SELECT COUNT(*) n FROM {table}").fetchone()["n"]
-            for table in ("sessions", "submissions", "events",
+            for table in ("sessions", "user_messages", "events",
                           "import_errors", "responses", "sources")}
         self.assertEqual(after, before)
         errors_after = sorted(
@@ -1720,7 +1720,7 @@ class GrokAdapterTest(LedgerCase):
         grok.sync(con, root=tmp)
         key = f"grok:{sid}"
         row = con.execute(
-            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            "SELECT kind, is_genuine, text_excerpt FROM user_messages"
             " WHERE session_key=?", (key,)).fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row["kind"], "synthetic")
@@ -1783,7 +1783,7 @@ class GrokAdapterTest(LedgerCase):
         grok.import_grok_session(con, child_dir)
         child_key = f"grok:{child_sid}"
         first = con.execute(
-            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            "SELECT kind, is_genuine, text_excerpt FROM user_messages"
             " WHERE session_key=?", (child_key,)).fetchone()
         # No child evidence yet: a genuine main-session prompt is kept.
         # The fixture text has no tag-like marker, so the excerpt is the
@@ -1813,20 +1813,20 @@ class GrokAdapterTest(LedgerCase):
             (child_key,)).fetchone()
         self.assertEqual(sess["parent_session_key"], f"grok:{parent_sid}")
         fixed = con.execute(
-            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            "SELECT kind, is_genuine, text_excerpt FROM user_messages"
             " WHERE session_key=?", (child_key,)).fetchone()
         self.assertEqual(fixed["kind"], "synthetic")
         self.assertEqual(fixed["is_genuine"], 0)
         self.assertEqual(fixed["text_excerpt"], "")
         self.assertEqual(
-            con.execute("SELECT COUNT(*) n FROM submissions"
+            con.execute("SELECT COUNT(*) n FROM user_messages"
                         " WHERE session_key=?", (child_key,)).fetchone()["n"],
             1)
         # A later child re-sync with no new bytes stays synthetic via the
         # persisted parent link, without duplicates or leaks.
         grok.import_grok_session(con, child_dir)
         again = con.execute(
-            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            "SELECT kind, is_genuine, text_excerpt FROM user_messages"
             " WHERE session_key=?", (child_key,)).fetchone()
         self.assertEqual(again["kind"], "synthetic")
         self.assertEqual(again["is_genuine"], 0)
@@ -2444,7 +2444,7 @@ class GrokAdapterTest(LedgerCase):
         grok.sync(con, root=tmp)
         key = f"grok:{sid}"
         rows = {r["native_id"]: r for r in con.execute(
-            "SELECT native_id, kind, is_genuine, text_excerpt FROM submissions"
+            "SELECT native_id, kind, is_genuine, text_excerpt FROM user_messages"
             " WHERE session_key=?", (key,))}
         self.assertEqual(
             set(rows), {f"{key}:prompt:0", f"{key}:prompt:1",
@@ -2536,8 +2536,8 @@ class GrokAdapterTest(LedgerCase):
                            ("sessions", "native_id"),
                            ("responses", "response_id"),
                            ("responses", "session_key"),
-                           ("submissions", "native_id"),
-                           ("submissions", "session_key"),
+                           ("user_messages", "native_id"),
+                           ("user_messages", "session_key"),
                            ("events", "session_key")):
             vals = [r[0] for r in con.execute(
                 f'SELECT "{col}" FROM "{table}"')]
@@ -2549,7 +2549,7 @@ class GrokAdapterTest(LedgerCase):
         self.assertEqual(
             con.execute("SELECT COUNT(*) n FROM responses").fetchone()["n"], 0)
         self.assertEqual(
-            con.execute("SELECT COUNT(*) n FROM submissions").fetchone()["n"],
+            con.execute("SELECT COUNT(*) n FROM user_messages").fetchone()["n"],
             0)
         self.assertEqual(
             con.execute("SELECT COUNT(*) n FROM events").fetchone()["n"], 0)
@@ -2721,7 +2721,7 @@ class GrokAdapterTest(LedgerCase):
         grok.sync(con, root=tmp)
         key = f"grok:{sid}"
         row = con.execute(
-            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            "SELECT kind, is_genuine, text_excerpt FROM user_messages"
             " WHERE native_id=?", (f"{key}:prompt:0",)).fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row["is_genuine"], 0)
@@ -2857,7 +2857,7 @@ class GrokAdapterTest(LedgerCase):
             self.assertEqual(sess["parent_session_key"],
                              f"grok:{parent_sid}")
             row = con.execute(
-                "SELECT kind, is_genuine, text_excerpt FROM submissions"
+                "SELECT kind, is_genuine, text_excerpt FROM user_messages"
                 " WHERE session_key=?", (key,)).fetchone()
             self.assertIsNotNone(row)
             self.assertEqual(row["kind"], "synthetic")
@@ -2865,7 +2865,7 @@ class GrokAdapterTest(LedgerCase):
             self.assertEqual(row["text_excerpt"], "")
         parent_key = f"grok:{parent_sid}"
         parent_row = con.execute(
-            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            "SELECT kind, is_genuine, text_excerpt FROM user_messages"
             " WHERE session_key=?", (parent_key,)).fetchone()
         self.assertIsNotNone(parent_row)
         self.assertEqual(parent_row["kind"], "genuine")
@@ -2964,14 +2964,14 @@ class GrokAdapterTest(LedgerCase):
         self.assertIsNotNone(sess)
         self.assertEqual(sess["parent_session_key"], f"grok:{parent_sid}")
         row = con.execute(
-            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            "SELECT kind, is_genuine, text_excerpt FROM user_messages"
             " WHERE session_key=?", (child_key,)).fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row["kind"], "synthetic")
         self.assertEqual(row["is_genuine"], 0)
         self.assertEqual(row["text_excerpt"], "")
         self.assertEqual(
-            con.execute("SELECT COUNT(*) n FROM submissions"
+            con.execute("SELECT COUNT(*) n FROM user_messages"
                         " WHERE session_key=?", (child_key,)).fetchone()["n"],
             1)
         con.close()
@@ -3073,7 +3073,7 @@ class GrokAdapterTest(LedgerCase):
         self.assertEqual(sess["parent_session_key"], f"grok:{parent_sid}")
         self.assertEqual(sess["role"], "subagent")
         row = con.execute(
-            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            "SELECT kind, is_genuine, text_excerpt FROM user_messages"
             " WHERE session_key=?", (child_key,)).fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row["kind"], "synthetic")
@@ -3103,7 +3103,7 @@ class GrokAdapterTest(LedgerCase):
         self.assertEqual(sess["parent_session_key"], S1)
         self.assertEqual(sess["role"], "subagent")
         row = con.execute(
-            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            "SELECT kind, is_genuine, text_excerpt FROM user_messages"
             " WHERE session_key=?", (S2,)).fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row["kind"], "synthetic")

@@ -209,7 +209,7 @@ class PrivacyFixtureScanTest(LedgerCase):
     def test_genuine_excerpts_truncate_at_tag_markers(self):
         sync_every_fixture(self.con)
         rows = {r["native_id"]: r for r in self.query(
-            "SELECT native_id, kind, text_excerpt FROM submissions"
+            "SELECT native_id, kind, text_excerpt FROM user_messages"
             " WHERE native_id IN ('codex:msg-priv-sub-01', 'claude:u-priv-1',"
             " 'claude:u-priv-int')")}
         # A tag with a quoted '>' in an attribute still truncates at the
@@ -326,7 +326,7 @@ class CodexMainSessionTest(LedgerCase):
     def test_parent_main_session_keeps_its_excerpt(self):
         self.sync("codex-parent.jsonl")
         row = self.query(
-            "SELECT kind, text_excerpt, is_genuine FROM submissions"
+            "SELECT kind, text_excerpt, is_genuine FROM user_messages"
             " WHERE native_id='codex:msg-scope-sub-p1'")[0]
         self.assertEqual(row["kind"], "genuine")
         self.assertEqual(row["text_excerpt"],
@@ -336,7 +336,7 @@ class CodexMainSessionTest(LedgerCase):
         self.sync("codex-child-message.jsonl")
         row = self.query(
             "SELECT kind, text_excerpt, is_genuine, text_hash, session_key"
-            " FROM submissions"
+            " FROM user_messages"
             " WHERE native_id='codex:msg-child-sub-01'")[0]
         # Authorship is still genuine human input, but a divergent own
         # thread proves a worker rollout, so no excerpt is stored. Hash,
@@ -352,7 +352,7 @@ class CodexMainSessionTest(LedgerCase):
     def test_unknown_metadata_keeps_no_excerpt(self):
         self.sync("codex-unknown-message.jsonl")
         row = self.query(
-            "SELECT kind, text_excerpt FROM submissions"
+            "SELECT kind, text_excerpt FROM user_messages"
             " WHERE native_id='codex:msg-unknown-sub-01'")[0]
         self.assertEqual(row["kind"], "genuine")
         self.assertEqual(row["text_excerpt"], "")
@@ -363,7 +363,7 @@ class CodexMainSessionTest(LedgerCase):
         # portion known, so the excerpt survives the ordering.
         self.sync("codex-early-message.jsonl")
         row = self.query(
-            "SELECT kind, text_excerpt FROM submissions"
+            "SELECT kind, text_excerpt FROM user_messages"
             " WHERE native_id='codex:msg-early-sub-01'")[0]
         self.assertEqual(row["kind"], "genuine")
         self.assertEqual(row["text_excerpt"],
@@ -376,21 +376,21 @@ class CodexMainSessionTest(LedgerCase):
                 mock.patch.object(privacy, "submission_excerpt", leaky):
             import_codex_file(self.con, fixture("codex-child-message.jsonl"))
         leaked = self.query(
-            "SELECT text_excerpt FROM submissions"
+            "SELECT text_excerpt FROM user_messages"
             " WHERE native_id='codex:msg-child-sub-01'")[0]["text_excerpt"]
         self.assertTrue(leaked)
-        before = self.query("SELECT COUNT(*) n FROM submissions")[0]["n"]
+        before = self.query("SELECT COUNT(*) n FROM user_messages")[0]["n"]
         errors_before = self.query(
             "SELECT COUNT(*) n FROM import_errors")[0]["n"]
         import_codex_file(self.con, fixture("codex-child-message.jsonl"))
         after = self.query(
-            "SELECT text_excerpt, kind, text_hash FROM submissions"
+            "SELECT text_excerpt, kind, text_hash FROM user_messages"
             " WHERE native_id='codex:msg-child-sub-01'")[0]
         self.assertEqual(after["text_excerpt"], "")
         self.assertEqual(after["kind"], "genuine")
         self.assertTrue(after["text_hash"])
         self.assertEqual(
-            self.query("SELECT COUNT(*) n FROM submissions")[0]["n"], before)
+            self.query("SELECT COUNT(*) n FROM user_messages")[0]["n"], before)
         self.assertEqual(
             self.query("SELECT COUNT(*) n FROM import_errors")[0]["n"],
             errors_before)
@@ -405,7 +405,7 @@ class CodexMainSessionTest(LedgerCase):
             fh.writelines(lines[:3])
         import_codex_file(self.con, path)
         first = self.query(
-            "SELECT text_excerpt, session_key FROM submissions"
+            "SELECT text_excerpt, session_key FROM user_messages"
             " WHERE native_id='codex:msg-child-sub-01'")[0]
         # Session id and thread source alone prove nothing: with no native
         # thread identity the excerpt stays empty instead of provisional.
@@ -414,7 +414,7 @@ class CodexMainSessionTest(LedgerCase):
             fh.writelines(lines[3:])
         import_codex_file(self.con, path)
         row = self.query(
-            "SELECT text_excerpt, session_key FROM submissions"
+            "SELECT text_excerpt, session_key FROM user_messages"
             " WHERE native_id='codex:msg-child-sub-01'")[0]
         # The appended usage proves a worker thread; persisted metadata
         # plus the new portion fail closed, and the row is reconciled to
@@ -423,7 +423,7 @@ class CodexMainSessionTest(LedgerCase):
         self.assertEqual(row["session_key"],
                          "codex:thread-fixture-childmsg-worker")
         self.assertEqual(
-            self.query("SELECT COUNT(*) n FROM submissions")[0]["n"], 1)
+            self.query("SELECT COUNT(*) n FROM user_messages")[0]["n"], 1)
 
 
 class EventPrivacyTest(LedgerCase):
@@ -812,7 +812,7 @@ class PrivacyVersionTest(LedgerCase):
     def _counts(self):
         return {
             table: self.query(f"SELECT COUNT(*) n FROM {table}")[0]["n"]
-            for table in ("submissions", "events", "import_errors",
+            for table in ("user_messages", "events", "import_errors",
                           "responses", "sources")}
 
     def _import_both(self):
@@ -836,7 +836,7 @@ class PrivacyVersionTest(LedgerCase):
             self._import_both()
         # The old rules leaked: the sensitive suite would catch it.
         leaked = "".join(r["text_excerpt"] or "" for r in self.query(
-            "SELECT text_excerpt FROM submissions"))
+            "SELECT text_excerpt FROM user_messages"))
         self.assertIn("SECRET-PRIV-CODEX-TAG-aaaa1111", leaked)
         versions = {r["privacy_version"] for r in self.query(
             "SELECT privacy_version FROM sources")}
@@ -854,7 +854,7 @@ class PrivacyVersionTest(LedgerCase):
         self.assertEqual(self._counts(), before)
         scan_secrets(self)
         excerpt = self.query(
-            "SELECT text_excerpt FROM submissions"
+            "SELECT text_excerpt FROM user_messages"
             " WHERE native_id='codex:msg-priv-sub-01'")[0]["text_excerpt"]
         self.assertEqual(excerpt, GENUINE_EXCERPT)
         categories = sorted(
@@ -920,7 +920,7 @@ class IdentityMigrationTest(LedgerCase):
     def _counts(self):
         return {
             table: self.query(f"SELECT COUNT(*) n FROM {table}")[0]["n"]
-            for table in ("sessions", "submissions", "events",
+            for table in ("sessions", "user_messages", "events",
                           "import_errors", "responses", "sources")}
 
     def _error_keys(self):

@@ -501,7 +501,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         # privacy-version re-imports already correct every row in place
         # above, so they skip this net.
         key_fix = con.execute(
-            "UPDATE submissions SET session_key=? WHERE source_id=?"
+            "UPDATE user_messages SET session_key=? WHERE source_id=?"
             " AND session_key!=?",
             (reader.session_key, src.source_id, reader.session_key))
         if key_fix.rowcount:
@@ -509,7 +509,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
                 stats.get("submissions_updated", 0) + key_fix.rowcount
         if not reader.is_main:
             cleared = con.execute(
-                "UPDATE submissions SET text_excerpt='' WHERE source_id=?"
+                "UPDATE user_messages SET text_excerpt='' WHERE source_id=?"
                 " AND text_excerpt!=''", (src.source_id,))
             if cleared.rowcount:
                 stats["submissions_updated"] = \
@@ -955,7 +955,7 @@ def _ingest_response_item(r: _Reader, obj: dict) -> None:
             text, is_genuine=kind == "genuine", is_main_session=r.is_main)
         genuine = 1 if kind == "genuine" else 0
         cur = r.con.execute(
-            "INSERT OR IGNORE INTO submissions(native_id, source_id,"
+            "INSERT OR IGNORE INTO user_messages(native_id, source_id,"
             " session_key, turn_id, ordinal_num, ts, kind, text_hash,"
             " text_excerpt, is_genuine) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (f"{HARNESS}:{native}", r.src.source_id, r.session_key, turn_id,
@@ -966,7 +966,7 @@ def _ingest_response_item(r: _Reader, obj: dict) -> None:
         elif r.src.privacy_stale:
             # Rule 3: a privacy version change corrects rows in place.
             r.con.execute(
-                "UPDATE submissions SET source_id=?, session_key=?, turn_id=?,"
+                "UPDATE user_messages SET source_id=?, session_key=?, turn_id=?,"
                 " ordinal_num=?, ts=?, kind=?, text_hash=?, text_excerpt=?,"
                 " is_genuine=? WHERE native_id=?",
                 (r.src.source_id, r.session_key, turn_id, obj.get("ordinal"),

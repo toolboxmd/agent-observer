@@ -187,7 +187,7 @@ class T3SyncTest(LedgerCase):
 
     def kinds(self):
         return {r["native_id"]: (r["kind"], r["turn_id"]) for r in self.query(
-            "SELECT native_id, kind, turn_id FROM submissions")}
+            "SELECT native_id, kind, turn_id FROM user_messages")}
 
     def test_missing_state_is_skipped_not_failed(self):
         totals = t3_adapter.sync(
@@ -250,7 +250,7 @@ class T3SyncTest(LedgerCase):
         self.assertEqual(turns["claude:resp-a2"], "claude:" + U1)
         # Backfill never invents excerpts: it never reads prompt text.
         excerpt = self.query(
-            "SELECT text_excerpt FROM submissions WHERE native_id=?",
+            "SELECT text_excerpt FROM user_messages WHERE native_id=?",
             ("claude:" + U1,))[0]["text_excerpt"]
         self.assertEqual(excerpt, "")
 
@@ -261,7 +261,7 @@ class T3SyncTest(LedgerCase):
         self.assertEqual(kinds["claude:" + U1][0], "genuine")
         self.assertEqual(kinds["claude:" + U2][0], "synthetic")
         excerpt = self.query(
-            "SELECT text_excerpt FROM submissions WHERE native_id=?",
+            "SELECT text_excerpt FROM user_messages WHERE native_id=?",
             ("claude:" + U1,))[0]["text_excerpt"]
         self.assertEqual(excerpt, "first question")
 
@@ -575,7 +575,7 @@ class UnboundUsageTest(LedgerCase):
                           "unbound-sess", source_id,
                           project_dir="/redacted/proj")
         self.con.execute(
-            "INSERT INTO submissions(native_id, source_id, session_key,"
+            "INSERT INTO user_messages(native_id, source_id, session_key,"
             " turn_id, ordinal_num, ts, kind, text_hash, text_excerpt,"
             " is_genuine) VALUES(?,?,?,?,?,?,?,?,?,?)",
             ("codex:lonely-sub", source_id, "codex:unbound-sess",
@@ -593,7 +593,7 @@ class UnboundUsageTest(LedgerCase):
             "INSERT INTO tasks(task_id, project, origin, created_at)"
             " VALUES(?,?,?,?)", ("T-LONELY", "proj", "capture", 1.0))
         self.con.execute(
-            "INSERT INTO assignments(submission_native_id, task_id,"
+            "INSERT INTO assignments(user_message_id, task_id,"
             " evidence, created_at) VALUES(?,?,?,?)",
             ("codex:lonely-sub", "T-LONELY", "test", 1.0))
         rep = report.task_report(self.con, "T-LONELY")
@@ -616,7 +616,7 @@ class UnboundUsageTest(LedgerCase):
         # on no bound turn: sessions known, no bound usage, no missing
         # assignment to report. The old text read "missing: none", exit 0.
         self.con.execute(
-            "INSERT INTO submissions(native_id, source_id, session_key,"
+            "INSERT INTO user_messages(native_id, source_id, session_key,"
             " turn_id, ordinal_num, ts, kind, text_hash, text_excerpt,"
             " is_genuine) VALUES(?,?,?,?,?,?,?,?,?,?)",
             ("codex:cli-sub", source_id, "codex:unbound-cli",
@@ -634,7 +634,7 @@ class UnboundUsageTest(LedgerCase):
             "INSERT INTO tasks(task_id, project, origin, created_at)"
             " VALUES(?,?,?,?)", ("T-UNBOUND", "proj", "capture", 1.0))
         self.con.execute(
-            "INSERT INTO assignments(submission_native_id, task_id,"
+            "INSERT INTO assignments(user_message_id, task_id,"
             " evidence, created_at) VALUES(?,?,?,?)",
             ("codex:cli-sub", "T-UNBOUND", "test", 1.0))
         self.con.commit()

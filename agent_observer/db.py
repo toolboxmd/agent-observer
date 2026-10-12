@@ -124,10 +124,10 @@ CREATE TABLE IF NOT EXISTS responses (
   cost_usd REAL,
   is_overlap INTEGER NOT NULL DEFAULT 0
 );
--- User-role inputs. kind: genuine (typed by a person), synthetic (tool
--- results, question replies, reminders), scaffolding (skill or environment
--- injection), interrupt (a person stopped the turn).
-CREATE TABLE IF NOT EXISTS submissions (
+-- User messages: user-role inputs. kind: genuine (typed by a person),
+-- synthetic (tool results, question replies, reminders), scaffolding
+-- (skill or environment injection), interrupt (a person stopped the turn).
+CREATE TABLE IF NOT EXISTS user_messages (
   native_id TEXT PRIMARY KEY,
   alias_id TEXT,
   source_id INTEGER REFERENCES sources(id),
@@ -150,17 +150,17 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS assignments (
-  submission_native_id TEXT NOT NULL REFERENCES submissions(native_id),
+  user_message_id TEXT NOT NULL REFERENCES user_messages(native_id),
   task_id TEXT NOT NULL REFERENCES tasks(task_id),
-  attempt TEXT,
+  task_turn TEXT,
   phase TEXT,
   evidence TEXT,
   shared INTEGER NOT NULL DEFAULT 0,
   created_at REAL NOT NULL,
-  PRIMARY KEY (submission_native_id, task_id)
+  PRIMARY KEY (user_message_id, task_id)
 );
 -- Whole-session ownership, for sessions wholly assigned to one task (a
--- runner job's worker and dispatcher sessions). Evidence names the record
+-- runner job's child and dispatcher sessions). Evidence names the record
 -- that proves the binding.
 CREATE TABLE IF NOT EXISTS session_assignments (
   session_key TEXT NOT NULL,
@@ -169,22 +169,24 @@ CREATE TABLE IF NOT EXISTS session_assignments (
   created_at REAL NOT NULL,
   PRIMARY KEY (session_key, task_id)
 );
-CREATE TABLE IF NOT EXISTS dispatches (
+-- Delegations: a parent's user message or turn delegating to a child.
+CREATE TABLE IF NOT EXISTS delegations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  owning_submission TEXT REFERENCES submissions(native_id),
+  owning_user_message TEXT REFERENCES user_messages(native_id),
   parent_thread TEXT,
   parent_turn TEXT,
-  worker_thread TEXT NOT NULL,
-  worker_turn TEXT,
+  child_thread TEXT NOT NULL,
+  child_turn TEXT,
   requested_model TEXT,
   requested_effort TEXT,
   policy_version TEXT,
   reason TEXT,
   task_name TEXT,
   created_at REAL NOT NULL,
-  UNIQUE (owning_submission, worker_thread)
+  UNIQUE (owning_user_message, child_thread)
 );
-CREATE TABLE IF NOT EXISTS attempts (
+-- Task turns: observed turns toward a task (role parent or child).
+CREATE TABLE IF NOT EXISTS task_turns (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   task_id TEXT REFERENCES tasks(task_id),
   turn_id TEXT NOT NULL,
@@ -192,7 +194,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   harness TEXT,
   session_key TEXT,
   stage TEXT,
-  route_requested TEXT,
+  color_requested TEXT,
   policy_version TEXT,
   reason TEXT,
   model_requested TEXT,
@@ -240,18 +242,18 @@ CREATE TABLE IF NOT EXISTS events (
   detail_json TEXT,
   UNIQUE (session_key, family, native_id)
 );
--- Judge verdicts on moments (agent_observer/moments.py ids). Observer
+-- Judge verdicts on interventions (agent_observer/interventions.py ids). Observer
 -- runs no model: an outside judge writes these through `verdict add`.
 -- problem is a judge-written line, redacted, and stays on this machine.
 CREATE TABLE IF NOT EXISTS verdicts (
-  moment_id TEXT NOT NULL,
+  intervention_id TEXT NOT NULL,
   behavior TEXT NOT NULL,
   judge TEXT NOT NULL,
   verdict TEXT NOT NULL,
   problem TEXT,
   group_id TEXT,
   recorded_at REAL NOT NULL,
-  PRIMARY KEY (moment_id, behavior, judge)
+  PRIMARY KEY (intervention_id, behavior, judge)
 );
 -- Session attributes supplied by other tools (contextmd's served or
 -- holdout arm), used only as report filters.
@@ -341,9 +343,24 @@ CREATE INDEX IF NOT EXISTS idx_responses_session ON responses(session_key);
 CREATE INDEX IF NOT EXISTS idx_responses_reconcile ON responses(session_key, semantics, is_overlap, thread_total_tokens, total_tokens);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_key, ts);
 CREATE INDEX IF NOT EXISTS idx_events_family ON events(family);
-CREATE INDEX IF NOT EXISTS idx_submissions_session ON submissions(session_key);
+CREATE INDEX IF NOT EXISTS idx_user_messages_session ON user_messages(session_key);
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_dir);
 CREATE INDEX IF NOT EXISTS idx_router_inv_request ON router_invocations(request_id);
+
+-- Schema-2 names as read-only views for one release (#65): readers such
+-- as contextmd capture query them directly. Remove in the next release.
+CREATE VIEW IF NOT EXISTS submissions AS SELECT * FROM user_messages;
+CREATE VIEW IF NOT EXISTS dispatches AS SELECT id,
+  owning_user_message AS owning_submission, parent_thread, parent_turn,
+  child_thread AS worker_thread, child_turn AS worker_turn, requested_model,
+  requested_effort, policy_version, reason, task_name, created_at
+  FROM delegations;
+CREATE VIEW IF NOT EXISTS attempts AS SELECT id, task_id, turn_id,
+  CASE role WHEN 'child' THEN 'worker' ELSE role END AS role, harness,
+  session_key, stage, color_requested AS route_requested, policy_version,
+  reason, model_requested, model_observed, effort_requested,
+  effort_observed, started_at, ended_at, elapsed_s, state, terminal_class,
+  usable_output, usage_json FROM task_turns;
 """
 
 OUTCOME_STATES = (
@@ -456,6 +473,60 @@ def connect(path: str) -> sqlite3.Connection:
     return con
 
 
+# Schema 2 -> 3 (#65): unified terms. Each statement keeps every row;
+# SQLite renames foreign-key references along with the tables.
+_MIGRATION_3 = (
+    "DROP INDEX IF EXISTS idx_submissions_session",
+    "ALTER TABLE submissions RENAME TO user_messages",
+    "ALTER TABLE assignments RENAME COLUMN submission_native_id"
+    " TO user_message_id",
+    "ALTER TABLE assignments RENAME COLUMN attempt TO task_turn",
+    "ALTER TABLE dispatches RENAME TO delegations",
+    "ALTER TABLE delegations RENAME COLUMN owning_submission"
+    " TO owning_user_message",
+    "ALTER TABLE delegations RENAME COLUMN worker_thread TO child_thread",
+    "ALTER TABLE delegations RENAME COLUMN worker_turn TO child_turn",
+    "ALTER TABLE attempts RENAME TO task_turns",
+    "ALTER TABLE task_turns RENAME COLUMN route_requested TO color_requested",
+    "UPDATE task_turns SET role='child' WHERE role='worker'",
+    "ALTER TABLE verdicts RENAME COLUMN moment_id TO intervention_id",
+    "UPDATE schema_meta SET value='3' WHERE key='schema_version'",
+)
+
+
+def _main_file(con: sqlite3.Connection) -> str | None:
+    row = con.execute("PRAGMA database_list").fetchone()
+    if row is None:
+        return None
+    return (row["file"] if "file" in row.keys() else row[2]) or None
+
+
+def _migrate_to_3(con: sqlite3.Connection) -> None:
+    """Back the ledger up next to itself, then migrate it in one
+    transaction; any failure rolls back and leaves schema 2."""
+    path = _main_file(con)
+    if path:
+        backup = sqlite3.connect(path + ".schema-2.bak")
+        try:
+            con.backup(backup)
+        finally:
+            backup.close()
+        _harden_path(path + ".schema-2.bak")
+    previous = con.isolation_level
+    con.isolation_level = None
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in _MIGRATION_3:
+                con.execute(statement)
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
+        con.execute("COMMIT")
+    finally:
+        con.isolation_level = previous
+
+
 def init_db(con: sqlite3.Connection) -> None:
     existing = con.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_meta'"
@@ -463,7 +534,9 @@ def init_db(con: sqlite3.Connection) -> None:
     if existing:
         row = con.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
-        if row and int(row["value"]) != SCHEMA_VERSION:
+        if row and int(row["value"]) == 2:
+            _migrate_to_3(con)
+        elif row and int(row["value"]) != SCHEMA_VERSION:
             raise RuntimeError(
                 f"ledger schema {row['value']} is not {SCHEMA_VERSION}; "
                 "move the old ledger aside and sync again")

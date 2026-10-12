@@ -7,10 +7,10 @@ show`` reports, never summed across counter semantics), and per task its
 outcome, identifiers and session keys. It carries no prompt or assistant text,
 excerpts, titles, local paths or branch names; a task's project and URL
 travel only as validated GitHub identifiers. Judge evidence (#60) travels
-as moment counts by origin and kind, and per judge its verdict counts,
+as intervention counts by origin and kind, and per judge its verdict counts,
 coverage and groups: group id, the judge's one-line problem and each
-judged-yes moment's id, session, origin and time, so ``combine`` can merge
-groups across machines and count a moment seen twice once. Moment and
+judged-yes intervention's id, session, origin and time, so ``combine`` can merge
+groups across machines and count a intervention seen twice once. Intervention and
 transcript text never leave.
 
 ``pull`` fetches another machine's export over SSH and stores it beside
@@ -38,11 +38,14 @@ import tempfile
 import unicodedata
 
 from . import __version__, report
-from . import moments as _moments
+from . import interventions as _interventions
 from . import verdicts as _verdicts
 from .publish import _GITHUB_URL_RE, _REPO_RE
 
-SCHEMA = "agent-observer.fleet-export/1"
+SCHEMA = "agent-observer.fleet-export/2"
+# Exports from Observer before ledger schema 3 (#65); read and translated
+# during the switch, removed in the next release.
+LEGACY_SCHEMA = "agent-observer.fleet-export/1"
 MACHINE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 # Task ids travel only as identifiers (repo#N, T-42, router ids); a free-text
 # id stays home and is counted as withheld.
@@ -133,12 +136,12 @@ def export(con: sqlite3.Connection, machine: str | None = None) -> dict:
             "observer_version": __version__, "exported_at": _now(),
             "ledger_synced_at": _iso(synced),
             "sessions": sessions, "tasks": tasks, "withheld_tasks": withheld,
-            "moments": counts, "judgments": judgments}
+            "interventions": counts, "judgments": judgments}
 
 
-def _point(moment: dict) -> dict:
-    return {"id": moment["id"], "session": moment["session"],
-            "origin": moment["origin"], "at": moment["at"]}
+def _point(intervention: dict) -> dict:
+    return {"id": intervention["id"], "session": intervention["session"],
+            "created_by": intervention["created_by"], "at": intervention["at"]}
 
 
 def _bump(table: dict, session: str, part: str, key: str) -> None:
@@ -147,47 +150,47 @@ def _bump(table: dict, session: str, part: str, key: str) -> None:
 
 
 def _judgments(con: sqlite3.Connection) -> tuple[dict, list]:
-    """Per-session moment counts and, per behavior and judge, per-session
-    verdict counts plus the judged-yes moments of each group.
+    """Per-session intervention counts and, per behavior and judge, per-session
+    verdict counts plus the judged-yes interventions of each group.
 
     Counts travel per session so ``combine`` can take each session's
     evidence from one machine only, the same rule as token usage."""
-    found, policy = _moments._all(con)
+    found, policy = _interventions._all(con)
     by_id = {m["id"]: m for m in found}
     sessions: dict[str, dict] = {}
     for m in found:
-        _bump(sessions, m["session"], "by_origin", m["origin"])
+        _bump(sessions, m["session"], "by_created_by", m["created_by"])
         _bump(sessions, m["session"], "by_kind", m["kind"])
     for _, bucket, session in policy:
         _bump(sessions, session, "policy_denials", bucket)
     judged: dict[tuple, dict] = {}
-    for r in con.execute("SELECT moment_id, behavior, judge, verdict,"
+    for r in con.execute("SELECT intervention_id, behavior, judge, verdict,"
                          " problem, group_id FROM verdicts"):
-        moment = by_id.get(r["moment_id"])
-        if moment is None:
+        intervention = by_id.get(r["intervention_id"])
+        if intervention is None:
             continue
         entry = judged.setdefault((r["behavior"], r["judge"]), {
             "behavior": r["behavior"], "judge": r["judge"],
             "sessions": {}, "groups": {}, "ungrouped": []})
-        _bump(entry["sessions"], moment["session"], "verdicts", r["verdict"])
-        _bump(entry["sessions"], moment["session"], "judged_by_origin",
-              moment["origin"])
+        _bump(entry["sessions"], intervention["session"], "verdicts", r["verdict"])
+        _bump(entry["sessions"], intervention["session"], "judged_by_created_by",
+              intervention["created_by"])
         if r["verdict"] != "yes":
             continue
         if r["group_id"]:
             group = entry["groups"].setdefault(r["group_id"], {
                 "group": r["group_id"], "problem": r["problem"],
-                "moments": []})
-            group["moments"].append(_point(moment))
+                "interventions": []})
+            group["interventions"].append(_point(intervention))
         else:
-            entry["ungrouped"].append(_point(moment))
+            entry["ungrouped"].append(_point(intervention))
     out = []
     for key in sorted(judged):
         entry = judged[key]
         groups = []
         for name in sorted(entry["groups"]):
             group = entry["groups"][name]
-            group["moments"].sort(key=lambda m: (m["at"] or "", m["id"]))
+            group["interventions"].sort(key=lambda m: (m["at"] or "", m["id"]))
             groups.append(group)
         entry["groups"] = groups
         out.append(entry)
@@ -234,10 +237,10 @@ def _count_map(value, keys) -> bool:
         k in keys and _count(v) for k, v in value.items())
 
 
-MOMENT_PARTS = {"by_origin": _moments.ORIGINS, "by_kind": _moments.KINDS,
-                "policy_denials": tuple(_moments.POLICY_DENIALS.values())}
+INTERVENTION_PARTS = {"by_created_by": _interventions.CREATED_BY, "by_kind": _interventions.KINDS,
+                "policy_denials": tuple(_interventions.POLICY_DENIALS.values())}
 JUDGED_PARTS = {"verdicts": _verdicts.VERDICTS,
-                "judged_by_origin": _moments.ORIGINS}
+                "judged_by_created_by": _interventions.CREATED_BY}
 
 
 def _session_counts(value, parts: dict) -> bool:
@@ -256,7 +259,7 @@ def _identifier(value, pattern) -> bool:
 def _valid_point(point) -> bool:
     return isinstance(point, dict) and _clean(point.get("id")) \
         and len(point["id"]) <= 400 and _clean(point.get("session")) \
-        and point.get("origin") in _moments.ORIGINS \
+        and point.get("created_by") in _interventions.CREATED_BY \
         and _text_or_none(point.get("at"))
 
 
@@ -276,10 +279,64 @@ def _valid_judgment(entry) -> bool:
                 or not _identifier(group.get("group"), _verdicts.GROUP_RE) \
                 or not (_clean(group.get("problem"))
                         and len(group["problem"]) <= _verdicts.PROBLEM_MAX) \
-                or not isinstance(group.get("moments"), list) \
-                or not all(_valid_point(m) for m in group["moments"]):
+                or not isinstance(group.get("interventions"), list) \
+                or not all(_valid_point(m) for m in group["interventions"]):
             return False
     return all(_valid_point(m) for m in ungrouped)
+
+
+def _from_legacy(doc: dict) -> dict:
+    """A schema-1 export in schema-2 terms: moments become interventions,
+    origin becomes created_by and `human` becomes `user`. Shapes stay as
+    sent; validation still checks every field afterwards."""
+    who = {"human": "user"}
+    parts = {"by_origin": "by_created_by",
+             "judged_by_origin": "judged_by_created_by"}
+
+    def counts(value):
+        if not isinstance(value, dict):
+            return value
+        return {key: {parts.get(part, part): (
+                    {who.get(k, k): v for k, v in c.items()}
+                    if isinstance(c, dict) else c)
+                    for part, c in counts_.items()}
+                if isinstance(counts_, dict) else counts_
+                for key, counts_ in value.items()}
+
+    def point(p):
+        if not isinstance(p, dict):
+            return p
+        out = {k: v for k, v in p.items() if k != "origin"}
+        out["created_by"] = who.get(p.get("origin"), p.get("origin"))
+        return out
+
+    new = {k: v for k, v in doc.items() if k != "moments"}
+    new["schema"] = SCHEMA
+    if isinstance(doc.get("moments"), dict):
+        new["interventions"] = {"sessions": counts(
+            doc["moments"].get("sessions", {}))}
+    judgments = []
+    for j in doc.get("judgments", []) if isinstance(
+            doc.get("judgments", []), list) else []:
+        if not isinstance(j, dict):
+            judgments.append(j)
+            continue
+        j = dict(j)
+        j["sessions"] = counts(j.get("sessions"))
+        groups = []
+        for g in j.get("groups", []) if isinstance(j.get("groups"), list) \
+                else []:
+            if isinstance(g, dict) and isinstance(g.get("moments"), list):
+                old_points = g["moments"]
+                g = {k: v for k, v in g.items() if k != "moments"}
+                g["interventions"] = [point(p) for p in old_points]
+            groups.append(g)
+        j["groups"] = groups
+        if isinstance(j.get("ungrouped"), list):
+            j["ungrouped"] = [point(p) for p in j["ungrouped"]]
+        judgments.append(j)
+    new["judgments"] = judgments
+    return new
 
 
 def validate(doc) -> dict:
@@ -287,8 +344,10 @@ def validate(doc) -> dict:
 
     Another machine's export is untrusted input: every field ``combine``
     reads is type-checked here, so a stored export can never break a
-    later report.
+    later report. A schema-1 export is translated first.
     """
+    if isinstance(doc, dict) and doc.get("schema") == LEGACY_SCHEMA:
+        doc = _from_legacy(doc)
     if not isinstance(doc, dict) or doc.get("schema") != SCHEMA:
         raise ValueError("not an Agent Observer fleet export")
     if not isinstance(doc.get("machine"), str) \
@@ -321,11 +380,11 @@ def validate(doc) -> dict:
                 or not all(_clean(k) for k in sessions):
             raise ValueError("invalid task entry")
     # Judge evidence is optional: exports from before #60 carry none.
-    counts = doc.get("moments")
+    counts = doc.get("interventions")
     if counts is not None and not (
             isinstance(counts, dict)
-            and _session_counts(counts.get("sessions", {}), MOMENT_PARTS)):
-        raise ValueError("invalid moment counts")
+            and _session_counts(counts.get("sessions", {}), INTERVENTION_PARTS)):
+        raise ValueError("invalid intervention counts")
     judgments = doc.get("judgments", [])
     if not isinstance(judgments, list) \
             or not all(_valid_judgment(j) for j in judgments):
@@ -353,16 +412,16 @@ def _schema_only(doc: dict) -> dict:
         return {key: {part: dict(c) for part, c in counts.items()
                       if part in parts}
                 for key, counts in (value or {}).items()}
-    if doc.get("moments") is not None:
-        out["moments"] = {"sessions": per_session(
-            doc["moments"].get("sessions"), MOMENT_PARTS)}
-    point = ("id", "session", "origin", "at")
+    if doc.get("interventions") is not None:
+        out["interventions"] = {"sessions": per_session(
+            doc["interventions"].get("sessions"), INTERVENTION_PARTS)}
+    point = ("id", "session", "created_by", "at")
     out["judgments"] = [
         {"behavior": j["behavior"], "judge": j["judge"],
          "sessions": per_session(j["sessions"], JUDGED_PARTS),
          "groups": [{"group": g["group"], "problem": g["problem"],
-                     "moments": [{k: m.get(k) for k in point}
-                                 for m in g["moments"]]}
+                     "interventions": [{k: m.get(k) for k in point}
+                                 for m in g["interventions"]]}
                     for g in j["groups"]],
          "ungrouped": [{k: m.get(k) for k in point} for m in j["ungrouped"]]}
         for j in doc.get("judgments", [])]
@@ -518,7 +577,7 @@ def combine(docs: list, expect: list | None = None) -> dict:
     present = [d["machine"] for d in docs]
     recurrence, unmerged, moment_counts = _combine_judgments(docs)
     return {"machines": machines,
-            "moments": moment_counts,
+            "interventions": moment_counts,
             "recurrence": recurrence,
             "unmerged_behaviors": unmerged,
             "withheld_tasks": {d["machine"]: d.get("withheld_tasks") or 0
@@ -535,24 +594,24 @@ def _combine_judgments(docs: list) -> tuple[list, list, dict]:
 
     Groups merge by id under one judge (a shared judge run grouped them);
     one rule decides every count: a session reported by several machines
-    takes all its evidence (moments, denials, verdicts, yes moments) from
+    takes all its evidence (interventions, denials, verdicts, yes interventions) from
     one owner, the first machine by name, as token usage does. A behavior
     judged by different judges on different machines is reported per
-    judge and listed in ``unmerged_behaviors``. Headline numbers count the origins
+    judge and listed in ``unmerged_behaviors``. Headline numbers count the created_by
     whose corrections count (human and agent); each group keeps its
     per-origin counts."""
-    counted = _moments.COUNTED_ORIGINS
-    moment_counts = {"by_origin": {o: 0 for o in _moments.ORIGINS},
-                     "by_kind": {k: 0 for k in _moments.KINDS},
+    counted = _interventions.COUNTED
+    moment_counts = {"by_created_by": {o: 0 for o in _interventions.CREATED_BY},
+                     "by_kind": {k: 0 for k in _interventions.KINDS},
                      "policy_denials": {b: 0 for b in
-                                        _moments.POLICY_DENIALS.values()}}
+                                        _interventions.POLICY_DENIALS.values()}}
     owner: dict[str, str] = {}
     for doc in docs:  # sorted by machine name
         keys = {s.get("session_key") for s in doc["sessions"]}
-        keys |= set(((doc.get("moments") or {}).get("sessions") or {}))
+        keys |= set(((doc.get("interventions") or {}).get("sessions") or {}))
         for j in doc.get("judgments") or []:
             keys |= set(j["sessions"])
-            keys |= {m["session"] for g in j["groups"] for m in g["moments"]}
+            keys |= {m["session"] for g in j["groups"] for m in g["interventions"]}
             keys |= {m["session"] for m in j["ungrouped"]}
         for key in keys:
             owner.setdefault(key, doc["machine"])
@@ -568,7 +627,7 @@ def _combine_judgments(docs: list) -> tuple[list, list, dict]:
     judges: dict[tuple, dict] = {}
     for doc in docs:
         machine = doc["machine"]
-        for key, counts in ((doc.get("moments") or {}).get("sessions")
+        for key, counts in ((doc.get("interventions") or {}).get("sessions")
                             or {}).items():
             if owned(key, machine):
                 add_counts(moment_counts, counts)
@@ -576,14 +635,14 @@ def _combine_judgments(docs: list) -> tuple[list, list, dict]:
             entry = judges.setdefault((j["behavior"], j["judge"]), {
                 "behavior": j["behavior"], "judge": j["judge"],
                 "machines": [], "verdicts": {v: 0 for v in _verdicts.VERDICTS},
-                "judged_by_origin": {o: 0 for o in _moments.ORIGINS},
+                "judged_by_created_by": {o: 0 for o in _interventions.CREATED_BY},
                 "points": {}, "groups": {}, "problems": {}})
             entry["machines"].append(machine)
             for key, counts in j["sessions"].items():
                 if owned(key, machine):
                     add_counts(entry, counts)
             for g in j["groups"]:
-                for m in g["moments"]:
+                for m in g["interventions"]:
                     if not owned(m["session"], machine) \
                             or m["id"] in entry["points"]:
                         continue
@@ -606,31 +665,31 @@ def _combine_judgments(docs: list) -> tuple[list, list, dict]:
         groups = []
         for name, members in entry["groups"].items():
             kept = [(m, machine) for m, machine in members
-                    if m["origin"] in counted]
+                    if m["created_by"] in counted]
             if not kept:
                 continue
             kept.sort(key=lambda x: (x[0]["at"] or "", x[0]["id"]))
-            by_origin: dict[str, int] = {}
+            by_created_by: dict[str, int] = {}
             for m, _ in kept:
-                by_origin[m["origin"]] = by_origin.get(m["origin"], 0) + 1
+                by_created_by[m["created_by"]] = by_created_by.get(m["created_by"], 0) + 1
             groups.append({
                 "group": name, "problem": entry["problems"][name][1],
                 "occurrences": len(kept), "repeats": len(kept) - 1,
-                "by_origin": by_origin,
+                "by_created_by": by_created_by,
                 "sessions": len({m["session"] for m, _ in kept}),
                 "machines": sorted({machine for _, machine in kept}),
                 "first_seen": kept[0][0]["at"], "last_seen": kept[-1][0]["at"]})
         groups.sort(key=lambda g: (-g["occurrences"], -g["sessions"],
                                    g["first_seen"] or "", g["group"]))
-        yes = [m for m in entry["points"].values() if m["origin"] in counted]
-        by_origin = {o: sum(1 for m in yes if m["origin"] == o)
+        yes = [m for m in entry["points"].values() if m["created_by"] in counted]
+        by_created_by = {o: sum(1 for m in yes if m["created_by"] == o)
                      for o in counted}
         out.append({
             "behavior": entry["behavior"], "judge": entry["judge"],
             "machines": sorted(entry["machines"]),
             "coverage": {"verdicts": entry["verdicts"],
-                         "judged_by_origin": entry["judged_by_origin"]},
-            "occurrences": len(yes), "by_origin": by_origin,
+                         "judged_by_created_by": entry["judged_by_created_by"]},
+            "occurrences": len(yes), "by_created_by": by_created_by,
             "ungrouped": sum(1 for m in yes if m.get("ungrouped")),
             "problems": len(groups),
             "recurring_problems": sum(1 for g in groups if g["sessions"] >= 2),
@@ -681,17 +740,17 @@ def render(result: dict) -> str:
         "; free-text ids kept home: " + ", ".join(
             f"{m} {n}" for m, n in sorted(withheld.items()))
         if withheld else ""))
-    counts = result.get("moments") or {}
+    counts = result.get("interventions") or {}
     if counts:
-        lines.append("moments by origin: " + ", ".join(
-            f"{k} {v}" for k, v in counts["by_origin"].items())
+        lines.append("interventions by origin: " + ", ".join(
+            f"{k} {v}" for k, v in counts["by_created_by"].items())
             + "; policy denials (not corrections): " + ", ".join(
             f"{k} {v}" for k, v in counts["policy_denials"].items()))
     for j in result.get("recurrence") or []:
         lines.append(
             f"{j['behavior']} by {j['judge']} on {', '.join(j['machines'])}:"
             f" {j['occurrences']} yes ("
-            + ", ".join(f"{k} {v}" for k, v in j["by_origin"].items())
+            + ", ".join(f"{k} {v}" for k, v in j["by_created_by"].items())
             + f"), problems {j['problems']}, recurring (2+ sessions)"
             f" {j['recurring_problems']}, repeats {j['repeats']},"
             f" ungrouped {j['ungrouped']}")

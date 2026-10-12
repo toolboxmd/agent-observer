@@ -25,7 +25,7 @@ class AnalysisCase(LedgerCase):
     def prompt(self, key, text, kind="genuine"):
         self.seq += 1
         self.con.execute(
-            "INSERT INTO submissions(native_id, session_key, ts, kind, text_hash,"
+            "INSERT INTO user_messages(native_id, session_key, ts, kind, text_hash,"
             " text_excerpt, is_genuine) VALUES(?,?,?,?,?,?,?)",
             (f"s{self.seq}", key, float(self.seq), kind, "h", text,
              1 if kind == "genuine" else 0))
@@ -357,7 +357,7 @@ class DiagnoseWindowTest(AnalysisCase):
         self.session("claude:w", started=1000.0)
         for ts in (1010.0, 1050.0):
             self.prompt("claude:w", "[Request interrupted by user]", kind="interrupt")
-            self.con.execute("UPDATE submissions SET ts=? WHERE native_id=?",
+            self.con.execute("UPDATE user_messages SET ts=? WHERE native_id=?",
                              (ts, f"s{self.seq}"))
         found = analysis.diagnose(self.con, since=1030.0, until=1100.0)
         self.assertEqual(found["counts"].get("human_correction"), 1)
@@ -366,7 +366,7 @@ class DiagnoseWindowTest(AnalysisCase):
     def test_incidents_without_a_timestamp_are_dropped_from_a_bounded_window(self):
         self.session("claude:n", started=1000.0)
         self.prompt("claude:n", "[Request interrupted by user]", kind="interrupt")
-        self.con.execute("UPDATE submissions SET ts=NULL WHERE native_id=?", (f"s{self.seq}",))
+        self.con.execute("UPDATE user_messages SET ts=NULL WHERE native_id=?", (f"s{self.seq}",))
         self.assertEqual(analysis.diagnose(self.con, since=900.0)["counts"], {})
         self.assertEqual(analysis.diagnose(self.con)["counts"], {"human_correction": 1})
 

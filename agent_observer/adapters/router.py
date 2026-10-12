@@ -1135,14 +1135,14 @@ def _import_invocation(con: sqlite3.Connection, db_path: str, inv: dict,
     turn_id = f"router:{invocation_id}"
     if task_id != f"router:{request_id}":
         # Replace this invocation's old adapter-owned projection after upgrade.
-        con.execute("DELETE FROM attempts WHERE task_id=? AND turn_id=?",
+        con.execute("DELETE FROM task_turns WHERE task_id=? AND turn_id=?",
                     (f"router:{request_id}", turn_id))
     attempt = {
         "role": kind or "unknown",
         "harness": HARNESS,
         "session_key": _session_key_for(inv),
         "stage": stage,
-        "route_requested": requested_route,
+        "color_requested": requested_route,
         "policy_version": policy_version,
         "reason": reason,
         "model_observed": observed_model,
@@ -1158,19 +1158,19 @@ def _import_invocation(con: sqlite3.Connection, db_path: str, inv: dict,
         "usage_json": usage_projected,
     }
     row = con.execute(
-        "SELECT * FROM attempts WHERE task_id=? AND turn_id=?",
+        "SELECT * FROM task_turns WHERE task_id=? AND turn_id=?",
         (task_id, turn_id)).fetchone()
     if row is None:
         cols = ["task_id", "turn_id"] + list(attempt)
         con.execute(
-            f"INSERT INTO attempts({','.join(cols)})"
+            f"INSERT INTO task_turns({','.join(cols)})"
             f" VALUES({','.join('?' for _ in cols)})",
             (task_id, turn_id) + tuple(attempt[c] for c in attempt))
         return True
     diff = {c: v for c, v in attempt.items() if row[c] != v}
     if diff:
         con.execute(
-            f"UPDATE attempts SET {','.join(f'{c}=?' for c in diff)}"
+            f"UPDATE task_turns SET {','.join(f'{c}=?' for c in diff)}"
             " WHERE task_id=? AND turn_id=?",
             tuple(diff.values()) + (task_id, turn_id))
         return True
@@ -1233,7 +1233,7 @@ def _binding_key(con: sqlite3.Connection, inv: dict,
                        (task_id,)).fetchone():
         return None
     if con.execute(
-            "SELECT 1 FROM assignments a JOIN submissions s ON s.native_id=a.submission_native_id"
+            "SELECT 1 FROM assignments a JOIN user_messages s ON s.native_id=a.user_message_id"
             " WHERE s.session_key=? AND a.task_id<>?", (key, task_id)).fetchone():
         # Explicit submission ownership outranks a purported dedicated worker.
         # The attempt retains its expected session, exposing the unbound gap.

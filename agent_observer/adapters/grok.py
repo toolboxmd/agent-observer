@@ -841,7 +841,7 @@ def _force_child_synthetic(con: sqlite3.Connection, stats: dict | None,
     assert empty == ""
     try:
         cur = con.execute(
-            "UPDATE submissions SET kind='synthetic', is_genuine=0,"
+            "UPDATE user_messages SET kind='synthetic', is_genuine=0,"
             " text_excerpt='' WHERE session_key=? AND (kind!='synthetic'"
             " OR is_genuine!=0 OR text_excerpt!='')",
             (child_key,))
@@ -2133,11 +2133,11 @@ def _upsert_submission(con, r: _Reader, src, chat: dict, key: str,
     native_id = f"{HARNESS}:{r.native_sid}:prompt:{key}"
     existing = con.execute(
         "SELECT text_hash, text_excerpt, turn_id, kind, is_genuine"
-        " FROM submissions WHERE native_id=?", (native_id,)).fetchone()
+        " FROM user_messages WHERE native_id=?", (native_id,)).fetchone()
     digest = text_hash(full_text)
     if existing is None:
         cur = con.execute(
-            "INSERT OR IGNORE INTO submissions(native_id, source_id,"
+            "INSERT OR IGNORE INTO user_messages(native_id, source_id,"
             " session_key, turn_id, ordinal_num, ts, kind, text_hash,"
             " text_excerpt, is_genuine) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (native_id, src.source_id if src is not None else None,
@@ -2151,13 +2151,13 @@ def _upsert_submission(con, r: _Reader, src, chat: dict, key: str,
             or existing["kind"] != kind \
             or (existing["is_genuine"] or 0) != is_genuine:
         con.execute(
-            "UPDATE submissions SET text_hash=?, text_excerpt=?, kind=?,"
+            "UPDATE user_messages SET text_hash=?, text_excerpt=?, kind=?,"
             " is_genuine=? WHERE native_id=?",
             (digest, excerpt, kind, is_genuine, native_id))
         r.stats["submissions_updated"] = \
             r.stats.get("submissions_updated", 0) + 1
     if turn_id and not existing["turn_id"]:
-        con.execute("UPDATE submissions SET turn_id=? WHERE native_id=?",
+        con.execute("UPDATE user_messages SET turn_id=? WHERE native_id=?",
                     (turn_id, native_id))
 
 

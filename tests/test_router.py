@@ -167,7 +167,7 @@ class RouterAdapterTest(LedgerCase):
         return {t: self.con.execute(
             f"SELECT COUNT(*) c FROM {t}").fetchone()["c"] for t in (
                 "router_jobs", "router_invocations", "router_readings",
-                "tasks", "attempts", "outcomes", "session_assignments",
+                "tasks", "task_turns", "outcomes", "session_assignments",
                 "responses", "events")}
 
     def test_explicit_task_combines_jobs_and_preserves_capture(self):
@@ -184,7 +184,7 @@ class RouterAdapterTest(LedgerCase):
             "observer_task_id": "repair:23"}),))
         src.commit(); src.close()
         router.sync(self.con, root=self.state)
-        rows = self.con.execute("SELECT task_id FROM attempts").fetchall()
+        rows = self.con.execute("SELECT task_id FROM task_turns").fetchall()
         self.assertEqual({r["task_id"] for r in rows}, {"repair:23"})
         bindings = self.con.execute("SELECT DISTINCT task_id FROM session_assignments").fetchall()
         self.assertEqual({r["task_id"] for r in bindings}, {"repair:23"})
@@ -198,7 +198,7 @@ class RouterAdapterTest(LedgerCase):
         self.assertEqual(again["unchanged"], 1)
         self.assertEqual(report.task_report(self.con, "repair:23")["attributed"],
                          before["attributed"])
-        self.assertEqual(len(before["attempts"]), 8)
+        self.assertEqual(len(before["task_turns"]), 8)
         self.assertNotIn("claude:plan-sess-1", before["scope_sessions"])
 
     def test_default_discovery_covers_current_legacy_and_configured_once(self):
@@ -293,15 +293,15 @@ class RouterAdapterTest(LedgerCase):
                     "cancel1": "cancelled", "crash1": "crashed"}
         for iid, state in expected.items():
             row = self.con.execute(
-                "SELECT * FROM attempts WHERE turn_id=?",
+                "SELECT * FROM task_turns WHERE turn_id=?",
                 (f"router:{iid}",)).fetchone()
             self.assertIsNotNone(row, iid)
             self.assertEqual(row["state"], state, iid)
             self.assertEqual(row["harness"], "router", iid)
         attempt = self.con.execute(
-            "SELECT * FROM attempts WHERE turn_id='router:aaa111'").fetchone()
+            "SELECT * FROM task_turns WHERE turn_id='router:aaa111'").fetchone()
         self.assertEqual(attempt["role"], "codex_dispatch")
-        self.assertEqual(attempt["route_requested"], "luna/max")
+        self.assertEqual(attempt["color_requested"], "luna/max")
         self.assertEqual(attempt["policy_version"], "2.4.0")
         self.assertEqual(attempt["stage"], "dispatch")
         self.assertEqual(attempt["terminal_class"], "completed")
@@ -359,7 +359,7 @@ class RouterAdapterTest(LedgerCase):
                 con = db.connect(fresh)
                 try:
                     for t in ("router_jobs", "router_invocations",
-                              "router_readings", "tasks", "attempts",
+                              "router_readings", "tasks", "task_turns",
                               "outcomes", "session_assignments", "responses",
                               "events"):
                         self.assertEqual(
@@ -414,9 +414,9 @@ class RouterAdapterTest(LedgerCase):
         ids["tasks"] = {
             r["task_id"]: r["rowid"] for r in self.con.execute(
                 "SELECT task_id, rowid FROM tasks")}
-        ids["attempts"] = {
+        ids["task_turns"] = {
             (r["task_id"], r["turn_id"]): r["id"] for r in self.con.execute(
-                "SELECT task_id, turn_id, id FROM attempts")}
+                "SELECT task_id, turn_id, id FROM task_turns")}
         ids["outcomes"] = {
             r["task_id"]: r["rowid"] for r in self.con.execute(
                 "SELECT task_id, rowid FROM outcomes")}
@@ -451,7 +451,7 @@ class RouterAdapterTest(LedgerCase):
         # Every natural-key table router touches gained rows, except
         # native event/submission tables the fixtures do not produce.
         for table in ("router_jobs", "router_invocations", "router_readings",
-                      "tasks", "attempts", "outcomes", "session_assignments",
+                      "tasks", "task_turns", "outcomes", "session_assignments",
                       "sources", "sessions", "turns", "responses"):
             self.assertTrue(before_ids[table], table)
         again = router.sync(self.con, root=self.state)
@@ -842,7 +842,7 @@ class RouterAdapterTest(LedgerCase):
         self.assertNotIn("source", stored_usage)
         self.assertNotIn("secret", stored_usage)
         attempt = self.con.execute(
-            "SELECT * FROM attempts WHERE turn_id='router:raw1'").fetchone()
+            "SELECT * FROM task_turns WHERE turn_id='router:raw1'").fetchone()
         self.assertIsNotNone(attempt)
         attempt_usage = json.loads(attempt["usage_json"])
         self.assertNotIn("source", attempt_usage)
@@ -852,7 +852,7 @@ class RouterAdapterTest(LedgerCase):
                 ("router_jobs", ["status", "issue", "block_reason"]),
                 ("router_invocations",
                  ["reason", "usage_json", "requested_route"]),
-                ("attempts", ["reason", "usage_json", "route_requested"])):
+                ("task_turns", ["reason", "usage_json", "color_requested"])):
             for row in self.con.execute(f"SELECT * FROM {table}"):
                 blob = " ".join(str(row[c] or "") for c in cols)
                 self.assertNotIn("MARKER-GOAL", blob, table)
@@ -880,7 +880,7 @@ class RouterAdapterTest(LedgerCase):
         self.assertIsNotNone(bad)
         self.assertIsNone(bad["reason"])
         bad_attempt = self.con.execute(
-            "SELECT * FROM attempts"
+            "SELECT * FROM task_turns"
             " WHERE turn_id='router:badreason1'").fetchone()
         self.assertIsNotNone(bad_attempt)
         self.assertIsNone(bad_attempt["reason"])
@@ -889,7 +889,7 @@ class RouterAdapterTest(LedgerCase):
             " WHERE invocation_id='aaa111'").fetchone()
         self.assertEqual(good["reason"], "initial")
         good_attempt = self.con.execute(
-            "SELECT reason FROM attempts"
+            "SELECT reason FROM task_turns"
             " WHERE turn_id='router:aaa111'").fetchone()
         self.assertEqual(good_attempt["reason"], "initial")
 
@@ -1016,7 +1016,7 @@ class RouterAdapterTest(LedgerCase):
                 terminal = sorted(terminals)[i % len(terminals)]
                 self.assertEqual(inv["terminal_class"], terminal)
                 attempt = self.con.execute(
-                    "SELECT * FROM attempts WHERE turn_id=?",
+                    "SELECT * FROM task_turns WHERE turn_id=?",
                     (f"router:cov-{i:02d}",)).fetchone()
                 self.assertIsNotNone(attempt)
                 self.assertEqual(attempt["reason"], reason)
@@ -1032,7 +1032,7 @@ class RouterAdapterTest(LedgerCase):
         self.assertIsNone(bad["terminal_class"])
         self.assertIsNone(bad["session_kind"])
         bad_attempt = self.con.execute(
-            "SELECT * FROM attempts WHERE turn_id='router:cov-bad'"
+            "SELECT * FROM task_turns WHERE turn_id='router:cov-bad'"
             ).fetchone()
         self.assertIsNotNone(bad_attempt)
         self.assertIsNone(bad_attempt["terminal_class"])
@@ -1040,7 +1040,7 @@ class RouterAdapterTest(LedgerCase):
         self.assertEqual(bad_attempt["state"], "unknown")
         # Genuinely absent: still active (the pre-existing t-null row).
         missing = self.con.execute(
-            "SELECT * FROM attempts WHERE turn_id='router:t-null'"
+            "SELECT * FROM task_turns WHERE turn_id='router:t-null'"
             ).fetchone()
         self.assertEqual(missing["state"], "active")
 
@@ -1118,7 +1118,7 @@ class RouterAdapterTest(LedgerCase):
                 fh.write(json.dumps(record) + "\n")
         router.sync(self.con, root=self.state)
         rows = self.con.execute(
-            "SELECT kind, is_genuine, text_excerpt FROM submissions"
+            "SELECT kind, is_genuine, text_excerpt FROM user_messages"
             " WHERE session_key=?", (f"codex:{thread}",)).fetchall()
         # The genuine-looking child message imported, but stores nothing.
         self.assertTrue(rows)
@@ -1181,7 +1181,7 @@ class RouterAdapterTest(LedgerCase):
         self.assertIsNotNone(self.con.execute(
             "SELECT * FROM tasks WHERE task_id='router:wid-late'").fetchone())
         self.assertIsNotNone(self.con.execute(
-            "SELECT * FROM attempts"
+            "SELECT * FROM task_turns"
             " WHERE turn_id='router:late1'").fetchone())
         # Malformed rows never land under their natural keys.
         self.assertIsNone(self.con.execute(
@@ -1191,7 +1191,7 @@ class RouterAdapterTest(LedgerCase):
             "SELECT * FROM router_invocations"
             " WHERE invocation_id='noreq1'").fetchone())
         self.assertIsNone(self.con.execute(
-            "SELECT * FROM attempts WHERE turn_id='router:dangling1'")
+            "SELECT * FROM task_turns WHERE turn_id='router:dangling1'")
             .fetchone())
         quarantined = self.con.execute(
             "SELECT error, line_excerpt FROM import_errors"
@@ -1379,7 +1379,7 @@ class RouterAdapterTest(LedgerCase):
         self.assertEqual(good["kit_hash"], KIT_HASH)
         # The malicious text persists nowhere in the ledger.
         blob = ""
-        for table in ("router_jobs", "router_invocations", "attempts"):
+        for table in ("router_jobs", "router_invocations", "task_turns"):
             for row in self.con.execute(f"SELECT * FROM {table}"):
                 blob += " ".join(str(row[c] or "") for c in row.keys())
         self.assertNotIn("evil_class", blob)
@@ -1431,7 +1431,7 @@ class RouterAdapterTest(LedgerCase):
         self.assertIsNotNone(inv)
         self.assertIsNone(inv["elapsed_secs"])
         attempt = self.con.execute(
-            "SELECT * FROM attempts"
+            "SELECT * FROM task_turns"
             " WHERE turn_id='router:badnum1'").fetchone()
         self.assertIsNotNone(attempt)
         self.assertIsNone(attempt["elapsed_s"])

@@ -215,7 +215,7 @@ class QuarantineRedactionTest(LedgerCase):
         # and the later record is not skipped.
         self.assertEqual(stats["responses_inserted"], 2)
         self.assertEqual(report.scope_totals(self.con)["total_tokens"], 1540)
-        subs = self.query("SELECT native_id FROM submissions")
+        subs = self.query("SELECT native_id FROM user_messages")
         self.assertEqual([r["native_id"] for r in subs], ["codex:msg-q-sub-01"])
 
     def test_excerpts_hold_no_raw_text(self):
@@ -251,7 +251,7 @@ class QuarantineRedactionTest(LedgerCase):
         for secret in (type_secret, payload_secret):
             for table, column in (("import_errors", "line_excerpt"),
                                   ("import_errors", "error"),
-                                  ("submissions", "text_excerpt"),
+                                  ("user_messages", "text_excerpt"),
                                   ("events", "detail_json"),
                                   ("responses", "model"),
                                   ("responses", "semantics")):
@@ -295,7 +295,7 @@ class QuarantineRedactionTest(LedgerCase):
         self.sync("codex-secrets-quarantine.jsonl")
         for table, column in (("import_errors", "line_excerpt"),
                               ("import_errors", "error"),
-                              ("submissions", "text_excerpt"),
+                              ("user_messages", "text_excerpt"),
                               ("events", "detail_json")):
             rows = self.query(f"SELECT {column} FROM {table}")
             for row in rows:

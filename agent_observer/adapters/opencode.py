@@ -449,7 +449,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
         # detail behind. Valid records recompute/update these fields in
         # place below.
         con.execute(
-            "UPDATE submissions SET text_excerpt=?, text_hash=?, kind=?,"
+            "UPDATE user_messages SET text_excerpt=?, text_hash=?, kind=?,"
             " is_genuine=? WHERE source_id=?",
             ("", text_hash(""), "synthetic", 0, source_id))
         con.execute(
@@ -700,7 +700,7 @@ def _ingest_submission(con, stats, identity, src_path, source_id,
         # any existing row in place with an empty excerpt and matching
         # non-genuine classification instead of returning early.
         existing = con.execute(
-            "SELECT kind, text_hash, text_excerpt, is_genuine FROM submissions"
+            "SELECT kind, text_hash, text_excerpt, is_genuine FROM user_messages"
             " WHERE native_id=?", (native_id,)).fetchone()
         if existing is None:
             return
@@ -709,7 +709,7 @@ def _ingest_submission(con, stats, identity, src_path, source_id,
                 or (existing["text_excerpt"] or "") != ""
                 or existing["is_genuine"] != 0):
             con.execute(
-                "UPDATE submissions SET source_id=?, session_key=?,"
+                "UPDATE user_messages SET source_id=?, session_key=?,"
                 " ordinal_num=?, ts=?, kind=?, text_hash=?, text_excerpt=?,"
                 " is_genuine=? WHERE native_id=?",
                 (source_id, session_key, index, ts, "synthetic", digest, "",
@@ -735,11 +735,11 @@ def _ingest_submission(con, stats, identity, src_path, source_id,
     digest = text_hash(excerpt)
     is_genuine = 1 if kind == "genuine" else 0
     existing = con.execute(
-        "SELECT kind, text_hash, text_excerpt, is_genuine FROM submissions"
+        "SELECT kind, text_hash, text_excerpt, is_genuine FROM user_messages"
         " WHERE native_id=?", (native_id,)).fetchone()
     if existing is None:
         con.execute(
-            "INSERT INTO submissions(native_id, source_id, session_key,"
+            "INSERT INTO user_messages(native_id, source_id, session_key,"
             " ordinal_num, ts, kind, text_hash, text_excerpt, is_genuine)"
             " VALUES(?,?,?,?,?,?,?,?,?)",
             (native_id, source_id, session_key, index, ts,
@@ -750,7 +750,7 @@ def _ingest_submission(con, stats, identity, src_path, source_id,
             or (existing["text_excerpt"] or "") != excerpt
             or existing["is_genuine"] != is_genuine):
         con.execute(
-            "UPDATE submissions SET source_id=?, session_key=?,"
+            "UPDATE user_messages SET source_id=?, session_key=?,"
             " ordinal_num=?, ts=?, kind=?, text_hash=?, text_excerpt=?,"
             " is_genuine=? WHERE native_id=?",
             (source_id, session_key, index, ts, kind, digest, excerpt,

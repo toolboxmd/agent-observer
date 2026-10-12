@@ -145,14 +145,14 @@ def task_sessions(con: sqlite3.Connection, task_id: str) -> set:
     """Sessions a task touches: those holding its assigned submissions or
     wholly assigned to it."""
     keys = {r["session_key"] for r in con.execute(
-        "SELECT DISTINCT s.session_key FROM assignments a JOIN submissions s"
-        " ON s.native_id=a.submission_native_id WHERE a.task_id=?"
+        "SELECT DISTINCT s.session_key FROM assignments a JOIN user_messages s"
+        " ON s.native_id=a.user_message_id WHERE a.task_id=?"
         " AND s.session_key IS NOT NULL", (task_id,))}
     keys |= {r["session_key"] for r in con.execute(
         "SELECT session_key FROM session_assignments WHERE task_id=?",
         (task_id,))}
     keys |= {r["session_key"] for r in con.execute(
-        "SELECT session_key FROM attempts WHERE task_id=? AND session_key IS NOT NULL",
+        "SELECT session_key FROM task_turns WHERE task_id=? AND session_key IS NOT NULL",
         (task_id,))}
     return keys
 
@@ -166,7 +166,7 @@ def _turn_submission(con: sqlite3.Connection) -> dict:
     """
     mapping = {}
     for s in con.execute(
-            "SELECT native_id, turn_id FROM submissions WHERE is_genuine=1"):
+            "SELECT native_id, turn_id FROM user_messages WHERE is_genuine=1"):
         if s["turn_id"] and s["turn_id"] not in mapping:
             mapping[s["turn_id"]] = s["native_id"]
     return mapping
@@ -189,7 +189,7 @@ def _source_cutoff(con: sqlite3.Connection, scope_keys: set) -> float | None:
         f"({placeholders}) UNION "
         "SELECT DISTINCT source_id FROM events WHERE session_key IN "
         f"({placeholders}) UNION "
-        "SELECT DISTINCT source_id FROM submissions WHERE session_key IN "
+        "SELECT DISTINCT source_id FROM user_messages WHERE session_key IN "
         f"({placeholders}) UNION "
         "SELECT DISTINCT source_id FROM sessions WHERE session_key IN "
         f"({placeholders}))",
@@ -206,8 +206,8 @@ def _snapshot_id(payload: dict) -> str:
 def _task_turn_ids(con: sqlite3.Connection, task_id: str,
                    turn_sub: dict, whole: dict) -> set:
     """Turns owned by the task: bound submission turns plus whole sessions."""
-    bound = {a["submission_native_id"] for a in con.execute(
-        "SELECT submission_native_id FROM assignments WHERE task_id=?",
+    bound = {a["user_message_id"] for a in con.execute(
+        "SELECT user_message_id FROM assignments WHERE task_id=?",
         (task_id,))}
     owned = {t for t, s in turn_sub.items() if s in bound}
     whole_keys = sorted(whole)
@@ -317,8 +317,8 @@ def _phase_report(con, task_id, rows, whole, attempts, schedule):
             return "review"
         return "unclassified"
 
-    for a in con.execute("SELECT s.turn_id,a.phase FROM assignments a JOIN submissions s"
-                         " ON s.native_id=a.submission_native_id WHERE a.task_id=?", (task_id,)):
+    for a in con.execute("SELECT s.turn_id,a.phase FROM assignments a JOIN user_messages s"
+                         " ON s.native_id=a.user_message_id WHERE a.task_id=?", (task_id,)):
         if a["turn_id"] and a["phase"]:
             by_turn.setdefault(a["turn_id"], set()).add(phase(a["phase"]))
     for a in attempts:
@@ -376,16 +376,16 @@ def task_report(con: sqlite3.Connection, task_id: str,
     turn_sub = _turn_submission(con)
     assigns = con.execute(
         "SELECT * FROM assignments WHERE task_id=?", (task_id,)).fetchall()
-    bound_subs = {a["submission_native_id"]: a for a in assigns}
+    bound_subs = {a["user_message_id"]: a for a in assigns}
     # Joint submissions bound to several tasks stay shared, never divided.
     joint = {}
     for a in con.execute(
-            "SELECT submission_native_id, COUNT(*) n FROM assignments "
+            "SELECT user_message_id, COUNT(*) n FROM assignments "
             "GROUP BY 1 HAVING n > 1"):
         rows = con.execute(
             "SELECT task_id, shared FROM assignments WHERE "
-            "submission_native_id=?", (a["submission_native_id"],)).fetchall()
-        joint[a["submission_native_id"]] = {
+            "user_message_id=?", (a["user_message_id"],)).fetchall()
+        joint[a["user_message_id"]] = {
             "tasks": [r["task_id"] for r in rows],
             "all_shared": all(r["shared"] for r in rows),
         }
@@ -398,8 +398,8 @@ def task_report(con: sqlite3.Connection, task_id: str,
         "SELECT session_key FROM session_assignments GROUP BY session_key"
         " HAVING COUNT(DISTINCT task_id) > 1")}
     whole_conflicts = {r["session_key"] for r in con.execute(
-        "SELECT DISTINCT w.session_key FROM session_assignments w JOIN submissions s"
-        " ON s.session_key=w.session_key JOIN assignments a ON a.submission_native_id=s.native_id"
+        "SELECT DISTINCT w.session_key FROM session_assignments w JOIN user_messages s"
+        " ON s.session_key=w.session_key JOIN assignments a ON a.user_message_id=s.native_id"
         " WHERE a.task_id<>w.task_id") if r["session_key"] in scope_keys}
     whole_shared |= whole_conflicts
     responses = _responses(con, scope_keys)
@@ -410,8 +410,8 @@ def task_report(con: sqlite3.Connection, task_id: str,
                   if key not in whole_conflicts}
     unplaced, elsewhere = [], []
     missing_submissions = []
-    assigned_anywhere = {r["submission_native_id"] for r in
-                         con.execute("SELECT submission_native_id "
+    assigned_anywhere = {r["user_message_id"] for r in
+                         con.execute("SELECT user_message_id "
                                      "FROM assignments").fetchall()}
     for r in responses:
         if r["is_overlap"]:
@@ -468,23 +468,23 @@ def task_report(con: sqlite3.Connection, task_id: str,
 
     scope = scope_totals(con, scope_keys)
     crashes = con.execute(
-        "SELECT COUNT(*) n FROM attempts WHERE task_id=? AND state='crashed'",
+        "SELECT COUNT(*) n FROM task_turns WHERE task_id=? AND state='crashed'",
         (task_id,)).fetchone()["n"]
     outcome_row = _row_or_none(
         con.execute("SELECT * FROM outcomes WHERE task_id=?",
                     (task_id,)).fetchone())
-    attempts_rows = [dict(r) for r in con.execute(
-        "SELECT * FROM attempts WHERE task_id=? ORDER BY turn_id",
+    task_turn_rows = [dict(r) for r in con.execute(
+        "SELECT * FROM task_turns WHERE task_id=? ORDER BY turn_id",
         (task_id,))]
-    dispatches_rows = [dict(r) for r in con.execute(
-        "SELECT * FROM dispatches WHERE owning_submission IN "
-        "(SELECT submission_native_id FROM assignments WHERE task_id=?)",
+    delegation_rows = [dict(r) for r in con.execute(
+        "SELECT * FROM delegations WHERE owning_user_message IN "
+        "(SELECT user_message_id FROM assignments WHERE task_id=?)",
         (task_id,))]
     owned_sessions = set(whole) | {r["session_key"] for r in con.execute(
-        "SELECT s.session_key FROM submissions s JOIN assignments a"
-        " ON a.submission_native_id=s.native_id WHERE a.task_id=?", (task_id,))}
+        "SELECT s.session_key FROM user_messages s JOIN assignments a"
+        " ON a.user_message_id=s.native_id WHERE a.task_id=?", (task_id,))}
 
-    def worker_session(identity):
+    def child_session(identity):
         exact = con.execute("SELECT session_key FROM sessions WHERE session_key=?",
                             (identity,)).fetchone()
         if exact:
@@ -493,23 +493,23 @@ def task_report(con: sqlite3.Connection, task_id: str,
                               (identity,)).fetchall()
         return matches[0]["session_key"] if len(matches) == 1 else None
 
-    unbound_dispatches = sorted({d["worker_thread"] for d in dispatches_rows
-                                 if worker_session(d["worker_thread"]) not in owned_sessions})
+    unbound_delegations = sorted({d["child_thread"] for d in delegation_rows
+                                 if child_session(d["child_thread"]) not in owned_sessions})
     missing_sessions = sorted(key for key in scope_keys if not con.execute(
         "SELECT 1 FROM sessions WHERE session_key=?", (key,)).fetchone())
     empty_sessions = sorted(key for key in scope_keys if key not in missing_sessions
                             and not con.execute("SELECT 1 FROM responses WHERE session_key=?",
                                                 (key,)).fetchone())
-    unbound_workers = sorted({a["session_key"] for a in attempts_rows
+    unbound_children = sorted({a["session_key"] for a in task_turn_rows
                               if a.get("harness") == "router" and a.get("session_key")
                               and a["session_key"] not in whole})
     unavailable_usage = bool(not scope_keys or missing_sessions or empty_sessions
-                             or unbound_workers or unbound_dispatches or whole_conflicts)
+                             or unbound_children or unbound_delegations or whole_conflicts)
     cutoff = _source_cutoff(con, scope_keys)
     task_turns = _task_turn_ids(con, task_id, turn_sub, whole)
     diagnostics = _task_diagnostics(con, scope_keys, whole, task_turns)
     phases, activity_context = _phase_report(con, task_id, attributed, set(whole)-whole_shared,
-                                             attempts_rows, schedule)
+                                             task_turn_rows, schedule)
 
     def _resp_tuple(r) -> list:
         return [r.get("response_id"), r.get("harness"), r.get("model"),
@@ -528,8 +528,8 @@ def task_report(con: sqlite3.Connection, task_id: str,
                               "joint": joint, "whole_shared": sorted(whole_shared),
                               "missing_sessions": missing_sessions,
                               "empty_sessions": empty_sessions,
-                              "unbound_workers": unbound_workers,
-                              "unbound_dispatches": unbound_dispatches},
+                              "unbound_children": unbound_children,
+                              "unbound_delegations": unbound_delegations},
         "task_id": task_id,
         "sessions": sorted(scope_keys),
         "attributed": sorted(_resp_tuple(r) for r in attributed),
@@ -538,15 +538,15 @@ def task_report(con: sqlite3.Connection, task_id: str,
         "unplaced": sorted(_resp_tuple(r) for r in unplaced),
         "elsewhere": sorted(_resp_tuple(r) for r in elsewhere),
         "assignments": sorted(
-            [a["submission_native_id"], a["task_id"], a["shared"]]
+            [a["user_message_id"], a["task_id"], a["shared"]]
             for a in con.execute(
-                "SELECT submission_native_id, task_id, shared FROM assignments"
+                "SELECT user_message_id, task_id, shared FROM assignments"
                 " WHERE task_id=?", (task_id,))),
         "outcome": outcome_row,
-        "attempts": sorted(
-            [a.get("turn_id"), a.get("role"), a.get("state")] for a in attempts_rows),
-        "dispatches": sorted(
-            [d.get("owning_submission"), d.get("worker_thread")] for d in dispatches_rows),
+        "task_turns": sorted(
+            [a.get("turn_id"), a.get("role"), a.get("state")] for a in task_turn_rows),
+        "delegations": sorted(
+            [d.get("owning_user_message"), d.get("child_thread")] for d in delegation_rows),
         "source_cutoff": cutoff,
     }
     snapshot = _snapshot_id(snapshot_payload)
@@ -566,7 +566,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
     acceptance = (outcome_row or {}).get("acceptance_state") or "unknown"
     # Acceptance is explicit only: process success, zero exit or a
     # successful attempt never implies an accepted outcome.
-    active_attempts = [a for a in attempts_rows if a.get("state") == "active"]
+    active_task_turns = [a for a in task_turn_rows if a.get("state") == "active"]
     report = {
         "task": dict(task),
         "attributed": total(attributed),
@@ -593,10 +593,10 @@ def task_report(con: sqlite3.Connection, task_id: str,
         "crashes_counted_separately": crashes,
         "outcome": outcome_row,
         "acceptance_state": acceptance,
-        "attempts": attempts_rows,
-        "dispatches": dispatches_rows,
-        "active_attempts": active_attempts,
-        "has_active_work": bool(active_attempts) or acceptance == "active",
+        "task_turns": task_turn_rows,
+        "delegations": delegation_rows,
+        "active_task_turns": active_task_turns,
+        "has_active_work": bool(active_task_turns) or acceptance == "active",
         "snapshot_id": snapshot,
         "price_schedule_id": _snapshot_id(schedule),
         "price_schedule": schedule,
@@ -633,8 +633,8 @@ def task_report(con: sqlite3.Connection, task_id: str,
             "conflicting_sessions": sorted(whole_conflicts),
             "missing_sessions": missing_sessions,
             "sessions_without_usage": empty_sessions,
-            "unbound_worker_sessions": unbound_workers,
-            "unbound_dispatches": unbound_dispatches,
+            "unbound_child_sessions": unbound_children,
+            "unbound_delegations": unbound_delegations,
             "missing": list(missing_submissions),
             "conflicting": [c["submission"] for c in [
                 {"submission": s, **j} for s, j in joint.items()
@@ -642,7 +642,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
             "joint": [c["submission"] for c in [
                 {"submission": s, **j} for s, j in joint.items()
                 if j["all_shared"] and s in bound_subs]],
-            "active_attempts": [a.get("turn_id") for a in active_attempts],
+            "active_task_turns": [a.get("turn_id") for a in active_task_turns],
             "crashes": crashes,
         },
     }
@@ -737,8 +737,8 @@ def _total_cost(con, task_id, estimate, attributed, shared, joint,
             seen_sessions.add(key)
             for row in con.execute(
                     "SELECT task_id FROM session_assignments WHERE session_key=?"
-                    " UNION SELECT a.task_id FROM assignments a JOIN submissions s"
-                    " ON a.submission_native_id=s.native_id WHERE s.session_key=?"
+                    " UNION SELECT a.task_id FROM assignments a JOIN user_messages s"
+                    " ON a.user_message_id=s.native_id WHERE s.session_key=?"
                     " AND ? IN (SELECT session_key FROM session_assignments)",
                     (key, key, key)):
                 others.add(row["task_id"])
@@ -769,8 +769,8 @@ def timeline(con: sqlite3.Connection, task_id: str | None = None,
     turn_sub = _turn_submission(con)
     task_turns: set[str] | None = None
     if task_id is not None:
-        bound = {a["submission_native_id"] for a in con.execute(
-            "SELECT submission_native_id FROM assignments WHERE task_id=?",
+        bound = {a["user_message_id"] for a in con.execute(
+            "SELECT user_message_id FROM assignments WHERE task_id=?",
             (task_id,))}
         task_turns = {t for t, s in turn_sub.items() if s in bound}
     q = "SELECT * FROM events WHERE 1=1"

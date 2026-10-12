@@ -39,7 +39,7 @@ def add_session(con, harness, native_id, tokens, model="fixture-model",
         (f"{key}:r1", source_id, harness, key, 1, model, semantics,
          tokens, 0, 10, 0, tokens + 10))
     con.execute(
-        "INSERT INTO submissions(native_id, source_id, session_key, kind,"
+        "INSERT INTO user_messages(native_id, source_id, session_key, kind,"
         " text_hash, text_excerpt, is_genuine) VALUES(?,?,?,?,?,?,?)",
         (f"{key}:s1", source_id, key, "genuine", "abc", "secret prompt", 1))
     return key
@@ -402,10 +402,10 @@ class CliTest(LedgerCase):
 
 
 # Cross-machine recurrence (#59 review, after #61): each machine judges its
-# own moments; the fleet report combines judge groups without moment text.
+# own interventions; the fleet report combines judge groups without intervention text.
 from agent_observer import verdicts  # noqa: E402
 from agent_observer.adapters import claude  # noqa: E402
-from tests.test_moments import _line, _write  # noqa: E402
+from tests.test_interventions import _line, _write  # noqa: E402
 
 JUDGE = "opus-5.5/correction-v1"
 PROBLEM = "Deleted files without asking"
@@ -426,10 +426,10 @@ class FleetRecurrenceTest(LedgerCase):
         claude.sync(con, root=root)
         con.commit()
         verdicts.add(con, [
-            {"moment": f"sub:claude:{session}-u2", "behavior": "correction",
+            {"intervention": f"sub:claude:{session}-u2", "behavior": "correction",
              "judge": judge, "verdict": "yes", "problem": PROBLEM,
              "group": group},
-            {"moment": f"sub:claude:{session}-u1", "behavior": "correction",
+            {"intervention": f"sub:claude:{session}-u1", "behavior": "correction",
              "judge": judge, "verdict": "no"}])
         local = verdicts.recurrence(con, "correction")
         self.assertEqual((local["occurrences"], local["recurring_problems"]),
@@ -456,11 +456,11 @@ class FleetRecurrenceTest(LedgerCase):
         [group] = judged["groups"]
         self.assertEqual(group["group"], "destructive")
         self.assertEqual(group["problem"], PROBLEM)
-        self.assertEqual(group["by_origin"], {"human": 2})
+        self.assertEqual(group["by_created_by"], {"user": 2})
         self.assertEqual(group["sessions"], 2)
         self.assertEqual(group["machines"], ["bestia", "rocky"])
-        self.assertEqual(judged["coverage"]["judged_by_origin"]["human"], 4)
-        self.assertEqual(result["moments"]["by_origin"]["human"], 4)
+        self.assertEqual(judged["coverage"]["judged_by_created_by"]["user"], 4)
+        self.assertEqual(result["interventions"]["by_created_by"]["user"], 4)
         self.assertIn("destructive", fleet.render(result))
 
     def test_a_session_on_two_machines_counts_once(self):
@@ -473,14 +473,14 @@ class FleetRecurrenceTest(LedgerCase):
         [judged] = result["recurrence"]
         self.assertEqual((judged["occurrences"], judged["recurring_problems"]),
                          (1, 0))
-        self.assertEqual(result["moments"], alone["moments"])
-        self.assertEqual(result["moments"]["by_origin"]["human"], 2)
-        self.assertEqual(result["moments"]["by_kind"]["prompt"], 2)
+        self.assertEqual(result["interventions"], alone["interventions"])
+        self.assertEqual(result["interventions"]["by_created_by"]["user"], 2)
+        self.assertEqual(result["interventions"]["by_kind"]["prompt"], 2)
         self.assertEqual(judged["coverage"],
                          alone["recurrence"][0]["coverage"])
         self.assertEqual(judged["coverage"]["verdicts"],
                          {"yes": 1, "no": 1, "unclear": 0})
-        self.assertEqual(judged["coverage"]["judged_by_origin"]["human"], 2)
+        self.assertEqual(judged["coverage"]["judged_by_created_by"]["user"], 2)
 
     def test_different_judges_are_reported_apart_and_flagged(self):
         rocky = self.machine("rocky", "sess-r")
@@ -503,7 +503,7 @@ class FleetRecurrenceTest(LedgerCase):
         with self.assertRaises(ValueError):
             fleet.validate(bad)
         bad = json.loads(json.dumps(doc))
-        bad["judgments"][0]["groups"][0]["moments"][0]["origin"] = "robot"
+        bad["judgments"][0]["groups"][0]["interventions"][0]["created_by"] = "robot"
         with self.assertRaises(ValueError):
             fleet.validate(bad)
         for field in ("behavior", "judge"):
@@ -515,3 +515,53 @@ class FleetRecurrenceTest(LedgerCase):
         bad["judgments"][0]["groups"][0]["group"] += "\n"
         with self.assertRaises(ValueError):
             fleet.validate(bad)
+
+
+def to_schema_1(doc):
+    """The same evidence as a schema-2 machine (Observer 0.15.x) exported it."""
+    old = json.loads(json.dumps(doc))
+    old["schema"] = "agent-observer.fleet-export/1"
+    rename = {"user": "human"}
+
+    def counts(parts):
+        out = {}
+        for part, c in parts.items():
+            key = {"by_created_by": "by_origin",
+                   "judged_by_created_by": "judged_by_origin"}.get(part, part)
+            out[key] = {rename.get(k, k): v for k, v in c.items()}
+        return out
+    if "interventions" in old:
+        old["moments"] = {"sessions": {k: counts(v) for k, v in
+                                       old.pop("interventions")["sessions"].items()}}
+    for j in old.get("judgments", []):
+        j["sessions"] = {k: counts(v) for k, v in j["sessions"].items()}
+        for g in j["groups"]:
+            g["moments"] = [{"id": p["id"], "session": p["session"],
+                             "origin": rename.get(p["created_by"], p["created_by"]),
+                             "at": p["at"]} for p in g.pop("interventions")]
+        j["ungrouped"] = [{"id": p["id"], "session": p["session"],
+                           "origin": rename.get(p["created_by"], p["created_by"]),
+                           "at": p["at"]} for p in j["ungrouped"]]
+    return old
+
+
+class SchemaSwitchTest(FleetRecurrenceTest):
+    """During the switch some machines still export schema 1 (#65)."""
+
+    def test_exports_carry_the_new_schema(self):
+        doc = self.machine("rocky", "sess-r")
+        self.assertEqual(doc["schema"], "agent-observer.fleet-export/2")
+        self.assertIn("interventions", doc)
+
+    def test_a_schema_1_export_combines_like_its_schema_2_twin(self):
+        rocky = self.machine("rocky", "sess-r")
+        bestia = self.machine("bestia", "sess-b")
+        new = fleet.combine([rocky, bestia])
+        mixed = fleet.combine([rocky, to_schema_1(bestia)])
+        for key in ("interventions", "recurrence", "unmerged_behaviors"):
+            self.assertEqual(mixed[key], new[key], key)
+        old = to_schema_1(rocky)
+        self.assertNotIn("interventions", json.dumps(old))
+        stored = fleet._schema_only(fleet.validate(old))
+        self.assertEqual(stored["schema"], "agent-observer.fleet-export/2")
+        self.assertEqual(stored["judgments"], rocky["judgments"])

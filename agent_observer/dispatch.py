@@ -223,7 +223,7 @@ def thread_sessions(con: sqlite3.Connection, thread_id: str) -> set:
             keys.add(row["session_key"])
     try:
         for row in con.execute(
-                "SELECT DISTINCT s.session_key FROM submissions s"
+                "SELECT DISTINCT s.session_key FROM user_messages s"
                 " JOIN t3_turn_origins o ON s.native_id='claude:' || o.message_id"
                 " WHERE o.thread_id=?", (thread_id,)):
             keys.add(row["session_key"])
