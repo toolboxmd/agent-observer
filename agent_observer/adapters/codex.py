@@ -378,11 +378,11 @@ def _move_rows(con: sqlite3.Connection, source_id: int, old: str, new: str,
     Without `copies`, the rows of a fork's own records (native ordinal at
     or after `start`) move from the parent's key to the fork's. With
     `copies`, the rows of the history the fork copied (before `start`)
-    leave the fork's key: events and fallback usage snapshots are dropped,
-    because the parent's own rollout holds its events and usage; rows with
-    a global id (responses, user messages) go to the parent, which a
-    re-read cannot otherwise restore. Rows `new` already holds are dropped
-    as duplicates. Fallback snapshots carry their session key in their id
+    move from the fork's key to the parent's. A re-read never imports
+    copied records again, so a copy may be the ledger's only evidence of
+    the parent's work: rows are moved, never dropped, unless `new`
+    already holds the same row (same event, or the same fallback usage
+    total). Fallback snapshots carry their session key in their id
     ("<key>:tc:<total>") and are renamed with it. Overlap flags of both
     sessions are reset for the caller to recompute. Returns whether
     anything changed.
@@ -393,19 +393,19 @@ def _move_rows(con: sqlite3.Connection, source_id: int, old: str, new: str,
         rows += " AND ordinal_num < ?" if copies else " AND ordinal_num >= ?"
         args.append(start)
     moved = 0
-    if not copies:
-        moved += con.execute(
-            f"UPDATE OR IGNORE events SET session_key=? WHERE {rows}",
-            [new] + args).rowcount
+    moved += con.execute(
+        f"UPDATE OR IGNORE events SET session_key=? WHERE {rows}",
+        [new] + args).rowcount
+    # Left behind only when `new` holds the same event.
     moved += con.execute(f"DELETE FROM events WHERE {rows}", args).rowcount
     prefix = old + ":tc:"
     fallback = f"{rows} AND substr(response_id, 1, ?) = ?"
-    if not copies:
-        moved += con.execute(
-            "UPDATE OR IGNORE responses SET session_key=?, response_id=?"
-            f" || substr(response_id, ?) WHERE {fallback}",
-            [new, new + ":tc:", len(prefix) + 1] + args
-            + [len(prefix), prefix]).rowcount
+    moved += con.execute(
+        "UPDATE OR IGNORE responses SET session_key=?, response_id=?"
+        f" || substr(response_id, ?) WHERE {fallback}",
+        [new, new + ":tc:", len(prefix) + 1] + args
+        + [len(prefix), prefix]).rowcount
+    # Left behind only when `new` holds a snapshot at the same total.
     moved += con.execute(f"DELETE FROM responses WHERE {fallback}",
                          args + [len(prefix), prefix]).rowcount
     for table in ("responses", "user_messages"):
@@ -427,14 +427,7 @@ def _move_rows(con: sqlite3.Connection, source_id: int, old: str, new: str,
         f" AND turn_id IN ({used.format(k=':new')})"
         f" AND turn_id NOT IN ({used.format(k=':old')})",
         {"new": new, "old": old, "src": source_id})
-    # First-seen fallback signatures that moved or went with their
-    # snapshots.
-    if copies:
-        con.execute(
-            f"DELETE FROM {_CUMULATIVE_TABLE} WHERE session_key=?"
-            " AND thread_total NOT IN (SELECT thread_total_tokens"
-            " FROM responses WHERE session_key=?"
-            " AND thread_total_tokens IS NOT NULL)", (old, old))
+    # First-seen fallback signatures that moved with their snapshots.
     con.execute(
         f"DELETE FROM {_CUMULATIVE_TABLE} WHERE session_key=?"
         " AND thread_total IN (SELECT thread_total_tokens FROM responses"

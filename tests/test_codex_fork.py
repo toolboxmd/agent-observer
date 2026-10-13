@@ -52,6 +52,9 @@ def _parent_history(turn="turn-p1"):
             "thread_id": PARENT, "turn_id": turn, "root_turn_id": turn,
             "usage": _usage(1000), "turn_token_usage": _usage(1000),
             "thread_token_usage": _usage(1000)}},
+        {"type": "event_msg", "payload": {"type": "token_count", "info": {
+            "last_token_usage": _usage(900),
+            "total_token_usage": _usage(1900)}}},
         {"type": "event_msg", "payload": {"type": "task_complete",
                                           "turn_id": turn}},
     ]
@@ -150,7 +153,8 @@ class ForkedRolloutTest(unittest.TestCase):
             ("codex:resp-c1", f"codex:{CHILD}", 500, 0),
             ("codex:resp-p1", f"codex:{PARENT}", 1000, 0),
             (f"codex:{CHILD}:tc:1200", f"codex:{CHILD}", 400, 0),
-            (f"codex:{CHILD}:tc:800", f"codex:{CHILD}", 300, 0)])
+            (f"codex:{CHILD}:tc:800", f"codex:{CHILD}", 300, 0),
+            (f"codex:{PARENT}:tc:1900", f"codex:{PARENT}", 900, 0)])
         by_key = {}
         for key, _family, native in snap["events"]:
             by_key.setdefault(key, set()).add(native)
@@ -284,6 +288,52 @@ class SingleMetaForkTest(ForkedRolloutTest):
         for path in (self.parent, self.child):
             import_codex_file(merged, path, full=True)
         self.assertEqual(self.snapshot(merged), expected)
+
+    def test_repair_keeps_copies_when_the_parent_rollout_is_missing(self):
+        # 1.0.1 imported the copied history into the child; the parent's
+        # rollout is gone, so that copy is the ledger's only evidence of
+        # the parent's events and usage. A re-read must not delete it.
+        merged = self.ledger("orphan.db")
+        self.write_child(None)
+        import_codex_file(merged, self.child)
+        before = {
+            "events": sorted(r[0] for r in merged.execute(
+                "SELECT native_id FROM events")),
+            "responses": sorted(r[0] for r in merged.execute(
+                "SELECT total_tokens FROM responses")),
+            "user_messages": merged.execute(
+                "SELECT COUNT(*) FROM user_messages").fetchone()[0],
+        }
+        self.assertIn("exec-p1", before["events"])
+
+        self.write_child(self.start)
+        import_codex_file(merged, self.child, full=True)
+        after = {
+            "events": sorted(r[0] for r in merged.execute(
+                "SELECT native_id FROM events")),
+            "responses": sorted(r[0] for r in merged.execute(
+                "SELECT total_tokens FROM responses")),
+            "user_messages": merged.execute(
+                "SELECT COUNT(*) FROM user_messages").fetchone()[0],
+        }
+        self.assertEqual(after["events"], before["events"])
+        self.assertEqual(after["user_messages"], before["user_messages"])
+        # Nothing is lost; the child also regains its own snapshots that
+        # 1.0.1 skipped below the copied parent total.
+        self.assertEqual(sorted(set(after["responses"])
+                                - set(before["responses"])), [300, 400])
+        self.assertLessEqual(set(before["responses"]),
+                             set(after["responses"]))
+        # The copies now sit with the parent, not the child.
+        owners = dict(merged.execute(
+            "SELECT native_id, session_key FROM events"
+            " WHERE native_id IN ('exec-p1', 'exec-c1')"))
+        self.assertEqual(owners, {"exec-p1": f"codex:{PARENT}",
+                                  "exec-c1": f"codex:{CHILD}"})
+        self.assertEqual(
+            merged.execute("SELECT session_key FROM responses"
+                           " WHERE total_tokens=900").fetchone()[0],
+            f"codex:{PARENT}")
 
 
 if __name__ == "__main__":
