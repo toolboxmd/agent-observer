@@ -360,9 +360,10 @@ not represent subscription spending or an invoice; native reported cost is
 shown separately. Provider source URLs travel with each model's estimate.
 
 Coordinators and dispatchers reuse `task show --task T-42 --json`; no Router
-price table is needed. Task inspection and publication open an existing ledger
-read-only, using one consistent database snapshot. Run `sync` first to create or
-upgrade the ledger; reporting never migrates it. A strict read-only sandbox may
+price table is needed. Every command except `sync`, `capture`, `verdict add`
+and `session-attr add` opens an existing ledger read-only, using one consistent
+database snapshot, so reports and lookups never wait for a running `sync`. Run
+`sync` first to create or upgrade the ledger; reporting never migrates it. A strict read-only sandbox may
 also prevent SQLite from opening a WAL ledger whose sidecars are absent. In
 that case the coordinator exports the report and hands its saved JSON to the
 dispatcher; do not relax permissions or bypass SQLite locking. Save that JSON
