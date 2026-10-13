@@ -12,7 +12,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 from agent_observer import cli, db
@@ -168,6 +168,113 @@ class IdleLedgerTest(unittest.TestCase):
         con.close()
         with self.assertRaises(RuntimeError):
             db.connect_read_only(self.path)
+
+
+class LookupsDoNotWriteTest(unittest.TestCase):
+    """Lookups read the ledger without the write lock (#71, #73).
+
+    Opening lookups read-write ran init_db, which writes schema_meta, so
+    every lookup needed the write lock and failed with "database is locked"
+    while sync held it.
+    """
+
+    LOOKUPS = (
+        ("trace", "--session", "codex:mini-session", "--json"),
+        ("interventions", "--json"),
+        ("intervention", "show", "codex:none", "--json"),
+        ("sessions", "list", "--json"),
+        ("sessions", "show", "--session", "codex:mini-session"),
+        ("verdict", "list", "--behavior", "b", "--json"),
+        ("verdict", "groups", "--behavior", "b", "--json"),
+        ("recurrence", "--behavior", "b", "--json"),
+        ("diagnose", "--json"),
+        ("compare", "--json"),
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = os.path.join(self.tmp.name, "ledger")
+        os.mkdir(self.dir)
+        self.path = os.path.join(self.dir, "observer.db")
+        mini = os.path.join(os.path.dirname(__file__), "fixtures",
+                            "codex-mini.jsonl")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["--db", self.path, "sync", "--source",
+                                       mini, "--harness", "codex"]), 0)
+        con = sqlite3.connect(self.path)
+        self.session = con.execute(
+            "SELECT session_key FROM sessions").fetchone()[0]
+        con.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def lookups(self):
+        for argv in self.LOOKUPS:
+            yield tuple(self.session if a == "codex:mini-session" else a
+                        for a in argv)
+
+    def run_cli(self, path, argv):
+        with redirect_stdout(io.StringIO()):
+            return cli.main(["--db", path, *argv])
+
+    def state(self):
+        # A reader may recreate SQLite's -shm index and an empty -wal, as
+        # any concurrent reader does; neither holds ledger content.
+        state = {}
+        for name in sorted(os.listdir(self.dir)):
+            path = os.path.join(self.dir, name)
+            if name.endswith("-shm"):
+                continue
+            if name.endswith("-wal"):
+                self.assertEqual(os.path.getsize(path), 0)
+                continue
+            state[name] = (_digest(path), os.stat(path).st_mode)
+        return state
+
+    def test_lookups_leave_the_ledger_unchanged(self):
+        before = self.state()
+        for argv in self.lookups():
+            with self.subTest(argv=argv):
+                self.assertIn(self.run_cli(self.path, argv), (0, 3))
+                self.assertEqual(self.state(), before)
+
+    def test_lookups_succeed_while_a_writer_holds_the_lock(self):
+        writer = sqlite3.connect(self.path, isolation_level=None)
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("INSERT INTO tasks(task_id, created_at)"
+                       " VALUES('held', 1)")
+        try:
+            for argv in self.lookups():
+                with self.subTest(argv=argv), \
+                        mock.patch("agent_observer.db.sqlite3.connect",
+                                   _without_busy_wait):
+                    self.assertIn(self.run_cli(self.path, argv), (0, 3))
+        finally:
+            writer.execute("ROLLBACK")
+            writer.close()
+
+    def test_lookups_never_create_a_ledger(self):
+        absent = os.path.join(self.dir, "absent.db")
+        for argv in self.lookups():
+            with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
+                self.assertEqual(self.run_cli(absent, argv), 2)
+                self.assertFalse(os.path.exists(absent))
+
+    def test_capabilities_need_no_ledger(self):
+        absent = os.path.join(self.dir, "absent.db")
+        self.assertEqual(self.run_cli(absent, ("trace", "--capabilities")), 0)
+        self.assertFalse(os.path.exists(absent))
+
+
+_real_connect = sqlite3.connect
+
+
+def _without_busy_wait(*args, **kwargs):
+    # A lookup that waits on the lock would block for the default 5 s and
+    # then fail; with no wait it fails at once, so the test stays fast.
+    kwargs["timeout"] = 0
+    return _real_connect(*args, **kwargs)
 
 
 if __name__ == "__main__":

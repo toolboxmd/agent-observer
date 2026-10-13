@@ -458,8 +458,14 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-READ_ONLY = ("task", "publish", "claims", "thread-misuse", "delegation-modes",
-             "event", "export", "fleet")
+# Only these commands write the ledger; every other command opens it
+# read-only, so lookups never take the write lock or create a ledger (#73).
+WRITERS = ("sync", "capture", "session-attr")
+
+
+def _writes(ns) -> bool:
+    return ns.cmd in WRITERS or (ns.cmd, getattr(ns, "op", None)) == (
+        "verdict", "add")
 
 
 # Schema-2 command names, accepted for one release (#65).
@@ -476,12 +482,17 @@ def main(argv=None) -> int:
         ns.op = OP_ALIASES[ns.op]
     if ns.cmd == "fleet" and ns.op == "pull":
         return _fleet_pull(ns)
+    if ns.cmd == "health":
+        return _health_check(ns)
+    if ns.cmd == "trace" and ns.capabilities:
+        return _capabilities(ns)
+    read_only = not _writes(ns)
     try:
-        con = _db.connect_read_only(ns.db) if ns.cmd in READ_ONLY else _con(ns.db)
+        con = _db.connect_read_only(ns.db) if read_only else _con(ns.db)
     except (RuntimeError, sqlite3.Error) as exc:
         print(str(exc), file=sys.stderr)
-        if ns.cmd in READ_ONLY:
-            print("Task reports, claim audits and event lookups require an existing ledger; run agent-observer sync first.", file=sys.stderr)
+        if read_only:
+            print("Reports and lookups require an existing ledger; run agent-observer sync first.", file=sys.stderr)
             if os.path.exists(ns.db):
                 print("If a read-only sandbox prevents access, consume a coordinator-exported task JSON instead.", file=sys.stderr)
         return 2
@@ -501,19 +512,6 @@ def main(argv=None) -> int:
         if ns.cmd in ("interventions", "intervention", "verdict", "recurrence",
                       "session-attr"):
             return _judge(con, ns)
-
-        if ns.cmd == "health":
-            from . import health as _health
-            result = _health.check()
-            if ns.as_json:
-                _emit(result, True)
-            else:
-                print(f"checked {result['checked']['claude_sessions']} Claude sessions and "
-                      f"{result['checked']['processes']} agent processes: "
-                      f"{len(result['findings'])} invisible")
-                for f in result["findings"]:
-                    print(f"- {f['host']} pid {f['pid']} in {f['cwd']}: {f['problem']}. Fix: {f['fix']}")
-            return 4 if result["findings"] else 0
 
         if ns.cmd == "capture":
             return _capture(con, ns)
@@ -610,16 +608,6 @@ def main(argv=None) -> int:
             return _fleet_report(con, ns)
 
         if ns.cmd == "trace":
-            if ns.capabilities:
-                caps = {"capabilities": _report.capabilities(),
-                        "contract": {"event": EVENT_CONTRACT_VERSION}}
-                if ns.as_json:
-                    print(json.dumps(caps, indent=2, sort_keys=True))
-                else:
-                    for c in caps["capabilities"]:
-                        mark = "yes" if c["supported"] else "no "
-                        print(f"{mark} {c['family']}: {c['detail']}")
-                return 0
             tl = _report.timeline(con, task_id=ns.task, turn_id=ns.turn,
                                  family=ns.family, limit=ns.limit,
                                  session_key=ns.session)
@@ -634,6 +622,32 @@ def main(argv=None) -> int:
     finally:
         con.close()
     return 2
+
+
+def _health_check(ns) -> int:
+    from . import health as _health
+    result = _health.check()
+    if ns.as_json:
+        _emit(result, True)
+    else:
+        print(f"checked {result['checked']['claude_sessions']} Claude sessions and "
+              f"{result['checked']['processes']} agent processes: "
+              f"{len(result['findings'])} invisible")
+        for f in result["findings"]:
+            print(f"- {f['host']} pid {f['pid']} in {f['cwd']}: {f['problem']}. Fix: {f['fix']}")
+    return 4 if result["findings"] else 0
+
+
+def _capabilities(ns) -> int:
+    caps = {"capabilities": _report.capabilities(),
+            "contract": {"event": EVENT_CONTRACT_VERSION}}
+    if ns.as_json:
+        print(json.dumps(caps, indent=2, sort_keys=True))
+    else:
+        for c in caps["capabilities"]:
+            mark = "yes" if c["supported"] else "no "
+            print(f"{mark} {c['family']}: {c['detail']}")
+    return 0
 
 
 def _fleet_pull(ns) -> int:

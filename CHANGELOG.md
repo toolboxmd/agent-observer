@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.2] - 2026-10-13
+
+### Changed
+
+- Lookups (trace, interventions, intervention show, sessions, verdict list and groups, recurrence, diagnose, compare) open the ledger read-only, so they never take the write lock, never fail with 'database is locked' while sync writes, and never create or migrate a ledger (#71, #73)
+
 ## [1.0.1] - 2026-10-13
 
 ### Changed
