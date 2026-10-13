@@ -1,23 +1,66 @@
-# Glossary
+# Agent Observer Glossary
 
-- Submission: one genuine user-authored request inside a harness session.
-- Assignment: explicit binding of one submission to one task.
-- Dispatch: recorded edge from an owning submission to a worker thread.
-- Attempt: one observed turn toward a task with role, route, and outcome.
-- Response: one atomic model usage record keyed by native response ID.
-- Checkpoint: cumulative counter snapshot; stored but never summed.
-- Joint response: one atomic response that serves several tasks; kept whole.
-- Scope: the selected set of responses a total is computed over.
-- Coverage: statement of which event families native evidence supports.
+Terms only Agent Observer uses. Terms shared across the user's system, such as
+task, harness, session, turn, machine, user message, created by, intervention,
+correction, policy denial and recurring problem, are defined once in
+Chromeria's system glossary,
+[`toolboxmd/chromeria` `GLOSSARY.md`](https://github.com/toolboxmd/chromeria/blob/main/GLOSSARY.md).
 
-- Task: an explicitly owned work outcome, spanning submissions, sessions and Router jobs.
-- List-price estimate: native usage valued at a dated provider API schedule, distinct from subscription spend.
-- Work phase: explicitly recorded purpose of a turn or dedicated execution, independent of reasoning and tool activity; mixed or unclassified when evidence cannot separate it.
+**Assignment**:
+An explicit binding of one user message to one task.
 
-- Moment: one point in a main session where a person acted (prompt, interrupt or rejection of a tool call), selected for an outside judge.
-- Origin: who acted at a moment (human, agent or unknown), from evidence only.
-- Policy denial: a tool call refused by a hook, a permission rule or auto mode; never a moment or a correction.
-- Verdict: an outside judge's yes, no or unclear on one moment for one behavior, with a problem line and group for yes.
-- Recurring problem: a verdict group whose yes verdicts span two or more sessions.
-- Machine export: one machine's aggregate document (session usage by model and counter semantics, task outcomes and session keys); never transcripts, prompts, titles or paths. _Avoid_: dump, backup.
-- Fleet report: machine exports combined, each session counted once, with missing machines and doubly reported sessions listed.
+**Delegation**:
+The recorded link from an owning user message to a child thread, with the
+requested model, effort and reason.
+_Avoid_: dispatch (the old command name, kept as an alias)
+
+**Task turn**:
+One observed turn toward a task, with its role (parent or child), Color and
+outcome.
+_Avoid_: attempt (the old command name, kept as an alias), run attempt
+
+**Response**:
+One atomic model usage record keyed by its native response id.
+
+**Usage snapshot**:
+A cumulative counter reading; stored but never summed.
+_Avoid_: checkpoint
+
+**Joint response**:
+One atomic response that serves several tasks; kept whole.
+
+**Scope**:
+The selected set of responses a total is computed over.
+
+**Coverage**:
+Which event families a harness's native evidence supports.
+
+**List-price estimate**:
+Native usage valued at a model vendor's dated API price list, distinct from
+subscription spend.
+
+**Work phase**:
+The explicitly recorded purpose of a turn or dedicated execution, independent
+of reasoning and tool activity; mixed or unclassified when evidence cannot
+separate it.
+
+**Verdict**:
+An outside judge's yes, no or unclear on one intervention for one behavior,
+with a problem line and group for yes.
+
+**Machine export**:
+One machine's aggregate document: session usage by model and counter
+semantics, task outcomes and session keys; never transcripts, prompts, titles
+or paths.
+_Avoid_: dump, backup
+
+**Fleet report**:
+Machine exports combined, each session counted once, with missing machines and
+doubly reported sessions listed.
+
+**Import source**:
+A harness id for records Agent Observer imports rather than reads from a
+session: `t3` is data from Chromeria (with `t3_*` tables and
+`tasks.origin = 't3'`), keeping T3's name because the stored format is T3's;
+`router` is jobs from the retired Model Router.
+_Avoid_: chromeria (as an id)
