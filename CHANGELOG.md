@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.1] - 2026-10-13
+
+### Changed
+
+- Glossary keeps Observer's own terms under the schema-3 names and points to Chromeria's system glossary; AGENTS.md lists connected projects (#66)
+
 ## [1.0.0] - 2026-10-12
 
 ### Changed
