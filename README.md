@@ -53,6 +53,17 @@ names another.
 | Grok Build | `~/.grok/sessions/*/*/` | per prompt completion |
 | Model Router | `DURABLE_RUNNER_STATE_DIR`, `~/.local/share/durable-runner`, and legacy `~/.local/state/model-router` (read-only, deduplicated) | explicit task ownership, jobs and invocations |
 
+Each Codex thread is its own session, keyed by the `id` of its rollout's
+first `session_meta`; continuation files (`rollout-...-<id>_<segment>.jsonl`)
+join their thread's session. A forked child rollout (a subagent or a
+guardian review) starts with a copy of its parent's history up to
+`subagent_history_start_ordinal`, sometimes with the parent's
+`session_meta`. That copy is not imported again: the parent's own rollout
+holds it. The child links to its parent through `parent_session_key`.
+Ledgers synced before 1.1.1 filed some children under their parent and
+imported copied history into others; `sync --full --harness codex` moves
+those rows to their own session.
+
 Counter meanings differ by harness (cached input is part of input on Codex
 and Grok, separate on Claude Code and OpenCode). Each response keeps its
 native counters and its harness's own total; reports never add cache or

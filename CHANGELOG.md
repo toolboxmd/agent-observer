@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.1] - 2026-10-13
+
+### Changed
+
+- Each forked Codex child rollout is its own session, keyed by its first session_meta id and linked to its fork parent; the copied parent history stays with the parent, and sync --full --harness codex moves children out of the parent sessions they were merged into (#69)
+
 ## [1.1.0] - 2026-10-13
 
 ### Added

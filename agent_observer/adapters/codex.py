@@ -287,6 +287,7 @@ class _Reader:
         # plus streamed): the main-session gate fails closed on divergence.
         # Referenced worker threads (spawn targets) never enter this set.
         self.observed_threads: set = set()
+        self.own: _Own | None = None
         if isinstance(self.thread_id, str) and self.thread_id:
             self.observed_threads.add(self.thread_id)
 
@@ -318,7 +319,147 @@ class _Reader:
                      update=self.src.privacy_stale, **kw)
 
 
-def _prescan_thread_meta(path: str, start_offset: int) -> dict:
+class _Own:
+    """The rollout's own identity, from its first session_meta (#69).
+
+    A forked child rollout starts with its own session_meta, then a copy of
+    the parent's session_meta and the parent's history up to
+    subagent_history_start_ordinal (a native ordinal), then its own
+    records. The copied records belong to the session they came from, which
+    imports them from its own rollout.
+    """
+
+    def __init__(self, payload: dict):
+        self.thread = payload["id"]
+        self.session = payload.get("session_id") or payload["id"]
+        self.source = payload.get("thread_source")
+        start = payload.get("subagent_history_start_ordinal")
+        self.history_start = start if isinstance(start, int) \
+            and not isinstance(start, bool) else None
+        parent = payload.get("forked_from_id") or \
+            payload.get("parent_thread_id")
+        self.parent = parent if isinstance(parent, str) and parent \
+            and parent != self.thread else None
+
+    def inherited(self, obj: dict) -> bool:
+        """A record copied from another session into this rollout."""
+        payload = obj.get("payload")
+        if obj.get("type") == "session_meta" and isinstance(payload, dict):
+            return payload.get("id") != self.thread
+        ordinal = obj.get("ordinal")
+        return self.history_start is not None and isinstance(ordinal, int) \
+            and ordinal < self.history_start
+
+
+def _first_meta(path: str) -> "_Own | None":
+    """The first record's session_meta identity, or None."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.readline()
+    except OSError:
+        return None
+    if not raw.endswith(b"\n"):
+        return None
+    try:
+        obj = json.loads(raw.decode("utf-8", "replace"))
+    except json.JSONDecodeError:
+        return None
+    payload = obj.get("payload") if isinstance(obj, dict) else None
+    if obj.get("type") != "session_meta" or not isinstance(payload, dict) \
+            or not isinstance(payload.get("id"), str) or not payload["id"]:
+        return None
+    return _Own(payload)
+
+
+def _move_rows(con: sqlite3.Connection, source_id: int, old: str, new: str,
+               start: int | None, copies: bool) -> bool:
+    """Move one rollout's rows from session `old` to session `new` (#69).
+
+    Without `copies`, the rows of a fork's own records (native ordinal at
+    or after `start`) move from the parent's key to the fork's. With
+    `copies`, the rows of the history the fork copied (before `start`)
+    move from the fork's key to the parent's. A re-read never imports
+    copied records again, so a copy may be the ledger's only evidence of
+    the parent's work: rows are moved, never dropped, unless `new`
+    already holds the same row (same event, or the same fallback usage
+    total). Fallback snapshots carry their session key in their id
+    ("<key>:tc:<total>") and are renamed with it. Overlap flags of both
+    sessions are reset for the caller to recompute. Returns whether
+    anything changed.
+    """
+    rows = "source_id=? AND session_key=?"
+    args: list = [source_id, old]
+    if start is not None:
+        rows += " AND ordinal_num < ?" if copies else " AND ordinal_num >= ?"
+        args.append(start)
+    moved = 0
+    moved += con.execute(
+        f"UPDATE OR IGNORE events SET session_key=? WHERE {rows}",
+        [new] + args).rowcount
+    # Left behind only when `new` holds the same event.
+    moved += con.execute(f"DELETE FROM events WHERE {rows}", args).rowcount
+    prefix = old + ":tc:"
+    fallback = f"{rows} AND substr(response_id, 1, ?) = ?"
+    moved += con.execute(
+        "UPDATE OR IGNORE responses SET session_key=?, response_id=?"
+        f" || substr(response_id, ?) WHERE {fallback}",
+        [new, new + ":tc:", len(prefix) + 1] + args
+        + [len(prefix), prefix]).rowcount
+    # Left behind only when `new` holds a snapshot at the same total.
+    moved += con.execute(f"DELETE FROM responses WHERE {fallback}",
+                         args + [len(prefix), prefix]).rowcount
+    for table in ("responses", "user_messages"):
+        moved += con.execute(
+            f"UPDATE {table} SET session_key=? WHERE {rows}",
+            [new] + args).rowcount
+    if not moved:
+        return False
+    # A turn follows its rows when none of them stayed behind.
+    used = ("SELECT turn_id FROM events WHERE session_key={k}"
+            " AND turn_id IS NOT NULL"
+            " UNION SELECT turn_id FROM responses WHERE session_key={k}"
+            " AND turn_id IS NOT NULL"
+            " UNION SELECT turn_id FROM user_messages WHERE session_key={k}"
+            " AND turn_id IS NOT NULL")
+    con.execute(
+        "UPDATE turns SET session_key=:new WHERE source_id=:src"
+        " AND session_key=:old"
+        f" AND turn_id IN ({used.format(k=':new')})"
+        f" AND turn_id NOT IN ({used.format(k=':old')})",
+        {"new": new, "old": old, "src": source_id})
+    # First-seen fallback signatures that moved with their snapshots.
+    con.execute(
+        f"DELETE FROM {_CUMULATIVE_TABLE} WHERE session_key=?"
+        " AND thread_total IN (SELECT thread_total_tokens FROM responses"
+        " WHERE session_key=? AND source_id=? AND semantics=?)"
+        " AND thread_total NOT IN (SELECT thread_total_tokens FROM responses"
+        " WHERE session_key=? AND thread_total_tokens IS NOT NULL)",
+        (old, new, source_id, TOKEN_COUNT_SEMANTICS, old))
+    con.execute(
+        "UPDATE responses SET is_overlap=0 WHERE session_key IN (?, ?)"
+        " AND semantics=?", (old, new, TOKEN_COUNT_SEMANTICS))
+    return True
+
+
+def _settle(con: sqlite3.Connection, key: str, native_id: str,
+            lost_rows: bool) -> None:
+    """Another session after rows moved: its overlap flags and a row if it
+    had none; when rows left it, its end time from what remains."""
+    _reconcile_fallback(con, key)
+    db.upsert_session(con, key, HARNESS, native_id)
+    if not lost_rows:
+        return
+    con.execute(
+        "UPDATE sessions SET ended_at=(SELECT MAX(ts) FROM ("
+        " SELECT ts FROM events WHERE session_key=?1"
+        " UNION ALL SELECT ts FROM responses WHERE session_key=?1"
+        " UNION ALL SELECT ts FROM user_messages WHERE session_key=?1))"
+        " WHERE session_key=?1 AND EXISTS (SELECT 1 FROM events"
+        " WHERE session_key=?1)", (key,))
+
+
+def _prescan_thread_meta(path: str, start_offset: int,
+                         own: "_Own | None" = None) -> dict:
     """Own-thread identity in the not-yet-imported file portion.
 
     Reads complete lines from start_offset (the same framing as
@@ -354,6 +495,8 @@ def _prescan_thread_meta(path: str, start_offset: int) -> dict:
                     continue
                 payload = obj.get("payload")
                 if not isinstance(payload, dict):
+                    continue
+                if own is not None and own.inherited(obj):
                     continue
                 if obj.get("type") == "session_meta":
                     if first_session is None:
@@ -435,11 +578,38 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         return stats
     reader = _Reader(con, src, stats)
     _ensure_cumulative_table(con)
+    own = _first_meta(path)
+    settle: dict = {}
+    if own is not None:
+        stored = src.row["thread_id"]
+        reader.own = own
+        reader.thread_id = own.thread
+        reader.session_id = own.session
+        reader.thread_source = own.source or reader.thread_source
+        reader.observed_threads = {own.thread}
+        if isinstance(stored, str) and stored and stored != own.thread:
+            # Before #69 a fork was keyed by the copied parent session_meta.
+            old = f"{HARNESS}:{stored}"
+            if _move_rows(con, src.source_id, old, reader.session_key,
+                          own.history_start, copies=False):
+                settle[old] = (stored, True)
+            # The parent's row may point at this rollout as its source.
+            con.execute(
+                "UPDATE sessions SET source_id=(SELECT id FROM sources"
+                " WHERE harness=? AND thread_id=? AND id!=? ORDER BY id"
+                " LIMIT 1) WHERE session_key=? AND source_id=?",
+                (HARNESS, stored, src.source_id, old, src.source_id))
+        if own.history_start is not None and own.parent:
+            # Copied history an earlier import stored in this session.
+            parent = f"{HARNESS}:{own.parent}"
+            if _move_rows(con, src.source_id, reader.session_key, parent,
+                          own.history_start, copies=True):
+                settle.setdefault(parent, (own.parent, False))
     # Seed the rollout's own thread identity before any row is written, so
     # a genuine user message keeps its excerpt only when the whole new
     # portion (plus persisted metadata) already proves a human main
     # session, and the session key is stable from the first insert.
-    pre = _prescan_thread_meta(path, src.start_offset)
+    pre = _prescan_thread_meta(path, src.start_offset, own)
     if reader.session_id is None:
         reader.session_id = pre["session_id"]
     if reader.thread_id is None:
@@ -464,6 +634,9 @@ def import_codex_file(con: sqlite3.Connection, path: str,
             src.error(ordinal,
                       "malformed_json" if obj is None else "unknown_record",
                       line)
+            continue
+        if own is not None and own.inherited(obj):
+            stats["inherited"] = stats.get("inherited", 0) + 1
             continue
         try:
             _ingest_record(reader, obj, ordinal)
@@ -500,22 +673,31 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         # excerpts. Clearing needs no native text, only stores less. Stale
         # privacy-version re-imports already correct every row in place
         # above, so they skip this net.
+        # A fork's copied history (#69) belongs to another session.
+        own_part, own_args = "", []
+        if own is not None and own.history_start is not None:
+            own_part = " AND (ordinal_num IS NULL OR ordinal_num >= ?)"
+            own_args = [own.history_start]
         key_fix = con.execute(
             "UPDATE user_messages SET session_key=? WHERE source_id=?"
-            " AND session_key!=?",
-            (reader.session_key, src.source_id, reader.session_key))
+            " AND session_key!=?" + own_part,
+            [reader.session_key, src.source_id, reader.session_key]
+            + own_args)
         if key_fix.rowcount:
             stats["user_messages_updated"] = \
                 stats.get("user_messages_updated", 0) + key_fix.rowcount
         if not reader.is_main:
             cleared = con.execute(
                 "UPDATE user_messages SET text_excerpt='' WHERE source_id=?"
-                " AND text_excerpt!=''", (src.source_id,))
+                " AND text_excerpt!=''" + own_part,
+                [src.source_id] + own_args)
             if cleared.rowcount:
                 stats["user_messages_updated"] = \
                     stats.get("user_messages_updated", 0) + cleared.rowcount
     fields = {"started_at": reader.first_ts, "ended_at": reader.last_ts,
               **reader.meta, **reader.identity.fields(con)}
+    if own is not None and own.parent:
+        fields["parent_session_key"] = f"{HARNESS}:{own.parent}"
     db.upsert_session(con, reader.session_key, HARNESS,
                       reader.session_key.split(":", 1)[1], src.source_id,
                       **fields)
@@ -526,6 +708,10 @@ def import_codex_file(con: sqlite3.Connection, path: str,
     con.execute("UPDATE sources SET codex_context_version=2,codex_context_offset=?,"
                 "codex_model=?,codex_effort=? WHERE id=?",
                 (src.end_offset, reader.model, reader.effort, src.source_id))
+    for key, (native, lost_rows) in settle.items():
+        _settle(con, key, native, lost_rows)
+    if settle:
+        stats["moved_rows_with"] = sorted(settle)
     stats["session_key"] = reader.session_key
     con.commit()
     return stats
@@ -542,6 +728,8 @@ def _ingest_record(r: _Reader, obj: dict, ordinal: int) -> None:
         raise ValueError(f"unsupported payload shape for {rtype}: "
                          f"{type(payload).__name__}")
     if rtype == "session_meta":
+        if r.own is not None and payload.get("id") != r.own.thread:
+            return
         r.session_id = payload.get("session_id") or payload.get("id") or r.session_id
         r.thread_id = payload.get("id") or r.thread_id
         r.thread_source = payload.get("thread_source") or r.thread_source
@@ -578,7 +766,7 @@ def _ingest_record(r: _Reader, obj: dict, ordinal: int) -> None:
     # beyond source metadata; they stay private in the raw file.
 
 
-def _reconcile_fallback(r: _Reader) -> None:
+def _reconcile_fallback(con: sqlite3.Connection, session_key: str) -> None:
     """Mark only genuinely reconciled fallback usage snapshots as overlap.
 
     A legacy cumulative usage snapshot is covered when an authoritative
@@ -588,7 +776,7 @@ def _reconcile_fallback(r: _Reader) -> None:
     authoritative span stay counted, so partial transitions never undercount
     and no representation is ever counted twice. The rows stay as evidence.
     """
-    r.con.execute(
+    con.execute(
         "UPDATE responses SET is_overlap=1 WHERE session_key=?"
         " AND semantics=? AND is_overlap=0"
         " AND thread_total_tokens IS NOT NULL"
@@ -600,7 +788,7 @@ def _reconcile_fallback(r: _Reader) -> None:
         " AND auth.thread_total_tokens - auth.total_tokens"
         " < responses.thread_total_tokens"
         " AND responses.thread_total_tokens <= auth.thread_total_tokens)",
-        (r.session_key, TOKEN_COUNT_SEMANTICS, SEMANTICS))
+        (session_key, TOKEN_COUNT_SEMANTICS, SEMANTICS))
 
 
 def _cumulative_sig(total_raw: dict) -> tuple:
@@ -667,7 +855,10 @@ def _flush_token_counts(r: _Reader) -> None:
             "SELECT MAX(thread_total_tokens) t FROM responses"
             " WHERE session_key=? AND semantics=?",
             (r.session_key, TOKEN_COUNT_SEMANTICS)).fetchone()
-        previous = row["t"] or 0
+        # The ledger's highest total seeds only an incremental resume. A
+        # full re-read walks the whole file in order, as a fresh import
+        # does, so it also restores snapshots an earlier import skipped.
+        previous = (row["t"] or 0) if r.src.incremental else 0
         # First cumulative bucket per total seen in this import, in file
         # order. The map is seeded from the persisted first-seen
         # signatures of earlier imports, so an incremental suffix that
@@ -836,7 +1027,7 @@ def _flush_token_counts(r: _Reader) -> None:
         has_auth = True
     if not has_auth:
         return
-    _reconcile_fallback(r)
+    _reconcile_fallback(r.con, r.session_key)
 
 
 def _ingest_usage(r: _Reader, obj: dict) -> None:
