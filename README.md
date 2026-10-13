@@ -36,6 +36,7 @@ agent-observer health                        # live sessions Observer cannot see
 agent-observer claims --session claude:<id>  # final-report claims checked against tool calls
 agent-observer delegation-modes --since 2026-10-01  # planner delegation versus a dispatcher thread
 agent-observer event show <id> [<id> ...]    # full tool input, result and assistant text from the native log
+agent-observer event search wal checkpoint  # events and user messages containing every word, read-only
 ```
 
 Every command accepts `--json`. The ledger lives at
@@ -217,6 +218,28 @@ the part. Known secret shapes are redacted as in the ledger; heredoc
 bodies, patches and outputs are shown in full, so treat the output as
 private. Each source is parsed once per run: 1,000 live events across all
 four hosts took 4.4 seconds on rocky.
+
+## Event search
+
+`event search` finds events and user messages that contain every given
+word, case-insensitively, newest first. It searches what the ledger keeps:
+event names and targets (commands and paths), assistant excerpts and user
+message excerpts, all redacted at import. It reads no native log and never
+writes, so another machine can call it over SSH, for example to check
+whether a problem came back on every machine:
+
+```sh
+ssh cavallo agent-observer event search database locked --since 2026-10-01 --json
+```
+
+Filters: `--since`, `--until`, `--harness`, `--project` (the project
+directory contains it) and `--limit` (default 50). The JSON carries
+`machine`, `ledger_synced_at` (the newest import, so a caller knows how
+current the answer is), `total`, `truncated` and `matches`. Each match has
+`type` (`event` or `user_message`), `id` (the event id for `event show`, or
+the user message's native id), `at`, `session`, `project`, `family` and
+`anchor`, about 160 characters around the first matching word. No matches
+exit 0 with an empty list; a missing ledger or no words exits 2.
 
 ## Judge interventions
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.0] - 2026-10-13
+
+### Added
+
+- event search finds events and user messages by words in the local ledger, read-only and callable over SSH, with machine, ledger sync time, total and truncation so a remote judge can check recurrence on every machine (#70)
+
 ## [1.0.2] - 2026-10-13
 
 ### Changed

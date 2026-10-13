@@ -354,6 +354,14 @@ def build_parser() -> argparse.ArgumentParser:
     es.add_argument("--ids-from", default=None, metavar="FILE",
                     help="read event ids, one per line, from FILE or - for stdin")
     es.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
+    esr = evsub.add_parser("search", help="find events and user messages by words, read-only")
+    esr.add_argument("words", nargs="+", help="every word must appear, case-insensitively")
+    esr.add_argument("--since", default=None, help="ISO date or epoch seconds")
+    esr.add_argument("--until", default=None, help="ISO date or epoch seconds")
+    esr.add_argument("--harness", default=None)
+    esr.add_argument("--project", default=None, help="project directory contains this")
+    esr.add_argument("--limit", type=int, default=50)
+    esr.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
     def _intervention_scope(parser):
         parser.add_argument("--since", default=None, help="ISO date or epoch seconds")
         parser.add_argument("--until", default=None, help="ISO date or epoch seconds")
@@ -591,6 +599,8 @@ def main(argv=None) -> int:
                 print(_dispatch.render(payload))
             return 0
 
+        if ns.cmd == "event" and ns.op == "search":
+            return _event_search(con, ns)
         if ns.cmd == "event":
             return _event_show(con, ns)
 
@@ -695,6 +705,24 @@ def _fleet_report(con, ns) -> int:
         print(_fleet.render(result))
     # Missing machines and doubly reported sessions are visible failures.
     return 3 if result["missing"] or result["duplicate_sessions"] else 0
+
+
+def _event_search(con, ns) -> int:
+    from . import fleet as _fleet
+    from . import search as _search
+    try:
+        result = _search.search(
+            con, ns.words, since=_when(ns.since), until=_when(ns.until),
+            harness=ns.harness, project=ns.project, limit=ns.limit,
+            machine=_fleet.machine_name())
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if ns.as_json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(_search.render(result))
+    return 0
 
 
 def _event_show(con, ns) -> int:

@@ -294,6 +294,14 @@ are counted separately and excluded from useful-work comparisons.
   `unsupported_rate`, `invalid_citations`, `models`, `cost_usd`. Exit 2 for
   an unknown or non-Claude session, an unreadable transcript, no final
   report, or a failed model call. The ledger is not written.
+- `event search WORD... [--since] [--until] [--harness] [--project]
+  [--limit N]`: read-only search of event name, target and assistant
+  excerpt, and user message excerpts; every word must appear in one record,
+  case-insensitively and literally. Output: `machine`, `words`, `filters`,
+  `ledger_synced_at`, `total`, `truncated`, `matches` (newest first: `type`
+  `event` or `user_message`, `id`, `at`, `session`, `project`, `family`,
+  `anchor`). Exit 0 with or without matches, 2 for a missing ledger or no
+  words. Native logs are not read and the ledger is not written.
 - `trace --task ID | --session KEY | --turn ID [--family F]`: ordered events
   with tool join status. `trace --capabilities` prints coverage per harness.
 
