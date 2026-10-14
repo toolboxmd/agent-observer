@@ -257,6 +257,11 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
         try:
             stats = import_codex_file(con, path, full=full)
         except (OSError, sqlite3.DatabaseError) as exc:
+            # A failed replay leaves its transaction open. The next source
+            # would commit that partial replacement, including a deleted
+            # occurrence set whose readiness marker still says complete.
+            if con.in_transaction:
+                con.rollback()
             totals["failed"].append({"path": path, "error": str(exc)})
             continue
         totals["sources"] += 1
@@ -361,6 +366,10 @@ class _Reader:
         # Referenced worker threads (spawn targets) never enter this set.
         self.observed_threads: set = set()
         self.own: _Own | None = None
+        # True only for a ledger imported before privacy 9, whose locators
+        # are still raw metadata ordinals. A later privacy refresh is stale
+        # too, and its locators are already file positions.
+        self.metadata_namespace = False
         if isinstance(self.thread_id, str) and self.thread_id:
             self.observed_threads.add(self.thread_id)
 
@@ -762,6 +771,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
     metadata_namespace = (isinstance(stored_privacy, int)
                           and not isinstance(stored_privacy, bool)
                           and stored_privacy < 9)
+    reader.metadata_namespace = metadata_namespace
     move_at = own.history_start if own is not None and metadata_namespace \
         else boundary
     settle: dict = {}
@@ -907,56 +917,227 @@ def import_codex_file(con: sqlite3.Connection, path: str,
 
 
 def _note_inherited(r: _Reader, obj: dict, position: int) -> None:
-    """An occurrence for a copied row this replay did not insert.
+    """Adopt retained rows for one copied record this replay does not insert.
 
-    The identity row, when one already exists, keeps its session. A copy
-    that matches nothing stays unknown instead of becoming a new identity.
+    The match is the native id that record stored. A raw metadata ordinal
+    can belong to several explicit ids and can be missing, so it is not an
+    identity. Rows keep their identity and session. A ledger imported
+    before privacy 9 still holds metadata ordinals, and those locators
+    become file positions. A later privacy refresh already holds file
+    positions and does not read them as metadata ordinals. Every matched
+    event, user, and response is recorded, including derived reads and
+    fallback usage from that record. A copy that matches nothing stays
+    unknown instead of becoming a new identity.
     """
-    payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+    r.record_position = position
+    rewrite = position if r.metadata_namespace else None
+    seen = getattr(r, "adopted_rows", None)
+    if seen is None:
+        seen = set()
+        r.adopted_rows = seen
+    for spec in _copied_identities(r, obj, position):
+        kind = "response" if spec[0] == "fallback" else spec[0]
+        for row in _rows_for_copied(r, spec):
+            marker = (kind, row["key"])
+            if marker in seen:
+                continue
+            seen.add(marker)
+            if rewrite is not None:
+                _rewrite_copied_locator(r, kind, row["key"], rewrite)
+            _note_occurrence(
+                r, kind, row["key"], obj, position=position,
+                model=r.model if kind == "response" else None,
+                effort=r.effort if kind == "response" else None,
+                session_key=row["session_key"])
+
+
+def _copied_identities(r: _Reader, obj: dict, position: int):
+    """Native rows one copied record would already have stored.
+
+    These are the same ids ingest uses. The raw ordinal is only the
+    id-less legacy form, never a query for every row at that number.
+    """
+    payload = obj.get("payload") if isinstance(obj, dict) else None
+    if not isinstance(payload, dict):
+        return
     rtype = obj.get("type")
-    if rtype == "token_usage_record" and isinstance(payload.get("response_id"), str):
-        rid = f"{HARNESS}:{payload['response_id']}"
-        row = r.con.execute(
-            "SELECT session_key FROM responses WHERE response_id=?",
-            (rid,)).fetchone()
-        if row is not None:
-            _note_occurrence(r, "response", rid, obj, position=position,
-                             model=r.model, effort=r.effort,
-                             session_key=row["session_key"])
+    raw = _native_ordinal(obj)
+    if rtype == "token_usage_record":
+        rid = payload.get("response_id")
+        if isinstance(rid, str) and rid:
+            yield ("response", f"{HARNESS}:{rid}")
         return
-    if rtype != "response_item":
+    if rtype == "compacted":
+        if "window_id" not in payload:
+            yield ("event", "compaction", f"compacted:{obj.get('ordinal')}")
+        elif isinstance(payload.get("window_id"), str) and payload.get("window_id"):
+            yield ("event", "compaction", payload["window_id"])
         return
+    if rtype == "response_item":
+        yield from _copied_response_item(payload, raw)
+        return
+    if rtype == "event_msg":
+        yield from _copied_event_msg(r, obj, payload, position)
+
+
+def _copied_response_item(payload: dict, raw):
     ptype = payload.get("type")
-    if ptype == "message" and payload.get("role") == "user" \
-            and isinstance(payload.get("id"), str):
-        key = f"{HARNESS}:{payload['id']}"
-        row = r.con.execute(
-            "SELECT session_key FROM user_messages WHERE native_id=?",
-            (key,)).fetchone()
-        if row is not None:
-            _note_occurrence(r, "user", key, obj, position=position,
-                             session_key=row["session_key"])
+    if ptype == "message" and payload.get("role") == "user":
+        native = payload.get("id")
+        if isinstance(native, str) and native:
+            yield ("user", f"{HARNESS}:{native}")
+        elif raw is not None:
+            yield ("user", f"{HARNESS}:ordinal:{raw}")
         return
-    if ptype == "message" and payload.get("role") == "assistant" \
-            and isinstance(payload.get("id"), str):
-        _note_inherited_event(r, obj, position, "assistant_message", payload["id"])
+    if ptype == "message" and payload.get("role") == "assistant":
+        if not _text_of_message(payload):
+            return
+        native = payload.get("id")
+        if isinstance(native, str) and native:
+            yield ("event", "assistant_message", native)
+        elif raw is not None:
+            yield ("event", "assistant_message", f"ordinal:{raw}")
         return
-    if ptype in ("function_call", "custom_tool_call"):
+    if ptype in ("function_call", "custom_tool_call",
+                 "function_call_output", "custom_tool_call_output"):
         native = payload.get("call_id") or payload.get("id")
         if isinstance(native, str) and native:
-            _note_inherited_event(r, obj, position, "tool_call", native)
+            family = "tool_call" if ptype in (
+                "function_call", "custom_tool_call") else "tool_result"
+            yield ("event", family, native)
 
 
-def _note_inherited_event(r: _Reader, obj: dict, position: int, family: str,
-                          native_id: str) -> None:
-    rows = r.con.execute(
-        "SELECT id, session_key FROM events WHERE source_id=? AND family=?"
-        " AND native_id=?",
-        (r.src.source_id, family, native_id)).fetchall()
-    if len(rows) != 1:
+def _copied_event_msg(r: _Reader, obj: dict, payload: dict, position: int):
+    etype = payload.get("type")
+    if etype == "task_complete":
+        yield ("event", "lifecycle", f"task_complete:{payload.get('turn_id')}")
         return
-    _note_occurrence(r, "event", rows[0]["id"], obj, position=position,
-                     session_key=rows[0]["session_key"])
+    if etype == "thread_goal_updated":
+        yield ("event", "lifecycle",
+               f"thread_goal_updated:{obj.get('ordinal')}")
+        return
+    if etype == "turn_aborted":
+        if payload.get("turn_id"):
+            native = f"turn_aborted:{payload['turn_id']}"
+        else:
+            native = "turn_aborted:" + _fallback_native_id(r.src.path, position)
+        yield ("event", "lifecycle", native)
+        return
+    if etype == "token_count":
+        info = payload.get("info")
+        total_raw = info.get("total_token_usage") if isinstance(info, dict) else None
+        total = total_raw.get("total_tokens") if isinstance(total_raw, dict) else None
+        if isinstance(total, int) and not isinstance(total, bool):
+            yield ("fallback", total)
+        return
+    if etype != "item_completed":
+        return
+    item = payload.get("item")
+    if isinstance(item, dict):
+        yield from _copied_item(obj, item)
+
+
+def _copied_item(obj: dict, item: dict):
+    """Same native ids as the completed-item ingest, including derived reads."""
+    itype = item.get("type")
+    if itype == "CommandExecution":
+        native = item.get("id")
+        if not isinstance(native, str) or not native:
+            return
+        yield ("event", "tool_result", native)
+        for entry in item.get("parsed_cmd") or []:
+            if not isinstance(entry, dict) or entry.get("type") != "read":
+                continue
+            target = entry.get("path")
+            if not isinstance(target, str) or not target:
+                target = entry.get("name")
+            if not isinstance(target, str) or not target:
+                continue
+            raw_skill = skill_from_path(target)
+            safe_skill = privacy.filter_target(raw_skill, family="skill_read") \
+                if raw_skill else None
+            looks_like_skill = target.endswith("SKILL.md") or "/skills/" in target
+            family = "skill_read" if (safe_skill or looks_like_skill) else "read"
+            yield ("event", family, f"{native}:{target}")
+        return
+    if itype in ("UserMessage", "AgentMessage", "Reasoning", "Extension"):
+        return
+    if itype == "McpToolCall":
+        native = item.get("id")
+        family = "tool_result"
+    elif itype == "FileChange":
+        native = item.get("id")
+        family = "file_change"
+    elif itype == "ContextCompaction":
+        native = item.get("id")
+        family = "compaction"
+    elif itype in ("SubAgentActivity", "CollabAgentToolCall"):
+        native = item.get("id")
+        family = "lifecycle"
+    elif itype in ("ImageView", "WebSearch", "DynamicToolCall",
+                   "FunctionCallOutput"):
+        native = item.get("call_id") or item.get("id")
+        family = "tool_result"
+    elif itype in ("Plan", "HookPrompt", "EnteredReviewMode", "ExitedReviewMode"):
+        native = item.get("id") or f"{itype}:{obj.get('ordinal')}"
+        family = "lifecycle"
+    else:
+        return
+    if isinstance(native, str) and native:
+        yield ("event", family, native)
+
+
+def _rows_for_copied(r: _Reader, spec):
+    kind = spec[0]
+    if kind == "user":
+        return r.con.execute(
+            "SELECT native_id AS key, session_key FROM user_messages"
+            " WHERE source_id=? AND native_id=?",
+            (r.src.source_id, spec[1])).fetchall()
+    if kind == "event":
+        return r.con.execute(
+            "SELECT id AS key, session_key FROM events"
+            " WHERE source_id=? AND family=? AND native_id=?",
+            (r.src.source_id, spec[1], spec[2])).fetchall()
+    if kind == "response":
+        return r.con.execute(
+            "SELECT response_id AS key, session_key FROM responses"
+            " WHERE source_id=? AND response_id=?",
+            (r.src.source_id, spec[1])).fetchall()
+    if kind != "fallback":
+        return []
+    # The move renames a copied snapshot onto the parent session. Prefer
+    # that id so a child snapshot with the same total stays where it is.
+    total = spec[1]
+    candidates = []
+    if r.own is not None and r.own.parent:
+        candidates.append(f"{HARNESS}:{r.own.parent}:tc:{total}")
+    candidates.append(f"{r.session_key}:tc:{total}")
+    for rid in candidates:
+        row = r.con.execute(
+            "SELECT response_id AS key, session_key FROM responses"
+            " WHERE source_id=? AND response_id=?",
+            (r.src.source_id, rid)).fetchone()
+        if row is not None:
+            return [row]
+    return []
+
+
+def _rewrite_copied_locator(r: _Reader, kind: str, key, position: int) -> None:
+    if kind == "user":
+        r.con.execute(
+            "UPDATE user_messages SET ordinal_num=? WHERE source_id=?"
+            " AND native_id=?",
+            (position, r.src.source_id, key))
+    elif kind == "event":
+        r.con.execute(
+            "UPDATE events SET ordinal_num=? WHERE source_id=? AND id=?",
+            (position, r.src.source_id, key))
+    else:
+        r.con.execute(
+            "UPDATE responses SET ordinal_num=? WHERE source_id=?"
+            " AND response_id=?",
+            (position, r.src.source_id, key))
 
 
 def _ingest_record(r: _Reader, obj: dict, ordinal: int) -> None:

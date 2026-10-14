@@ -1,6 +1,10 @@
 """Timeline: compaction, tool joins, read/skill evidence limits."""
 
+import json
+import os
+
 from agent_observer import report
+from agent_observer.adapters.codex import import_codex_file
 from tests.helpers import LedgerCase
 
 
@@ -78,3 +82,45 @@ class TimelineTest(LedgerCase):
         self.assertEqual(turn["state"], "cancelled")
         tl = report.timeline(self.con, turn_id="codex:turn-mini-ccc")
         self.assertEqual(tl["events"][0]["name"], "turn_aborted")
+
+
+class MultiSessionOrderTest(LedgerCase):
+    def test_unrelated_session_does_not_invert_a_known_order(self):
+        meta = lambda name: {"type": "session_meta", "payload": {
+            "id": name, "thread_source": "user"}}
+        call = lambda name: {"type": "response_item", "payload": {
+            "type": "function_call", "call_id": name, "name": "exec_command",
+            "arguments": '{"cmd":"echo x"}'}}
+        usage = lambda name: {"type": "token_usage_record", "payload": {
+            "response_id": name, "thread_id": "multi",
+            "usage": {"input_tokens": 10, "output_tokens": 2,
+                      "total_tokens": 12}}}
+        original = os.path.join(self.tmp.name, "multi-a.jsonl")
+        continuation = os.path.join(self.tmp.name, "multi-b.jsonl")
+        other = os.path.join(self.tmp.name, "multi-other.jsonl")
+
+        def dump(path, rows):
+            with open(path, "w") as fh:
+                for row in rows:
+                    fh.write(json.dumps(row) + "\n")
+
+        dump(original, [meta("multi"), call("call-a"), usage("r1"),
+                        call("call-b"), usage("r2")])
+        dump(continuation, [meta("multi")]
+             + [{"type": "world_state", "payload": {}}] * 8
+             + [call("call-a")])
+        dump(other, [meta("other")]
+             + [{"type": "world_state", "payload": {}}] * 12
+             + [call("unrelated")])
+        for full in (False, True, False):
+            for path in (continuation, original, other):
+                import_codex_file(self.con, path, full=full)
+            single = report.timeline(
+                self.con, session_key="codex:multi", family="tool_call",
+                limit=1)
+            global_ = report.timeline(self.con, family="tool_call", limit=1)
+            self.assertEqual(
+                [e["native_id"] for e in single["events"]], ["call-a"])
+            self.assertEqual(
+                [e["native_id"] for e in global_["events"]], ["call-a"])
+            self.assertEqual(global_["chronology"], "unknown")

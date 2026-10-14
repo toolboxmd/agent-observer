@@ -178,6 +178,24 @@ def _detector_groups(con, session_key: str, events) -> list:
     return [group for group in groups if group]
 
 
+def _once_per_evidence(incidents: list) -> list:
+    """One incident per native evidence, across source projections.
+
+    Separate projections stay separate while they are built. The same
+    event ids are one piece of native work even when a copied file makes
+    the projection partial.
+    """
+    seen = set()
+    out = []
+    for incident in incidents:
+        key = (incident["detector"], tuple(incident.get("event_refs") or ()))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(incident)
+    return out
+
+
 def _incident(session, detector, ts, summary, refs, extra=None) -> dict:
     return {"detector": detector, "heuristic": detector in HEURISTIC,
             "session": session["session_key"], "harness": session["harness"],
@@ -194,6 +212,7 @@ def detect_session(con, session) -> list:
         incidents += _repeated_skills(session, group)
         incidents += _repeated_commands(session, group)
         incidents += _test_edits_after_failure(session, group)
+    incidents = _once_per_evidence(incidents)
     incidents += _permission_seeking(session, events)
     incidents += _human_corrections(con, session, events)
     incidents += _large_outputs(session, events)

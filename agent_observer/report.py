@@ -845,26 +845,27 @@ def timeline(con: sqlite3.Connection, task_id: str | None = None,
     for event in out:
         sessions.setdefault(event["session_key"], []).append(event)
     unknown = {}
-    if len(sessions) == 1:
-        key, events = next(iter(sessions.items()))
+    ordered = []
+    # Each session keeps a supported source order. Representative ordinals
+    # are not a clock across sessions, so a multi-session view says so
+    # and still applies the limit after those per-session orders.
+    for key, events in sessions.items():
         wanted = {("event", str(event["id"])) for event in events}
         state, order, sequences = codex_order.resolve(con, key, wanted)
-        if state == "known":
+        if state == "known" and order is not None:
             index = {}
             for place, group in enumerate(order):
                 for ident in group:
                     index[ident] = place
             events.sort(key=lambda event: (
-                index.get(("event", str(event["id"])), len(index)), event["id"]))
-            out = events
+                index.get(("event", str(event["id"])), len(index)),
+                event["id"]))
+            if len(sessions) > 1:
+                unknown[key] = [order]
         elif state in ("partial", "conflict"):
             unknown[key] = sequences
-    else:
-        for key, events in sessions.items():
-            wanted = {("event", str(event["id"])) for event in events}
-            state, _order, sequences = codex_order.resolve(con, key, wanted)
-            if state in ("partial", "conflict"):
-                unknown[key] = sequences
+        ordered.extend(events)
+    out = ordered
     out = out[:limit]
     # Tool join status: calls joined to results only on equal call_id.
     calls = {e["native_id"] for e in out if e["family"] == "tool_call"}

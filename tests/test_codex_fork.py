@@ -9,13 +9,15 @@ session and the child had no session row.
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 
-from agent_observer import db
-from agent_observer.adapters.codex import import_codex_file
+from agent_observer import db, interventions, lookup, placement, report
+from agent_observer.adapters import t3
+from agent_observer.adapters.codex import import_codex_file, sync
 
 PARENT = "thr-parent"
 CHILD = "thr-child"
@@ -494,9 +496,12 @@ class SparseForkCutoffTest(unittest.TestCase):
         import_codex_file(self.con, self.child)
         self.assertEqual(self.owners().get("parent-text"), {f"codex:{PARENT}"})
         self.assert_child_owns_its_rows()
+        # The metadata cutoff moved the copied assistant before this replay
+        # rewrote its locator. The stored position is now the file position,
+        # so a later cutoff cannot read metadata ordinal 90 as a file position.
         self.assertEqual(self.con.execute(
             "SELECT ordinal_num FROM events WHERE native_id='parent-text'"
-        ).fetchone()[0], 90)
+        ).fetchone()[0], 2)
         _dump(self.child, _sparse_rows(100, extra=[{
             "type": "response_item", "ordinal": 180, "payload": {
                 "type": "message", "role": "assistant", "id": "child-tail",
@@ -514,6 +519,354 @@ class SparseForkCutoffTest(unittest.TestCase):
         self.assertEqual(self.con.execute(
             "SELECT privacy_version FROM sources").fetchone()[0], 9)
         self.assert_child_owns_its_rows()
+
+
+class RetainedHistoryUpgradeTest(unittest.TestCase):
+    """A privacy-8 fork upgrade keeps copied history in the parent's namespace.
+
+    The child file is the only copy of the parent input. Its metadata
+    ordinal is not a file position, and a later full replay must not move
+    that input back onto the child.
+    """
+
+    BASE = "a4ba7cea0b15d6afb2926a931477e5dece1b4d61"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "fork-upgrade.jsonl")
+        self.db_path = os.path.join(self.tmp.name, "fork-upgrade.db")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _rows(self, history_start, user_id):
+        child = {"id": "child", "thread_source": "subagent",
+                 "parent_thread_id": "parent", "originator": "codex-tui"}
+        if history_start is not None:
+            child["subagent_history_start_ordinal"] = history_start
+        user = {"type": "message", "role": "user",
+                "content": [{"type": "input_text",
+                             "text": "retained parent input"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "content_item_kinds": ["user.text"]}}
+        if user_id:
+            user["id"] = user_id
+        alpha = os.path.join(self.tmp.name, "removed-alpha", "x.py")
+        beta = os.path.join(self.tmp.name, "removed-beta", "x.py")
+        rows = [
+            {"type": "session_meta", "payload": child},
+            {"type": "session_meta", "payload": {
+                "id": "parent", "thread_source": "user",
+                "originator": "codex-tui"}},
+            {"type": "response_item", "payload": user},
+            {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                "type": "CommandExecution", "id": "read-p1",
+                "command": ["cat " + alpha], "status": "completed",
+                "exit_code": 0, "parsed_cmd": [
+                    {"type": "read", "path": alpha, "cmd": "cat"}]}}},
+            {"type": "token_usage_record", "payload": {
+                "response_id": "parent-r1", "thread_id": "parent",
+                "usage": _usage(12)}},
+            {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                "type": "CommandExecution", "id": "read-p2",
+                "command": ["cat " + beta], "status": "completed",
+                "exit_code": 0, "parsed_cmd": [
+                    {"type": "read", "path": beta, "cmd": "cat"}]}}},
+            {"type": "token_usage_record", "payload": {
+                "response_id": "parent-r2", "thread_id": "parent",
+                "usage": _usage(12)}},
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "assistant", "id": "parent-answer",
+                "content": [{"type": "output_text", "text": "parent"}]}},
+            {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "last_token_usage": _usage(12),
+                "total_token_usage": _usage(48)}}},
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "assistant", "id": "child-answer",
+                "content": [{"type": "output_text", "text": "child"}]}},
+            {"type": "token_usage_record", "payload": {
+                "response_id": "child-r", "thread_id": "child",
+                "usage": _usage(12)}},
+        ]
+        for i, row in enumerate(rows):
+            row["ordinal"] = i * 10
+        return rows
+
+    def _bind(self, con):
+        t3._ensure_tables(con)
+        for i, repo in enumerate(("alpha", "beta"), 1):
+            task = f"o/{repo}#{i}"
+            root = os.path.join(self.tmp.name, f"removed-{repo}")
+            con.execute(
+                "INSERT OR IGNORE INTO tasks(task_id, title, created_at)"
+                " VALUES(?,?,0)", (task, task))
+            con.execute(
+                "INSERT OR IGNORE INTO session_assignments"
+                "(session_key, task_id, evidence, created_at)"
+                " VALUES('codex:parent', ?, 'review', 0)", (task,))
+            con.execute(
+                "INSERT OR IGNORE INTO t3_links(thread_id, kind, host,"
+                " repository, number, url, head_branch)"
+                " VALUES('t','pr','github.com',?,?,?,?)",
+                (f"o/{repo}", i, f"https://github.com/o/{repo}/pull/{i}",
+                 "fix/" + repo))
+            con.execute(
+                "INSERT OR IGNORE INTO checkouts(root, repository, branch,"
+                " seen_at) VALUES(?,?,?,0)",
+                (root, f"o/{repo}", "fix/" + repo))
+
+    def test_upgrade_keeps_parent_input_and_read_attribution(self):
+        for user_id in (None, "parent-input"):
+            with self.subTest(user_id=user_id):
+                if os.path.exists(self.db_path):
+                    os.remove(self.db_path)
+                _dump(self.path, self._rows(None, user_id))
+                _import_at_revision(self.BASE, self.db_path, self.path)
+                _dump(self.path, self._rows(90, user_id))
+                con = db.connect(self.db_path)
+                try:
+                    db.init_db(con)
+                    self._bind(con)
+                    sub = ("sub:codex:parent-input" if user_id
+                           else "sub:codex:ordinal:20")
+                    for full in (False, True, False):
+                        import_codex_file(con, self.path, full=full)
+                        user = con.execute(
+                            "SELECT native_id, session_key, ordinal_num"
+                            " FROM user_messages").fetchone()
+                        self.assertEqual(user["session_key"], "codex:parent")
+                        self.assertNotEqual(user["ordinal_num"], 20)
+                        shown = interventions.show(
+                            con, [sub], turns_before=0, turns_after=0)[0]
+                        self.assertEqual(shown["status"], "ok", shown)
+                        self.assertIn("retained parent input", shown["text"])
+                        placed = placement.place_session(con, "codex:parent")
+                        self.assertEqual(placed["codex:parent-r1"], "o/alpha#1")
+                        self.assertEqual(placed["codex:parent-r2"], "o/beta#2")
+                        for i, repo in enumerate(("alpha", "beta"), 1):
+                            measured = report.task_report(
+                                con, f"o/{repo}#{i}", schedule={"models": {}})[
+                                    "measured"]
+                            self.assertIn(f"codex:parent-r{i}",
+                                          measured["attributed_responses"])
+                        reads = con.execute(
+                            "SELECT e.family FROM codex_occurrences o"
+                            " JOIN events e ON e.id = o.row_key"
+                            " WHERE o.session_key='codex:parent'"
+                            " AND o.row_kind='event' AND e.family='read'"
+                        ).fetchall()
+                        self.assertEqual(len(reads), 2)
+                        fallback = con.execute(
+                            "SELECT session_key, ordinal_num FROM responses"
+                            " WHERE response_id LIKE '%:tc:48'").fetchone()
+                        self.assertIsNotNone(fallback)
+                        self.assertEqual(fallback["session_key"], "codex:parent")
+                        self.assertNotEqual(fallback["ordinal_num"], 80)
+                        noted = con.execute(
+                            "SELECT 1 FROM codex_occurrences"
+                            " WHERE row_kind='response' AND row_key LIKE '%:tc:48'"
+                        ).fetchone()
+                        self.assertIsNotNone(noted)
+                        authoritative = con.execute(
+                            "SELECT COUNT(*) n, SUM(total_tokens) tokens"
+                            " FROM responses WHERE response_id IN"
+                            " ('codex:parent-r1','codex:parent-r2','codex:child-r')"
+                        ).fetchone()
+                        self.assertEqual(authoritative["n"], 3)
+                        self.assertEqual(authoritative["tokens"], 36)
+                        self.assertEqual(con.execute(
+                            "SELECT COUNT(*) FROM responses"
+                            " WHERE response_id LIKE '%:tc:48'").fetchone()[0], 1)
+                        self.assertEqual(con.execute(
+                            "PRAGMA foreign_key_check").fetchall(), [])
+                finally:
+                    con.close()
+
+
+class SharedOrdinalUpgradeTest(unittest.TestCase):
+    """Distinct explicit ids may share one raw metadata ordinal.
+
+    A base ledger stores that ordinal as the locator. The upgrade has to
+    give each retained user and event the file position a fresh import of
+    the same lines stores. A later privacy refresh already holds file
+    positions, so it must not read them as metadata ordinals.
+    """
+
+    BASE = "a4ba7cea0b15d6afb2926a931477e5dece1b4d61"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "shared-ordinal.jsonl")
+        self.db_path = os.path.join(self.tmp.name, "shared-ordinal.db")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _rows(self, history_start):
+        child = {"id": "child", "thread_source": "subagent",
+                 "parent_thread_id": "parent", "originator": "codex-tui"}
+        if history_start is not None:
+            child["subagent_history_start_ordinal"] = history_start
+
+        def user(native_id, text):
+            return {"type": "response_item", "ordinal": 4, "payload": {
+                "type": "message", "role": "user", "id": native_id,
+                "content": [{"type": "input_text", "text": text}],
+                "internal_chat_message_metadata_passthrough": {
+                    "content_item_kinds": ["user.text"]}}}
+
+        def event(native_id, text):
+            return {"type": "response_item", "ordinal": 4, "payload": {
+                "type": "message", "role": "assistant", "id": native_id,
+                "content": [{"type": "output_text", "text": text}]}}
+
+        return [
+            {"type": "session_meta", "payload": child},
+            {"type": "session_meta", "payload": {
+                "id": "parent", "thread_source": "user",
+                "originator": "codex-tui"}},
+            user("user-a", "alpha input"),
+            event("event-a", "alpha answer"),
+            user("user-b", "beta input"),
+            event("event-b", "beta answer"),
+            {"type": "response_item", "ordinal": 100, "payload": {
+                "type": "message", "role": "assistant", "id": "child-own",
+                "content": [{"type": "output_text", "text": "child own"}]}},
+        ]
+
+    def _positions(self, con):
+        found = {}
+        for row in con.execute(
+                "SELECT native_id, ordinal_num FROM user_messages"):
+            found[row["native_id"]] = row["ordinal_num"]
+        for row in con.execute(
+                "SELECT native_id, ordinal_num FROM events"):
+            found[row["native_id"]] = row["ordinal_num"]
+        for row in con.execute(
+                "SELECT row_key, record_position FROM codex_occurrences"
+                " WHERE row_kind='user'"):
+            found["occ:" + row["row_key"]] = row["record_position"]
+        for row in con.execute(
+                "SELECT e.native_id AS native_id, o.record_position"
+                " FROM codex_occurrences o JOIN events e"
+                " ON e.id = o.row_key WHERE o.row_kind='event'"):
+            found["occ:" + row["native_id"]] = row["record_position"]
+        return found
+
+    def test_shared_raw_ordinal_keeps_each_explicit_identity(self):
+        _dump(self.path, self._rows(None))
+        fresh_path = os.path.join(self.tmp.name, "fresh.db")
+        fresh = db.connect(fresh_path)
+        db.init_db(fresh)
+        import_codex_file(fresh, self.path)
+        expected = self._positions(fresh)
+        fresh.close()
+        self.assertEqual(expected["codex:user-a"], 2)
+        self.assertEqual(expected["codex:user-b"], 4)
+        self.assertEqual(expected["event-a"], 3)
+        self.assertEqual(expected["event-b"], 5)
+        self.assertNotEqual(expected["codex:user-a"], expected["codex:user-b"])
+
+        _import_at_revision(self.BASE, self.db_path, self.path)
+        _dump(self.path, self._rows(50))
+        con = db.connect(self.db_path)
+        try:
+            db.init_db(con)
+            index = lookup._index_codex(self.path)
+            wanted = ("codex:user-a", "codex:user-b", "event-a", "event-b")
+            for full in (False, True, False):
+                import_codex_file(con, self.path, full=full)
+                found = self._positions(con)
+                for key in wanted:
+                    self.assertEqual(found[key], expected[key], key)
+                    self.assertEqual(
+                        found["occ:" + key], expected[key], "occ:" + key)
+                    bare = key.removeprefix("codex:")
+                    self.assertEqual(
+                        index.records[found[key]]["payload"]["id"], bare, key)
+                self.assertEqual(found["codex:user-a"], 2)
+                self.assertNotEqual(found["codex:user-b"], 2)
+                for native_id, text in (
+                        ("codex:user-a", "alpha input"),
+                        ("codex:user-b", "beta input")):
+                    shown = interventions.show(
+                        con, ["sub:" + native_id],
+                        turns_before=0, turns_after=0)[0]
+                    self.assertEqual(shown["status"], "ok", shown)
+                    self.assertEqual(shown["text"], text)
+                self.assertEqual(con.execute(
+                    "SELECT session_key FROM events WHERE native_id='child-own'"
+                ).fetchone()[0], "codex:child")
+            con.execute("UPDATE sources SET privacy_version=10")
+            con.commit()
+            import_codex_file(con, self.path, full=True)
+            found = self._positions(con)
+            for key in wanted:
+                self.assertEqual(found[key], expected[key], key)
+                self.assertEqual(
+                    found["occ:" + key], expected[key], "occ:" + key)
+                bare = key.removeprefix("codex:")
+                self.assertEqual(
+                    index.records[found[key]]["payload"]["id"], bare, key)
+            self.assertEqual(con.execute(
+                "SELECT privacy_version FROM sources").fetchone()[0], 9)
+        finally:
+            con.close()
+
+
+class OccurrenceReplayFailureTest(unittest.TestCase):
+    """A denied occurrence write must not commit by the next source."""
+
+    def test_failed_replay_keeps_prior_occurrences(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            original = os.path.join(tmp.name, "replay-a.jsonl")
+            healthy = os.path.join(tmp.name, "replay-b.jsonl")
+            continuation = os.path.join(tmp.name, "replay-continuation.jsonl")
+            meta = lambda name: {"type": "session_meta", "payload": {
+                "id": name, "thread_source": "user"}}
+            call = lambda name: {"type": "response_item", "payload": {
+                "type": "function_call", "call_id": name,
+                "name": "exec_command", "arguments": '{"cmd":"echo x"}'}}
+            _dump(original, [meta("failure"), call("a"), call("b")])
+            _dump(healthy, [meta("healthy")])
+            _dump(continuation, [meta("failure")]
+                  + [{"type": "world_state", "payload": {}}] * 8
+                  + [call("a")])
+            con = db.connect(os.path.join(tmp.name, "failure.db"))
+            db.init_db(con)
+            sync(con, source=continuation)
+            sync(con, source=original)
+            before = report.timeline(
+                con, session_key="codex:failure", family="tool_call", limit=1)
+            self.assertEqual(
+                [e["native_id"] for e in before["events"]], ["a"])
+
+            def deny_occurrence_insert(action, table, column, database, source):
+                if (action == sqlite3.SQLITE_INSERT
+                        and table == "codex_occurrences"):
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            con.set_authorizer(deny_occurrence_insert)
+            failed = sync(con, source=original, full=True)
+            con.set_authorizer(None)
+            self.assertFalse(con.in_transaction)
+            self.assertTrue(failed["failed"])
+            sync(con, source=healthy)
+            retry = sync(con, source=original)
+            after = report.timeline(
+                con, session_key="codex:failure", family="tool_call", limit=1)
+            self.assertEqual(
+                [e["native_id"] for e in after["events"]], ["a"])
+            self.assertNotIn("chronology", after)
+            self.assertGreater(con.execute(
+                "SELECT COUNT(*) FROM codex_occurrences"
+                " WHERE session_key='codex:failure'").fetchone()[0], 0)
+            self.assertFalse(retry["failed"])
+            con.close()
+        finally:
+            tmp.cleanup()
 
 
 def _import_at_revision(rev: str, db_path: str, rollout: str) -> None:
