@@ -8,8 +8,11 @@ file, so a re-read, a grown log, or a copied file never adds usage twice.
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import os
 import sqlite3
+import sys
 import time
 from pathlib import Path
 
@@ -17,6 +20,14 @@ from . import CAPTURE_CONTRACT_VERSION, EVENT_CONTRACT_VERSION, SCHEMA_VERSION
 
 DEFAULT_DB = os.path.join(
     os.path.expanduser("~"), ".local", "state", "agent-observer", "observer.db")
+
+# How long a writer waits for another writer of the same ledger. Tests patch
+# this. There is no flag or environment variable.
+WRITER_LOCK_WAIT_S = 600
+
+
+class LedgerBusy(Exception):
+    """Another writer held this ledger's lock for the whole wait."""
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -444,6 +455,64 @@ def _open_existing(path: str) -> sqlite3.Connection:
         con.close()
         raise refused
     return con
+
+
+def _wait_label(seconds: float) -> str:
+    if seconds == int(seconds):
+        return str(int(seconds))
+    return format(seconds, "g")
+
+
+def _flock_exclusive_now(fd: int) -> bool:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+            return False
+        raise
+    return True
+
+
+def acquire_writer_lock(path: str) -> int:
+    """Exclusive flock on ``realpath(db) + ".lock"`` until the caller releases it.
+
+    Taken before the ledger is opened, so migration is covered too. The first
+    try does not block. On contention, one stderr line names the ledger and
+    the call retries until ``WRITER_LOCK_WAIT_S`` seconds have passed.
+    ``O_CLOEXEC`` keeps a forked child from inheriting the lock.
+    """
+    real = os.path.realpath(path)
+    os.makedirs(os.path.dirname(real), exist_ok=True)
+    fd = os.open(real + ".lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        if not _flock_exclusive_now(fd):
+            print(f"agent-observer: waiting for another writer of {real}",
+                  file=sys.stderr)
+            deadline = time.monotonic() + WRITER_LOCK_WAIT_S
+            while not _flock_exclusive_now(fd):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    label = _wait_label(WRITER_LOCK_WAIT_S)
+                    raise LedgerBusy(
+                        f"agent-observer: ledger {real} is busy "
+                        f"(another writer held it for {label} s)")
+                time.sleep(min(0.02, remaining))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def release_writer_lock(fd: int) -> None:
+    """Drop the writer lock. Closing the fd is what the kernel honors."""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def connect_read_only(path: str) -> sqlite3.Connection:

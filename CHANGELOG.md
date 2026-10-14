@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.3] - 2026-10-14
+
+### Changed
+
+- Writers take one ledger lock and a second writer waits up to 10 minutes before exiting 2, and text sync output names each failed source (#78)
+
 ## [1.1.2] - 2026-10-14
 
 ### Changed
