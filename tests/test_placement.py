@@ -150,6 +150,37 @@ class PlacementTest(LedgerCase):
             ro.close()
         self.assertEqual(alpha["measured"]["attributed_responses"], ["r0"])
 
+    def test_read_only_report_keeps_its_snapshot_across_git(self):
+        # A concurrent sync commits during live git. The reader opened
+        # with BEGIN must not COMMIT, or scope totals see the new row
+        # while attributed rows stay on the old snapshot.
+        self.claude_session()
+        self.con.commit()
+        ro = db.connect_read_only(self.db_path)
+        real = placement._git
+        bumped = []
+
+        def wrapped(checkout, *args):
+            if not bumped:
+                bumped.append(checkout)
+                self.con.execute(
+                    "UPDATE responses SET input_tokens=1100, total_tokens=1110"
+                    " WHERE response_id='r0'")
+                self.con.commit()
+            return real(checkout, *args)
+
+        placement._git = wrapped
+        try:
+            alpha = report.task_report(ro, "o/alpha#1", schedule=SCHEDULE)
+            self.assertTrue(ro.in_transaction)
+        finally:
+            placement._git = real
+            ro.close()
+        self.assertTrue(bumped)
+        self.assertTrue(alpha["reconciles"])
+        self.assertEqual(alpha["attributed"]["total_tokens"], 110)
+        self.assertEqual(alpha["scope"]["total_tokens"], 550)
+
     def test_shared_checkout_is_resolved_once_per_sync(self):
         # Two shared sessions in one record_shared_checkouts share a root.
         # A per-session roots map would ask git twice for that root.

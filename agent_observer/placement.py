@@ -78,12 +78,30 @@ def _write(con, sql: str, args: tuple) -> None:
 def _end_write(con) -> None:
     """Commit an open write so the next git call is outside it.
 
-    A read-only ledger refuses the commit. The live answer still applies
-    and only the checkout record is skipped, as `_write` already does.
+    A read-only report holds BEGIN for one snapshot. COMMIT succeeds on
+    that connection and would end the snapshot. `PRAGMA query_only` is
+    off for a normal `mode=ro` open, and SAVEPOINT itself does not write,
+    so the probe writes a row inside the savepoint and removes it before
+    release. A connection that cannot write leaves its transaction open.
     """
+    if not con.in_transaction:
+        return
     try:
-        if con.in_transaction:
-            con.commit()
+        con.execute("SAVEPOINT ao_write_probe")
+        con.execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value)"
+            " VALUES('ao_write_probe', '1')")
+        con.execute("DELETE FROM schema_meta WHERE key='ao_write_probe'")
+        con.execute("RELEASE ao_write_probe")
+    except sqlite3.OperationalError:
+        try:
+            con.execute("ROLLBACK TO ao_write_probe")
+            con.execute("RELEASE ao_write_probe")
+        except sqlite3.OperationalError:
+            pass
+        return
+    try:
+        con.commit()
     except sqlite3.OperationalError:
         pass
 
