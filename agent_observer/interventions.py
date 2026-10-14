@@ -468,11 +468,10 @@ class _Sources:
         state, index = "source_missing", None
         source = row
         if row is not None:
-            resolved = lookup.resolve_source(row, self.names)
+            resolved = lookup._with_companion(
+                self.con, row, lookup.resolve_source(row, self.names))
             state = resolved["status"]
             read_path = resolved["path"] or row["path"]
-            if state == "ok" and row["harness"] == "grok":
-                state = lookup._grok_updates_state(self.con, read_path)
             if state == "ok" and row["harness"] in lookup._INDEXERS:
                 try:
                     index = lookup._INDEXERS[row["harness"]](read_path)

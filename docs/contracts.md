@@ -235,6 +235,8 @@ are counted separately and excluded from useful-work comparisons.
   The machine summary names no paths. Exit 3 when any listed session is
   `ledger_only` or `partial`. `available` means every indexed event is
   still readable, including a unique archived copy whose tail matches.
+  An OpenCode source is the session row. A Grok session whose
+  `updates.jsonl` is gone or replaced is not available.
 - `task list|show --task ID [--prices schedule.json]`: attributed, shared joint, and unassigned token
   buckets over the sessions the task touches; per-model rows with native
   buckets and exact semantics; missing and conflicting

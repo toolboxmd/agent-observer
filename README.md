@@ -231,6 +231,9 @@ status is 3 when any event is not `ok`.
 `sessions availability` reports the same fact per session without reading
 event text. A session is `available` when every indexed event is live or
 relocated, `ledger_only` when every one is gone, and `partial` otherwise.
+An OpenCode source is its session row, not merely the database file. A
+Grok session whose `updates.jsonl` is gone or replaced is the same gap
+hydration reports.
 The machine summary (`sessions availability`, optional `--harness`) counts
 events and sessions and names no paths. `--session` includes each source
 path, status and reason. `sessions list` adds `source_status`; `sessions

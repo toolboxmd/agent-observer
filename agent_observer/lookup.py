@@ -10,9 +10,11 @@ Per event the status is one of:
 - ok: the native record was found in a source that only grew since import.
   `reason` is `live` at the indexed path, or `relocated` when that path is
   gone and the same file name was read from the harness's session or archive tree
-- source_missing: the log (or OpenCode database) is not readable. `reason`
+- source_missing: the log is not readable, the OpenCode database or its
+  session row is gone, or a Grok session's updates log is gone. `reason`
   is `gone` (nothing with that file name remains in the session or archive
-  tree), `ambiguous` (more than one copy), or `no_source` (no source row)
+  tree, or the OpenCode session row is gone), `ambiguous` (more than one
+  copy), or `no_source` (no source row)
 - source_changed: the log shrank or was replaced since import (`reason`
   `replaced`)
 - not_found: the source is intact but holds no record with that native id
@@ -406,8 +408,9 @@ def resolve_source(row, names: _NameIndex | None = None) -> dict:
     if not path or not harness:
         return {"status": "source_missing", "reason": "no_source", "path": None}
     if harness == "opencode":
-        db_path = path.partition("#")[0]
-        if os.path.exists(db_path):
+        db_path, sep, session = path.partition("#")
+        if (os.path.exists(db_path) and sep and session
+                and _opencode_session_exists(db_path, session)):
             return {"status": "ok", "reason": "live", "path": path}
         return {"status": "source_missing", "reason": "gone", "path": None}
     if os.path.exists(path):
@@ -523,7 +526,8 @@ def availability(con: sqlite3.Connection, session_key: str | None = None,
                     "status": "source_missing", "reason": "no_source",
                     "path": None}
             else:
-                resolved_by[source_id] = resolve_source(row, names)
+                resolved_by[source_id] = _with_companion(
+                    con, row, resolve_source(row, names))
         resolved = resolved_by[source_id]
         if resolved["status"] == "ok" and resolved["reason"] == "relocated":
             kind = "relocated"
@@ -581,6 +585,23 @@ def availability(con: sqlite3.Connection, session_key: str | None = None,
     return summary
 
 
+def _opencode_session_exists(db_path: str, session: str) -> bool:
+    """The native session row is the OpenCode source, not the database file."""
+    try:
+        native = sqlite3.connect(
+            Path(db_path).absolute().as_uri() + "?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        row = native.execute(
+            "SELECT 1 FROM session WHERE id=? LIMIT 1", (session,)).fetchone()
+    except sqlite3.Error:
+        return False
+    finally:
+        native.close()
+    return row is not None
+
+
 def _grok_updates_state(con: sqlite3.Connection, path: str) -> str:
     """Grok tool content lives in the session's updates.jsonl; check it too."""
     updates = os.path.join(os.path.dirname(path), "updates.jsonl")
@@ -592,6 +613,28 @@ def _grok_updates_state(con: sqlite3.Connection, path: str) -> str:
     if row is None:
         return "ok" if os.path.exists(updates) else "source_missing"
     return _source_state(row)
+
+
+def _with_companion(con: sqlite3.Connection, row, resolved: dict) -> dict:
+    """The same readability check hydration uses, including companion logs.
+
+    A Grok session's tool text lives in updates.jsonl. If that file is gone
+    or replaced, every event from the session fails hydration, so availability
+    must not call those events live.
+    """
+    if resolved["status"] != "ok":
+        return resolved
+    harness = row["harness"] if "harness" in row.keys() else None
+    if harness != "grok" or not resolved.get("path"):
+        return resolved
+    grok_state = _grok_updates_state(con, resolved["path"])
+    if grok_state == "ok":
+        return resolved
+    return {
+        "status": grok_state,
+        "reason": "gone" if grok_state == "source_missing" else "replaced",
+        "path": None,
+    }
 
 
 # Structured inputs split a secret's name from its value, which the string
@@ -679,15 +722,10 @@ def show(con: sqlite3.Connection, event_ids: list[int]) -> list[dict]:
             else:
                 resolved = {"status": "source_missing", "reason": "no_source",
                             "path": None}
+            resolved = _with_companion(con, event, resolved)
             state = resolved["status"]
             reason = resolved["reason"]
             read_path = resolved["path"]
-            if state == "ok" and event["harness"] == "grok":
-                grok_state = _grok_updates_state(con, read_path)
-                if grok_state != "ok":
-                    state = grok_state
-                    reason = "gone" if grok_state == "source_missing" else "replaced"
-                    read_path = None
             index = None
             if state == "ok" and event["harness"] in _INDEXERS:
                 try:
