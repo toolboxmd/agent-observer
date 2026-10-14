@@ -91,8 +91,9 @@ valuations with `--prices`.
   event whose status is not `ok` as unknown; never fill it in. A
   `ledger_only` or `partial` session is a coverage gap: say the status
   and reason (`gone`, `ambiguous`, `replaced` or `no_source`) and do not
-  treat the task as complete. A unique archived copy with a matching
-  tail is `relocated` and readable.
+  treat the task as complete. That includes a session with no indexed
+  events whose backing source is gone. A unique archived copy with a
+  matching tail is `relocated` and readable.
 - `publish` writes to GitHub. Run it on the PR of the task you are
   delivering, or when a person asks, and only against the repository and
   PR or commit of that task or request.

@@ -205,3 +205,84 @@ class SourceAvailabilityTest(LedgerCase):
         after = report.task_report(self.con, "T-G")
         self.assertFalse(after["complete"])
         self.assertNotEqual(before["snapshot_id"], after["snapshot_id"])
+
+    def test_eventless_opencode_session_is_not_available(self):
+        native_path = os.path.join(self.tmp.name, "opencode.db")
+        build_native(native_path)
+        opencode.sync(self.con, source=native_path)
+        self.con.commit()
+        child = "opencode:ses_child"
+        parent = "opencode:ses_parent"
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) n FROM events WHERE session_key=?",
+            (child,)).fetchone()["n"], 0)
+        self.assertGreater(self.con.execute(
+            "SELECT COUNT(*) n FROM responses WHERE session_key=?",
+            (child,)).fetchone()["n"], 0)
+        child_messages = [row["native_id"] for row in self.con.execute(
+            "SELECT native_id FROM user_messages WHERE session_key=?",
+            (child,))]
+        self.assertGreater(len(child_messages), 0)
+        _setup_tasks(self, "T-CHILD")
+        for native_id in child_messages:
+            _assign(self, native_id, "T-CHILD")
+        source = self.con.execute(
+            "SELECT * FROM sources WHERE path LIKE '%#ses_child'"
+        ).fetchone()
+        before_child = report.task_report(self.con, "T-CHILD")
+        self.assertEqual(before_child["source_availability"]["status"],
+                         "available")
+        self.assertTrue(before_child["complete"])
+        self.assertEqual(
+            lookup.availability(self.con, session_key=child)["status"],
+            "available")
+        native = sqlite3.connect(native_path)
+        native.execute("DELETE FROM session WHERE id='ses_child'")
+        native.execute("DELETE FROM message WHERE session_id='ses_child'")
+        native.execute("DELETE FROM part WHERE session_id='ses_child'")
+        native.commit()
+        native.close()
+        resolved = lookup.resolve_source(source)
+        self.assertEqual(resolved["status"], "source_missing")
+        self.assertEqual(resolved["reason"], "gone")
+        session = lookup.availability(self.con, session_key=child)
+        self.assertEqual(session["status"], "ledger_only")
+        self.assertEqual(session["events"]["ledger_only"], 0)
+        self.assertEqual(session["reasons"].get("gone"), 0)
+        after_child = report.task_report(self.con, "T-CHILD")
+        self.assertEqual(after_child["source_availability"]["status"],
+                         "ledger_only")
+        self.assertEqual(after_child["coverage"]["ledger_only_events"], 0)
+        self.assertFalse(after_child["complete"])
+        self.assertNotEqual(before_child["snapshot_id"],
+                            after_child["snapshot_id"])
+        self.assertEqual(
+            lookup.availability(self.con, session_key=parent)["status"],
+            "available")
+
+    def test_eventless_gap_makes_a_mixed_task_partial(self):
+        native_path = os.path.join(self.tmp.name, "opencode.db")
+        build_native(native_path)
+        opencode.sync(self.con, source=native_path)
+        self.con.commit()
+        self._bind_all("T-MIX")
+        before = report.task_report(self.con, "T-MIX")
+        self.assertEqual(before["source_availability"]["status"], "available")
+        self.assertTrue(before["complete"])
+        native = sqlite3.connect(native_path)
+        native.execute("DELETE FROM session WHERE id='ses_child'")
+        native.execute("DELETE FROM message WHERE session_id='ses_child'")
+        native.execute("DELETE FROM part WHERE session_id='ses_child'")
+        native.commit()
+        native.close()
+        after = report.task_report(self.con, "T-MIX")
+        self.assertEqual(after["source_availability"]["status"], "partial")
+        self.assertEqual(after["coverage"]["ledger_only_events"], 0)
+        self.assertFalse(after["complete"])
+        self.assertNotEqual(before["snapshot_id"], after["snapshot_id"])
+        self.assertEqual(lookup.availability(
+            self.con, session_key="opencode:ses_child")["status"],
+            "ledger_only")
+        self.assertEqual(lookup.availability(
+            self.con, session_key="opencode:ses_parent")["status"],
+            "available")

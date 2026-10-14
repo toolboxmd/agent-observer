@@ -233,14 +233,17 @@ event text. A session is `available` when every indexed event is live or
 relocated, `ledger_only` when every one is gone, and `partial` otherwise.
 An OpenCode source is its session row, not merely the database file. A
 Grok session whose `updates.jsonl` is gone or replaced is the same gap
-hydration reports.
+hydration reports. A session with no indexed events is still unavailable
+when a source backing the session, its responses, or its submissions is
+gone or replaced.
 The machine summary (`sessions availability`, optional `--harness`) counts
-events and sessions and names no paths. `--session` includes each source
-path, status and reason. `sessions list` adds `source_status`; `sessions
-show` embeds `source_availability`. `sessions availability` exits 3 when
-any listed session is ledger-only or partial. A task report is not
-`complete` unless in-scope source availability is `available`, and its
-snapshot changes when a source disappears.
+events and sessions and names no paths. Text for `--session` also names
+no paths. `--json` for one session includes each source path, status and
+reason. `sessions list` adds `source_status`; `sessions show` embeds
+`source_availability`. `sessions availability` exits 3 when any listed
+session is ledger-only or partial. A task report is not `complete`
+unless in-scope source availability is `available`, and its snapshot
+changes when a source disappears.
 
 It works for Claude Code, Codex, Grok Build and OpenCode, including
 subagent transcripts, because every event keeps its source and native id.

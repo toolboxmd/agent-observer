@@ -40,7 +40,7 @@ An indexed event whose native source file no longer exists, so the ledger still 
 _Avoid_: missing event
 
 **Source availability**:
-For one session, whether each indexed event is backed by a live or relocated native source, or is ledger-only, and why.
+For one session, whether each indexed event is backed by a live or relocated native source, or is ledger-only, and why. A session with no indexed events is still ledger-only or partial when a source backing the session, its responses, or its submissions is gone or replaced.
 _Avoid_: completeness, coverage
 
 **List-price estimate**:

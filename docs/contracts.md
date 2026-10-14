@@ -236,7 +236,9 @@ are counted separately and excluded from useful-work comparisons.
   `ledger_only` or `partial`. `available` means every indexed event is
   still readable, including a unique archived copy whose tail matches.
   An OpenCode source is the session row. A Grok session whose
-  `updates.jsonl` is gone or replaced is not available.
+  `updates.jsonl` is gone or replaced is not available. A session with
+  no indexed events is still unavailable when a source backing the
+  session, its responses, or its submissions is gone or replaced.
 - `task list|show --task ID [--prices schedule.json]`: attributed, shared joint, and unassigned token
   buckets over the sessions the task touches; per-model rows with native
   buckets and exact semantics; missing and conflicting

@@ -457,16 +457,83 @@ def _empty_counts() -> dict:
     return {key: 0 for key in _AVAIL_ORDER}
 
 
-def _session_status(counts: dict) -> str:
-    """available, partial or ledger_only. Never complete."""
+def _session_status(counts: dict, *, unreadable: bool = False) -> str:
+    """available, partial or ledger_only. Never complete.
+
+    `unreadable` covers a backing source that is gone or replaced even when
+    it contributed no indexed events, such as a response-only session.
+    """
     readable = counts["live"] + counts["relocated"]
     gone = counts["ledger_only"]
     changed = counts["changed"]
-    if gone == 0 and changed == 0:
+    if gone == 0 and changed == 0 and not unreadable:
         return "available"
     if readable == 0 and changed == 0:
         return "ledger_only"
     return "partial"
+
+
+def _scope_status(sessions: dict) -> str:
+    """One scope is available only when every session in it is."""
+    if sessions["partial"] or (
+            sessions["available"] and sessions["ledger_only"]):
+        return "partial"
+    if sessions["ledger_only"]:
+        return "ledger_only"
+    return "available"
+
+
+def _key_filter(column: str, session_key, session_keys) -> tuple[str, list]:
+    if session_key is not None:
+        return f" AND {column}=?", [session_key]
+    if session_keys is not None:
+        keys = sorted(session_keys)
+        marks = ",".join("?" * len(keys))
+        return f" AND {column} IN ({marks})", keys
+    return "", []
+
+
+def _backing_without_events(con, event_rows, *, session_key, session_keys,
+                            harness) -> list:
+    """Sources that back a session but have no event rows.
+
+    A response-only session still has a native source. Event counts miss it,
+    and a default of available would hide that the source is gone.
+    """
+    selects = []
+    args: list = []
+    for table in ("sessions", "events", "user_messages", "responses", "turns"):
+        clause, key_args = _key_filter("session_key", session_key, session_keys)
+        selects.append(
+            f"SELECT session_key, source_id FROM {table}"
+            f" WHERE source_id IS NOT NULL{clause}")
+        args.extend(key_args)
+    clause, key_args = _key_filter(
+        "sess.session_key", session_key, session_keys)
+    selects.append(
+        "SELECT sess.session_key, src.id FROM sessions sess"
+        " JOIN sources src ON src.harness = sess.harness"
+        " AND src.session_id = sess.native_id"
+        f" WHERE src.id IS NOT NULL{clause}")
+    args.extend(key_args)
+    harness_sql = ""
+    if harness is not None:
+        harness_sql = " WHERE harness=?"
+        args.append(harness)
+    found = con.execute(
+        "SELECT session_key, source_id, 0 n, harness, path, size_bytes,"
+        " read_offset, tail_sha256, ino FROM ("
+        "SELECT b.session_key, b.source_id,"
+        " COALESCE(src.harness, sess.harness, substr(b.session_key, 1,"
+        " instr(b.session_key, ':') - 1)) harness,"
+        " src.path, src.size_bytes, src.read_offset, src.tail_sha256, src.ino"
+        f" FROM ({' UNION '.join(selects)}) b"
+        " LEFT JOIN sources src ON src.id = b.source_id"
+        " LEFT JOIN sessions sess ON sess.session_key = b.session_key"
+        f") backed{harness_sql}", args).fetchall()
+    seen = {(row["session_key"], row["source_id"]) for row in event_rows}
+    return [row for row in found
+            if (row["session_key"], row["source_id"]) not in seen]
 
 
 def availability(con: sqlite3.Connection, session_key: str | None = None,
@@ -498,13 +565,16 @@ def availability(con: sqlite3.Connection, session_key: str | None = None,
             " instr(e.session_key, ':') - 1))=?")
         args.append(harness)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
-    rows = con.execute(
+    rows = list(con.execute(
         "SELECT e.session_key, e.source_id, COUNT(*) n,"
         " COALESCE(s.harness, substr(e.session_key, 1,"
         " instr(e.session_key, ':') - 1)) harness,"
         " s.path, s.size_bytes, s.read_offset, s.tail_sha256, s.ino"
         " FROM events e LEFT JOIN sources s ON s.id = e.source_id"
-        f"{clause} GROUP BY e.session_key, e.source_id", args).fetchall()
+        f"{clause} GROUP BY e.session_key, e.source_id", args))
+    rows.extend(_backing_without_events(
+        con, rows, session_key=session_key, session_keys=session_keys,
+        harness=harness))
     names = _NameIndex()
     resolved_by: dict[object, dict] = {}
     per: dict[str, dict] = {}
@@ -537,14 +607,21 @@ def availability(con: sqlite3.Connection, session_key: str | None = None,
             kind = "changed"
         else:
             kind = "ledger_only"
+        if row["n"] == 0 and kind == "live":
+            continue
         entry = per.setdefault(row["session_key"], {
             "events": _empty_counts(), "reasons": {}, "sources": [],
-            "harness": row["harness"]})
-        entry["events"][kind] += row["n"]
-        if kind != "live":
+            "harness": row["harness"], "unreadable": False})
+        if row["n"] == 0:
+            entry["unreadable"] = True
+        else:
+            entry["events"][kind] += row["n"]
+        if kind != "live" and row["n"]:
             entry["reasons"][resolved["reason"]] = (
                 entry["reasons"].get(resolved["reason"], 0) + row["n"])
             reasons[resolved["reason"]] = reasons.get(resolved["reason"], 0) + row["n"]
+        elif kind != "live":
+            entry["reasons"].setdefault(resolved["reason"], 0)
         if session_key is not None:
             entry["sources"].append({
                 "source_id": source_id,
@@ -553,21 +630,24 @@ def availability(con: sqlite3.Connection, session_key: str | None = None,
                 "events": row["n"],
                 "path": row["path"],
             })
-        harness_bucket = bucket(row["harness"] or "unknown")
-        harness_bucket["events"][kind] += row["n"]
-        if kind != "live":
-            harness_bucket["reasons"][resolved["reason"]] = (
-                harness_bucket["reasons"].get(resolved["reason"], 0) + row["n"])
+        if row["n"]:
+            harness_bucket = bucket(row["harness"] or "unknown")
+            harness_bucket["events"][kind] += row["n"]
+            if kind != "live":
+                harness_bucket["reasons"][resolved["reason"]] = (
+                    harness_bucket["reasons"].get(resolved["reason"], 0)
+                    + row["n"])
     sessions = {"available": 0, "partial": 0, "ledger_only": 0}
     events = _empty_counts()
     for entry in per.values():
-        status = _session_status(entry["events"])
+        status = _session_status(
+            entry["events"], unreadable=entry.get("unreadable", False))
         entry["status"] = status
         sessions[status] += 1
         for key in _AVAIL_ORDER:
             events[key] += entry["events"][key]
     summary = {
-        "status": _session_status(events) if per else "available",
+        "status": _scope_status(sessions),
         "events": events,
         "sessions": sessions,
         "reasons": reasons,
