@@ -1,10 +1,16 @@
 # Changelog
 
+## [1.1.5] - 2026-10-14
+
+### Changed
+
+- Map AgentsMD versions from the clone root behind the global instruction link (#81)
+
 ## [1.1.4] - 2026-10-14
 
 ### Changed
 
-- Map AgentsMD versions from the clone root behind the global instruction link
+- Resolve each shared checkout once per sync
 
 ## [1.1.3] - 2026-10-14
 

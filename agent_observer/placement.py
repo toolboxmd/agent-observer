@@ -75,9 +75,41 @@ def _write(con, sql: str, args: tuple) -> None:
         pass
 
 
+def _end_write(con) -> None:
+    """Commit an open write so the next git call is outside it.
+
+    A read-only report holds BEGIN for one snapshot. COMMIT succeeds on
+    that connection and would end the snapshot. `PRAGMA query_only` is
+    off for a normal `mode=ro` open, and SAVEPOINT itself does not write,
+    so the probe writes a row inside the savepoint and removes it before
+    release. A connection that cannot write leaves its transaction open.
+    """
+    if not con.in_transaction:
+        return
+    try:
+        con.execute("SAVEPOINT ao_write_probe")
+        con.execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value)"
+            " VALUES('ao_write_probe', '1')")
+        con.execute("DELETE FROM schema_meta WHERE key='ao_write_probe'")
+        con.execute("RELEASE ao_write_probe")
+    except sqlite3.OperationalError:
+        try:
+            con.execute("ROLLBACK TO ao_write_probe")
+            con.execute("RELEASE ao_write_probe")
+        except sqlite3.OperationalError:
+            pass
+        return
+    try:
+        con.commit()
+    except sqlite3.OperationalError:
+        pass
+
+
 def _live(con, root: str, known: list | None, roots: dict | None):
     if roots is not None and root in roots:
         return roots[root]
+    _end_write(con)
     remote = _git(root, "remote", "get-url", "origin") or ""
     match = REMOTE_RE.search(remote)
     found = None
@@ -87,6 +119,7 @@ def _live(con, root: str, known: list | None, roots: dict | None):
         found = (match.group(1), branch)
         _write(con, "INSERT OR REPLACE INTO checkouts(root, repository, branch, seen_at)"
                " VALUES(?,?,?,?)", (root, found[0], branch, time.time()))
+        _end_write(con)
         if known is not None:
             known[:] = [r for r in known if r["root"] != root]
             known.append({"root": root, "repository": found[0], "branch": branch})
@@ -95,6 +128,7 @@ def _live(con, root: str, known: list | None, roots: dict | None):
         # No recognizable origin now: drop the old mapping so it cannot
         # answer for this path after the checkout is removed.
         _write(con, "DELETE FROM checkouts WHERE root=?", (root,))
+        _end_write(con)
         if known is not None:
             known[:] = [r for r in known if r["root"] != root]
     if roots is not None:
@@ -122,11 +156,13 @@ def session_tasks(con, session_key: str) -> list:
         (session_key,))]
 
 
-def place_session(con, session_key: str) -> dict | None:
+def place_session(con, session_key: str, known: list | None = None,
+                  roots: dict | None = None) -> dict | None:
     """response_id -> task_id (or None when unplaced) for one shared session.
 
     None when the harness cannot tie tool calls to responses, so the
-    session keeps whole-session sharing.
+    session keeps whole-session sharing. `known` and `roots` are optional
+    and cover one sync; omitted, this call resolves checkouts itself.
     """
     session = con.execute("SELECT harness, project_dir FROM sessions WHERE session_key=?",
                           (session_key,)).fetchone()
@@ -145,9 +181,11 @@ def place_session(con, session_key: str) -> dict | None:
         "SELECT ordinal_num, target FROM events WHERE session_key=? AND"
         " family IN ('tool_call', 'read', 'skill_read', 'file_change')"
         " AND ordinal_num IS NOT NULL ORDER BY ordinal_num", (session_key,)).fetchall()
-    known = [dict(r) for r in _known_checkouts(con)]
+    if known is None:
+        known = [dict(r) for r in _known_checkouts(con)]
+    if roots is None:
+        roots = {}
     seen: dict = {}
-    roots: dict = {}
     touched: dict = {r["response_id"]: set() for r in responses}
     ordinals = [r["ordinal_num"] for r in responses]
     for call in calls:
@@ -177,12 +215,15 @@ def _owner(ordinals: list, ordinal: int, follows: bool) -> int | None:
 def record_shared_checkouts(con) -> int:
     """Record the checkouts of every session bound to several PRs.
 
-    Runs during sync, while task worktrees still exist.
+    Sync calls this once, while task worktrees still exist. One `known`
+    list and one `roots` map serve every session in that call.
     """
     shared = [r["session_key"] for r in con.execute(
         "SELECT session_key FROM session_assignments GROUP BY session_key"
         " HAVING COUNT(DISTINCT task_id) > 1")]
+    known = [dict(r) for r in _known_checkouts(con)]
+    roots: dict = {}
     for key in shared:
-        place_session(con, key)
+        place_session(con, key, known, roots)
     con.commit()
     return len(shared)
