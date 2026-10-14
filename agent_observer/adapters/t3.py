@@ -70,7 +70,7 @@ import os
 import re
 import sqlite3
 
-from .. import db, placement, privacy
+from .. import db, privacy
 from ..ingest import text_hash
 
 # A PR head branch as T3 snapshots it; anything else is not stored.
@@ -368,8 +368,6 @@ def sync(con: sqlite3.Connection, root: str | None = None,
         totals["tasks"] = bound["tasks"]
         totals["sessions_bound"] = bound["sessions_bound"]
         totals["outcomes"] = _write_outcomes(con, links)
-        # Record checkouts while task worktrees still exist (#43).
-        totals["shared_sessions"] = placement.record_shared_checkouts(con)
         con.execute(
             "INSERT INTO sources(harness, path, sha256, imported_at)"
             " VALUES(?,?,?,?) ON CONFLICT(harness, path) DO UPDATE SET"

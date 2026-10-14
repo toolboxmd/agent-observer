@@ -1,10 +1,13 @@
 """A session shared by several PRs splits per response by checkout (#43)."""
 
+import io
+import json
 import os
 import shutil
 import subprocess
+from contextlib import redirect_stdout
 
-from agent_observer import db, placement, report
+from agent_observer import cli, db, placement, report
 from agent_observer.adapters import t3 as t3_adapter
 from tests.helpers import LedgerCase
 
@@ -146,3 +149,143 @@ class PlacementTest(LedgerCase):
         finally:
             ro.close()
         self.assertEqual(alpha["measured"]["attributed_responses"], ["r0"])
+
+    def test_shared_checkout_is_resolved_once_per_sync(self):
+        # Two shared sessions in one record_shared_checkouts share a root.
+        # A per-session roots map would ask git twice for that root.
+        root = self.checkouts["alpha"]
+        for n in (1, 2):
+            key = f"claude:s{n}"
+            db.upsert_session(self.con, key, "claude", f"s{n}", None,
+                              project_dir="/nowhere")
+            for task in ("o/alpha#1", "o/beta#2"):
+                self.con.execute(
+                    "INSERT INTO session_assignments(session_key, task_id,"
+                    " evidence, created_at) VALUES(?,?,'t3',0)", (key, task))
+            self.con.execute(
+                "INSERT INTO responses(response_id, source_id, harness,"
+                " session_key, ordinal_num, model, input_tokens,"
+                " output_tokens, total_tokens)"
+                " VALUES(?,?,?,?,?,'m',100,10,110)",
+                (f"once{n}", self.source, "claude", key, 1))
+            self.con.execute(
+                "INSERT INTO events(source_id, session_key, ordinal_num,"
+                " family, native_id, name, target)"
+                " VALUES(?,?,?,'tool_call',?,'Bash',?)",
+                (self.source, key, 2, f"once-e{n}", f"ls {root}"))
+        calls = []
+        real = placement._git
+
+        def wrapped(checkout, *args):
+            calls.append((checkout, args))
+            return real(checkout, *args)
+
+        placement._git = wrapped
+        try:
+            self.assertEqual(placement.record_shared_checkouts(self.con), 2)
+        finally:
+            placement._git = real
+        self.assertEqual(
+            [c for c in calls if c == (root, ("remote", "get-url", "origin"))],
+            [(root, ("remote", "get-url", "origin"))])
+        self.assertEqual(
+            [c for c in calls if c == (root, ("rev-parse", "--abbrev-ref", "HEAD"))],
+            [(root, ("rev-parse", "--abbrev-ref", "HEAD"))])
+        row = self.con.execute(
+            "SELECT repository, branch FROM checkouts WHERE root=?",
+            (root,)).fetchone()
+        self.assertEqual((row["repository"], row["branch"]), ("o/alpha", "fix/a"))
+
+    def test_live_git_runs_outside_an_open_write(self):
+        self.con.execute(
+            "INSERT INTO checkouts(root, repository, branch, seen_at)"
+            " VALUES(?,?,?,0)", ("/tmp/seed-open-write", "o/seed", "main"))
+        self.assertTrue(self.con.in_transaction)
+        flags = []
+        real = placement._git
+
+        def wrapped(checkout, *args):
+            flags.append(self.con.in_transaction)
+            return real(checkout, *args)
+
+        placement._git = wrapped
+        try:
+            found = placement.checkout_of(self.con, self.checkouts["alpha"])
+        finally:
+            placement._git = real
+        self.assertEqual(found, ("o/alpha", "fix/a"))
+        self.assertEqual(flags, [False, False])
+        other = db.connect(self.db_path)
+        try:
+            row = other.execute(
+                "SELECT repository, branch FROM checkouts WHERE root=?",
+                (self.checkouts["alpha"],)).fetchone()
+        finally:
+            other.close()
+        self.assertEqual((row["repository"], row["branch"]), ("o/alpha", "fix/a"))
+
+    def test_sync_records_shared_sessions_once_after_refresh(self):
+        calls = []
+
+        def record(con):
+            calls.append(1)
+            return 4
+
+        class Harness:
+            def __init__(self, name, skipped=None):
+                self.name = name
+                self.skipped = skipped
+
+            def sync(self, con, root=None, full=False, source=None):
+                row = {"harness": self.name, "sources": 1, "shared_sessions": 9}
+                if self.skipped:
+                    row["skipped"] = self.skipped
+                return row
+
+        real_available = cli._adapters.available
+        real_record = placement.record_shared_checkouts
+        cli._adapters.available = lambda: {
+            "t3": Harness("t3"), "codex": Harness("codex")}
+        placement.record_shared_checkouts = record
+        ns = type("NS", (), {})()
+        ns.harness = ["t3", "codex"]
+        ns.source = None
+        ns.root = None
+        ns.full = False
+        ns.agentsmd_repo = os.path.join(self.tmp.name, "no-such-repo")
+        ns.as_json = True
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = cli._sync(self.con, ns)
+        finally:
+            cli._adapters.available = real_available
+            placement.record_shared_checkouts = real_record
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [1])
+        payload = json.loads(buf.getvalue())
+        t3 = next(row for row in payload["harnesses"] if row["harness"] == "t3")
+        self.assertEqual(t3["shared_sessions"], 4)
+
+        calls.clear()
+        cli._adapters.available = lambda: {"t3": Harness("t3", "no T3 state")}
+        placement.record_shared_checkouts = record
+        ns.harness = ["t3"]
+        try:
+            with redirect_stdout(io.StringIO()):
+                cli._sync(self.con, ns)
+        finally:
+            cli._adapters.available = real_available
+            placement.record_shared_checkouts = real_record
+        self.assertEqual(calls, [])
+
+        cli._adapters.available = lambda: {"codex": Harness("codex")}
+        placement.record_shared_checkouts = record
+        ns.harness = ["codex"]
+        try:
+            with redirect_stdout(io.StringIO()):
+                cli._sync(self.con, ns)
+        finally:
+            cli._adapters.available = real_available
+            placement.record_shared_checkouts = real_record
+        self.assertEqual(calls, [])

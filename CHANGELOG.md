@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.4] - 2026-10-14
+
+### Changed
+
+- Resolve each shared checkout once per sync
+
 ## [1.1.3] - 2026-10-14
 
 ### Changed

@@ -15,6 +15,7 @@ from . import analysis as _analysis
 from . import db as _db
 from . import identity as _identity
 from . import interventions as _interventions
+from . import placement
 from . import report as _report
 
 
@@ -968,6 +969,14 @@ def _sync(con, ns) -> int:
                     row[key] = (row.get(key) or 0) + value
                 elif key not in row:
                     row[key] = value
+    # Placement runs once, after every harness import and the T3 refresh,
+    # so sessions imported later in this run are visible (#80). The refresh
+    # merge must not add shared_sessions a second time.
+    if "t3" in wanted:
+        for row in results:
+            if row.get("harness") == "t3" and "skipped" not in row:
+                row["shared_sessions"] = placement.record_shared_checkouts(con)
+                break
     _identity.refresh_session_versions(con)
     con.commit()
     payload = {"_view": "sync", "harnesses": results,
