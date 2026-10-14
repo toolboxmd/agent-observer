@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.1] - 2026-10-14
+
+### Changed
+
+- publish reads plain JSON from gh when color is forced, and names the command and stderr when output is empty or not JSON (#88)
+
 ## [1.2.0] - 2026-10-14
 
 ### Added

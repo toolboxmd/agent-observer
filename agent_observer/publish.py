@@ -10,7 +10,9 @@ prompts, tool arguments or file contents.
 from __future__ import annotations
 
 import json
+import os
 import re
+import shlex
 import subprocess
 from datetime import datetime, timezone
 
@@ -568,12 +570,28 @@ def render(summary: dict, target: str | None = None) -> str:
 
 
 def _gh(args: list, payload: dict | None = None) -> dict | list:
-    proc = subprocess.run(["gh", "api", *args] + (["--input", "-"] if payload else []),
-                          input=json.dumps(payload) if payload else None,
-                          capture_output=True, text=True, check=False)
+    """Run `gh api` and parse one JSON document.
+
+    CLICOLOR_FORCE makes gh colorize JSON even on a pipe and even when
+    NO_COLOR is set. That stdout is not JSON. This call turns the force
+    off. Empty or non-JSON stdout names the command and its stderr.
+    """
+    cmd = ["gh", "api", *args] + (["--input", "-"] if payload else [])
+    env = os.environ.copy()
+    env["CLICOLOR_FORCE"] = "0"
+    proc = subprocess.run(cmd, input=json.dumps(payload) if payload else None,
+                          capture_output=True, text=True, check=False, env=env)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or f"gh api failed: {args}")
-    return json.loads(proc.stdout) if proc.stdout.strip() else {}
+    stdout = proc.stdout or ""
+    stderr = (proc.stderr or "").strip() or "(no stderr)"
+    command = shlex.join(cmd)
+    if not stdout.strip():
+        raise RuntimeError(f"{command} returned empty output: {stderr}")
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"{command} returned non-JSON output: {stderr}") from None
 
 
 def _authenticated_login() -> str:
