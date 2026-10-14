@@ -111,7 +111,8 @@ def _text(payload) -> str:
                 f"{r['session_key']}  {r.get('project_dir') or '?'}  "
                 f"agentsmd={r.get('agentsmd_version') or 'unknown'}  "
                 f"responses={r.get('responses', 0)} "
-                f"total={_fmt_session_total(r)}")
+                f"total={_fmt_session_total(r)} "
+                f"sources={r.get('source_status') or 'unknown'}")
         return "\n".join(lines) or "no sessions"
     if isinstance(payload, dict) and payload.get("_view") == "task":
         r = payload
@@ -129,6 +130,10 @@ def _text(payload) -> str:
             f"  unassigned in scope: {r['unassigned_in_scope']['responses']} "
             f"total={_fmt_section_total(r['unassigned_in_scope'])}",
             f"  reconciles against scope: {r['reconciles']}",
+            f"  sources: {(r.get('source_availability') or {}).get('status') or 'unknown'}"
+            + (f" ({(r.get('source_availability') or {}).get('events', {}).get('ledger_only', 0)}"
+               " ledger-only events)"
+               if (r.get('source_availability') or {}).get('status') != 'available' else ''),
             f"  missing assignments: {r['missing_assignments'] or 'none'}",
             f"  unbound usage: {r.get('unbound_usage') or 'none'}",
             f"  conflicting: {r['conflicting_assignments'] or 'none'}",
@@ -220,6 +225,12 @@ def build_parser() -> argparse.ArgumentParser:
     sw = ssub.add_parser("show")
     sw.add_argument("--session", required=True)
     sw.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
+    sa = ssub.add_parser(
+        "availability",
+        help="say which indexed events still have a native source")
+    sa.add_argument("--session", default=None)
+    sa.add_argument("--harness", default=None)
+    sa.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
     c = sub.add_parser("capture", help="record workload facts")
     c.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
@@ -1222,7 +1233,51 @@ def _publish(con, ns) -> int:
     return 0
 
 
+def _availability_text(summary: dict) -> str:
+    events = summary["events"]
+    sessions = summary.get("sessions") or {}
+    lines = [
+        "source availability: " + summary["status"],
+        "  events: " + ", ".join(
+            f"{key.replace('_', '-')} {events[key]}"
+            for key in ("live", "relocated", "ledger_only", "changed")),
+    ]
+    if sessions:
+        lines.append(
+            "  sessions: " + ", ".join(
+                f"{key.replace('_', '-')} {sessions[key]}"
+                for key in ("available", "partial", "ledger_only")))
+    reasons = summary.get("reasons") or {}
+    if reasons:
+        lines.append("  reasons: " + ", ".join(
+            f"{key} {reasons[key]}" for key in sorted(reasons)))
+    for harness, bucket in sorted((summary.get("by_harness") or {}).items()):
+        ev = bucket["events"]
+        lines.append(
+            f"  {harness}: live {ev['live']}, relocated {ev['relocated']}, "
+            f"ledger-only {ev['ledger_only']}, changed {ev['changed']}")
+    return "\n".join(lines)
+
+
 def _sessions(con, ns) -> int:
+    from . import lookup
+    if ns.op == "availability":
+        if ns.session:
+            summary = lookup.availability(
+                con, session_key=ns.session, harness=ns.harness)
+        else:
+            summary = lookup.availability(con, harness=ns.harness)
+        if getattr(ns, "as_json", False):
+            _emit(summary, True)
+        else:
+            print(_availability_text(summary))
+        # A ledger-only or partial session is a coverage gap, not success.
+        if ns.session and summary["status"] != "available":
+            return 3
+        if not ns.session and summary["sessions"].get("ledger_only", 0) + summary[
+                "sessions"].get("partial", 0):
+            return 3
+        return 0
     if ns.op == "show":
         row = con.execute("SELECT * FROM sessions WHERE session_key=?",
                           (ns.session,)).fetchone()
@@ -1237,6 +1292,8 @@ def _sessions(con, ns) -> int:
         payload["user_messages"] = {r["kind"]: r["n"] for r in con.execute(
             "SELECT kind, COUNT(*) n FROM user_messages WHERE session_key=?"
             " GROUP BY kind", (ns.session,))}
+        payload["source_availability"] = lookup.availability(
+            con, session_key=ns.session)
         _emit(payload, True)
         return 0
     q = ("SELECT s.* FROM sessions s WHERE 1=1")
@@ -1256,7 +1313,13 @@ def _sessions(con, ns) -> int:
     q += " ORDER BY COALESCE(s.ended_at, s.started_at) DESC LIMIT ?"
     args.append(ns.limit)
     rows = [dict(r) for r in con.execute(q, args)]
+    statuses = {}
+    if rows:
+        statuses = lookup.availability(
+            con, session_keys={r["session_key"] for r in rows}).get(
+                "by_session") or {}
     for r in rows:
+        r["source_status"] = statuses.get(r["session_key"], "available")
         r.pop("identity_json", None)
         usage = _report.scope_totals(con, {r["session_key"]})
         r["responses"] = usage.get("responses", 0)

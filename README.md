@@ -36,6 +36,7 @@ agent-observer health                        # live sessions Observer cannot see
 agent-observer claims --session claude:<id>  # final-report claims checked against tool calls
 agent-observer delegation-modes --since 2026-10-01  # planner delegation versus a dispatcher thread
 agent-observer event show <id> [<id> ...]    # full tool input, result and assistant text from the native log
+agent-observer sessions availability         # which indexed events still have a native source
 agent-observer event search wal checkpoint  # events and user messages containing every word, read-only
 ```
 
@@ -216,10 +217,34 @@ Each event returns `status` and, when it is `ok`:
 - `record`: the native record, for lifecycle, compaction and other events
   with no tool call.
 
-The other statuses carry no content: `source_missing` (the log or OpenCode
-database is gone), `source_changed` (the log shrank or was replaced since
-the last sync), `not_found` (the log no longer holds that native id) and
-`no_such_event`. The exit status is 3 when any event is not `ok`.
+Every event row also returns `reason`. `no_such_event` has no row and no
+reason. `ok` is `live` at the indexed path, or
+`relocated` when that path is gone and exactly one file of the same name
+in the harness's session or archive tree still matches the imported tail.
+A relocated event includes `read_path` and is readable. The other statuses
+carry no content: `source_missing` with `gone` (nothing of that name
+remains), `ambiguous` (more than one copy, so Observer does not guess) or
+`no_source` (no source row); `source_changed` with `replaced` (the log
+shrank or its tail no longer matches); `not_found` (the source is intact
+but holds no record with that native id); and `no_such_event`. The exit
+status is 3 when any event is not `ok`.
+
+`sessions availability` reports the same fact per session without reading
+event text. A session is `available` when every indexed event is live or
+relocated, `ledger_only` when every one is gone, and `partial` otherwise.
+An OpenCode source is its session row, not merely the database file. A
+Grok session whose `updates.jsonl` is gone or replaced is the same gap
+hydration reports. A session with no indexed events is still unavailable
+when a source backing the session, its responses, or its submissions is
+gone or replaced.
+The machine summary (`sessions availability`, optional `--harness`) counts
+events and sessions and names no paths. Text for `--session` also names
+no paths. `--json` for one session includes each source path, status and
+reason. `sessions list` adds `source_status`; `sessions show` embeds
+`source_availability`. `sessions availability` exits 3 when any listed
+session is ledger-only or partial. A task report is not `complete`
+unless in-scope source availability is `available`, and its snapshot
+changes when a source disappears.
 
 It works for Claude Code, Codex, Grok Build and OpenCode, including
 subagent transcripts, because every event keeps its source and native id.
@@ -371,13 +396,15 @@ exact counter semantics. Buckets are never added across semantics; a mixed
 scope exposes per-semantics groups with no combined total. The attributed
 headline excludes shared and outside-task usage; shared model rows render
 separately. Missing ownership, conflicting ownership, active task turns,
-crashes, missing native sessions, unbound child sessions and incomplete coverage stay visible; arithmetic reconciliation
-alone never claims completeness. Acceptance is explicit only: a zero exit
+crashes, missing native sessions, unbound child sessions, ledger-only events and incomplete coverage stay visible; arithmetic reconciliation
+alone never claims completeness. A task whose in-scope sources are not all `available` is not complete. Acceptance is explicit only: a zero exit
 or successful task turn never implies an accepted outcome.
 
 Task reports carry a stable snapshot identity (`snapshot_id`, a SHA-256
 over the selected task, sessions, response counters, assignments, outcome,
-task turns, delegations, source cutoff and price schedule) and a measured set (task, sessions
+task turns, delegations, source cutoff, price schedule, source
+availability, the sessions that are not available, and the source ids
+that are not readable) and a measured set (task, sessions
 and attributed/shared/unassigned response ids). Repeated rendering without
 ledger changes keeps the same identity; new evidence changes it. Time and
 diagnostics are task-turn scoped when turn timing exists, otherwise labeled

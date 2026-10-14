@@ -25,6 +25,7 @@ Run `sync` first; it is incremental and takes seconds after the first run.
 | Refresh the ledger | `sync` (or `sync --harness claude`) |
 | Recent sessions for a project | `sessions list --project <name> [--since 2026-09-01]` |
 | One session's usage, events and prompts | `sessions show --session <key>` |
+| Whether indexed events still have a native source | `sessions availability [--session <key>] [--harness <name>]` |
 | What happened inside a session or task | `trace --session <key>` or `trace --task <id>` |
 | The full command, heredoc body, tool output or assistant text behind events (the ledger keeps none) | `event show <id>...` or `event show --ids-from - --json` with ids from `trace --json` |
 | Repeated work and behavior incidents | `diagnose [--project P] [--since D] [--detector test_edit_after_failure]` |
@@ -87,7 +88,12 @@ valuations with `--prices`.
   `event show` output is such content: use it for your analysis, and
   report counts and event ids.
 - Use `event show` instead of parsing host logs yourself. Report any
-  event whose status is not `ok` as unknown; never fill it in.
+  event whose status is not `ok` as unknown; never fill it in. A
+  `ledger_only` or `partial` session is a coverage gap: say the status
+  and reason (`gone`, `ambiguous`, `replaced` or `no_source`) and do not
+  treat the task as complete. That includes a session with no indexed
+  events whose backing source is gone. A unique archived copy with a
+  matching tail is `relocated` and readable.
 - `publish` writes to GitHub. Run it on the PR of the task you are
   delivering, or when a person asks, and only against the repository and
   PR or commit of that task or request.

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.0] - 2026-10-14
+
+### Added
+
+- Report whether each indexed event still has a native source.
+
 ## [1.1.5] - 2026-10-14
 
 ### Changed
