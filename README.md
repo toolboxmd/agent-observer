@@ -217,7 +217,8 @@ Each event returns `status` and, when it is `ok`:
 - `record`: the native record, for lifecycle, compaction and other events
   with no tool call.
 
-Every event also returns `reason`. `ok` is `live` at the indexed path, or
+Every event row also returns `reason`. `no_such_event` has no row and no
+reason. `ok` is `live` at the indexed path, or
 `relocated` when that path is gone and exactly one file of the same name
 in the harness's session or archive tree still matches the imported tail.
 A relocated event includes `read_path` and is readable. The other statuses

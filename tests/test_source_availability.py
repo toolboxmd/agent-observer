@@ -1,5 +1,6 @@
 """A session says when its indexed events no longer have a native source (#86)."""
 
+import json
 import os
 import shutil
 import sqlite3
@@ -259,6 +260,20 @@ class SourceAvailabilityTest(LedgerCase):
         self.assertEqual(
             lookup.availability(self.con, session_key=parent)["status"],
             "available")
+        listed = lookup.availability(
+            self.con, session_keys={child, parent})["by_session"]
+        self.assertEqual(listed[child], "ledger_only")
+        self.assertEqual(listed[parent], "available")
+        env = dict(os.environ, AGENT_OBSERVER_DB=self.db_path)
+        cli = subprocess.run(
+            [sys.executable, "-m", "agent_observer", "sessions",
+             "list", "--json"],
+            cwd=REPO, capture_output=True, text=True, env=env)
+        self.assertEqual(cli.returncode, 0, cli.stderr)
+        by_key = {row["session_key"]: row["source_status"]
+                  for row in json.loads(cli.stdout)["sessions"]}
+        self.assertEqual(by_key[child], "ledger_only")
+        self.assertEqual(by_key[parent], "available")
 
     def test_eventless_gap_makes_a_mixed_task_partial(self):
         native_path = os.path.join(self.tmp.name, "opencode.db")
