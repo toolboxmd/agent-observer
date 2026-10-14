@@ -224,6 +224,7 @@ class ClaudeLookupTest(LookupCase):
         os.remove(os.path.join(self.claude_root, "proj", "sess-a.jsonl"))
         [item] = self.show(call)
         self.assertEqual(item["status"], "source_missing")
+        self.assertEqual(item["reason"], "gone")
         self.assertNotIn("input", item)
         self.assertNotIn("result", item)
 

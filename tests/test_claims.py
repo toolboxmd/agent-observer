@@ -190,6 +190,7 @@ class ClaimsCliTest(LedgerCase):
         code, _, err = self.main("claims", "--session", SESSION)
         self.assertEqual(code, 2)
         self.assertIn("cannot read transcript", err)
+        self.assertIn("source_missing: gone", err)
 
 
 if __name__ == "__main__":

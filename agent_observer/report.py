@@ -519,6 +519,8 @@ def task_report(con: sqlite3.Connection, task_id: str,
                 r.get("reasoning_output_tokens"), r.get("total_tokens"),
                 r.get("cost_usd"), r.get("cache_write_5m_tokens"), r.get("cache_write_1h_tokens")]
 
+    from . import lookup
+    source_availability = lookup.availability(con, session_keys=scope_keys)
     snapshot_payload = {
         "price_schedule": schedule,
         "phases": phases,
@@ -529,7 +531,9 @@ def task_report(con: sqlite3.Connection, task_id: str,
                               "missing_sessions": missing_sessions,
                               "empty_sessions": empty_sessions,
                               "unbound_children": unbound_children,
-                              "unbound_delegations": unbound_delegations},
+                              "unbound_delegations": unbound_delegations,
+                              "source_availability": source_availability["status"],
+                              "ledger_only_events": source_availability["events"]["ledger_only"]},
         "task_id": task_id,
         "sessions": sorted(scope_keys),
         "attributed": sorted(_resp_tuple(r) for r in attributed),
@@ -680,12 +684,21 @@ def task_report(con: sqlite3.Connection, task_id: str,
             for sem in parts)
     report["reconciles"] = responses_reconcile and totals_reconcile
     report["unbound_usage"] = unbound_usage
+    report["source_availability"] = {
+        "status": source_availability["status"],
+        "events": source_availability["events"],
+        "reasons": source_availability["reasons"],
+    }
     report["complete"] = (not missing_submissions
                           and not report["conflicting_assignments"]
                           and not unavailable_usage
-                          and not report["has_active_work"])
+                          and not report["has_active_work"]
+                          and source_availability["status"] == "available")
     report["coverage"]["reconciles"] = report["reconciles"]
     report["coverage"]["complete"] = report["complete"]
+    report["coverage"]["source_availability"] = source_availability["status"]
+    report["coverage"]["ledger_only_events"] = (
+        source_availability["events"]["ledger_only"])
     report["total_cost"] = _total_cost(
         con, task_id, total_estimated, attributed, shared, joint, whole)
     report["total_cost"]["unplaced"] = {

@@ -261,13 +261,21 @@ def audit(transcript: dict, model=None) -> dict:
 
 def transcript_path(con, session_key: str) -> str:
     row = con.execute(
-        "SELECT s.harness, src.path FROM sessions s JOIN sources src ON src.id = s.source_id "
-        "WHERE s.session_key = ?", (session_key,)).fetchone()
+        "SELECT s.harness, src.harness AS source_harness, src.path, src.size_bytes,"
+        " src.read_offset, src.tail_sha256, src.ino"
+        " FROM sessions s JOIN sources src ON src.id = s.source_id"
+        " WHERE s.session_key = ?", (session_key,)).fetchone()
     if row is None:
         raise AuditError(f"unknown session {session_key}; run agent-observer sync first")
-    if row[0] != "claude":
-        raise AuditError(f"claim audit reads Claude Code transcripts only, not {row[0]}")
-    return row[1]
+    if row["harness"] != "claude":
+        raise AuditError(
+            f"claim audit reads Claude Code transcripts only, not {row['harness']}")
+    from . import lookup
+    resolved = lookup.resolve_source(row)
+    if resolved["status"] != "ok":
+        raise AuditError(
+            f"cannot read transcript: {resolved['status']}: {resolved['reason']}")
+    return resolved["path"]
 
 
 def render(result: dict) -> str:

@@ -456,6 +456,7 @@ class _Sources:
 
     def __init__(self, con):
         self.con = con
+        self.names = lookup._NameIndex()
         self.cache: dict[int, tuple[str, object]] = {}
 
     def get(self, source_id):
@@ -465,16 +466,21 @@ class _Sources:
             "SELECT id, harness, path, size_bytes, read_offset, tail_sha256,"
             " ino FROM sources WHERE id=?", (source_id,)).fetchone()
         state, index = "source_missing", None
+        source = row
         if row is not None:
-            state = lookup._source_state(row)
+            resolved = lookup.resolve_source(row, self.names)
+            state = resolved["status"]
+            read_path = resolved["path"] or row["path"]
             if state == "ok" and row["harness"] == "grok":
-                state = lookup._grok_updates_state(self.con, row["path"])
+                state = lookup._grok_updates_state(self.con, read_path)
             if state == "ok" and row["harness"] in lookup._INDEXERS:
                 try:
-                    index = lookup._INDEXERS[row["harness"]](row["path"])
+                    index = lookup._INDEXERS[row["harness"]](read_path)
                 except (OSError, sqlite3.Error):
                     state = "source_missing"
-        self.cache[source_id] = (state, (row, index))
+            source = dict(row)
+            source["path"] = read_path
+        self.cache[source_id] = (state, (source, index))
         return self.cache[source_id]
 
 

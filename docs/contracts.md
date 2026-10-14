@@ -227,6 +227,14 @@ are counted separately and excluded from useful-work comparisons.
 
 - `sync`: import every available harness, or `--harness` / `--source`.
 - `sessions list|show`: sessions with project, AgentsMD version and usage.
+  `list` adds `source_status` (`available`, `partial` or `ledger_only`).
+  `show` embeds `source_availability` for that session, including each
+  source path, status and reason.
+- `sessions availability [--session K] [--harness H]`: how many indexed
+  events are `live`, `relocated`, `ledger_only` or `changed`, and why.
+  The machine summary names no paths. Exit 3 when any listed session is
+  `ledger_only` or `partial`. `available` means every indexed event is
+  still readable, including a unique archived copy whose tail matches.
 - `task list|show --task ID [--prices schedule.json]`: attributed, shared joint, and unassigned token
   buckets over the sessions the task touches; per-model rows with native
   buckets and exact semantics; missing and conflicting
@@ -325,7 +333,8 @@ Reconciliation: attributed plus shared plus unassigned equals the scope
 total. Responses must partition exactly; token sums are compared per
 counter semantics when the scope is mixed, so an absent mixed total is
 never treated as zero. A report never claims completeness from arithmetic alone; the
-`complete` flag requires zero missing and zero conflicting bindings and no
+`complete` flag requires zero missing and zero conflicting bindings, source
+availability `available` (no ledger-only or changed in-scope events), and no
 recorded active work, missing native sessions/usage or unbound child sessions.
 Captured delegations without explicit child ownership are coverage gaps too;
 the delegation edge alone never assigns the child's usage to the task.
@@ -338,7 +347,8 @@ arithmetic.
 - `snapshot_id` is a SHA-256 over the selected task, sorted sessions,
   response counters with semantics and model/effort/turn, assignments,
   outcome, task turns, delegations, source cutoff, price schedule and coverage
-  evidence, including ownership that another task records in the same session. `source_cutoff`
+  evidence (including source availability and the ledger-only event count),
+  and ownership that another task records in the same session. `source_cutoff`
   is the max native `imported_at` backing the scope. Repeats without
   ledger changes keep the identity; changed evidence changes it. The
   `measured` set names the task, sessions and attributed/shared/

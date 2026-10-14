@@ -35,6 +35,14 @@ The selected set of responses a total is computed over.
 **Coverage**:
 Which event families a harness's native evidence supports.
 
+**Ledger-only event**:
+An indexed event whose native source file no longer exists, so the ledger still names it and reading its text fails with that status.
+_Avoid_: missing event
+
+**Source availability**:
+For one session, whether each indexed event is backed by a live or relocated native source, or is ledger-only, and why.
+_Avoid_: completeness, coverage
+
 **List-price estimate**:
 Native usage valued at a model vendor's dated API price list, distinct from
 subscription spend.
