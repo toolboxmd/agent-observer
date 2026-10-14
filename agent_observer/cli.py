@@ -20,7 +20,11 @@ from . import report as _report
 
 def _con(path: str):
     con = _db.connect(path)
-    _db.init_db(con)
+    try:
+        _db.init_db(con)
+    except BaseException:
+        con.close()
+        raise
     return con
 
 
@@ -93,6 +97,9 @@ def _text(payload) -> str:
             if h.get("skipped"):
                 line += f" (skipped: {h['skipped']})"
             lines.append(line)
+            for item in h.get("failed") or []:
+                lines.append(
+                    f"  failed {h['harness']} {item['path']}: {item['error']}")
         if payload.get("agentsmd_versions") is not None:
             lines.append(f"agentsmd versions mapped: {payload['agentsmd_versions']}")
         return "\n".join(lines)
@@ -482,28 +489,7 @@ CMD_ALIASES = {"moments": "interventions", "moment": "intervention",
 OP_ALIASES = {"dispatch": "delegation", "attempt": "task-turn"}
 
 
-def main(argv=None) -> int:
-    ap = build_parser()
-    ns = ap.parse_args(argv)
-    ns.cmd = CMD_ALIASES.get(ns.cmd, ns.cmd)
-    if getattr(ns, "op", None) in OP_ALIASES:
-        ns.op = OP_ALIASES[ns.op]
-    if ns.cmd == "fleet" and ns.op == "pull":
-        return _fleet_pull(ns)
-    if ns.cmd == "health":
-        return _health_check(ns)
-    if ns.cmd == "trace" and ns.capabilities:
-        return _capabilities(ns)
-    read_only = not _writes(ns)
-    try:
-        con = _db.connect_read_only(ns.db) if read_only else _con(ns.db)
-    except (RuntimeError, sqlite3.Error) as exc:
-        print(str(exc), file=sys.stderr)
-        if read_only:
-            print("Reports and lookups require an existing ledger; run agent-observer sync first.", file=sys.stderr)
-            if os.path.exists(ns.db):
-                print("If a read-only sandbox prevents access, consume a coordinator-exported task JSON instead.", file=sys.stderr)
-        return 2
+def _run_command(con, ns) -> int:
     try:
         if ns.cmd == "sync":
             return _sync(con, ns)
@@ -629,9 +615,51 @@ def main(argv=None) -> int:
             raise
         print(f"Cannot read ledger: {exc}. Run agent-observer sync with the current version first.", file=sys.stderr)
         return 2
-    finally:
-        con.close()
     return 2
+
+
+def main(argv=None) -> int:
+    ap = build_parser()
+    ns = ap.parse_args(argv)
+    ns.cmd = CMD_ALIASES.get(ns.cmd, ns.cmd)
+    if getattr(ns, "op", None) in OP_ALIASES:
+        ns.op = OP_ALIASES[ns.op]
+    if ns.cmd == "fleet" and ns.op == "pull":
+        return _fleet_pull(ns)
+    if ns.cmd == "health":
+        return _health_check(ns)
+    if ns.cmd == "trace" and ns.capabilities:
+        return _capabilities(ns)
+    read_only = not _writes(ns)
+    lock_fd = None
+    con = None
+    try:
+        if not read_only:
+            # Before open and migration, so a second writer cannot migrate
+            # or write the same ledger. Released on every exit, including
+            # an open or migration failure. Read-only commands skip this.
+            try:
+                lock_fd = _db.acquire_writer_lock(ns.db)
+            except _db.LedgerBusy as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+        try:
+            con = _db.connect_read_only(ns.db) if read_only else _con(ns.db)
+        except (RuntimeError, sqlite3.Error) as exc:
+            print(str(exc), file=sys.stderr)
+            if read_only:
+                print("Reports and lookups require an existing ledger; run agent-observer sync first.", file=sys.stderr)
+                if os.path.exists(ns.db):
+                    print("If a read-only sandbox prevents access, consume a coordinator-exported task JSON instead.", file=sys.stderr)
+            return 2
+        return _run_command(con, ns)
+    finally:
+        try:
+            if con is not None:
+                con.close()
+        finally:
+            if lock_fd is not None:
+                _db.release_writer_lock(lock_fd)
 
 
 def _health_check(ns) -> int:

@@ -396,7 +396,10 @@ shown separately. Provider source URLs travel with each model's estimate.
 Coordinators and dispatchers reuse `task show --task T-42 --json`; no Router
 price table is needed. Every command except `sync`, `capture`, `verdict add`
 and `session-attr add` opens an existing ledger read-only, using one consistent
-database snapshot, so reports and lookups never wait for a running `sync`. Run
+database snapshot, so reports and lookups never wait for a running `sync`.
+Writers run one at a time. A second writer waits up to 10 minutes, then exits 2,
+so a contended `sync` can take that wait plus its own run; run it in the
+background or with a long tool timeout. Run
 `sync` first to create or upgrade the ledger; reporting never migrates it. A strict read-only sandbox may
 also prevent SQLite from opening a WAL ledger whose sidecars are absent. In
 that case the coordinator exports the report and hands its saved JSON to the
