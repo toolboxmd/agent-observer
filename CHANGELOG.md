@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.2] - 2026-10-14
+
+### Changed
+
+- Default sync imports Codex rollouts under ~/.codex/archived_sessions as well as ~/.codex/sessions, and the same rollout basename in both is imported once (#77)
+
 ## [1.1.1] - 2026-10-13
 
 ### Changed
