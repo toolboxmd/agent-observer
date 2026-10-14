@@ -193,16 +193,25 @@ def skill_from_path(path: str) -> str | None:
 
 
 def default_agentsmd_repo() -> str | None:
-    """The repository behind the global instruction link, when resolvable."""
+    """The repository behind the global instruction link, when resolvable.
+
+    The link may name a file inside the clone, such as global/AGENTS.md.
+    The clone root is the nearest directory at or above that file that
+    contains .git, as a directory or a file.
+    """
     override = os.environ.get("AGENT_OBSERVER_AGENTSMD_REPO")
     if override:
         return override
     for link in ("~/.claude/CLAUDE.md", "~/.codex/AGENTS.md"):
-        target = os.path.realpath(os.path.expanduser(link))
-        root = os.path.dirname(target)
-        if os.path.isdir(os.path.join(root, ".git")) or os.path.isfile(
-                os.path.join(root, ".git")):
-            return root
+        start = os.path.dirname(os.path.realpath(os.path.expanduser(link)))
+        while True:
+            marker = os.path.join(start, ".git")
+            if os.path.isdir(marker) or os.path.isfile(marker):
+                return start
+            parent = os.path.dirname(start)
+            if parent == start:
+                break
+            start = parent
     return None
 
 
