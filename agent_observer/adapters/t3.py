@@ -35,17 +35,12 @@ onto the existing workload tables:
   from exit codes (which are never read).
 - Ghostty bodies and unknown provider shapes are out of scope: their
   rows are skipped, never guessed.
-- Chromeria V2 (#53): ``orchestration_v2_projection_threads`` payload
-  ``lineage`` gives parent and root (V2 ids carry no ``sub.`` prefix) and
-  ``pullRequests`` the PR links; ``orchestration_v2_projection_provider_threads``
-  ``nativeThreadRef.nativeId`` maps a thread to each native Claude, Codex,
-  Grok or OpenCode session it ran. V2 has no native Claude turn ids, so
-  turn origin joins by prompt: a V2 user message whose text hash matches
-  a prompt in the same native Claude session marks it ``client``
-  (``createdBy=user`` from a client surface) or ``server`` (``agent`` or
-  ``system``). A hash both sides sent stays unknown. Only the hash is
-  stored. A ``senderThreadId`` message into a thread that is not the
-  sender's child is a cross-thread message.
+- Chromeria V2 (#53, #85): thread lineage and PR links come from V2
+  projections. Strong nativeThreadRef maps each provider thread to its
+  harness session. Runs name their userMessageId; run attempts name their
+  provider turns, whose nativeTurnRef joins the imported native message or
+  turn. Equal text is never an attribution key. Missing or ambiguous native
+  identity stays unknown, including older V2 records without native refs.
 - spawns and cross-thread messages (#42): every ``sub.`` thread in
   ``projection_threads`` mirrors its parent, depth and creation time;
   every delivered message Chromeria prefixed with ``[Message from <title>
@@ -57,8 +52,8 @@ Privacy (fail closed): only identifiers (thread, message and session
 ids), link coordinates (host, repository, number, url), PR snapshot
 state and validated actor kinds reach the ledger. No prompt, title or
 other free text is stored: task titles are the ``repo#N`` identifier
-itself. Backfilled submission excerpts stay empty; excerpts for newly
-genuine prompts come only from the native transcript import.
+itself. Excerpts come only from the native transcript adapter; retiring an
+agent origin may reread an affected native source to restore permitted text.
 
 Stdlib only. Never writes the T3 database.
 """
@@ -71,7 +66,6 @@ import re
 import sqlite3
 
 from .. import db, privacy
-from ..ingest import text_hash
 
 # A PR head branch as T3 snapshots it; anything else is not stored.
 BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
@@ -95,7 +89,11 @@ V2_MESSAGES = "orchestration_v2_projection_messages"
 V2_RUNS = "orchestration_v2_projection_runs"
 V2_LEGACY_IMPORTS = "orchestration_v2_legacy_imports"
 # V2 drivers whose nativeThreadRef is the ledger's native session id.
-V2_DRIVERS = ("claudeAgent", "codex", "grok", "opencode")
+DRIVER_HARNESSES = {"claudeAgent": "claude", "codex": "codex", "grok": "grok",
+                    "opencode": "opencode", "opencode2": "opencode"}
+V2_DRIVERS = tuple(DRIVER_HARNESSES)
+V2_PROVIDER_TURNS = "orchestration_v2_projection_provider_turns"
+V2_RUN_ATTEMPTS = "orchestration_v2_projection_run_attempts"
 # Chromeria surfaces where a person types; any other source is no evidence.
 CLIENT_SOURCES = ("web", "mobile")
 RATES_RELATIVE = os.path.join("userdata", "usage-model-rates.json")
@@ -186,6 +184,10 @@ def _ensure_tables(con: sqlite3.Connection) -> None:
         " actor_kind TEXT NOT NULL,"
         " PRIMARY KEY (native_session, text_hash))")
     con.execute(
+        "CREATE TABLE IF NOT EXISTS t3_native_prompt_origins("
+        " session_key TEXT NOT NULL, native_id TEXT NOT NULL,"
+        " actor_kind TEXT NOT NULL, PRIMARY KEY(session_key, native_id))")
+    con.execute(
         "CREATE TABLE IF NOT EXISTS checkouts("
         " root TEXT PRIMARY KEY,"
         " repository TEXT NOT NULL,"
@@ -220,25 +222,21 @@ def turn_actor(con: sqlite3.Connection, message_id: str) -> str | None:
     return actor if actor in ACTORS else None
 
 
-def prompt_actor(con: sqlite3.Connection, native_session,
-                 digest: str) -> str | None:
-    """The V2 origin of a prompt by native session and text hash.
-
-    Missing table, unknown session or hash read as None, never as a
-    guessed origin.
-    """
-    if not isinstance(native_session, str) or not native_session:
+def prompt_actor(con: sqlite3.Connection, session_key,
+                 native_id: str, turn_id=None) -> str | None:
+    """Origin from exact native message/turn identity; ambiguous stays unknown."""
+    if not isinstance(session_key, str) or not session_key:
         return None
+    if session_key.startswith("claude:"):
+        turn_id = None  # Claude authorship belongs to the input's own UUID.
     try:
-        row = con.execute(
-            "SELECT actor_kind FROM t3_prompt_origins"
-            " WHERE native_session=? AND text_hash=?",
-            (native_session, digest)).fetchone()
+        actors = {r[0] for r in con.execute(
+            "SELECT actor_kind FROM t3_native_prompt_origins"
+            " WHERE session_key=? AND native_id IN (?,?)",
+            (session_key, native_id, turn_id))}
     except sqlite3.DatabaseError:
         return None
-    if row is None:
-        return None
-    return row[0] if row[0] in ACTORS else None
+    return next(iter(actors)) if len(actors) == 1 and actors <= set(ACTORS) else None
 
 
 def thread_root(thread_id: str) -> str:
@@ -361,8 +359,7 @@ def sync(con: sqlite3.Connection, root: str | None = None,
         _import_spawns(con, native, totals, lineage)
         _import_messages(con, native, totals, lineage)
         _import_prompt_origins(con, native, totals)
-        totals["user_messages_reclassified"] = _backfill_submissions(con) \
-            + _backfill_prompt_origins(con)
+        totals["user_messages_reclassified"] = _backfill_prompt_origins(con)
         totals["responses_retouched"] = _retouch_response_turns(con)
         bound = _bind_trees(con, threads, links, lineage)
         totals["tasks"] = bound["tasks"]
@@ -583,74 +580,104 @@ def _prompt_actor_of(created_by, source) -> str | None:
 
 def _import_prompt_origins(con: sqlite3.Connection,
                            native: sqlite3.Connection, totals: dict) -> None:
-    """Mirror V2 prompt origins per native session and text hash.
+    """Join each run's author to its provider turn's native identity.
 
-    A message joins the native session of its run's provider thread (any
-    driver: Claude import reclassifies by it, judge moments read it;
-    Grok and OpenCode native prompt text differs from V2 text, so only
-    Claude and Codex hashes match), or every Claude session of its thread when the run
-    names none. A hash sent by both a person and an agent in one session
-    is dropped. Only hashes are stored; the text never leaves this
-    function.
+    Run attempts retain retries and rotated sessions. No text, positional
+    matching or synthetic turn-id interpretation is evidence of authorship.
+    A reference that no native message or turn has is simply unmatched.
     """
+    previous = con.execute(
+        "SELECT DISTINCT u.native_id,u.session_key FROM user_messages u"
+        " JOIN t3_native_prompt_origins o ON o.session_key=u.session_key"
+        " AND o.native_id=u.native_id"
+        " WHERE u.session_key LIKE 'claude:%' AND u.kind IN ('genuine','synthetic')").fetchall()
+    con.execute("DELETE FROM t3_prompt_origins")  # Retire legacy hash evidence.
+    con.execute("DELETE FROM t3_native_prompt_origins")
+    totals["prompt_origins"] = 0
     tables = _tables(native)
-    if not {V2_MESSAGES, V2_PROVIDER_THREADS} <= tables:
+    required = {V2_MESSAGES, V2_RUNS, V2_PROVIDER_THREADS,
+                V2_PROVIDER_TURNS, V2_RUN_ATTEMPTS}
+    if not required <= tables:
+        _clear_retired_actors(con, previous)
         return
     try:
         providers = native.execute(
-            "SELECT provider_thread_id, thread_id, provider, payload_json"
-            f" FROM {V2_PROVIDER_THREADS}").fetchall()
-        runs = {} if V2_RUNS not in tables else {
-            r["run_id"]: r["provider_thread_id"] for r in native.execute(
-                f"SELECT run_id, provider_thread_id FROM {V2_RUNS}")}
-        messages = native.execute(
-            "SELECT thread_id, run_id,"
-            " json_extract(payload_json, '$.createdBy') AS created_by,"
-            " json_extract(payload_json, '$.creationSource') AS source,"
-            " json_extract(payload_json, '$.text') AS text"
-            f" FROM {V2_MESSAGES} WHERE role='user'").fetchall()
+            f"SELECT provider_thread_id, thread_id, provider, payload_json FROM {V2_PROVIDER_THREADS}").fetchall()
+        runs = {r["run_id"]: r for r in native.execute(
+            f"SELECT run_id, thread_id, payload_json FROM {V2_RUNS}")}
+        attempts = {r["attempt_id"]: r for r in native.execute(
+            f"SELECT attempt_id, run_id, thread_id, provider_thread_id FROM {V2_RUN_ATTEMPTS}")}
+        messages = {r["message_id"]: r for r in native.execute(
+            f"SELECT message_id, thread_id, run_id, payload_json FROM {V2_MESSAGES} WHERE role='user'")}
+        turns = native.execute(
+            f"SELECT provider_thread_id, run_attempt_id, payload_json FROM {V2_PROVIDER_TURNS}").fetchall()
     except sqlite3.DatabaseError:
+        _clear_retired_actors(con, previous)
         return
-    by_provider: dict[str, str] = {}
-    by_thread: dict[str, list] = {}
-    known = {row["provider_thread_id"] for row in providers}
+    sessions = {}
     for row in providers:
-        session = _v2_native_ref(row["payload_json"], row["provider"])
-        if session is None:
+        try:
+            payload = json.loads(row["payload_json"])
+            ref = payload.get("nativeThreadRef") or {}
+            driver = ref.get("driver") or payload.get("driver") or row["provider"]
+        except (ValueError, TypeError, AttributeError):
             continue
-        by_provider[row["provider_thread_id"]] = session
-        if (row["provider"] or "") == "claudeAgent":
-            by_thread.setdefault(row["thread_id"], []).append(session)
-    seen: dict[tuple, set] = {}
-    for row in messages:
-        actor = _prompt_actor_of(row["created_by"], row["source"])
-        if actor is None or not isinstance(row["text"], str) \
-                or not row["text"]:
+        session = _v2_native_ref(row["payload_json"], driver)
+        if session and driver in DRIVER_HARNESSES:
+            sessions[row["provider_thread_id"]] = (DRIVER_HARNESSES[driver], session, row["thread_id"], driver)
+    seen = {}
+    for turn in turns:
+        attempt = attempts.get(turn["run_attempt_id"])
+        provider = sessions.get(turn["provider_thread_id"])
+        if attempt is None or provider is None:
             continue
-        provider = runs.get(row["run_id"])
-        if provider in by_provider:
-            sessions = [by_provider[provider]]
-        elif provider in known:
-            # A run on a provider thread without a native session says
-            # nothing about the thread's Claude sessions.
+        harness, session, thread, driver = provider
+        run = runs.get(attempt["run_id"])
+        if run is None or run["thread_id"] != thread or attempt["thread_id"] != thread \
+                or attempt["provider_thread_id"] != turn["provider_thread_id"]:
             continue
-        else:
-            sessions = by_thread.get(row["thread_id"], [])
-        digest = text_hash(row["text"])
-        for session in sessions:
-            seen.setdefault((session, digest), set()).add(actor)
-    con.execute("DELETE FROM t3_prompt_origins")
-    stored = 0
-    for (session, digest), actors in sorted(seen.items()):
-        if len(actors) != 1:
+        try:
+            mid = json.loads(run["payload_json"]).get("userMessageId")
+            message = messages.get(mid)
+            ref = json.loads(turn["payload_json"]).get("nativeTurnRef")
+            if message is None or message["thread_id"] != thread or message["run_id"] != run["run_id"] \
+                    or not isinstance(ref, dict) or ref.get("driver") != driver \
+                    or ref.get("strength") not in ("strong", "weak"):
+                continue
+            native_id = _valid_id(ref.get("nativeId"))
+            payload = json.loads(message["payload_json"])
+            actor = _prompt_actor_of(payload.get("createdBy"), payload.get("creationSource"))
+        except (ValueError, TypeError, AttributeError):
             continue
-        con.execute(
-            "INSERT INTO t3_prompt_origins(native_session, text_hash,"
-            " actor_kind) VALUES(?,?,?)", (session, digest, actors.pop()))
-        stored += 1
-    totals["prompt_origins"] = stored
-    if V2_RUNS in tables:
-        totals["v2_runs"] = len(runs)
+        if native_id is None or actor is None:
+            continue
+        identity = f"{harness}:{session}:{native_id}" if harness == "grok" else f"{harness}:{native_id}"
+        seen.setdefault((f"{harness}:{session}", identity), set()).add(actor)
+    for (session_key, native_id), actors in sorted(seen.items()):
+        if len(actors) == 1:
+            con.execute("INSERT INTO t3_native_prompt_origins VALUES(?,?,?)",
+                        (session_key, native_id, next(iter(actors))))
+            totals["prompt_origins"] += 1
+    totals["v2_runs"] = len(runs)
+    _clear_retired_actors(con, previous)
+
+
+def _clear_retired_actors(con: sqlite3.Connection, previous: list) -> None:
+    """A formerly matched SDK input stays counted when its origin is removed."""
+    from .claude import native_kind, restore_native_excerpts
+
+    retired = []
+    for row in previous:
+        if turn_actor(con, row["native_id"].partition(":")[2]) or prompt_actor(
+                con, row["session_key"], row["native_id"]):
+            continue
+        kind = native_kind(con, row["native_id"]) or "unknown"
+        con.execute("UPDATE user_messages SET kind=?,is_genuine=?,"
+                    " text_excerpt=CASE WHEN ?='genuine' THEN text_excerpt ELSE '' END"
+                    " WHERE native_id=?", (kind, 1 if kind == "genuine" else 0, kind, row["native_id"]))
+        if kind == "genuine":
+            retired.append(row["native_id"])
+    restore_native_excerpts(con, retired)
 
 
 def _cursor_session(adapter_key, cursor: dict) -> str | None:
@@ -992,12 +1019,17 @@ def _import_v2_messages(con: sqlite3.Connection, native: sqlite3.Connection,
 def _reclassify(con: sqlite3.Connection, native_id: str, sub,
                 actor: str) -> bool:
     """Move one submission to its T3 origin; True when it changed."""
+    from .claude import prompt_origin_allowed
+
+    if not prompt_origin_allowed(con, native_id):
+        return False
     want = "genuine" if actor == "client" else "synthetic"
     if sub["kind"] == want and (want == "synthetic" or sub["turn_id"]):
         return False
     con.execute(
-        "UPDATE user_messages SET kind=?, is_genuine=? WHERE native_id=?",
-        (want, 1 if want == "genuine" else 0, native_id))
+        "UPDATE user_messages SET kind=?, is_genuine=?,"
+        " text_excerpt=CASE WHEN ?='synthetic' THEN '' ELSE text_excerpt END WHERE native_id=?",
+        (want, 1 if want == "genuine" else 0, want, native_id))
     if want == "genuine" and not sub["turn_id"]:
         con.execute("UPDATE user_messages SET turn_id=? WHERE native_id=?",
                     (native_id, native_id))
@@ -1005,57 +1037,23 @@ def _reclassify(con: sqlite3.Connection, native_id: str, sub,
 
 
 def _backfill_prompt_origins(con: sqlite3.Connection) -> int:
-    """Reclassify main-session Claude prompts from V2 prompt origins.
+    """Reclassify Claude inputs by native identity, preserving transcript markers."""
+    from .claude import restore_native_excerpts
 
-    Same rules as the turn-uuid backfill; a prompt with uuid evidence
-    keeps that verdict.
-    """
-    try:
-        rows = con.execute(
-            "SELECT s.native_id, s.kind, s.turn_id, o.actor_kind"
-            " FROM user_messages s JOIN t3_prompt_origins o"
-            " ON s.session_key='claude:' || o.native_session"
-            " AND s.text_hash=o.text_hash"
-            " WHERE s.kind IN ('synthetic', 'genuine')"
-            " AND NOT EXISTS (SELECT 1 FROM t3_turn_origins t"
-            " WHERE s.native_id='claude:' || t.message_id)").fetchall()
-    except sqlite3.DatabaseError:
-        return 0
-    return sum(1 for row in rows
-               if row["actor_kind"] in ACTORS
-               and _reclassify(con, row["native_id"], row,
-                               row["actor_kind"]))
-
-
-def _backfill_submissions(con: sqlite3.Connection) -> int:
-    """Reclassify imported Claude submissions from T3 turn evidence.
-
-    Only rows still carrying a live human-or-synthetic verdict
-    (``synthetic`` or ``genuine``) move: ``command``, ``interrupt`` and
-    ``scaffolding`` verdicts from the transcript import stay put (fail
-    closed on contradictory records). Genuine rows gain their
-    ``claude:<message id>`` turn when missing so later responses join;
-    excerpts stay empty because the backfill never reads prompt text.
-    """
-    try:
-        origins = con.execute(
-            "SELECT message_id, actor_kind FROM t3_turn_origins").fetchall()
-    except sqlite3.DatabaseError:
-        return 0
-    retouched = 0
-    for origin in origins:
-        native_id = f"claude:{origin['message_id']}"
-        try:
-            sub = con.execute(
-                "SELECT kind, turn_id FROM user_messages WHERE native_id=?",
-                (native_id,)).fetchone()
-        except sqlite3.DatabaseError:
-            continue
-        if sub is None or sub["kind"] not in ("synthetic", "genuine"):
-            continue
-        if _reclassify(con, native_id, sub, origin["actor_kind"]):
-            retouched += 1
-    return retouched
+    rows = con.execute(
+        "SELECT native_id, session_key, kind, turn_id FROM user_messages"
+        " WHERE session_key LIKE 'claude:%' AND kind IN ('synthetic','genuine','unknown')").fetchall()
+    changed = 0
+    restored = []
+    for row in rows:
+        actor = turn_actor(con, row["native_id"].partition(":")[2]) or prompt_actor(
+            con, row["session_key"], row["native_id"])
+        if actor and _reclassify(con, row["native_id"], row, actor):
+            changed += 1
+            if actor == "client":
+                restored.append(row["native_id"])
+    restore_native_excerpts(con, restored)
+    return changed
 
 
 def _retouch_response_turns(con: sqlite3.Connection) -> int:

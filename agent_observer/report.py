@@ -6,6 +6,8 @@ import hashlib
 import json
 import sqlite3
 
+from . import codex_order
+
 BUCKETS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
            "output_tokens", "reasoning_output_tokens", "total_tokens")
 PHASES = ("research", "planning", "design", "implementation", "review",
@@ -192,8 +194,10 @@ def _source_cutoff(con: sqlite3.Connection, scope_keys: set) -> float | None:
         "SELECT DISTINCT source_id FROM user_messages WHERE session_key IN "
         f"({placeholders}) UNION "
         "SELECT DISTINCT source_id FROM sessions WHERE session_key IN "
+        f"({placeholders}) UNION "
+        "SELECT DISTINCT source_id FROM codex_occurrences WHERE session_key IN "
         f"({placeholders}))",
-        keys + keys + keys + keys).fetchone()
+        keys + keys + keys + keys + keys).fetchone()
     return row["m"] if row is not None else None
 
 
@@ -823,8 +827,10 @@ def timeline(con: sqlite3.Connection, task_id: str | None = None,
     if family:
         q += " AND family=?"
         args.append(family)
-    q += " ORDER BY COALESCE(ts, 0), ordinal_num LIMIT ?"
-    args.append(limit)
+    # Source order is applied to the assembled rows. The representative
+    # ordinal is one file's locator, so limiting by it can drop an earlier
+    # call whose locator was written by a later file.
+    q += " ORDER BY COALESCE(ts, 0), ordinal_num, id"
     rows = con.execute(q, args).fetchall()
     out = []
     for r in rows:
@@ -835,10 +841,35 @@ def timeline(con: sqlite3.Connection, task_id: str | None = None,
             d["detail"] = {"raw": d["detail_json"]}
         d.pop("detail_json", None)
         out.append(d)
+    sessions = {}
+    for event in out:
+        sessions.setdefault(event["session_key"], []).append(event)
+    unknown = {}
+    if len(sessions) == 1:
+        key, events = next(iter(sessions.items()))
+        wanted = {("event", str(event["id"])) for event in events}
+        state, order, sequences = codex_order.resolve(con, key, wanted)
+        if state == "known":
+            index = {}
+            for place, group in enumerate(order):
+                for ident in group:
+                    index[ident] = place
+            events.sort(key=lambda event: (
+                index.get(("event", str(event["id"])), len(index)), event["id"]))
+            out = events
+        elif state in ("partial", "conflict"):
+            unknown[key] = sequences
+    else:
+        for key, events in sessions.items():
+            wanted = {("event", str(event["id"])) for event in events}
+            state, _order, sequences = codex_order.resolve(con, key, wanted)
+            if state in ("partial", "conflict"):
+                unknown[key] = sequences
+    out = out[:limit]
     # Tool join status: calls joined to results only on equal call_id.
     calls = {e["native_id"] for e in out if e["family"] == "tool_call"}
     results = {e["native_id"] for e in out if e["family"] == "tool_result"}
-    return {
+    result = {
         "events": out,
         "join": {
             "calls": len(calls),
@@ -850,6 +881,13 @@ def timeline(con: sqlite3.Connection, task_id: str | None = None,
         "coverage_note": ("Native evidence absent stays unknown; unmatched "
                           "items are retained, never guessed into a match."),
     }
+    if unknown:
+        result["chronology"] = "unknown"
+        result["source_sequences"] = {
+            key: [[[list(ident) for ident in sorted(group)] for group in sequence]
+                  for sequence in sequences]
+            for key, sequences in unknown.items()}
+    return result
 
 
 def capabilities() -> list[dict]:

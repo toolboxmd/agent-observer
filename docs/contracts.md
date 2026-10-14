@@ -82,8 +82,9 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
    assistant_message event per text block, so a message with several
    blocks keeps one excerpt per block; the Codex adapter concatenates
    the text items of an assistant message and keeps one excerpt for
-   the combined message. No other adapter emits assistant_message
-   excerpts. Every source records the privacy rules version; a version
+   the combined message. Grok emits one per native assistant chunk;
+   OpenCode emits one per assistant text part, updated as the part streams.
+   Every source records the privacy rules version; a version
    change fully re-imports the source, updating rows in place and
    replacing that source's `import_errors`. `import_errors.error` is
    exactly one closed category (`malformed_json`, `unknown_record`,
@@ -160,7 +161,7 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
 | `file_change` | Edit or write by the agent | path, change kind, content size and hash |
 | `compaction` | Context compaction boundary | trigger, before and after sizes when recorded |
 | `lifecycle` | Turn start, completion, abort, subagent activity, stop reasons | duration, reason |
-| `assistant_message` | Final assistant text of a turn | last 400 characters per Claude assistant text block; one combined-message excerpt on Codex |
+| `assistant_message` | Native assistant text | last 400 characters per Claude block, Codex message, Grok chunk or OpenCode text part |
 | `permission` | Permission request or denial | tool, outcome; Claude's denial kind (`user-rejected`, `permission-rule`, `automode-blocked`, `interrupted`) in detail `denial` |
 
 A tool call joins its result only on an equal native call id. Nothing is
@@ -260,12 +261,13 @@ are counted separately and excluded from useful-work comparisons.
   Intervention ids are `sub:<user message native id>` (genuine or interrupt
   user messages, and synthetic ones that Chromeria records as agent-sent,
   created by `agent`) and `ev:<session_key>/<family>/<native id>` (Codex
-  `turn_aborted` cancelled; a denied permission that is `user-rejected`
+  `turn_aborted` or Grok `turn_ended` interrupted/cancelled; a denied
+  permission that is `user-rejected`
   on Claude or kindless elsewhere). An interrupt user message within one
   second after a `user-rejected` denial in the same session is the same
   act and no intervention. `permission-rule` and `automode-blocked` denials are
   `policy_denials`, never interventions. `created_by` precedence: T3 turn origin
-  (Claude uuid), then V2 prompt origin by native session and text hash,
+  (Claude uuid), then V2 origin by harness, native session and message/turn id,
   then a headless entrypoint (`agent`); for interrupts and rejections a
   T3 child thread, or a top-level thread not opened by a person
   (`launched`: V2 `createdBy` agent or system, or no evidence; V1
@@ -475,16 +477,15 @@ re-read every sync; workload bindings are durable ledger rows.
   carry no `sub.` prefix. `pullRequests` snapshots are PR links (a V2
   snapshot replaces the V1 row for the same thread and PR). Each provider
   thread's strong `nativeThreadRef.nativeId` is a native Claude, Codex,
-  Grok or OpenCode session of its thread. V2 has no native turn ids, so a
-  prompt takes its origin from a V2 user message with the same text hash
-  in the same native session (mirrored for every driver; the Claude
-  import reclassifies by it, judge interventions read it; Codex prompt text
-  matches V2 text, Grok and OpenCode prompt text does not, so their
-  prompts stay without origin) (a run on another driver's provider
-  thread is no evidence): `createdBy=user` from `web` or `mobile` is `genuine`, `agent` or `system` is `synthetic`, a hash sent by
-  both stays unknown, and uuid evidence outranks it. Legacy copies of V1
-  messages (`user` from `server`) are no evidence. Only hashes are
-  stored. Prompts classified at import keep their excerpt.
+  Grok or OpenCode session of its thread. Each run names its user message;
+  its attempts name provider turns, whose `nativeTurnRef` joins the native
+  message or turn in that exact harness session. `createdBy=user` from
+  `web` or `mobile` is a person; `agent` or `system` is an agent. Missing
+  or conflicting identity stays unknown and is counted in actor coverage.
+  Older synthetic refs that have no native counterpart stay unmatched.
+  Native Claude uuid evidence takes precedence. Legacy copies of V1
+  messages (`user` from `server`) are no evidence. No prompt text or hash
+  is used for attribution. Prompts classified at import keep their excerpt.
 
 - Turn origin: `thread.turn-start-requested` `actor_kind` (`client` human,
   `server` dispatch) joins the native Claude user-message uuid through

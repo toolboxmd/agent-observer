@@ -28,7 +28,7 @@ import re
 
 # Rule 3: bump when any rule in this module changes meaning. A stored source
 # version that differs forces a full re-import with in-place correction.
-PRIVACY_VERSION = 8
+PRIVACY_VERSION = 9
 
 SUBMISSION_EXCERPT_CHARS = 300
 ASSISTANT_EXCERPT_CHARS = 400
@@ -730,7 +730,7 @@ EVENT_STATUS_ENUMS: dict[str, frozenset] = {
     "read": _COMMON_STATUS | frozenset({"cancelled"}),
     "skill_read": _COMMON_STATUS | frozenset({"cancelled"}),
     "lifecycle": frozenset(
-        {"completed", "cancelled", "denied", "ok", "error",
+        {"completed", "cancelled", "interrupted", "denied", "ok", "error",
          "success", "failed"}),
     "permission": frozenset({"denied", "deny", "allow"}),
     "file_change": frozenset(),

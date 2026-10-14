@@ -22,6 +22,41 @@ from ..identity import SessionIdentity, skill_from_path
 from ..ingest import (JsonlSource, MissingNativeId, fingerprint, insert_event,
                       iso_ts, text_hash)
 
+def _native_ordinal(obj) -> int | None:
+    if not isinstance(obj, dict):
+        return None
+    value = obj.get("ordinal")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _note_occurrence(r, kind: str, key, obj, position: int | None = None,
+                     model=None, effort=None, session_key: str | None = None) -> None:
+    """Record this source's first position for one identity. A later sight
+    in the same source does not move it. Another source inserts its own row.
+    """
+    if position is None:
+        position = r.record_position
+    if position is None or key is None or key == "":
+        return
+    r.con.execute(
+        "INSERT OR IGNORE INTO codex_occurrences(source_id, session_key,"
+        " row_kind, row_key, record_position, native_ordinal, model, effort)"
+        " VALUES(?,?,?,?,?,?,?,?)",
+        (r.src.source_id, session_key or r.session_key, kind, str(key),
+         position, _native_ordinal(obj), model, effort))
+
+
+def _occurrences_ready(row) -> bool:
+    if row is None:
+        return False
+    try:
+        return row["occurrence_backfill"] == 1
+    except (KeyError, IndexError, TypeError):
+        return False
+
+
 HARNESS = "codex"
 SEMANTICS = "codex:input_includes_cached,output_includes_reasoning"
 # Older rollouts carry usage only in token_count events: last_token_usage per
@@ -30,6 +65,7 @@ TOKEN_COUNT_SEMANTICS = SEMANTICS + ";source=token_count"
 SYNTHETIC_PREFIX = "<send_user_message_question_reply>"
 DEFAULT_ROOT = os.path.expanduser("~/.codex/sessions")
 ARCHIVE_ROOT = os.path.expanduser("~/.codex/archived_sessions")
+
 
 CAPABILITIES = [
     # (family, supported, detail)
@@ -47,6 +83,15 @@ CAPABILITIES = [
     ("instruction_identity", True, "AgentsMD direction block in injected messages and versioned plugin paths read"),
     ("quota", False, "rate-limit snapshots are account evidence, not task attribution; stays unknown at task level"),
 ]
+
+
+def _fallback_native_id(path: str, position: int) -> str:
+    """Native rollout name and complete-record position, stable on replay.
+
+    Continuation files share a session but have independent record positions.
+    Keeping the filename also preserves identity when a rollout is archived.
+    """
+    return f"file:{os.path.basename(path)}:ordinal:{position}"
 
 
 class _MalformedUsage(ValueError):
@@ -286,6 +331,11 @@ class _Reader:
         self.meta: dict = {}
         self.token_counts: list = []
         self.usage_context_seen: set[str] = set()
+        # First sight of a native id inside this import. A later exact
+        # repeat in the same file must not move that position. Another
+        # file records its own occurrence and does not take this one.
+        self.events_seen: set[tuple] = set()
+        self.user_messages_seen: set[str] = set()
         # Compaction context for deferred token_count flushing: token_count
         # usage snapshots are collected during ingestion and reconciled only at
         # flush, so each usage snapshot captures whether a compaction boundary
@@ -304,6 +354,7 @@ class _Reader:
         # before the imported prefix counts on incremental imports; full
         # re-reads start at zero and consult nothing but the captured flag).
         self.import_start_ordinal = 0
+        self.record_position = None
         self.prior_event_ceiling = None
         # Every own-thread identity seen so far (persisted plus prescanned
         # plus streamed): the main-session gate fails closed on divergence.
@@ -333,12 +384,53 @@ class _Reader:
             thread_id=self.thread_id,
             observed_thread_ids=tuple(self.observed_threads))
 
-    def event(self, obj, family, native_id, **kw):
+    def _legacy_source_matches(self, source_id) -> bool:
+        if source_id == self.src.source_id:
+            return True
+        row = self.con.execute("SELECT path FROM sources WHERE id=? AND harness=?",
+                               (source_id, HARNESS)).fetchone()
+        # Archival relocation keeps the native rollout filename. A different
+        # continuation file has a different filename, even in the same session.
+        return bool(row and os.path.basename(row["path"]) == os.path.basename(self.src.path))
+
+    def event(self, obj, family, native_id, *, legacy_id=None, **kw):
+        if self.src.privacy_stale and legacy_id:
+            prior = self.con.execute(
+                "SELECT id,source_id FROM events WHERE session_key=?"
+                " AND family=? AND native_id=?",
+                (self.session_key, family, legacy_id)).fetchone()
+            if prior and self._legacy_source_matches(prior["source_id"]):
+                # The old parser retained the first such record. Move that
+                # row, and any verdict referring to it, before replaying.
+                self.con.execute("UPDATE events SET native_id=?,ordinal_num=?,source_id=? WHERE id=?",
+                                 (native_id, self.record_position, self.src.source_id, prior["id"]))
+                self.con.execute("UPDATE verdicts SET intervention_id=? WHERE intervention_id=?",
+                                 (f"ev:{self.session_key}/{family}/{native_id}",
+                                  f"ev:{self.session_key}/{family}/{legacy_id}"))
+        identity = (family, native_id)
+        prior = self.con.execute(
+            "SELECT id, source_id FROM events WHERE session_key=?"
+            " AND family=? AND native_id=?",
+            (self.session_key, family, native_id)).fetchone()
+        # A privacy reimport may adopt this file's position only for a row
+        # this source already holds. A different file keeps its own locator.
+        same_source = prior is None or prior["source_id"] == self.src.source_id
+        first = identity not in self.events_seen
+        self.events_seen.add(identity)
         insert_event(self.con, self.stats, source_id=self.src.source_id,
                      session_key=self.session_key, family=family,
-                     native_id=native_id, ordinal=obj.get("ordinal"),
+                     native_id=native_id, ordinal=self.record_position,
                      ts=iso_ts(obj.get("timestamp")),
-                     update=self.src.privacy_stale, **kw)
+                     update=self.src.privacy_stale and same_source,
+                     migrate_ordinal=first and same_source, **kw)
+        event_id = prior["id"] if prior is not None else None
+        if event_id is None:
+            stored = self.con.execute(
+                "SELECT id FROM events WHERE session_key=? AND family=? AND native_id=?",
+                (self.session_key, family, native_id)).fetchone()
+            event_id = stored["id"] if stored is not None else None
+        if event_id is not None:
+            _note_occurrence(self, "event", event_id, obj)
 
 
 class _Own:
@@ -393,21 +485,58 @@ def _first_meta(path: str) -> "_Own | None":
     return _Own(payload)
 
 
+def _before_own_records(own: "_Own", obj: dict) -> bool:
+    """Copied history, or a session_meta, which writes no row."""
+    payload = obj.get("payload")
+    if obj.get("type") == "session_meta" and isinstance(payload, dict):
+        return True
+    return own.inherited(obj)
+
+
+def _history_file_boundary(path: str, own: "_Own") -> int | None:
+    """Complete-line index of the first record that is not copied history.
+
+    ``history_start`` is a metadata ordinal. Stored ``ordinal_num`` is the
+    complete-line index on an append, a full replay, and a repair of rows
+    imported before the fork boundary was known. The cutoff passed to
+    ``_move_rows`` is that index. The rollout's own session_meta writes no
+    row, so a low metadata ordinal on it is not the boundary.
+    """
+    if own.history_start is None:
+        return None
+    position = 0
+    with open(path, "rb") as fh:
+        for raw in fh:
+            if not raw.endswith(b"\n"):
+                break
+            text = raw.decode("utf-8", "replace")
+            if not text.strip():
+                continue
+            try:
+                obj = json.loads(text)
+            except json.JSONDecodeError:
+                return position
+            if not isinstance(obj, dict) or not _before_own_records(own, obj):
+                return position
+            position += 1
+    return position
+
+
 def _move_rows(con: sqlite3.Connection, source_id: int, old: str, new: str,
                start: int | None, copies: bool) -> bool:
     """Move one rollout's rows from session `old` to session `new` (#69).
 
-    Without `copies`, the rows of a fork's own records (native ordinal at
-    or after `start`) move from the parent's key to the fork's. With
-    `copies`, the rows of the history the fork copied (before `start`)
-    move from the fork's key to the parent's. A re-read never imports
-    copied records again, so a copy may be the ledger's only evidence of
-    the parent's work: rows are moved, never dropped, unless `new`
-    already holds the same row (same event, or the same fallback usage
-    total). Fallback snapshots carry their session key in their id
-    ("<key>:tc:<total>") and are renamed with it. Overlap flags of both
-    sessions are reset for the caller to recompute. Returns whether
-    anything changed.
+    ``start`` is the complete-line index where the fork's own records
+    begin, from ``_history_file_boundary``. Without `copies`, rows at or
+    after that index move from the parent's key to the fork's. With
+    `copies`, rows before that index move from the fork's key to the
+    parent's. A re-read never imports copied records again, so a copy may
+    be the ledger's only evidence of the parent's work: rows are moved,
+    never dropped, unless `new` already holds the same row (same event,
+    or the same fallback usage total). Fallback snapshots carry their
+    session key in their id ("<key>:tc:<total>") and are renamed with it.
+    Overlap flags of both sessions are reset for the caller to recompute.
+    Returns whether anything changed.
     """
     rows = "source_id=? AND session_key=?"
     args: list = [source_id, old]
@@ -434,6 +563,20 @@ def _move_rows(con: sqlite3.Connection, source_id: int, old: str, new: str,
         moved += con.execute(
             f"UPDATE {table} SET session_key=? WHERE {rows}",
             [new] + args).rowcount
+    occ = "source_id=? AND session_key=?"
+    occ_args: list = [source_id, old]
+    if start is not None:
+        occ += " AND record_position < ?" if copies else " AND record_position >= ?"
+        occ_args.append(start)
+    prefix_len = len(prefix)
+    con.execute(
+        "UPDATE codex_occurrences SET session_key=?, row_key=? || substr(row_key, ?)"
+        f" WHERE row_kind='response' AND substr(row_key, 1, ?)=? AND {occ}",
+        [new, new + ":tc:", prefix_len + 1, prefix_len, prefix] + occ_args)
+    con.execute(
+        "UPDATE codex_occurrences SET session_key=?"
+        f" WHERE NOT (row_kind='response' AND substr(row_key, 1, ?)=?) AND {occ}",
+        [new, prefix_len, prefix] + occ_args)
     if not moved:
         return False
     # A turn follows its rows when none of them stayed behind.
@@ -562,6 +705,13 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         src.start_offset = 0
         src.end_offset = 0
         src.unchanged = False
+    if not _occurrences_ready(src.row):
+        # Occurrence backfill is not privacy. A source already at the
+        # current privacy version is still read once from the start so
+        # each file can record its own positions.
+        src.start_offset = 0
+        src.end_offset = 0
+        src.unchanged = False
     if src.unchanged and src.recheck_unchanged():
         # Unchanged fast path: same size, mtime, inode and tail bytes at
         # the recorded offset, same privacy version, not full, no new
@@ -601,6 +751,19 @@ def import_codex_file(con: sqlite3.Connection, path: str,
     reader = _Reader(con, src, stats)
     _ensure_cumulative_table(con)
     own = _first_meta(path)
+    boundary = _history_file_boundary(path, own) if own is not None else None
+    # Privacy 9 is the writer that stores file positions. A ledger
+    # imported under an older version still holds raw metadata ordinals,
+    # so the move uses that cutoff before replay. A current ledger, and
+    # any later privacy version, already holds file positions.
+    stored_privacy = (src.row["privacy_version"]
+                      if src.row is not None and "privacy_version" in src.row.keys()
+                      else None)
+    metadata_namespace = (isinstance(stored_privacy, int)
+                          and not isinstance(stored_privacy, bool)
+                          and stored_privacy < 9)
+    move_at = own.history_start if own is not None and metadata_namespace \
+        else boundary
     settle: dict = {}
     if own is not None:
         stored = src.row["thread_id"]
@@ -613,7 +776,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
             # Before #69 a fork was keyed by the copied parent session_meta.
             old = f"{HARNESS}:{stored}"
             if _move_rows(con, src.source_id, old, reader.session_key,
-                          own.history_start, copies=False):
+                          move_at, copies=False):
                 settle[old] = (stored, True)
             # The parent's row may point at this rollout as its source.
             con.execute(
@@ -625,7 +788,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
             # Copied history an earlier import stored in this session.
             parent = f"{HARNESS}:{own.parent}"
             if _move_rows(con, src.source_id, reader.session_key, parent,
-                          own.history_start, copies=True):
+                          move_at, copies=True):
                 settle.setdefault(parent, (own.parent, False))
     # Seed the rollout's own thread identity before any row is written, so
     # a genuine user message keeps its excerpt only when the whole new
@@ -649,6 +812,9 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         (src.row["ordinal_max"] + 1) if src.incremental else 0
     reader.prior_event_ceiling = con.execute(
         "SELECT MAX(id) FROM events").fetchone()[0]
+    if src.start_offset == 0:
+        con.execute("DELETE FROM codex_occurrences WHERE source_id=?",
+                    (src.source_id,))
     for ordinal, obj, line in src.records():
         stats["lines"] += 1
         if obj is None or not isinstance(obj, dict):
@@ -659,6 +825,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
             continue
         if own is not None and own.inherited(obj):
             stats["inherited"] = stats.get("inherited", 0) + 1
+            _note_inherited(reader, obj, ordinal)
             continue
         try:
             _ingest_record(reader, obj, ordinal)
@@ -699,7 +866,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         own_part, own_args = "", []
         if own is not None and own.history_start is not None:
             own_part = " AND (ordinal_num IS NULL OR ordinal_num >= ?)"
-            own_args = [own.history_start]
+            own_args = [boundary]
         key_fix = con.execute(
             "UPDATE user_messages SET session_key=? WHERE source_id=?"
             " AND session_key!=?" + own_part,
@@ -728,7 +895,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
                             cli_version=reader.cli_version,
                             thread_source=reader.thread_source))
     con.execute("UPDATE sources SET codex_context_version=2,codex_context_offset=?,"
-                "codex_model=?,codex_effort=? WHERE id=?",
+                "codex_model=?,codex_effort=?,occurrence_backfill=1 WHERE id=?",
                 (src.end_offset, reader.model, reader.effort, src.source_id))
     for key, (native, lost_rows) in settle.items():
         _settle(con, key, native, lost_rows)
@@ -739,7 +906,65 @@ def import_codex_file(con: sqlite3.Connection, path: str,
     return stats
 
 
+def _note_inherited(r: _Reader, obj: dict, position: int) -> None:
+    """An occurrence for a copied row this replay did not insert.
+
+    The identity row, when one already exists, keeps its session. A copy
+    that matches nothing stays unknown instead of becoming a new identity.
+    """
+    payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+    rtype = obj.get("type")
+    if rtype == "token_usage_record" and isinstance(payload.get("response_id"), str):
+        rid = f"{HARNESS}:{payload['response_id']}"
+        row = r.con.execute(
+            "SELECT session_key FROM responses WHERE response_id=?",
+            (rid,)).fetchone()
+        if row is not None:
+            _note_occurrence(r, "response", rid, obj, position=position,
+                             model=r.model, effort=r.effort,
+                             session_key=row["session_key"])
+        return
+    if rtype != "response_item":
+        return
+    ptype = payload.get("type")
+    if ptype == "message" and payload.get("role") == "user" \
+            and isinstance(payload.get("id"), str):
+        key = f"{HARNESS}:{payload['id']}"
+        row = r.con.execute(
+            "SELECT session_key FROM user_messages WHERE native_id=?",
+            (key,)).fetchone()
+        if row is not None:
+            _note_occurrence(r, "user", key, obj, position=position,
+                             session_key=row["session_key"])
+        return
+    if ptype == "message" and payload.get("role") == "assistant" \
+            and isinstance(payload.get("id"), str):
+        _note_inherited_event(r, obj, position, "assistant_message", payload["id"])
+        return
+    if ptype in ("function_call", "custom_tool_call"):
+        native = payload.get("call_id") or payload.get("id")
+        if isinstance(native, str) and native:
+            _note_inherited_event(r, obj, position, "tool_call", native)
+
+
+def _note_inherited_event(r: _Reader, obj: dict, position: int, family: str,
+                          native_id: str) -> None:
+    rows = r.con.execute(
+        "SELECT id, session_key FROM events WHERE source_id=? AND family=?"
+        " AND native_id=?",
+        (r.src.source_id, family, native_id)).fetchall()
+    if len(rows) != 1:
+        return
+    _note_occurrence(r, "event", rows[0]["id"], obj, position=position,
+                     session_key=rows[0]["session_key"])
+
+
 def _ingest_record(r: _Reader, obj: dict, ordinal: int) -> None:
+    # record_position is the one chronology for every Codex row. The raw
+    # metadata ordinal stays on obj and is the only ordinal copied into
+    # native ids or legacy identity (ordinal:N).
+    native_ordinal = obj.get("ordinal")
+    r.record_position = ordinal
     rtype = obj.get("type")
     if rtype not in ("session_meta", "event_msg", "response_item",
                      "token_usage_record", "turn_context", "compacted",
@@ -777,7 +1002,7 @@ def _ingest_record(r: _Reader, obj: dict, ordinal: int) -> None:
     if rtype == "token_usage_record":
         _ingest_usage(r, obj)
     elif rtype == "response_item":
-        _ingest_response_item(r, obj)
+        _ingest_response_item(r, obj, native_ordinal, ordinal)
     elif rtype == "turn_context":
         _ingest_turn(r, obj)
     elif rtype == "event_msg":
@@ -835,7 +1060,25 @@ def _fallback_want(last: dict, total: int) -> dict:
     }
 
 
-def _repair_usage_context(r: _Reader, rid: str, obj: dict, model, effort) -> None:
+def _migrate_response_position(r: _Reader, rid: str, position: int) -> None:
+    """Adopt a file position only from the first sight in this source.
+
+    A later exact repeat leaves that index. Another file records its own
+    occurrence and does not move this row.
+    """
+    if not r.src.privacy_stale or rid in r.usage_context_seen:
+        return
+    row = r.con.execute(
+        "SELECT source_id FROM responses WHERE response_id=?", (rid,)).fetchone()
+    if row is None or row["source_id"] != r.src.source_id:
+        return
+    r.con.execute(
+        "UPDATE responses SET ordinal_num=? WHERE response_id=? AND source_id=?",
+        (position, rid, r.src.source_id))
+
+
+def _repair_usage_context(r: _Reader, rid: str, obj: dict, model, effort,
+                          position: int) -> None:
     """Only the original record in a full source replay can repair context.
 
     Repeated counters after a model switch are not new usage. A copied source
@@ -848,7 +1091,7 @@ def _repair_usage_context(r: _Reader, rid: str, obj: dict, model, effort) -> Non
         r.con.execute(
             "UPDATE responses SET model=?,effort=? WHERE response_id=?"
             " AND source_id=? AND ordinal_num IS ? AND ts IS ?",
-            (model, effort, rid, r.src.source_id, obj.get("ordinal"),
+            (model, effort, rid, r.src.source_id, position,
              iso_ts(obj.get("timestamp"))))
 
 
@@ -911,10 +1154,10 @@ def _flush_token_counts(r: _Reader) -> None:
                 if r.prior_event_ceiling is not None:
                     hit = r.con.execute(
                         "SELECT 1 FROM events WHERE session_key=?"
-                        " AND family='compaction' AND id <= ?"
+                        " AND source_id=? AND family='compaction' AND id <= ?"
                         " AND ordinal_num IS NOT NULL"
                         " AND ordinal_num < ? LIMIT 1",
-                        (r.session_key, r.prior_event_ceiling,
+                        (r.session_key, r.src.source_id, r.prior_event_ceiling,
                          r.import_start_ordinal)).fetchone()
                     prior_compaction = hit is not None
             return prior_compaction
@@ -968,7 +1211,10 @@ def _flush_token_counts(r: _Reader) -> None:
                                 previous = total
                             continue
                         raise _UsageConflict("usage conflict")
-                    _repair_usage_context(r, rid, obj, model, effort)
+                    _migrate_response_position(r, rid, ordinal)
+                    _repair_usage_context(r, rid, obj, model, effort, ordinal)
+                    _note_occurrence(r, "response", rid, obj, position=ordinal,
+                                     model=model, effort=effort)
                     r.stats["responses_duplicate"] += 1
                     if total > previous:
                         previous = total
@@ -983,7 +1229,7 @@ def _flush_token_counts(r: _Reader) -> None:
                     " reasoning_output_tokens, total_tokens, thread_total_tokens, semantics)"
                     " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (rid, r.src.source_id, HARNESS,
-                     r.session_key, r.thread_id, obj.get("ordinal"), iso_ts(obj.get("timestamp")),
+                     r.session_key, r.thread_id, ordinal, iso_ts(obj.get("timestamp")),
                      model, effort, last_raw.get("input_tokens"), last_raw.get("cached_input_tokens"),
                      last_raw.get("cache_write_input_tokens"), last_raw.get("output_tokens"),
                      last_raw.get("reasoning_output_tokens"), last_raw.get("total_tokens"), total,
@@ -991,6 +1237,8 @@ def _flush_token_counts(r: _Reader) -> None:
                 if cur.rowcount:
                     r.usage_context_seen.add(rid)
                     r.stats["responses_inserted"] += 1
+                    _note_occurrence(r, "response", rid, obj, position=ordinal,
+                                     model=model, effort=effort)
                 else:
                     # Lost a race with an existing row: compare before counting.
                     # The same post-compaction duplicate-evidence rule applies
@@ -1010,6 +1258,8 @@ def _flush_token_counts(r: _Reader) -> None:
                             r.stats["responses_duplicate"] += 1
                             continue
                         raise _UsageConflict("usage conflict")
+                    _note_occurrence(r, "response", rid, obj, position=ordinal,
+                                     model=model, effort=effort)
                     r.stats["responses_duplicate"] += 1
             except _UsageConflict:
                 r.stats["malformed"] += 1
@@ -1080,7 +1330,7 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
         " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (rid, r.src.source_id, HARNESS, r.session_key, p.get("thread_id"),
          turn_id, p.get("root_turn_id"), p.get("session_id"),
-         obj.get("ordinal"), iso_ts(obj.get("timestamp")), r.model, r.effort,
+         r.record_position, iso_ts(obj.get("timestamp")), r.model, r.effort,
          u.get("input_tokens"), u.get("cached_input_tokens"),
          u.get("cache_write_input_tokens"), u.get("output_tokens"),
          u.get("reasoning_output_tokens"), u.get("total_tokens"),
@@ -1105,11 +1355,14 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
                 "thread_total_tokens": th.get("total_tokens")}
         if seen != want:
             raise _UsageConflict("usage conflict")
-        _repair_usage_context(r, rid, obj, r.model, r.effort)
+        _migrate_response_position(r, rid, r.record_position)
+        _repair_usage_context(r, rid, obj, r.model, r.effort, r.record_position)
+        _note_occurrence(r, "response", rid, obj, model=r.model, effort=r.effort)
         r.stats["responses_duplicate"] += 1
     else:
         r.usage_context_seen.add(rid)
         r.stats["responses_inserted"] += 1
+        _note_occurrence(r, "response", rid, obj, model=r.model, effort=r.effort)
     if turn_id:
         r.con.execute(
             "INSERT OR IGNORE INTO turns(turn_id, source_id, session_key,"
@@ -1140,9 +1393,10 @@ def _ingest_turn(r: _Reader, obj: dict) -> None:
         (p.get("model"), p.get("effort"), turn_id))
 
 
-def _ingest_response_item(r: _Reader, obj: dict) -> None:
+def _ingest_response_item(r: _Reader, obj: dict, native_ordinal, position: int) -> None:
     p = obj["payload"]
     ptype = p.get("type")
+    fallback = _fallback_native_id(r.src.path, position)
     raw_turn = (p.get("internal_chat_message_metadata_passthrough") or {}).get(
         "turn_id")
     turn_id = f"{HARNESS}:{raw_turn}" if raw_turn else None
@@ -1156,7 +1410,25 @@ def _ingest_response_item(r: _Reader, obj: dict) -> None:
         if p.get("role") != "user":
             return
         kind = _submission_kind(p)
-        native = p.get("id") or f"ordinal:{obj.get('ordinal')}"
+        native = p.get("id") or f"{r.session_key.partition(':')[2]}:{fallback}"
+        if not p.get("id") and r.src.privacy_stale:
+            legacy = f"{HARNESS}:ordinal:{native_ordinal}"
+            prior = r.con.execute("SELECT source_id FROM user_messages WHERE native_id=? AND session_key=?",
+                                  (legacy, r.session_key)).fetchone()
+            if prior and r._legacy_source_matches(prior["source_id"]):
+                # Preserve captured ownership for every source-owned old
+                # fallback, including the first collapsed None identity.
+                r.con.execute("PRAGMA defer_foreign_keys=ON")
+                r.con.execute(
+                    "UPDATE user_messages SET native_id=?, source_id=?, ordinal_num=?"
+                    " WHERE native_id=?",
+                    (f"{HARNESS}:{native}", r.src.source_id, r.record_position, legacy))
+                r.con.execute("UPDATE assignments SET user_message_id=? WHERE user_message_id=?",
+                              (f"{HARNESS}:{native}", legacy))
+                r.con.execute("UPDATE delegations SET owning_user_message=? WHERE owning_user_message=?",
+                              (f"{HARNESS}:{native}", legacy))
+                r.con.execute("UPDATE verdicts SET intervention_id=? WHERE intervention_id=?",
+                              (f"sub:{HARNESS}:{native}", f"sub:{legacy}"))
         # Privacy rule 1 via agent_observer/privacy.py: only a genuine
         # human submission of a proven main session keeps an excerpt,
         # truncated at the first tag-like marker. The main-session gate
@@ -1167,32 +1439,53 @@ def _ingest_response_item(r: _Reader, obj: dict) -> None:
         excerpt = privacy.submission_excerpt(
             text, is_genuine=kind == "genuine", is_main_session=r.is_main)
         genuine = 1 if kind == "genuine" else 0
+        native_key = f"{HARNESS}:{native}"
+        # This source may refresh its own row. A continuation of the same
+        # session records an occurrence and leaves the row. The parent
+        # rollout can claim a copy that a child stored before the parent
+        # was read.
+        prior = r.con.execute(
+            "SELECT source_id, session_key FROM user_messages WHERE native_id=?",
+            (native_key,)).fetchone()
+        same_source = prior is None or prior["source_id"] == r.src.source_id
+        claims = prior is not None and prior["session_key"] != r.session_key
+        first = native_key not in r.user_messages_seen
+        r.user_messages_seen.add(native_key)
         cur = r.con.execute(
             "INSERT OR IGNORE INTO user_messages(native_id, source_id,"
             " session_key, turn_id, ordinal_num, ts, kind, text_hash,"
             " text_excerpt, is_genuine) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (f"{HARNESS}:{native}", r.src.source_id, r.session_key, turn_id,
-             obj.get("ordinal"), iso_ts(obj.get("timestamp")), kind,
+            (native_key, r.src.source_id, r.session_key, turn_id,
+             r.record_position, iso_ts(obj.get("timestamp")), kind,
              text_hash(text), excerpt, genuine))
         if cur.rowcount:
             r.stats["user_messages_inserted"] += 1
-        elif r.src.privacy_stale:
+        elif r.src.privacy_stale and (same_source or claims):
             # Rule 3: a privacy version change corrects rows in place.
+            fields = ("source_id=?, session_key=?, turn_id=?, ts=?, kind=?,"
+                      " text_hash=?, text_excerpt=?, is_genuine=?")
+            values = [r.src.source_id, r.session_key, turn_id,
+                      iso_ts(obj.get("timestamp")), kind, text_hash(text),
+                      excerpt, genuine]
+            if first:
+                fields = ("source_id=?, session_key=?, turn_id=?, ordinal_num=?,"
+                          " ts=?, kind=?, text_hash=?, text_excerpt=?, is_genuine=?")
+                values = [r.src.source_id, r.session_key, turn_id,
+                          r.record_position, iso_ts(obj.get("timestamp")), kind,
+                          text_hash(text), excerpt, genuine]
             r.con.execute(
-                "UPDATE user_messages SET source_id=?, session_key=?, turn_id=?,"
-                " ordinal_num=?, ts=?, kind=?, text_hash=?, text_excerpt=?,"
-                " is_genuine=? WHERE native_id=?",
-                (r.src.source_id, r.session_key, turn_id, obj.get("ordinal"),
-                 iso_ts(obj.get("timestamp")), kind, text_hash(text), excerpt,
-                 genuine, f"{HARNESS}:{native}"))
+                f"UPDATE user_messages SET {fields} WHERE native_id=?",
+                values + [native_key])
             r.stats["user_messages_updated"] = \
                 r.stats.get("user_messages_updated", 0) + 1
+        _note_occurrence(r, "user", native_key, obj)
         return
     if ptype == "message" and p.get("role") == "assistant":
         text = _text_of_message(p)
         if text:
             excerpt = privacy.assistant_excerpt(text)
-            r.event(obj, "assistant_message", p.get("id") or f"ordinal:{obj.get('ordinal')}",
+            r.event(obj, "assistant_message", p.get("id") or fallback,
+                    legacy_id=f"ordinal:{native_ordinal}" if not p.get("id") else None,
                     turn_id=turn_id, name="assistant_message",
                     size_bytes=len(text), fingerprint=text_hash(text),
                     detail={"excerpt": excerpt} if excerpt else None)
@@ -1391,7 +1684,10 @@ def _ingest_event_msg(r: _Reader, obj: dict, ordinal: int) -> None:
                 "UPDATE turns SET completed_at=?, duration_ms=?, state='cancelled'"
                 " WHERE turn_id=?",
                 (iso_ts(obj.get("timestamp")), p.get("duration_ms"), turn_id))
-        r.event(obj, "lifecycle", f"turn_aborted:{p.get('turn_id')}",
+        native_id = (f"turn_aborted:{p['turn_id']}" if p.get("turn_id")
+                     else f"turn_aborted:{_fallback_native_id(r.src.path, ordinal)}")
+        r.event(obj, "lifecycle", native_id,
+                legacy_id="turn_aborted:None" if not p.get("turn_id") else None,
                 turn_id=turn_id, name="turn_aborted", status="cancelled",
                 duration_ms=p.get("duration_ms"))
     else:

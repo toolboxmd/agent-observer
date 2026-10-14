@@ -55,7 +55,8 @@ EXTENSION_KINDS = frozenset({
     "current_mode_update", "rewind_marker",
 })
 COMPACTION_KINDS = frozenset({"auto_compact_started", "auto_compact_completed"})
-TERMINAL_TOOL_STATUS = {"completed": "ok", "failed": "error", "success": "ok"}
+TERMINAL_TOOL_STATUS = {"completed": "ok", "failed": "error", "success": "ok",
+                        "cancelled": "cancelled"}
 # High-volume run-loop noise with no task evidence; never stored.
 SKIP_EVENT_TYPES = frozenset({"phase_changed", "loop_started", "first_token"})
 
@@ -117,7 +118,8 @@ _FREE_TEXT_LOCATION_KEYS = frozenset({
 # token-shaped, is dropped (a lexical check alone cannot tell free text
 # from an enum). Event detail itself is filtered by agent_observer/privacy.py
 # rule 6 through the ingest path, so the adapter builds no detail allowlist.
-_OUTCOME_VALUES = frozenset({"success", "completed", "failed", "error"})
+_OUTCOME_VALUES = frozenset({"success", "completed", "failed", "error",
+                            "interrupted", "cancelled"})
 _DECISION_VALUES = frozenset({"allow", "deny"})
 
 
@@ -2128,8 +2130,7 @@ def _upsert_submission(con, r: _Reader, src, chat: dict, key: str,
     excerpt = privacy.submission_excerpt(
         full_text, is_genuine=bool(is_genuine), is_main_session=is_main)
     pid = entry.get("prompt_id")
-    turn_id = (f"{HARNESS}:{r.native_sid}:{pid}"
-               if pid and pid in completions_by_id else None)
+    turn_id = f"{HARNESS}:{r.native_sid}:{pid}" if pid else None
     native_id = f"{HARNESS}:{r.native_sid}:prompt:{key}"
     existing = con.execute(
         "SELECT text_hash, text_excerpt, turn_id, kind, is_genuine"
@@ -2468,7 +2469,17 @@ def _ingest_update(r: _Reader, src: JsonlSource, obj: dict,
             r.identity.observe_text(text)
             for body in USER_RULE_RE.findall(text):
                 r.identity.observe_loaded_instructions(body.strip())
-    elif kind in ("agent_message_chunk", "agent_thought_chunk"):
+    elif kind == "agent_message_chunk":
+        text = _content_text(update.get("content"))
+        if text:
+            meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+            native_id = _valid_native_id(meta.get("eventId")) or f"ordinal:{ordinal}"
+            excerpt = privacy.assistant_excerpt(text)
+            r.event(src, "assistant_message", native_id, ordinal, ts,
+                    turn_id=_turn_id(r, params), name="assistant_message",
+                    size_bytes=len(text), fingerprint=text_hash(text),
+                    detail={"excerpt": excerpt} if excerpt else None)
+    elif kind == "agent_thought_chunk":
         return
     elif kind == "tool_call":
         _tool_call(r, src, update, params, ordinal, ts)

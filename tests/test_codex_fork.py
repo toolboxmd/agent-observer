@@ -9,6 +9,8 @@ session and the child had no session row.
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -334,6 +336,220 @@ class SingleMetaForkTest(ForkedRolloutTest):
             merged.execute("SELECT session_key FROM responses"
                            " WHERE total_tokens=900").fetchone()[0],
             f"codex:{PARENT}")
+
+
+def _sparse_rows(history_start, extra=()):
+    """Metadata ordinals that are not the complete-line index.
+
+    The copied assistant is ordinal 90 at file position 2. The child's own
+    rows start at file position 3, while history_start stays 100.
+    """
+    meta = {"id": CHILD, "thread_source": "subagent",
+            "parent_thread_id": PARENT, "cwd": "/w",
+            "cli_version": "0.151.0", "originator": "codex-tui"}
+    if history_start is not None:
+        meta["subagent_history_start_ordinal"] = history_start
+    rows = [
+        {"type": "session_meta", "ordinal": 0, "payload": meta},
+        {"type": "session_meta", "ordinal": 1, "payload": {
+            "id": PARENT, "cwd": "/w", "cli_version": "0.151.0",
+            "originator": "codex-tui"}},
+        {"type": "response_item", "ordinal": 90, "payload": {
+            "type": "message", "role": "assistant", "id": "parent-text",
+            "content": [{"type": "output_text", "text": "from the parent"}]}},
+        {"type": "response_item", "ordinal": 100, "payload": {
+            "type": "message", "role": "user", "id": "child-user",
+            "content": [{"type": "input_text", "text": "do the child work"}],
+            "internal_chat_message_metadata_passthrough": {
+                "content_item_kinds": ["user.text"]}}},
+        {"type": "response_item", "ordinal": 101, "payload": {
+            "type": "message", "role": "assistant", "id": "child-text",
+            "content": [{"type": "output_text", "text": "child answer"}]}},
+        {"type": "token_usage_record", "ordinal": 102, "payload": {
+            "response_id": "child-usage", "thread_id": CHILD,
+            "usage": _usage(40)}},
+        {"type": "event_msg", "ordinal": 157, "payload": {
+            "type": "thread_goal_updated"}},
+    ]
+    return rows + list(extra)
+
+
+def _dump(path, rows):
+    with open(path, "w") as fh:
+        for rec in rows:
+            fh.write(json.dumps(rec) + "\n")
+
+
+class SparseForkCutoffTest(unittest.TestCase):
+    """A fork cutoff has to be the file position of the first own record.
+
+    Comparing stored file positions with the metadata history_start moves
+    the child's own rows onto the parent on an append, and a full replay
+    then stores them twice. A repair of a ledger imported before the
+    boundary was known has the same cutoff.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.child = os.path.join(self.tmp.name, "sparse-child.jsonl")
+        self.con = db.connect(os.path.join(self.tmp.name, "sparse.db"))
+        db.init_db(self.con)
+
+    def tearDown(self):
+        self.con.close()
+        self.tmp.cleanup()
+
+    def owners(self):
+        found = {}
+        for native, key in self.con.execute(
+                "SELECT native_id, session_key FROM events"):
+            found.setdefault(native, set()).add(key)
+        for native, key in self.con.execute(
+                "SELECT native_id, session_key FROM user_messages"):
+            found.setdefault(native, set()).add(key)
+        for native, key in self.con.execute(
+                "SELECT response_id, session_key FROM responses"):
+            found.setdefault(native, set()).add(key)
+        return found
+
+    def assert_child_owns_its_rows(self):
+        found = self.owners()
+        child = f"codex:{CHILD}"
+        for native in ("child-text", "thread_goal_updated:157",
+                       "codex:child-user", "codex:child-usage"):
+            self.assertEqual(found.get(native), {child}, native)
+        self.assertNotIn("thread_goal_updated:6", found)
+        self.assertNotIn("thread_goal_updated:7", found)
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) FROM responses WHERE response_id=?",
+            ("codex:child-usage",)).fetchone()[0], 1)
+        self.assertEqual(self.con.execute(
+            "SELECT ordinal_num FROM responses WHERE response_id=?",
+            ("codex:child-usage",)).fetchone()[0], 5)
+
+    def test_append_full_and_repeat_keep_the_child_rows(self):
+        _dump(self.child, _sparse_rows(100))
+        import_codex_file(self.con, self.child)
+        self.assert_child_owns_its_rows()
+        _dump(self.child, _sparse_rows(100, extra=[{
+            "type": "response_item", "ordinal": 180, "payload": {
+                "type": "message", "role": "assistant", "id": "child-tail",
+                "content": [{"type": "output_text", "text": "still the child"}]}}]))
+        import_codex_file(self.con, self.child)
+        self.assert_child_owns_its_rows()
+        self.assertEqual(self.owners().get("child-tail"), {f"codex:{CHILD}"})
+        import_codex_file(self.con, self.child, full=True)
+        self.assert_child_owns_its_rows()
+        self.assertEqual(self.owners().get("child-tail"), {f"codex:{CHILD}"})
+        import_codex_file(self.con, self.child, full=True)
+        self.assert_child_owns_its_rows()
+
+    def test_legacy_repair_maps_the_cutoff_to_file_positions(self):
+        # Imported before the fork boundary was present: copied history and
+        # the child's own rows share the child key, at file positions.
+        _dump(self.child, _sparse_rows(None))
+        import_codex_file(self.con, self.child)
+        self.assertEqual(self.owners().get("parent-text"), {f"codex:{CHILD}"})
+        _dump(self.child, _sparse_rows(100))
+        import_codex_file(self.con, self.child, full=True)
+        found = self.owners()
+        self.assertEqual(found.get("parent-text"), {f"codex:{PARENT}"})
+        self.assert_child_owns_its_rows()
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) FROM events WHERE native_id='parent-text'"
+        ).fetchone()[0], 1)
+
+    def test_session_key_repair_returns_file_positions_to_the_child(self):
+        _dump(self.child, _sparse_rows(100))
+        import_codex_file(self.con, self.child)
+        parent = f"codex:{PARENT}"
+        child = f"codex:{CHILD}"
+        for table in ("events", "responses", "user_messages"):
+            self.con.execute(f"UPDATE {table} SET session_key=?"
+                             " WHERE session_key=?", (parent, child))
+        self.con.execute("UPDATE sources SET thread_id=? WHERE path=?",
+                         (PARENT, self.child))
+        self.con.commit()
+        import_codex_file(self.con, self.child, full=True)
+        self.assert_child_owns_its_rows()
+        self.assertNotIn("parent-text", self.owners())
+
+    def test_privacy8_sparse_fork_moves_copied_history_before_replay(self):
+        # The exact base stores metadata ordinals. The file-position
+        # boundary is the wrong cutoff until those rows have been replayed.
+        base = "a4ba7cea0b15d6afb2926a931477e5dece1b4d61"
+        db_path = os.path.join(self.tmp.name, "privacy8.db")
+        _dump(self.child, _sparse_rows(None))
+        _import_at_revision(base, db_path, self.child)
+        self.con.close()
+        self.con = db.connect(db_path)
+        db.init_db(self.con)
+        self.assertEqual(self.con.execute(
+            "SELECT privacy_version FROM sources").fetchone()[0], 8)
+        self.assertEqual(dict(self.con.execute(
+            "SELECT native_id, ordinal_num FROM events")),
+            {"parent-text": 90, "child-text": 101,
+             "thread_goal_updated:157": 157})
+        _dump(self.child, _sparse_rows(100))
+        import_codex_file(self.con, self.child)
+        self.assertEqual(self.owners().get("parent-text"), {f"codex:{PARENT}"})
+        self.assert_child_owns_its_rows()
+        self.assertEqual(self.con.execute(
+            "SELECT ordinal_num FROM events WHERE native_id='parent-text'"
+        ).fetchone()[0], 90)
+        _dump(self.child, _sparse_rows(100, extra=[{
+            "type": "response_item", "ordinal": 180, "payload": {
+                "type": "message", "role": "assistant", "id": "child-tail",
+                "content": [{"type": "output_text", "text": "appended"}]}}]))
+        import_codex_file(self.con, self.child)
+        self.assertEqual(self.owners().get("parent-text"), {f"codex:{PARENT}"})
+        self.assertEqual(self.owners().get("child-tail"), {f"codex:{CHILD}"})
+        self.assert_child_owns_its_rows()
+        import_codex_file(self.con, self.child, full=True)
+        import_codex_file(self.con, self.child, full=True)
+        self.assertEqual(self.owners().get("parent-text"), {f"codex:{PARENT}"})
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) FROM events WHERE native_id='parent-text'"
+        ).fetchone()[0], 1)
+        self.assertEqual(self.con.execute(
+            "SELECT privacy_version FROM sources").fetchone()[0], 9)
+        self.assert_child_owns_its_rows()
+
+
+def _import_at_revision(rev: str, db_path: str, rollout: str) -> None:
+    """Import one rollout with the adapter at an exact historical commit."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script = r"""
+import importlib.abc, importlib.util, subprocess, sys
+rev, root, db_path, rollout = sys.argv[1:5]
+class GitSource(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != "agent_observer" and not fullname.startswith("agent_observer."):
+            return None
+        rel = fullname.replace(".", "/")
+        package = fullname in ("agent_observer", "agent_observer.adapters")
+        rel += "/__init__.py" if package else ".py"
+        return importlib.util.spec_from_loader(fullname, self, origin=rel, is_package=package)
+    def create_module(self, spec):
+        return None
+    def exec_module(self, module):
+        rel = module.__spec__.origin
+        source = subprocess.check_output(["git", "show", f"{rev}:{rel}"], cwd=root)
+        module.__file__ = str(__import__("pathlib").Path(root, rel))
+        exec(compile(source, f"git:{rev}:{rel}", "exec"), module.__dict__)
+sys.meta_path.insert(0, GitSource())
+from agent_observer import db
+from agent_observer.adapters.codex import import_codex_file
+con = db.connect(db_path)
+db.init_db(con)
+stats = import_codex_file(con, rollout)
+if stats.get("failed"):
+    raise SystemExit(stats["failed"])
+con.commit()
+con.close()
+"""
+    subprocess.run([sys.executable, "-c", script, rev, root, db_path, rollout],
+                   check=True)
 
 
 if __name__ == "__main__":

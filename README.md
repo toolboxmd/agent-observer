@@ -304,8 +304,8 @@ out.
   session ran headless (`sdk-cli`, `codex_exec`). Other synthetic input,
   such as reminders, is no intervention.
 - `unknown`: no evidence either way, for example a prompt in a delegated
-  child thread from before Chromeria V2, a Grok or OpenCode prompt (their
-  Chromeria text does not match the native prompt), or any interrupt or
+  child thread from before Chromeria V2, a prompt whose native message or
+  turn identity does not match a Chromeria run, or any interrupt or
   rejection in a child thread or in a top-level thread an agent launched
   (`thread` `child` or `launched`), which an agent can cause. A
   top-level thread counts as person-opened from Chromeria V2's
@@ -613,8 +613,9 @@ marker: Claude Code emits one assistant_message event per nonempty
 assistant text block, so a message streamed as several blocks keeps
 one excerpt per block. Codex instead concatenates the text items of
 an assistant message and keeps one excerpt for the combined message.
-No other adapter emits assistant_message excerpts. Error records keep only a fixed category and the sorted
-top-level key names of the record, never its values. Event details keep
+Grok keeps one excerpt per native assistant chunk; OpenCode keeps one per
+text part and updates it as that part streams. Error records keep only a
+fixed category and the sorted top-level key names of the record, never its values. Event details keep
 only allowlisted, correctly typed metadata (identifiers, paths,
 commands, numbers, closed status and kind values), never titles,
 messages, error text, outputs, content, arguments or other free text;

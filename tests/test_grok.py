@@ -94,7 +94,7 @@ class GrokAdapterTest(LedgerCase):
         self.assertEqual(kinds[f"{S1}:prompt:2"], ("synthetic", f"{S1}:p-ccc"))
         self.assertEqual(kinds[f"{S1}:prompt:3"], ("genuine", f"{S1}:p-ddd"))
         # Prompt 4 has chunks but no completion yet: kept, unbound.
-        self.assertEqual(kinds[f"{S1}:prompt:4"], ("genuine", None))
+        self.assertEqual(kinds[f"{S1}:prompt:4"], ("genuine", f"{S1}:p-eee"))
         genuine = self.query(
             "SELECT is_genuine FROM user_messages WHERE native_id=?",
             (f"{S1}:prompt:2",))[0]
@@ -430,8 +430,8 @@ class GrokAdapterTest(LedgerCase):
         self.assertEqual(subs[f"{S1}:prompt:1"], f"{S1}:p-bbb")
         self.assertEqual(subs[f"{S1}:prompt:2"], f"{S1}:p-ccc")
         self.assertEqual(subs[f"{S1}:prompt:3"], f"{S1}:p-ddd")
-        # Open prompt stays unbound; duplicate never shifts bindings.
-        self.assertIsNone(subs[f"{S1}:prompt:4"])
+        # Native identity is available before completion; duplicates never shift it.
+        self.assertEqual(subs[f"{S1}:prompt:4"], f"{S1}:p-eee")
         resps = list(con.execute(
             "SELECT response_id FROM responses WHERE session_key=?"
             " ORDER BY response_id", (S1,)))

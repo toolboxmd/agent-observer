@@ -9,6 +9,7 @@ from contextlib import redirect_stdout
 
 from agent_observer import cli, db, placement, report
 from agent_observer.adapters import t3 as t3_adapter
+from agent_observer.adapters.codex import import_codex_file
 from tests.helpers import LedgerCase
 
 SCHEDULE = {"models": {"m": {"input": 1.0, "output": 1.0, "cached_input": 1.0,
@@ -180,6 +181,405 @@ class PlacementTest(LedgerCase):
         self.assertTrue(alpha["reconciles"])
         self.assertEqual(alpha["attributed"]["total_tokens"], 110)
         self.assertEqual(alpha["scope"]["total_tokens"], 550)
+
+    def test_repeated_usage_keeps_the_first_response_on_its_task(self):
+        # An exact later copy of the first response must not take its
+        # chronology. Placement then assigns both calls to one response
+        # and both task reports lose their attributed response.
+        alpha = self.checkouts["alpha"]
+        beta = self.checkouts["beta"]
+        path = os.path.join(self.tmp.name, "placement.jsonl")
+
+        def call(name, root):
+            return {"type": "response_item", "payload": {
+                "type": "function_call", "call_id": name, "name": "exec_command",
+                "arguments": json.dumps({"cmd": "cat " + os.path.join(root, "x.py")})}}
+
+        def usage(name, total):
+            return {"type": "token_usage_record", "payload": {
+                "response_id": name, "thread_id": "placement-review",
+                "usage": {"input_tokens": total - 2, "output_tokens": 2,
+                          "total_tokens": total}}}
+
+        rows = [
+            {"type": "session_meta", "payload": {
+                "id": "placement-review", "thread_source": "user", "cwd": "/w"}},
+            {"type": "turn_context", "payload": {"model": "model-a"}},
+            call("call-a", alpha),
+            usage("r1", 12),
+            {"type": "turn_context", "payload": {"model": "model-b"}},
+            call("call-b", beta),
+            usage("r2", 22),
+            usage("r1", 12),
+        ]
+        for ordinal, rec in enumerate(rows):
+            rec["ordinal"] = ordinal
+        with open(path, "w") as fh:
+            for rec in rows:
+                fh.write(json.dumps(rec) + "\n")
+        key = "codex:placement-review"
+        for task in ("o/alpha#1", "o/beta#2"):
+            self.con.execute(
+                "INSERT INTO session_assignments(session_key, task_id,"
+                " evidence, created_at) VALUES(?,?,'t3',0)", (key, task))
+        for full in (False, True, False):
+            import_codex_file(self.con, path, full=full)
+            stored = dict(self.con.execute(
+                "SELECT response_id, ordinal_num FROM responses"))
+            self.assertEqual(stored, {"codex:r1": 3, "codex:r2": 6})
+            self.assertEqual(placement.place_session(self.con, key), {
+                "codex:r1": "o/alpha#1", "codex:r2": "o/beta#2"})
+            alpha_report = report.task_report(self.con, "o/alpha#1", schedule=SCHEDULE)
+            beta_report = report.task_report(self.con, "o/beta#2", schedule=SCHEDULE)
+            self.assertEqual(alpha_report["measured"]["attributed_responses"],
+                             ["codex:r1"])
+            self.assertEqual(beta_report["measured"]["attributed_responses"],
+                             ["codex:r2"])
+        # A privacy reimport still adopts the original file position once,
+        # and the exact repeat later in the same file does not move it again.
+        self.con.execute("UPDATE sources SET privacy_version=8")
+        self.con.execute(
+            "UPDATE responses SET ordinal_num=50 WHERE response_id='codex:r1'")
+        import_codex_file(self.con, path, full=True)
+        self.assertEqual(self.con.execute(
+            "SELECT ordinal_num FROM responses WHERE response_id='codex:r1'"
+        ).fetchone()[0], 3)
+        self.assertEqual(placement.place_session(self.con, key), {
+            "codex:r1": "o/alpha#1", "codex:r2": "o/beta#2"})
+
+    def test_repeated_fallback_snapshot_keeps_its_first_position(self):
+        path = os.path.join(self.tmp.name, "fallback.jsonl")
+        buckets = {"input_tokens": 90, "cached_input_tokens": 0,
+                   "cache_write_input_tokens": 0, "output_tokens": 10,
+                   "reasoning_output_tokens": 0, "total_tokens": 100}
+        snapshot = {"type": "event_msg", "payload": {"type": "token_count", "info": {
+            "last_token_usage": buckets, "total_token_usage": buckets}}}
+        rows = [
+            {"type": "session_meta", "payload": {
+                "id": "fallback-review", "thread_source": "user", "cwd": "/w"}},
+            {"type": "turn_context", "payload": {"model": "model-a"}},
+            snapshot,
+            {"type": "turn_context", "payload": {"model": "model-b"}},
+            snapshot,
+        ]
+        for ordinal, rec in enumerate(rows):
+            rec["ordinal"] = ordinal
+        with open(path, "w") as fh:
+            for rec in rows:
+                fh.write(json.dumps(rec) + "\n")
+        for full in (False, True, False):
+            import_codex_file(self.con, path, full=full)
+            row = self.con.execute(
+                "SELECT ordinal_num, model FROM responses WHERE response_id=?",
+                ("codex:fallback-review:tc:100",)).fetchone()
+            self.assertEqual(tuple(row), (2, "model-a"))
+
+    def test_repeated_tool_call_keeps_the_first_call_on_its_task(self):
+        # A brand-new source is privacy-stale. An exact later copy of the
+        # same tool call must not take the original call's chronology, or
+        # the call falls after every response and the task report loses it.
+        alpha = self.checkouts["alpha"]
+        beta = self.checkouts["beta"]
+        path = os.path.join(self.tmp.name, "calls.jsonl")
+
+        def call(name, root):
+            return {"type": "response_item", "payload": {
+                "type": "function_call", "call_id": name, "name": "exec_command",
+                "arguments": json.dumps({"cmd": "cat " + os.path.join(root, "x.py")})}}
+
+        def usage(name, total):
+            return {"type": "token_usage_record", "payload": {
+                "response_id": name, "thread_id": "placement-review",
+                "usage": {"input_tokens": total - 2, "output_tokens": 2,
+                          "total_tokens": total}}}
+
+        rows = [
+            {"type": "session_meta", "payload": {
+                "id": "placement-review", "thread_source": "user", "cwd": "/w"}},
+            {"type": "turn_context", "payload": {"model": "model-a"}},
+            call("call-a", alpha),
+            usage("r1", 12),
+            {"type": "turn_context", "payload": {"model": "model-b"}},
+            call("call-b", beta),
+            usage("r2", 22),
+            call("call-a", alpha),
+        ]
+        for ordinal, rec in enumerate(rows):
+            rec["ordinal"] = ordinal
+        rows[-1] = dict(rows[2])
+        with open(path, "w") as fh:
+            for rec in rows:
+                fh.write(json.dumps(rec) + "\n")
+        key = "codex:placement-review"
+        for task in ("o/alpha#1", "o/beta#2"):
+            self.con.execute(
+                "INSERT INTO session_assignments(session_key, task_id,"
+                " evidence, created_at) VALUES(?,?,'t3',0)", (key, task))
+        for full in (False, True, False):
+            import_codex_file(self.con, path, full=full)
+            stored = dict(self.con.execute(
+                "SELECT native_id, ordinal_num FROM events"))
+            self.assertEqual(stored, {"call-a": 2, "call-b": 5})
+            self.assertEqual(placement.place_session(self.con, key), {
+                "codex:r1": "o/alpha#1", "codex:r2": "o/beta#2"})
+            alpha_report = report.task_report(self.con, "o/alpha#1", schedule=SCHEDULE)
+            beta_report = report.task_report(self.con, "o/beta#2", schedule=SCHEDULE)
+            self.assertEqual(alpha_report["measured"]["attributed_responses"],
+                             ["codex:r1"])
+            self.assertEqual(beta_report["measured"]["attributed_responses"],
+                             ["codex:r2"])
+        event = self.con.execute(
+            "SELECT id, source_id FROM events WHERE native_id='call-a'").fetchone()
+        self.con.execute(
+            "INSERT INTO verdicts(intervention_id, behavior, judge, verdict,"
+            " recorded_at) VALUES(?, 'correction', 'judge', 'yes', 0)",
+            (f"ev:{key}/tool_call/call-a",))
+        self.con.execute("UPDATE sources SET privacy_version=8")
+        self.con.commit()
+        import_codex_file(self.con, path, full=True)
+        again = self.con.execute(
+            "SELECT id, source_id, ordinal_num FROM events WHERE native_id='call-a'"
+        ).fetchone()
+        self.assertEqual(tuple(again), (event["id"], event["source_id"], 2))
+        self.assertEqual(self.con.execute(
+            "SELECT intervention_id FROM verdicts").fetchone()[0],
+            f"ev:{key}/tool_call/call-a")
+        self.assertEqual(placement.place_session(self.con, key)["codex:r1"],
+                         "o/alpha#1")
+
+    def test_continuation_keeps_the_original_call_and_response(self):
+        # The same native call in a second rollout of this session is not
+        # a new occurrence. Its file position must not replace the call
+        # that already owns the first response.
+        alpha = self.checkouts["alpha"]
+        beta = self.checkouts["beta"]
+        path = os.path.join(self.tmp.name, "calls.jsonl")
+        continuation = os.path.join(self.tmp.name, "calls-continuation.jsonl")
+
+        def call(name, root):
+            return {"type": "response_item", "payload": {
+                "type": "function_call", "call_id": name, "name": "exec_command",
+                "arguments": json.dumps({"cmd": "cat " + os.path.join(root, "x.py")})}}
+
+        def usage(name, total):
+            return {"type": "token_usage_record", "payload": {
+                "response_id": name, "thread_id": "placement-review",
+                "usage": {"input_tokens": total - 2, "output_tokens": 2,
+                          "total_tokens": total}}}
+
+        rows = [
+            {"type": "session_meta", "payload": {
+                "id": "placement-review", "thread_source": "user", "cwd": "/w"}},
+            {"type": "turn_context", "payload": {"model": "model-a"}},
+            call("call-a", alpha),
+            usage("r1", 12),
+            {"type": "turn_context", "payload": {"model": "model-b"}},
+            call("call-b", beta),
+            usage("r2", 22),
+        ]
+        for ordinal, rec in enumerate(rows):
+            rec["ordinal"] = ordinal
+        with open(path, "w") as fh:
+            for rec in rows:
+                fh.write(json.dumps(rec) + "\n")
+        continued = [rows[0]] + [
+            {"type": "world_state", "ordinal": 20 + i, "payload": {}}
+            for i in range(8)] + [dict(rows[2])]
+        with open(continuation, "w") as fh:
+            for rec in continued:
+                fh.write(json.dumps(rec) + "\n")
+        key = "codex:placement-review"
+        for task in ("o/alpha#1", "o/beta#2"):
+            self.con.execute(
+                "INSERT INTO session_assignments(session_key, task_id,"
+                " evidence, created_at) VALUES(?,?,'t3',0)", (key, task))
+
+        def owned(table, key_column, native):
+            row = self.con.execute(
+                f"SELECT t.ordinal_num, s.path FROM {table} t"
+                " JOIN sources s ON s.id=t.source_id"
+                f" WHERE t.{key_column}=?", (native,)).fetchone()
+            return (row["ordinal_num"], os.path.basename(row["path"]))
+
+        for full in (False, True, False):
+            import_codex_file(self.con, path, full=full)
+            import_codex_file(self.con, continuation, full=full)
+            self.assertEqual(owned("events", "native_id", "call-a"),
+                             (2, "calls.jsonl"))
+            self.assertEqual(owned("events", "native_id", "call-b"),
+                             (5, "calls.jsonl"))
+            self.assertEqual(owned("responses", "response_id", "codex:r1"),
+                             (3, "calls.jsonl"))
+            self.assertEqual(owned("responses", "response_id", "codex:r2"),
+                             (6, "calls.jsonl"))
+            self.assertEqual(placement.place_session(self.con, key), {
+                "codex:r1": "o/alpha#1", "codex:r2": "o/beta#2"})
+            alpha_report = report.task_report(
+                self.con, "o/alpha#1", schedule=SCHEDULE)
+            beta_report = report.task_report(
+                self.con, "o/beta#2", schedule=SCHEDULE)
+            self.assertEqual(alpha_report["measured"]["attributed_responses"],
+                             ["codex:r1"])
+            self.assertEqual(beta_report["measured"]["attributed_responses"],
+                             ["codex:r2"])
+            self.assertEqual(self.con.execute(
+                "SELECT COUNT(*) FROM import_errors").fetchone()[0], 0)
+
+    def _bind_placement_tasks(self, con):
+        key = "codex:placement-review"
+        for task in ("o/alpha#1", "o/beta#2"):
+            con.execute(
+                "INSERT INTO session_assignments(session_key, task_id,"
+                " evidence, created_at) VALUES(?,?,'t3',0)", (key, task))
+        return key
+
+    def _continuation_files(self, label):
+        alpha = self.checkouts["alpha"]
+        beta = self.checkouts["beta"]
+        path = os.path.join(self.tmp.name, f"calls-{label}.jsonl")
+        continuation = os.path.join(
+            self.tmp.name, f"calls-{label}-continuation.jsonl")
+
+        def call(name, root):
+            return {"type": "response_item", "payload": {
+                "type": "function_call", "call_id": name, "name": "exec_command",
+                "arguments": json.dumps({"cmd": "cat " + os.path.join(root, "x.py")})}}
+
+        def usage(name, total):
+            return {"type": "token_usage_record", "payload": {
+                "response_id": name, "thread_id": "placement-review",
+                "usage": {"input_tokens": total - 2, "output_tokens": 2,
+                          "total_tokens": total}}}
+
+        rows = [
+            {"type": "session_meta", "payload": {
+                "id": "placement-review", "thread_source": "user", "cwd": "/w"}},
+            {"type": "turn_context", "payload": {"model": "model-a"}},
+            call("call-a", alpha),
+            usage("r1", 12),
+            {"type": "turn_context", "payload": {"model": "model-b"}},
+            call("call-b", beta),
+            usage("r2", 22),
+        ]
+        for ordinal, rec in enumerate(rows):
+            rec["ordinal"] = ordinal
+        with open(path, "w") as fh:
+            for rec in rows:
+                fh.write(json.dumps(rec) + "\n")
+        continued = [rows[0]] + [
+            {"type": "world_state", "ordinal": 20 + i, "payload": {}}
+            for i in range(8)] + [dict(rows[2])]
+        with open(continuation, "w") as fh:
+            for rec in continued:
+                fh.write(json.dumps(rec) + "\n")
+        return path, continuation
+
+    def _assert_public_placement(self, con):
+        key = "codex:placement-review"
+        self.assertEqual(con.execute(
+            "SELECT COUNT(*) FROM events WHERE native_id='call-a'").fetchone()[0], 1)
+        self.assertEqual(con.execute(
+            "SELECT COUNT(*) FROM responses WHERE is_overlap=0").fetchone()[0], 2)
+        self.assertEqual(placement.place_session(con, key), {
+            "codex:r1": "o/alpha#1", "codex:r2": "o/beta#2"})
+        alpha_report = report.task_report(con, "o/alpha#1", schedule=SCHEDULE)
+        beta_report = report.task_report(con, "o/beta#2", schedule=SCHEDULE)
+        self.assertEqual(alpha_report["measured"]["attributed_responses"],
+                         ["codex:r1"])
+        self.assertEqual(beta_report["measured"]["attributed_responses"],
+                         ["codex:r2"])
+        for table, column, native in (
+                ("events", "native_id", "call-a"),
+                ("events", "native_id", "call-b"),
+                ("responses", "response_id", "codex:r1"),
+                ("responses", "response_id", "codex:r2")):
+            row = con.execute(
+                f"SELECT source_id, ordinal_num FROM {table} WHERE {column}=?",
+                (native,)).fetchone()
+            kind = "event" if table == "events" else "response"
+            if kind == "event":
+                key_row = con.execute(
+                    "SELECT id FROM events WHERE native_id=?", (native,)).fetchone()
+                row_key = str(key_row["id"])
+            else:
+                row_key = native
+            seen = con.execute(
+                "SELECT 1 FROM codex_occurrences WHERE source_id=? AND row_kind=?"
+                " AND row_key=? AND record_position=?",
+                (row["source_id"], kind, row_key, row["ordinal_num"])).fetchone()
+            self.assertIsNotNone(seen)
+
+    def test_reverse_continuation_still_places_the_original_response(self):
+        # The duplicate-only file is imported first. Its call has no
+        # response after it, so it cannot take the original response.
+        path, continuation = self._continuation_files("reverse")
+        key = self._bind_placement_tasks(self.con)
+        for full in (False, True, False):
+            import_codex_file(self.con, continuation, full=full)
+            import_codex_file(self.con, path, full=full)
+            self._assert_public_placement(self.con)
+            calls = report.timeline(
+                self.con, session_key=key, family="tool_call", limit=1)
+            self.assertEqual(
+                [event["native_id"] for event in calls["events"]], ["call-a"])
+            self.assertEqual(self.con.execute(
+                "SELECT COUNT(*) FROM import_errors").fetchone()[0], 0)
+        self.assertTrue(key)
+
+    def test_competing_response_witnesses_leave_the_call_unplaced(self):
+        # Each file pairs the same call with a different response. Neither
+        # import order picks one of those responses.
+        alpha = self.checkouts["alpha"]
+
+        def call():
+            return {"type": "response_item", "payload": {
+                "type": "function_call", "call_id": "call-a", "name": "exec_command",
+                "arguments": json.dumps({"cmd": "cat " + os.path.join(alpha, "x.py")})}}
+
+        def usage(name, total):
+            return {"type": "token_usage_record", "payload": {
+                "response_id": name, "thread_id": "placement-review",
+                "usage": {"input_tokens": total - 2, "output_tokens": 2,
+                          "total_tokens": total}}}
+
+        def write(name, response, total):
+            path = os.path.join(self.tmp.name, name)
+            rows = [
+                {"type": "session_meta", "payload": {
+                    "id": "placement-review", "thread_source": "user", "cwd": "/w"}},
+                {"type": "turn_context", "payload": {"model": "model-a"}},
+                call(),
+                usage(response, total),
+            ]
+            for ordinal, rec in enumerate(rows):
+                rec["ordinal"] = ordinal
+            with open(path, "w") as fh:
+                for rec in rows:
+                    fh.write(json.dumps(rec) + "\n")
+            return path
+
+        first = write("compete-a.jsonl", "r1", 12)
+        second = write("compete-b.jsonl", "r2", 22)
+        key = self._bind_placement_tasks(self.con)
+        other = db.connect(os.path.join(self.tmp.name, "compete-reverse.db"))
+        self.addCleanup(other.close)
+        db.init_db(other)
+        t3_adapter._ensure_tables(other)
+        for n, (repo, branch) in enumerate((("alpha", "fix/a"), ("beta", "fix/b")), 1):
+            task = f"o/{repo}#{n}"
+            other.execute("INSERT INTO tasks(task_id, project, title, created_at)"
+                          " VALUES(?,?,?,0)", (task, f"o/{repo}", task))
+            other.execute(
+                "INSERT INTO t3_links(thread_id, kind, host, repository, number, url,"
+                " head_branch) VALUES('t','pr','github.com',?,?,?,?)",
+                (f"o/{repo}", n, f"https://github.com/o/{repo}/pull/{n}", branch))
+        self._bind_placement_tasks(other)
+        for con, order in ((self.con, (first, second)), (other, (second, first))):
+            for full in (False, True, False):
+                for path in order:
+                    import_codex_file(con, path, full=full)
+                self.assertEqual(placement.place_session(con, key), {
+                    "codex:r1": None, "codex:r2": None})
 
     def test_shared_checkout_is_resolved_once_per_sync(self):
         # Two shared sessions in one record_shared_checkouts share a root.

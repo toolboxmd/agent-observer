@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.2] - 2026-10-14
+
+### Changed
+
+- Index native conversation events and attribute actors by identity, keeping sidechain restrictions, Codex user text, and cleared OpenCode text aligned with those records. Codex orders every row by its complete-line position. Native ids keep the raw metadata ordinal, and a Codex privacy reimport of the same source updates that stored position from the first record without replacing the event or its verdict. A fork moves copied history by that file position on an append, a full replay, and a repair. A ledger imported before that chronology still moves on its stored metadata ordinals, and the replay then stores file positions. A repeat in the same source keeps that source's first position, and another file records another occurrence rather than moving the original. Competing response witnesses stay unplaced. A timeline orders the assembled rows from a spanning source before it applies a limit.
+
 ## [1.2.1] - 2026-10-14
 
 ### Changed

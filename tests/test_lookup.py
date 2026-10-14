@@ -294,11 +294,13 @@ class CodexLookupTest(LookupCase):
         self.assertNotIn("hunter2value", json.dumps(item))
         self.assertNotIn("plainvalue1", json.dumps(item))
 
-    def test_lifecycle_record_by_native_ordinal(self):
+    def test_lifecycle_record_by_native_key(self):
         row = self.con.execute(
             "SELECT id, ordinal_num FROM events WHERE family='lifecycle'"
             " AND native_id LIKE 'task_complete:%'").fetchone()
-        self.assertEqual(row["ordinal_num"], 20)
+        # The file line is the chronology. Metadata ordinal 20 is a
+        # different sequence and must not be required to find the record.
+        self.assertEqual(row["ordinal_num"], 8)
         [item] = self.show(row["id"])
         self.assertEqual(item["status"], "ok")
         self.assertEqual(item["record"]["payload"]["type"], "task_complete")

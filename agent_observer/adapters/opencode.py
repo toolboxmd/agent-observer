@@ -37,7 +37,7 @@ CAPABILITIES = [
     ("skill_invocation", True, "skill tool calls name the skill; skill dir observed as SKILL.md path"),
     ("file_change", True, "edit/write/patch tool calls and patch parts as file_change; patch parts keyed by part id with snapshot hash"),
     ("compaction", True, "compaction parts and session time_compacting as compaction boundaries"),
-    ("lifecycle_task", True, "message errors as lifecycle error events carrying the status code"),
+    ("lifecycle_task", True, "message errors carry the status code; MessageAbortedError records an interruption"),
     ("human_input", True, "user text parts as genuine/synthetic user messages; child sessions and synthetic flags told apart"),
     ("instruction_identity", True, "AgentsMD direction block from user text; versioned plugin paths read"),
     ("subagents", True, "child sessions as subagent sessions of their parent"),
@@ -60,7 +60,7 @@ IMPORT_ERROR_CATEGORIES = privacy.ERROR_CATEGORIES
 # Part types that are known to carry no ledger event. Anything else is
 # quarantined as unknown_part_type instead of being silently dropped.
 _KNOWN_QUIET_PART_TYPES = frozenset(
-    {"text", "reasoning", "file", "step-start", "step-finish"})
+    {"reasoning", "file", "step-start", "step-finish"})
 _INCOMPLETE_TOOL_STATUSES = frozenset({"running", "pending"})
 
 
@@ -563,15 +563,15 @@ def _ingest_message(con, native, stats, identity, src_path, source_id,
         code = detail.get("statusCode")
         # Rule 6: the lifecycle family keeps no detail, so error names,
         # messages and other free text never persist; the numeric status
-        # survives in the status column. update=True lets a privacy-stale
-        # re-import replace or clear an older unsafe detail row.
-        insert_event(con, stats, source_id=source_id,
+        # survives in the status column. Native messages are mutable, so a
+        # later cancellation updates the same lifecycle identity in place.
+        _upsert_event(con, stats, source_id=source_id,
                      session_key=session_key, family="lifecycle",
                      native_id=msg_id, ordinal=ordinal, ts=ts,
-                     name="error",
-                     status=str(code) if isinstance(
-                         code, int) and not isinstance(code, bool) else None,
-                     detail=None, update=privacy_stale)
+                     name="turn_aborted" if error.get("name") == "MessageAbortedError" else "error",
+                     status="interrupted" if error.get("name") == "MessageAbortedError" else
+                     (str(code) if isinstance(code, int) and not isinstance(code, bool) else None),
+                     detail=None)
     role = data.get("role")
     if role == "assistant":
         _ingest_response(con, stats, src_path, source_id, session_key,
@@ -696,6 +696,7 @@ def _ingest_submission(con, stats, identity, src_path, source_id,
     native_id = f"{HARNESS}:{msg.get('id')}"
     is_child = bool(sess.get("parent_id"))
     if not texts:
+        kind = "synthetic" if is_child else "unknown"
         # No valid text remains: never leave a stale excerpt behind. Clear
         # any existing row in place with an empty excerpt and matching
         # non-genuine classification instead of returning early.
@@ -703,16 +704,25 @@ def _ingest_submission(con, stats, identity, src_path, source_id,
             "SELECT kind, text_hash, text_excerpt, is_genuine FROM user_messages"
             " WHERE native_id=?", (native_id,)).fetchone()
         if existing is None:
+            # A native user message can contain only files or images. Keep
+            # its identity even though no text proves an actor or excerpt.
+            con.execute(
+                "INSERT INTO user_messages(native_id,source_id,session_key,"
+                "ordinal_num,ts,kind,text_hash,text_excerpt,is_genuine)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                (native_id, source_id, session_key, index, ts,
+                 kind, text_hash(""), "", 0))
+            stats["user_messages_inserted"] += 1
             return
         digest = text_hash("")
-        if (existing["kind"] != "synthetic" or existing["text_hash"] != digest
+        if (existing["kind"] != kind or existing["text_hash"] != digest
                 or (existing["text_excerpt"] or "") != ""
                 or existing["is_genuine"] != 0):
             con.execute(
                 "UPDATE user_messages SET source_id=?, session_key=?,"
                 " ordinal_num=?, ts=?, kind=?, text_hash=?, text_excerpt=?,"
                 " is_genuine=? WHERE native_id=?",
-                (source_id, session_key, index, ts, "synthetic", digest, "",
+                (source_id, session_key, index, ts, kind, digest, "",
                  0, native_id))
             stats["user_messages_inserted"] += 1
         return
@@ -784,7 +794,28 @@ def _ingest_part(con, stats, identity, src_path, source_id, session_key,
         _oops(con, stats, src_path, ordinal, "missing_id",
               _record_line(raw, data))
         return
-    if ptype == "tool":
+    if ptype == "text":
+        if roles.get(part.get("message_id")) != "assistant":
+            return  # User text is indexed once under its message id.
+        text = data.get("text")
+        if not isinstance(text, str):
+            _oops(con, stats, src_path, ordinal, "schema_error", _record_line(raw, data))
+            return
+        # Empty text is a valid clear. Reconcile an existing row so search
+        # drops an excerpt the native part no longer contains. A part that
+        # was always empty still creates no event.
+        native = privacy.filter_native_id("assistant_message", part_id)
+        exists = bool(native) and con.execute(
+            "SELECT 1 FROM events WHERE session_key=? AND family=? AND native_id=?",
+            (session_key, "assistant_message", native)).fetchone()
+        if text or exists:
+            excerpt = privacy.assistant_excerpt(text)
+            _upsert_event(con, stats, source_id=source_id, session_key=session_key,
+                          family="assistant_message", native_id=part_id,
+                          ordinal=ordinal, ts=ts, name="assistant_message",
+                          size_bytes=len(text), fingerprint=text_hash(text),
+                          detail={"excerpt": excerpt} if excerpt else None)
+    elif ptype == "tool":
         _ingest_tool(con, stats, identity, src_path, source_id,
                       session_key, sess, roles, part, data, ordinal, ts,
                       line=_record_line(raw, data))

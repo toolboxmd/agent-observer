@@ -176,8 +176,8 @@ class InterventionsCase(unittest.TestCase):
                          ("w1", "th-root", "client", None))
         self.con.execute("INSERT INTO t3_turn_origins VALUES(?,?,?,?)",
                          ("w2", "th-root", "server", None))
-        self.con.execute("INSERT INTO t3_prompt_origins VALUES(?,?,?)",
-                         ("cx-1", text_hash(BRIEF), "server"))
+        self.con.execute("INSERT INTO t3_native_prompt_origins VALUES(?,?,?)",
+                         ("codex:cx-1", "codex:msg-u1", "server"))
         threads = "INSERT INTO t3_threads(thread_id, root_thread_id,"\
             " provider, native_session, opened_by) VALUES(?,?,?,?,?)"
         self.con.execute(threads, ("th-root", "th-root", "claudeAgent",
@@ -221,6 +221,7 @@ class SelectTest(InterventionsCase):
             # A Chromeria server turn: another agent wrote to this session.
             "sub:claude:w2": ("prompt", "agent"),
             "sub:claude:w3": ("interrupt", "user"),
+            "sub:claude:w4": ("prompt", "unknown"),
             "ev:claude:sess-four/permission/toolu_cp": ("rejection", "unknown"),
             "sub:claude:x3": ("interrupt", "unknown"),
             "ev:claude:sess-five/permission/toolu_lx": ("rejection", "unknown"),
@@ -235,7 +236,7 @@ class SelectTest(InterventionsCase):
                          "child")
         self.assertEqual(found["sub:claude:u1"]["thread"], "none")
         self.assertEqual(found["sub:claude:y2"]["thread"], "launched")
-        self.assertNotIn("sub:claude:w4", found)
+        self.assertEqual(found["sub:claude:w4"]["created_by"], "unknown")
 
     def test_ledger_without_opened_by_stays_conservative(self):
         # A ledger synced before opened_by existed: top-level threads read
@@ -265,7 +266,7 @@ class SelectTest(InterventionsCase):
                          {"user", "agent"})
         self.assertEqual(len(result["interventions"]), 10)
         self.assertEqual(result["counts"]["by_created_by"],
-                         {"user": 7, "agent": 3, "unknown": 5})
+                         {"user": 7, "agent": 3, "unknown": 6})
 
     def test_hook_and_rule_denials_are_counted_never_selected(self):
         result = self.select(created_by=None)

@@ -173,6 +173,8 @@ def place_session(con, session_key: str, known: list | None = None,
     if not heads:
         return None
     by_head = {head: task for task, head in heads.items()}
+    if session["harness"] == "codex" and _has_occurrences(con, session_key):
+        return _place_occurrences(con, session_key, by_head, known, roots)
     responses = con.execute(
         "SELECT response_id, ordinal_num FROM responses WHERE session_key=?"
         " AND is_overlap=0 AND ordinal_num IS NOT NULL ORDER BY ordinal_num",
@@ -194,6 +196,78 @@ def place_session(con, session_key: str, known: list | None = None,
             continue
         rid = responses[owner]["response_id"]
         for path in PATH_RE.findall(call["target"] or ""):
+            if path not in seen:
+                seen[path] = checkout_of(con, path, known, roots)
+            found = seen[path]
+            if found in by_head:
+                touched[rid].add(by_head[found])
+    return {rid: next(iter(tasks)) if len(tasks) == 1 else None
+            for rid, tasks in touched.items()}
+
+
+def _has_occurrences(con, session_key: str) -> bool:
+    row = con.execute(
+        "SELECT 1 FROM codex_occurrences WHERE session_key=? LIMIT 1",
+        (session_key,)).fetchone()
+    return row is not None
+
+
+def _place_occurrences(con, session_key: str, by_head: dict,
+                       known: list | None, roots: dict | None) -> dict:
+    """Place Codex calls from agreeing per-source response witnesses.
+
+    Each source keeps the first position of a call and of a live response.
+    The witness is the first live response at or after the call in that
+    source. A source that repeats a call with no response after it adds
+    no witness. Witnesses that name different responses leave the call
+    unplaced. A session with no stored occurrences uses the ordinal bisect.
+    """
+    live = [r["response_id"] for r in con.execute(
+        "SELECT response_id FROM responses WHERE session_key=? AND is_overlap=0",
+        (session_key,))]
+    live_ids = set(live)
+    touched = {rid: set() for rid in live}
+    if known is None:
+        known = [dict(r) for r in _known_checkouts(con)]
+    if roots is None:
+        roots = {}
+    witnesses: dict = {}
+    targets: dict = {}
+    sources = con.execute(
+        "SELECT DISTINCT source_id FROM codex_occurrences WHERE session_key=?",
+        (session_key,)).fetchall()
+    for source in sources:
+        sid = source["source_id"]
+        response_seq = [
+            (row["record_position"], row["row_key"])
+            for row in con.execute(
+                "SELECT record_position, row_key FROM codex_occurrences"
+                " WHERE source_id=? AND session_key=? AND row_kind='response'"
+                " ORDER BY record_position",
+                (sid, session_key))
+            if row["row_key"] in live_ids]
+        calls = con.execute(
+            "SELECT o.record_position AS record_position, e.family, e.native_id,"
+            " e.target FROM codex_occurrences o"
+            " JOIN events e ON e.id = o.row_key"
+            " WHERE o.source_id=? AND o.session_key=? AND o.row_kind='event'"
+            " AND e.family IN ('tool_call', 'read', 'skill_read', 'file_change')"
+            " ORDER BY o.record_position",
+            (sid, session_key)).fetchall()
+        for call in calls:
+            following = [rid for position, rid in response_seq
+                         if position >= call["record_position"]]
+            if not following:
+                continue
+            identity = (call["family"], call["native_id"])
+            witnesses.setdefault(identity, set()).add(following[0])
+            targets.setdefault(identity, call["target"])
+    seen: dict = {}
+    for identity, rids in witnesses.items():
+        if len(rids) != 1:
+            continue
+        rid = next(iter(rids))
+        for path in PATH_RE.findall(targets.get(identity) or ""):
             if path not in seen:
                 seen[path] = checkout_of(con, path, known, roots)
             found = seen[path]
