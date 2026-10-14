@@ -325,6 +325,54 @@ class SourceAvailabilityTest(LedgerCase):
         self.assertTrue(after["complete"])
         self.assertEqual(before["snapshot_id"], after["snapshot_id"])
 
+    def test_second_eventless_source_changes_the_snapshot(self):
+        thread = "thr-two"
+        paths = []
+        for name, response, message in (
+                ("rollout-2026-10-01T10-00-00-thr-two-a.jsonl", "resp-a", "msg-a"),
+                ("rollout-2026-10-01T10-00-00-thr-two-b.jsonl", "resp-b", "msg-b")):
+            path = os.path.join(
+                self.tmp.name, "sessions", "2026", "10", "01", name)
+            records = _rollout(thread, response)
+            records.insert(1, {"type": "response_item", "payload": {
+                "type": "message", "role": "user", "id": message,
+                "content": [{"type": "input_text", "text": message}]}})
+            _write_rollout(path, records)
+            import_codex_file(self.con, path)
+            paths.append(path)
+        self.con.commit()
+        session_key = f"codex:{thread}"
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) n FROM events WHERE session_key=?",
+            (session_key,)).fetchone()["n"], 0)
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(DISTINCT id) n FROM sources WHERE path IN (?,?)",
+            tuple(paths)).fetchone()["n"], 2)
+        _setup_tasks(self, "T-TWO-SRC")
+        messages = self.con.execute(
+            "SELECT native_id FROM user_messages WHERE session_key=?",
+            (session_key,)).fetchall()
+        self.assertEqual(len(messages), 2)
+        for row in messages:
+            _assign(self, row["native_id"], "T-TWO-SRC")
+        before = report.task_report(self.con, "T-TWO-SRC")
+        self.assertEqual(before["source_availability"]["status"], "available")
+        self.assertEqual(before["coverage"]["unavailable_sources"], [])
+        os.remove(paths[0])
+        mid = report.task_report(self.con, "T-TWO-SRC")
+        self.assertEqual(mid["source_availability"]["status"], "ledger_only")
+        self.assertEqual(mid["coverage"]["unavailable_sessions"], [session_key])
+        self.assertEqual(len(mid["coverage"]["unavailable_sources"]), 1)
+        self.assertEqual(mid["coverage"]["ledger_only_events"], 0)
+        self.assertNotEqual(before["snapshot_id"], mid["snapshot_id"])
+        os.remove(paths[1])
+        after = report.task_report(self.con, "T-TWO-SRC")
+        self.assertEqual(after["source_availability"]["status"], "ledger_only")
+        self.assertEqual(after["coverage"]["unavailable_sessions"], [session_key])
+        self.assertEqual(len(after["coverage"]["unavailable_sources"]), 2)
+        self.assertEqual(after["coverage"]["ledger_only_events"], 0)
+        self.assertNotEqual(mid["snapshot_id"], after["snapshot_id"])
+
     def test_second_eventless_loss_changes_the_snapshot(self):
         native_path = os.path.join(self.tmp.name, "opencode.db")
         build_native(native_path)

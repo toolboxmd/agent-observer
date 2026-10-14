@@ -555,7 +555,7 @@ def availability(con: sqlite3.Connection, session_key: str | None = None,
             empty = _empty_counts()
             return {"status": "available", "events": empty, "sessions": {
                 "available": 0, "partial": 0, "ledger_only": 0},
-                "reasons": {}, "by_harness": {}}
+                "reasons": {}, "by_harness": {}, "unavailable_sources": []}
         where.append(
             f"e.session_key IN ({','.join('?' * len(keys))})")
         args.extend(keys)
@@ -624,6 +624,8 @@ def availability(con: sqlite3.Connection, session_key: str | None = None,
             reasons[resolved["reason"]] = reasons.get(resolved["reason"], 0) + row["n"]
         elif kind != "live":
             entry["reasons"].setdefault(resolved["reason"], 0)
+        if kind not in ("live", "relocated"):
+            entry.setdefault("lost_sources", []).append(source_id)
         if session_key is not None:
             entry["sources"].append({
                 "source_id": source_id,
@@ -654,6 +656,10 @@ def availability(con: sqlite3.Connection, session_key: str | None = None,
         "sessions": sessions,
         "reasons": reasons,
         "by_harness": per_harness,
+        "unavailable_sources": sorted({
+            sid for entry in per.values()
+            for sid in entry.get("lost_sources", [])
+            if isinstance(sid, int)}),
     }
     if session_keys is not None:
         summary["by_session"] = {

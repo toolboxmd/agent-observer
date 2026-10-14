@@ -352,7 +352,8 @@ arithmetic.
   response counters with semantics and model/effort/turn, assignments,
   outcome, task turns, delegations, source cutoff, price schedule and coverage
   evidence (including source availability, the ledger-only event count,
-  and the session keys that are not available),
+  the session keys that are not available, and the source ids that are
+  not readable),
   and ownership that another task records in the same session. `source_cutoff`
   is the max native `imported_at` backing the scope. Repeats without
   ledger changes keep the identity; changed evidence changes it. The
