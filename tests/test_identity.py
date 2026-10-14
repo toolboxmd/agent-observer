@@ -2,6 +2,9 @@
 
 import hashlib
 import json
+import os
+import subprocess
+import tempfile
 import unittest
 
 from agent_observer import identity
@@ -202,3 +205,80 @@ class EmbeddedTest(LedgerCase):
         ident = identity.SessionIdentity()
         ident.observe_text("<INSTRUCTIONS>\nunreleased edit\n</INSTRUCTIONS>")
         self.assertNotIn("instructions_sha256", ident.fields(self.con))
+
+
+class DefaultRepoTest(unittest.TestCase):
+    def setUp(self):
+        self._old_home = os.environ.get("HOME")
+        self._old_repo = os.environ.pop("AGENT_OBSERVER_AGENTSMD_REPO", None)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        if self._old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._old_home
+        if self._old_repo is None:
+            os.environ.pop("AGENT_OBSERVER_AGENTSMD_REPO", None)
+        else:
+            os.environ["AGENT_OBSERVER_AGENTSMD_REPO"] = self._old_repo
+
+    def _link_claude(self, target):
+        home = os.path.join(self.tmp.name, "home")
+        os.makedirs(os.path.join(home, ".claude"))
+        os.environ["HOME"] = home
+        os.symlink(target, os.path.join(home, ".claude", "CLAUDE.md"))
+
+    def test_global_link_resolves_to_the_clone_root(self):
+        repo = os.path.join(self.tmp.name, "agentsmd")
+        global_dir = os.path.join(repo, "global")
+        os.makedirs(global_dir)
+        agents = os.path.join(global_dir, "AGENTS.md")
+        with open(agents, "w", encoding="utf-8") as fh:
+            fh.write("rules\n")
+        with open(os.path.join(repo, ".git"), "w", encoding="utf-8") as fh:
+            fh.write("gitdir: /unused\n")
+        self._link_claude(agents)
+        self.assertEqual(identity.default_agentsmd_repo(), os.path.realpath(repo))
+
+    def test_link_directory_itself_can_be_the_git_root(self):
+        repo = os.path.join(self.tmp.name, "agentsmd")
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q", repo], check=True)
+        agents = os.path.join(repo, "AGENTS.md")
+        with open(agents, "w", encoding="utf-8") as fh:
+            fh.write("rules\n")
+        self._link_claude(agents)
+        self.assertEqual(identity.default_agentsmd_repo(), os.path.realpath(repo))
+
+    def test_env_override_wins_unchanged(self):
+        repo = os.path.join(self.tmp.name, "agentsmd")
+        global_dir = os.path.join(repo, "global")
+        os.makedirs(global_dir)
+        agents = os.path.join(global_dir, "AGENTS.md")
+        with open(agents, "w", encoding="utf-8") as fh:
+            fh.write("rules\n")
+        with open(os.path.join(repo, ".git"), "w", encoding="utf-8") as fh:
+            fh.write("gitdir: /unused\n")
+        self._link_claude(agents)
+        os.environ["AGENT_OBSERVER_AGENTSMD_REPO"] = "/override/repo"
+        self.assertEqual(identity.default_agentsmd_repo(), "/override/repo")
+
+    def test_missing_claude_link_does_not_claim_an_ancestor_repo(self):
+        home = os.path.join(self.tmp.name, "home")
+        os.makedirs(os.path.join(home, ".codex"))
+        subprocess.run(["git", "init", "-q", home], check=True)
+        os.environ["HOME"] = home
+        other = os.path.join(self.tmp.name, "agentsmd")
+        global_dir = os.path.join(other, "global")
+        os.makedirs(global_dir)
+        agents = os.path.join(global_dir, "AGENTS.md")
+        with open(agents, "w", encoding="utf-8") as fh:
+            fh.write("rules\n")
+        with open(os.path.join(other, ".git"), "w", encoding="utf-8") as fh:
+            fh.write("gitdir: /unused\n")
+        os.symlink(agents, os.path.join(home, ".codex", "AGENTS.md"))
+        self.assertFalse(os.path.exists(os.path.join(home, ".claude", "CLAUDE.md")))
+        self.assertEqual(identity.default_agentsmd_repo(), os.path.realpath(other))
