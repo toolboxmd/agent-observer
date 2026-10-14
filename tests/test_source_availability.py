@@ -12,8 +12,10 @@ from agent_observer.adapters import grok, opencode
 from agent_observer.adapters.codex import import_codex_file
 from tests.helpers import LedgerCase, fixture
 from tests.test_capture import _assign, _setup_tasks
+from tests.test_codex_archive import _rollout
+from tests.test_codex_archive import _write as _write_rollout
 from tests.test_lookup import _codex_rollout, _grok_session
-from tests.test_opencode import build_native
+from tests.test_opencode import T0, _msg, _tokens, build_native
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NAME = "rollout-2026-10-01T10-00-00-thr-avail.jsonl"
@@ -274,6 +276,111 @@ class SourceAvailabilityTest(LedgerCase):
                   for row in json.loads(cli.stdout)["sessions"]}
         self.assertEqual(by_key[child], "ledger_only")
         self.assertEqual(by_key[parent], "available")
+
+    def test_relocated_eventless_source_stays_available(self):
+        name = "rollout-2026-10-01T10-00-00-thr-quiet.jsonl"
+        live = os.path.join(self.tmp.name, "sessions", "2026", "10", "01", name)
+        records = _rollout("thr-quiet", "resp-quiet")
+        records.insert(1, {
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user", "id": "msg-quiet",
+                        "content": [{"type": "input_text", "text": "quiet"}]}})
+        _write_rollout(live, records)
+        import_codex_file(self.con, live)
+        self.con.commit()
+        session_key = self.con.execute(
+            "SELECT session_key FROM sessions WHERE harness='codex'"
+        ).fetchone()["session_key"]
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) n FROM events WHERE session_key=?",
+            (session_key,)).fetchone()["n"], 0)
+        self.assertGreater(self.con.execute(
+            "SELECT COUNT(*) n FROM responses WHERE session_key=?",
+            (session_key,)).fetchone()["n"], 0)
+        native_id = self.con.execute(
+            "SELECT native_id FROM user_messages WHERE session_key=?",
+            (session_key,)).fetchone()["native_id"]
+        _setup_tasks(self, "T-QUIET")
+        _assign(self, native_id, "T-QUIET")
+        source = self.con.execute(
+            "SELECT * FROM sources WHERE path=?", (live,)).fetchone()
+        before = report.task_report(self.con, "T-QUIET")
+        self.assertEqual(before["source_availability"]["status"], "available")
+        self.assertTrue(before["complete"])
+        archived = os.path.join(
+            self.tmp.name, "archived_sessions", "2026", "10", "01", name)
+        os.makedirs(os.path.dirname(archived), exist_ok=True)
+        shutil.move(live, archived)
+        resolved = lookup.resolve_source(source)
+        self.assertEqual(resolved["status"], "ok")
+        self.assertEqual(resolved["reason"], "relocated")
+        session = lookup.availability(self.con, session_key=session_key)
+        self.assertEqual(session["status"], "available")
+        self.assertEqual(session["events"], {
+            "live": 0, "relocated": 0, "ledger_only": 0, "changed": 0})
+        machine = lookup.availability(self.con)
+        self.assertEqual(machine["sessions"]["ledger_only"], 0)
+        self.assertEqual(machine["sessions"]["available"], 0)
+        after = report.task_report(self.con, "T-QUIET")
+        self.assertTrue(after["complete"])
+        self.assertEqual(before["snapshot_id"], after["snapshot_id"])
+
+    def test_second_eventless_loss_changes_the_snapshot(self):
+        native_path = os.path.join(self.tmp.name, "opencode.db")
+        build_native(native_path)
+        native = sqlite3.connect(native_path)
+        native.execute(
+            "INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("ses_quiet", "ses_parent", "/repo", "Quiet", "1.2.3", None,
+             "build", T0 + 3000, T0 + 70000, None))
+        native.execute(
+            "INSERT INTO message VALUES(?,?,?,?,?)",
+            ("msg_qu1", "ses_quiet", T0 + 90, T0 + 90,
+             json.dumps({"role": "user", "time": {"created": T0 + 90}})))
+        native.execute(
+            "INSERT INTO part VALUES(?,?,?,?,?,?)",
+            ("p_qu1", "msg_qu1", "ses_quiet", T0 + 90, T0 + 90,
+             json.dumps({"type": "text", "text": "quiet prompt"})))
+        native.execute(
+            "INSERT INTO message VALUES(?,?,?,?,?)",
+            ("msg_qa1", "ses_quiet", T0 + 100, T0 + 100,
+             _msg("assistant", T0 + 100, T0 + 110, _tokens(3, 3, 0, 0, 0))))
+        native.commit()
+        native.close()
+        opencode.sync(self.con, source=native_path)
+        self.con.commit()
+        for key in ("opencode:ses_child", "opencode:ses_quiet"):
+            self.assertEqual(self.con.execute(
+                "SELECT COUNT(*) n FROM events WHERE session_key=?",
+                (key,)).fetchone()["n"], 0)
+        self._bind_all("T-TWO")
+        before = report.task_report(self.con, "T-TWO")
+        self.assertEqual(before["source_availability"]["status"], "available")
+        self.assertEqual(before["coverage"]["unavailable_sessions"], [])
+        native = sqlite3.connect(native_path)
+        native.execute("DELETE FROM session WHERE id='ses_child'")
+        native.execute("DELETE FROM message WHERE session_id='ses_child'")
+        native.execute("DELETE FROM part WHERE session_id='ses_child'")
+        native.commit()
+        mid = report.task_report(self.con, "T-TWO")
+        self.assertEqual(mid["source_availability"]["status"], "partial")
+        self.assertEqual(mid["coverage"]["ledger_only_events"], 0)
+        self.assertEqual(mid["coverage"]["unavailable_sessions"],
+                         ["opencode:ses_child"])
+        self.assertFalse(mid["complete"])
+        self.assertNotEqual(before["snapshot_id"], mid["snapshot_id"])
+        native.execute("DELETE FROM session WHERE id='ses_quiet'")
+        native.execute("DELETE FROM message WHERE session_id='ses_quiet'")
+        native.execute("DELETE FROM part WHERE session_id='ses_quiet'")
+        native.commit()
+        native.close()
+        after = report.task_report(self.con, "T-TWO")
+        self.assertEqual(after["source_availability"]["status"], "partial")
+        self.assertEqual(after["coverage"]["ledger_only_events"], 0)
+        self.assertEqual(after["coverage"]["unavailable_sessions"],
+                         ["opencode:ses_child", "opencode:ses_quiet"])
+        self.assertFalse(after["complete"])
+        self.assertNotEqual(mid["snapshot_id"], after["snapshot_id"])
 
     def test_eventless_gap_makes_a_mixed_task_partial(self):
         native_path = os.path.join(self.tmp.name, "opencode.db")

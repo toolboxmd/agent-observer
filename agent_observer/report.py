@@ -521,6 +521,10 @@ def task_report(con: sqlite3.Connection, task_id: str,
 
     from . import lookup
     source_availability = lookup.availability(con, session_keys=scope_keys)
+    unavailable_sessions = sorted(
+        key for key, status in (
+            source_availability.get("by_session") or {}).items()
+        if status != "available")
     snapshot_payload = {
         "price_schedule": schedule,
         "phases": phases,
@@ -533,7 +537,8 @@ def task_report(con: sqlite3.Connection, task_id: str,
                               "unbound_children": unbound_children,
                               "unbound_delegations": unbound_delegations,
                               "source_availability": source_availability["status"],
-                              "ledger_only_events": source_availability["events"]["ledger_only"]},
+                              "ledger_only_events": source_availability["events"]["ledger_only"],
+                              "unavailable_sessions": unavailable_sessions},
         "task_id": task_id,
         "sessions": sorted(scope_keys),
         "attributed": sorted(_resp_tuple(r) for r in attributed),
@@ -699,6 +704,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
     report["coverage"]["source_availability"] = source_availability["status"]
     report["coverage"]["ledger_only_events"] = (
         source_availability["events"]["ledger_only"])
+    report["coverage"]["unavailable_sessions"] = unavailable_sessions
     report["total_cost"] = _total_cost(
         con, task_id, total_estimated, attributed, shared, joint, whole)
     report["total_cost"]["unplaced"] = {

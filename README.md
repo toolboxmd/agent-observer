@@ -402,8 +402,8 @@ or successful task turn never implies an accepted outcome.
 
 Task reports carry a stable snapshot identity (`snapshot_id`, a SHA-256
 over the selected task, sessions, response counters, assignments, outcome,
-task turns, delegations, source cutoff, price schedule and source
-availability) and a measured set (task, sessions
+task turns, delegations, source cutoff, price schedule, source
+availability and the sessions that are not available) and a measured set (task, sessions
 and attributed/shared/unassigned response ids). Repeated rendering without
 ledger changes keeps the same identity; new evidence changes it. Time and
 diagnostics are task-turn scoped when turn timing exists, otherwise labeled

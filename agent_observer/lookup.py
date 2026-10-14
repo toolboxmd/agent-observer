@@ -607,7 +607,9 @@ def availability(con: sqlite3.Connection, session_key: str | None = None,
             kind = "changed"
         else:
             kind = "ledger_only"
-        if row["n"] == 0 and kind == "live":
+        # Readable and eventless is not a gap, and it is not an extra
+        # available session. Only a gone or replaced source marks one.
+        if row["n"] == 0 and kind in ("live", "relocated"):
             continue
         entry = per.setdefault(row["session_key"], {
             "events": _empty_counts(), "reasons": {}, "sources": [],
