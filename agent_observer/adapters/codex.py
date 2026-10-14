@@ -1,6 +1,7 @@
 """Codex native adapter: session rollout JSONL into the ledger.
 
-Reads persisted Codex rollouts (`~/.codex/sessions/**/rollout-*.jsonl`).
+Reads persisted Codex rollouts (`~/.codex/sessions/**/rollout-*.jsonl`
+and `~/.codex/archived_sessions/**/rollout-*.jsonl`).
 Counter rule: each token_usage_record usage block is one atomic response.
 turn_token_usage and thread_token_usage are overlapping usage snapshots and are
 stored per row but never summed. The compaction latest_token_usage_record is
@@ -28,6 +29,7 @@ SEMANTICS = "codex:input_includes_cached,output_includes_reasoning"
 TOKEN_COUNT_SEMANTICS = SEMANTICS + ";source=token_count"
 SYNTHETIC_PREFIX = "<send_user_message_question_reply>"
 DEFAULT_ROOT = os.path.expanduser("~/.codex/sessions")
+ARCHIVE_ROOT = os.path.expanduser("~/.codex/archived_sessions")
 
 CAPABILITIES = [
     # (family, supported, detail)
@@ -173,15 +175,35 @@ def _validate_bucket(bucket, *, allow_none: bool = True):
             raise _MalformedUsage("malformed usage counter")
 
 
+def _rollout_paths(root: str) -> list[str]:
+    """Rollout files under root. A missing directory contributes none."""
+    return glob.glob(os.path.join(root, "**", "rollout-*.jsonl"), recursive=True)
+
+
 def discover(root: str | None = None) -> list[str]:
-    root = root or DEFAULT_ROOT
-    return sorted(glob.glob(os.path.join(root, "**", "rollout-*.jsonl"),
-                            recursive=True))
+    """Rollout files under one root, or the live tree plus the archive.
+
+    An explicit root is that directory only. With root unset, scan
+    ``~/.codex/sessions`` and ``~/.codex/archived_sessions``. The same
+    rollout basename in both trees is the live file; continuation files
+    (``rollout-...-<id>_<segment>.jsonl``) have different names and both
+    stay. Dedup is by basename, not by thread id.
+    """
+    if root:
+        return sorted(_rollout_paths(root))
+    live = _rollout_paths(DEFAULT_ROOT)
+    live_names = {os.path.basename(path) for path in live}
+    archived = [path for path in _rollout_paths(ARCHIVE_ROOT)
+                if os.path.basename(path) not in live_names]
+    return sorted(live + archived)
 
 
 def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
          source: str | None = None) -> dict:
-    """Import every rollout under root, or one source file."""
+    """Import every rollout under root, or one source file.
+
+    With root unset, import the live session tree and the archive.
+    """
     paths = [source] if source else discover(root)
     totals = {"harness": HARNESS, "sources": 0, "unchanged": 0,
               "responses_inserted": 0, "events_inserted": 0,

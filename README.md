@@ -47,7 +47,7 @@ names another.
 
 | Source | Location | Usage granularity |
 | --- | --- | --- |
-| Codex | `~/.codex/sessions/**/rollout-*.jsonl` | per response (`token_usage_record`); older rollouts from rising `token_count` totals |
+| Codex | `~/.codex/sessions/**/rollout-*.jsonl` and `~/.codex/archived_sessions/**/rollout-*.jsonl` | per response (`token_usage_record`); older rollouts from rising `token_count` totals |
 | Claude Code | `~/.claude/projects/*/*.jsonl` and subagent transcripts | per message, counted once across streamed blocks |
 | OpenCode | `~/.local/share/opencode/opencode.db` (read-only) | per completed assistant message |
 | Grok Build | `~/.grok/sessions/*/*/` | per prompt completion |
