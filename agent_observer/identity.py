@@ -197,13 +197,18 @@ def default_agentsmd_repo() -> str | None:
 
     The link may name a file inside the clone, such as global/AGENTS.md.
     The clone root is the nearest directory at or above that file that
-    contains .git, as a directory or a file.
+    contains .git, as a directory or a file. A link that is missing, or
+    whose target is missing, is skipped so an ancestor checkout is not
+    used in its place.
     """
     override = os.environ.get("AGENT_OBSERVER_AGENTSMD_REPO")
     if override:
         return override
     for link in ("~/.claude/CLAUDE.md", "~/.codex/AGENTS.md"):
-        start = os.path.dirname(os.path.realpath(os.path.expanduser(link)))
+        expanded = os.path.expanduser(link)
+        if not os.path.exists(expanded):
+            continue
+        start = os.path.dirname(os.path.realpath(expanded))
         while True:
             marker = os.path.join(start, ".git")
             if os.path.isdir(marker) or os.path.isfile(marker):

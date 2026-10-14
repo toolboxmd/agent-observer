@@ -265,3 +265,20 @@ class DefaultRepoTest(unittest.TestCase):
         self._link_claude(agents)
         os.environ["AGENT_OBSERVER_AGENTSMD_REPO"] = "/override/repo"
         self.assertEqual(identity.default_agentsmd_repo(), "/override/repo")
+
+    def test_missing_claude_link_does_not_claim_an_ancestor_repo(self):
+        home = os.path.join(self.tmp.name, "home")
+        os.makedirs(os.path.join(home, ".codex"))
+        subprocess.run(["git", "init", "-q", home], check=True)
+        os.environ["HOME"] = home
+        other = os.path.join(self.tmp.name, "agentsmd")
+        global_dir = os.path.join(other, "global")
+        os.makedirs(global_dir)
+        agents = os.path.join(global_dir, "AGENTS.md")
+        with open(agents, "w", encoding="utf-8") as fh:
+            fh.write("rules\n")
+        with open(os.path.join(other, ".git"), "w", encoding="utf-8") as fh:
+            fh.write("gitdir: /unused\n")
+        os.symlink(agents, os.path.join(home, ".codex", "AGENTS.md"))
+        self.assertFalse(os.path.exists(os.path.join(home, ".claude", "CLAUDE.md")))
+        self.assertEqual(identity.default_agentsmd_repo(), os.path.realpath(other))
