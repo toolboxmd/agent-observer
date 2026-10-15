@@ -708,9 +708,10 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         "events_duplicate": 0, "compactions": 0, "malformed": 0,
     }
     src = JsonlSource(con, HARNESS, path, full=full)
-    if (src.row["codex_context_version"] != 2
+    if (src.row["codex_context_version"] != 3
             or src.row["codex_context_offset"] != src.row["read_offset"]):
-        # One in-place replay repairs metadata lost by older incremental imports.
+        # Replay older indexes once, including search extensions previously
+        # discarded from otherwise unchanged sources (#94).
         src.start_offset = 0
         src.end_offset = 0
         src.unchanged = False
@@ -906,7 +907,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
                             thread_source=reader.thread_source))
     backfill = 1 if _backfill_complete(
         con, src.source_id, getattr(src, "last_ordinal", None)) else 0
-    con.execute("UPDATE sources SET codex_context_version=2,codex_context_offset=?,"
+    con.execute("UPDATE sources SET codex_context_version=3,codex_context_offset=?,"
                 "codex_model=?,codex_effort=?,occurrence_backfill=? WHERE id=?",
                 (src.end_offset, reader.model, reader.effort, backfill,
                  src.source_id))
@@ -1097,7 +1098,13 @@ def _copied_item(obj: dict, item: dict):
             family = "skill_read" if (safe_skill or looks_like_skill) else "read"
             yield ("event", family, f"{native}:{target}")
         return
-    if itype in ("UserMessage", "AgentMessage", "Reasoning", "Extension"):
+    if itype == "Extension":
+        if item.get("kind") == "web.search":
+            native = item.get("call_id") or item.get("id")
+            if isinstance(native, str) and native:
+                yield ("event", "tool_result", native)
+        return
+    if itype in ("UserMessage", "AgentMessage", "Reasoning"):
         return
     if itype == "McpToolCall":
         native = item.get("id")
@@ -1858,7 +1865,12 @@ def _ingest_event_msg(r: _Reader, obj: dict, ordinal: int) -> None:
                        "ExitedReviewMode"):
             r.event(obj, "lifecycle", item.get("id") or f"{itype}:{obj.get('ordinal')}",
                     turn_id=turn_id, name=itype, status=item.get("status"))
-        elif itype in ("UserMessage", "AgentMessage", "Reasoning", "Extension"):
+        elif itype == "Extension":
+            if item.get("kind") != "web.search":
+                raise _UnsupportedSchema("unsupported extension kind")
+            r.event(obj, "tool_result", item.get("call_id") or item.get("id"),
+                    turn_id=turn_id, name="web_search", status=item.get("status"))
+        elif itype in ("UserMessage", "AgentMessage", "Reasoning"):
             # Content payload, not an operational event; captured from
             # response_item to avoid double counting wrapper and inner forms.
             return

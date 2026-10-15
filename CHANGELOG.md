@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.3] - 2026-10-15
+
+### Changed
+
+- Retain native Codex Extension web.search evidence and repair existing indexes
+
 ## [1.2.2] - 2026-10-14
 
 ### Changed
