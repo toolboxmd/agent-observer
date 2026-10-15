@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.4] - 2026-10-15
+
+### Changed
+
+- Hydrate valid empty OpenCode assistant text without treating it as missing
+
 ## [1.2.3] - 2026-10-15
 
 ### Changed

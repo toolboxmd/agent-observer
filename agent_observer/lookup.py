@@ -305,7 +305,12 @@ def _index_opencode(path: str) -> _Index:
         index.records[part_id] = data
         if data.get("type") == "text":
             if role == "assistant":
-                index.text(part_id, data.get("text"))
+                if data.get("text") == "":
+                    # OpenCode can clear an indexed part without removing it.
+                    # Keep the empty value out of tool narration.
+                    index.texts[part_id] = ""
+                else:
+                    index.text(part_id, data.get("text"))
             else:
                 index.boundary()
         elif data.get("type") == "tool":
