@@ -12,8 +12,13 @@ of the session.
 
 from __future__ import annotations
 
+from .db import _has_table
+
 
 def _groups(con, session_key: str) -> list:
+    # A read-only query must not backfill metadata on an older schema 3.
+    if not _has_table(con, "codex_occurrences"):
+        return []
     rows = con.execute(
         "SELECT source_id, row_kind, row_key, record_position"
         " FROM codex_occurrences WHERE session_key=?"

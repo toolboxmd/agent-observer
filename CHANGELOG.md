@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.5] - 2026-10-15
+
+### Changed
+
+- Keep schema-3 queries readable before occurrence metadata migration
+
 ## [1.2.4] - 2026-10-15
 
 ### Changed
