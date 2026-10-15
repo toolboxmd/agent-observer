@@ -177,6 +177,46 @@ class CopiedAnchorOrderTest(LedgerCase):
 
 
 class TimestampInterleaveTest(LedgerCase):
+    def test_codex_order_preserves_intervening_claude_timestamp(self):
+        from agent_observer.adapters.claude import import_claude_file
+
+        def answer(name, minute):
+            return {"type": "response_item",
+                    "timestamp": f"2026-10-14T12:{minute:02d}:00Z",
+                    "payload": {"type": "message", "role": "assistant",
+                                "id": name, "content": [
+                                    {"type": "text", "text": name}]}}
+
+        a = os.path.join(self.tmp.name, "mixed-a.jsonl")
+        b = os.path.join(self.tmp.name, "mixed-b.jsonl")
+        with open(a, "w") as fh:
+            for row in ({"type": "session_meta", "payload": {
+                    "id": "a", "thread_source": "user"}},
+                    answer("a1", 1), answer("a3", 3)):
+                fh.write(json.dumps(row) + "\n")
+        with open(b, "w") as fh:
+            fh.write(json.dumps({
+                "type": "assistant", "sessionId": "b", "uuid": "b2",
+                "timestamp": "2026-10-14T12:02:00Z", "message": {
+                    "id": "b2", "role": "assistant",
+                    "content": [{"type": "text", "text": "b2"}]}}) + "\n")
+        for reverse in (False, True):
+            self.con.close()
+            self.con = db.connect(
+                os.path.join(self.tmp.name, f"mixed-{reverse}.db"))
+            db.init_db(self.con)
+            importers = [(import_codex_file, a), (import_claude_file, b)]
+            for full in (False, True, False):
+                for importer, path in (importers[::-1] if reverse else importers):
+                    importer(self.con, path, full=full)
+                for limit in (10, 2):
+                    with self.subTest(reverse=reverse, full=full, limit=limit):
+                        out = report.timeline(self.con, limit=limit)
+                        self.assertEqual(
+                            [event["native_id"] for event in out["events"]],
+                            ["a1", "b2:0", "a3"][:limit])
+                self.assertEqual(self.query("SELECT * FROM import_errors"), [])
+
     def test_claude_sessions_stay_in_timestamp_order(self):
         from agent_observer.adapters.claude import import_claude_file
 

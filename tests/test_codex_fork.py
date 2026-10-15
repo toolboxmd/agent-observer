@@ -912,6 +912,66 @@ class RetainedFallbackFamilyTest(unittest.TestCase):
         ]
         return rows
 
+    def test_repeated_abort_hydrates_the_retained_position(self):
+        for seed in ("base", "current"):
+            with self.subTest(seed=seed):
+                path = os.path.join(self.tmp.name, f"repeat-{seed}.jsonl")
+                db_path = os.path.join(self.tmp.name, f"repeat-{seed}.db")
+                rows = self._rows(seed, None)
+                rows.insert(5, {"type": "event_msg", "ordinal": 45, "payload": {
+                    "type": "turn_aborted", "duration_ms": 456}})
+                _dump(path, rows)
+                if seed == "base":
+                    _import_at_revision(self.BASE, db_path, path)
+                con = db.connect(db_path)
+                db.init_db(con)
+                try:
+                    if seed == "current":
+                        import_codex_file(con, path)
+                    retained = [tuple(row) for row in con.execute(
+                        "SELECT id, native_id FROM events WHERE family='lifecycle'"
+                        " ORDER BY id")]
+                    rows[0]["payload"]["subagent_history_start_ordinal"] = 50
+                    _dump(path, rows)
+                    for full in (False, True, False):
+                        with self.subTest(full=full):
+                            import_codex_file(con, path, full=full)
+                            aborts = list(con.execute(
+                                "SELECT id, native_id, ordinal_num, duration_ms"
+                                " FROM events WHERE family='lifecycle'"
+                                " AND session_key=? ORDER BY id",
+                                ("codex:p-" + seed,)))
+                            self.assertEqual(
+                                [(row["id"], row["native_id"]) for row in aborts],
+                                retained)
+                            self.assertEqual(
+                                [row["ordinal_num"] for row in aborts],
+                                [4] if seed == "base" else [4, 5])
+                            if seed == "base":
+                                self.assertEqual(aborts[0]["native_id"],
+                                                 "turn_aborted:None")
+                            shown = lookup.show(con, [row["id"] for row in aborts])
+                            for row, item, raw, duration in zip(
+                                    aborts, shown, (40, 45), (123, 456)):
+                                self.assertEqual(item["status"], "ok")
+                                self.assertEqual(item["record"]["ordinal"], raw)
+                                self.assertEqual(
+                                    item["record"]["payload"]["duration_ms"], duration)
+                                self.assertEqual(
+                                    row["duration_ms"],
+                                    duration)
+                                self.assertEqual(con.execute(
+                                    "SELECT record_position FROM codex_occurrences"
+                                    " WHERE row_kind='event' AND row_key=?",
+                                    (str(row["id"]),)).fetchone()[0],
+                                    row["ordinal_num"])
+                            self.assertEqual(con.execute(
+                                "SELECT COUNT(*) FROM import_errors").fetchone()[0], 0)
+                            self.assertEqual(list(con.execute(
+                                "PRAGMA foreign_key_check")), [])
+                finally:
+                    con.close()
+
     def test_base_and_current_seeds_keep_answer_and_abort(self):
         for seed in ("base", "current"):
             with self.subTest(seed=seed):

@@ -179,7 +179,8 @@ def _index_codex(path: str) -> _Index:
                 index.records[f"turn_aborted:{p['turn_id']}"] = obj
             else:
                 index.records[f"turn_aborted:{fallback}"] = obj
-                index.records["turn_aborted:None"] = obj
+                # The legacy turn_aborted:None key collapsed distinct aborts.
+                # Leave it to _content's retained file-position lookup.
         elif obj.get("type") == "event_msg" and ptype == "task_complete":
             index.records[f"task_complete:{p.get('turn_id')}"] = obj
         if obj.get("type") == "response_item":
@@ -188,8 +189,9 @@ def _index_codex(path: str) -> _Index:
                 index.text(p.get("id") or fallback, text)
                 if not p.get("id"):
                     raw = obj.get("ordinal")
-                    if isinstance(raw, int) and not isinstance(raw, bool):
-                        index.text(f"ordinal:{raw}", text)
+                    if text and isinstance(raw, int) and not isinstance(raw, bool):
+                        # A lookup alias is not another native text unit.
+                        index.texts.setdefault(f"ordinal:{raw}", text)
             elif ptype == "message" and p.get("role") == "user":
                 message_id = p.get("id")
                 if isinstance(message_id, str) and message_id:

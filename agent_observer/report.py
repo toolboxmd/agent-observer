@@ -844,40 +844,29 @@ def timeline(con: sqlite3.Connection, task_id: str | None = None,
     sessions = {}
     for event in out:
         sessions.setdefault(event["session_key"], []).append(event)
-    resolved = {}
+    unknown = {}
+    ordered_sessions = {}
     for key, events in sessions.items():
         wanted = {("event", str(event["id"])) for event in events}
-        resolved[key] = codex_order.resolve(con, key, wanted)
-    unknown = {}
-    ordered = []
-    placed = set()
-    # Sessions with no Codex order stay in the timestamp order above.
-    # A supported Codex order is one block, emitted at that session's
-    # first row, and the limit applies after that block. Representative
-    # ordinals are not a clock across sessions.
-    for event in out:
-        key = event["session_key"]
-        if key in placed:
-            continue
-        state, order, sequences = resolved[key]
-        events = sessions[key]
+        state, order, sequences = codex_order.resolve(con, key, wanted)
         if state == "known" and order is not None:
             index = {}
             for place, group in enumerate(order):
                 for ident in group:
                     index[ident] = place
-            block = sorted(events, key=lambda item: (
+            ordered_sessions[key] = iter(sorted(events, key=lambda item: (
                 index.get(("event", str(item["id"])), len(index)),
-                item["id"]))
+                item["id"])))
             if len(sessions) > 1:
                 unknown[key] = [order]
-            ordered.extend(block)
-            placed.add(key)
-        else:
-            if state in ("partial", "conflict"):
-                unknown[key] = sequences
-            ordered.append(event)
-    out = ordered
+        elif state in ("partial", "conflict"):
+            unknown[key] = sequences
+    # Apply supported source order within that session's existing slots.
+    # Unrelated timestamped rows keep their interleaving, and the limit
+    # still sees the corrected order when locators came from later files.
+    out = [next(ordered_sessions[event["session_key"]])
+           if event["session_key"] in ordered_sessions else event
+           for event in out]
     out = out[:limit]
     # Tool join status: calls joined to results only on equal call_id.
     calls = {e["native_id"] for e in out if e["family"] == "tool_call"}
