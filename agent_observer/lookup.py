@@ -218,10 +218,12 @@ def _index_codex(path: str) -> _Index:
                 index.boundary()
             elif itype not in ("Reasoning",) and item.get("id"):
                 key = item.get("call_id") or item.get("id")
-                index.call(key, item.get("tool") or itype, {
+                search = itype == "Extension" and item.get("kind") == "web.search"
+                result_keys = _ITEM_RESULT_KEYS + ("results",) if search else _ITEM_RESULT_KEYS
+                index.call(key, "web_search" if search else item.get("tool") or itype, {
                     k: v for k, v in item.items()
-                    if k not in _ITEM_RESULT_KEYS and k not in ("id", "type")})
-                found = [item[k] for k in _ITEM_RESULT_KEYS if k in item]
+                    if k not in result_keys and k not in ("id", "type")})
+                found = [item[k] for k in result_keys if k in item]
                 index.result(key, found[0] if found else None)
                 if key != item.get("id"):
                     index.calls.setdefault(item["id"], index.calls[key])
