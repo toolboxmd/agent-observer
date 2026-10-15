@@ -7,6 +7,7 @@ import json
 import sqlite3
 
 from . import codex_order
+from .db import _has_table
 
 BUCKETS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
            "output_tokens", "reasoning_output_tokens", "total_tokens")
@@ -185,19 +186,15 @@ def _source_cutoff(con: sqlite3.Connection, scope_keys: set) -> float | None:
     if not keys:
         return None
     placeholders = ",".join("?" * len(keys))
+    tables = ["responses", "events", "user_messages", "sessions"]
+    if _has_table(con, "codex_occurrences"):
+        tables.append("codex_occurrences")
+    backing = " UNION ".join(
+        f"SELECT DISTINCT source_id FROM {table}"
+        f" WHERE session_key IN ({placeholders})" for table in tables)
     row = con.execute(
-        "SELECT MAX(imported_at) m FROM sources WHERE id IN ("
-        "SELECT DISTINCT source_id FROM responses WHERE session_key IN "
-        f"({placeholders}) UNION "
-        "SELECT DISTINCT source_id FROM events WHERE session_key IN "
-        f"({placeholders}) UNION "
-        "SELECT DISTINCT source_id FROM user_messages WHERE session_key IN "
-        f"({placeholders}) UNION "
-        "SELECT DISTINCT source_id FROM sessions WHERE session_key IN "
-        f"({placeholders}) UNION "
-        "SELECT DISTINCT source_id FROM codex_occurrences WHERE session_key IN "
-        f"({placeholders}))",
-        keys + keys + keys + keys + keys).fetchone()
+        f"SELECT MAX(imported_at) m FROM sources WHERE id IN ({backing})",
+        keys * len(tables)).fetchone()
     return row["m"] if row is not None else None
 
 

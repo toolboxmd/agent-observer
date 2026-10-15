@@ -19,6 +19,8 @@ import sqlite3
 import subprocess
 import time
 
+from .db import _has_table
+
 # Harnesses whose tool calls can be tied to the response that made them.
 # Claude writes the tool_use in the response's own record, so a call
 # belongs to the latest response at or before it. Codex reports usage
@@ -206,6 +208,8 @@ def place_session(con, session_key: str, known: list | None = None,
 
 
 def _has_occurrences(con, session_key: str) -> bool:
+    if not _has_table(con, "codex_occurrences"):
+        return False
     row = con.execute(
         "SELECT 1 FROM codex_occurrences WHERE session_key=? LIMIT 1",
         (session_key,)).fetchone()

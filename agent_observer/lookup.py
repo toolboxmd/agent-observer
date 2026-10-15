@@ -32,6 +32,7 @@ import sqlite3
 from pathlib import Path
 
 from . import privacy
+from .db import _has_table
 from .ingest import _tail_sha
 
 TOOL_FAMILIES = ("tool_call", "tool_result", "read", "skill_read",
@@ -536,6 +537,9 @@ def _backing_without_events(con, event_rows, *, session_key, session_keys,
     args: list = []
     for table in ("sessions", "events", "user_messages", "responses", "turns",
                   "codex_occurrences"):
+        # Older schema-3 ledgers acquire occurrence metadata only on sync.
+        if table == "codex_occurrences" and not _has_table(con, table):
+            continue
         clause, key_args = _key_filter("session_key", session_key, session_keys)
         selects.append(
             f"SELECT session_key, source_id FROM {table}"
