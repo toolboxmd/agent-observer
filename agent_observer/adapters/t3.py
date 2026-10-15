@@ -1114,6 +1114,23 @@ def _retouch_response_turns(con: sqlite3.Connection) -> int:
     return retouched
 
 
+def claude_turn_sessions(con: sqlite3.Connection, thread_id: str) -> set:
+    """Historical sessions proved by a thread's native Claude user uuids.
+
+    A queue-first row keeps its ledger key and stores the matched user uuid
+    in alias_id. Canonical user rows instead alias an enqueue, which is not
+    a native turn uuid and must not establish a thread/session link.
+    """
+    try:
+        return {row["session_key"] for row in con.execute(
+            "SELECT DISTINCT s.session_key FROM user_messages s"
+            " JOIN t3_turn_origins o ON s.native_id='claude:' || o.message_id"
+            " OR (s.native_id LIKE 'claude:queue:%' AND s.alias_id='claude:' || o.message_id)"
+            " WHERE o.thread_id=?", (thread_id,))}
+    except sqlite3.DatabaseError:
+        return set()  # A ledger without the T3 mirror has no native links.
+
+
 def _tree_sessions(con: sqlite3.Connection, threads: dict,
                    roots: dict[str, list[str]]) -> dict[str, set]:
     """Ledger session keys per tree root.
@@ -1143,15 +1160,7 @@ def _tree_sessions(con: sqlite3.Connection, threads: dict,
                     elif harness in ("codex", "opencode", "grok") \
                             and native_id == native_session:
                         keys.add(sess_row["session_key"])
-            try:
-                for row in con.execute(
-                        "SELECT DISTINCT s.session_key FROM user_messages s"
-                        " JOIN t3_turn_origins o ON s.native_id="
-                        "'claude:' || o.message_id"
-                        " WHERE o.thread_id=?", (thread_id,)):
-                    keys.add(row["session_key"])
-            except sqlite3.DatabaseError:
-                pass
+            keys.update(claude_turn_sessions(con, thread_id))
         # Only sessions the ledger knows; phantom bindings would read as
         # missing native usage instead of measured work.
         out[root] = keys & known
