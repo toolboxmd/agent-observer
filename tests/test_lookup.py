@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 
-from agent_observer import db, lookup
+from agent_observer import db, lookup, search
 from agent_observer.adapters import claude, codex, grok, opencode
 from tests.test_opencode import SECRET_READ, T0, _tool, build_native
 
@@ -423,6 +423,58 @@ class OpenCodeLookupTest(LookupCase):
         native.close()
         opencode.sync(self.con, source=self.native)
         self.con.commit()
+
+    def test_assistant_text_clear_and_restore_preserve_identity(self):
+        event_id = self.event_id("assistant_message", "p_text0")
+        for step, text in enumerate(("Reading the notes.", "", "Notes restored.")):
+            with sqlite3.connect(self.native) as native:
+                native.execute(
+                    "UPDATE part SET data=?, time_updated=? WHERE id='p_text0'",
+                    (json.dumps({"type": "text", "text": text}),
+                     T0 + 200000 + step))
+            for full in (False, True, False):
+                with self.subTest(text=text, full=full):
+                    stats = opencode.sync(self.con, source=self.native, full=full)
+                    self.assertEqual(stats["failed"], [])
+                    self.con.commit()
+                    rows = self.con.execute(
+                        "SELECT id, size_bytes FROM events"
+                        " WHERE family='assistant_message' AND native_id='p_text0'"
+                    ).fetchall()
+                    self.assertEqual([(r["id"], r["size_bytes"]) for r in rows],
+                                     [(event_id, len(text))])
+                    [item] = self.show(event_id)
+                    self.assertEqual(item["status"], "ok")
+                    self.assertEqual(item["text"], text)
+                    self.assertEqual(lookup.availability(
+                        self.con, session_key="opencode:ses_parent")["status"],
+                        "available")
+                    for word in ("Reading", "restored"):
+                        matches = search.search(self.con, [word])["matches"]
+                        found = [m["id"] for m in matches if m["type"] == "event"]
+                        self.assertEqual(event_id in found, word in text)
+                    [tool] = self.show(self.event_id("tool_call", "call_read1"))
+                    self.assertEqual(tool.get("assistant_text", ""), text)
+
+    def test_absent_or_malformed_assistant_part_is_not_empty_success(self):
+        event_id = self.event_id("assistant_message", "p_text0")
+        for step, raw in enumerate((None, "{", "[]", json.dumps({"type": "text"}),
+                                    json.dumps({"type": "text", "text": None}),
+                                    json.dumps({"type": "text", "text": 0}))):
+            with self.subTest(raw=raw):
+                with sqlite3.connect(self.native) as native:
+                    native.execute("DELETE FROM part WHERE id='p_text0'")
+                    if raw is not None:
+                        native.execute(
+                            "INSERT INTO part VALUES(?,?,?,?,?,?)",
+                            ("p_text0", "msg_a1", "ses_parent",
+                             T0 + 20, T0 + 200001 + step, raw))
+                stats = opencode.sync(self.con, source=self.native)
+                self.assertEqual(stats["failed"], [])
+                self.con.commit()
+                [item] = self.show(event_id)
+                self.assertEqual(item["status"], "not_found")
+                self.assertNotIn("text", item)
 
     def test_tool_part(self):
         [item] = self.show(self.event_id("tool_call", "call_read1"))
