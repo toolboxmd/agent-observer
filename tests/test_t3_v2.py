@@ -53,6 +53,10 @@ CREATE TABLE orchestration_v2_projection_runs(run_id TEXT PRIMARY KEY,
  thread_id TEXT NOT NULL, ordinal INTEGER NOT NULL, provider TEXT NOT NULL,
  provider_thread_id TEXT, status TEXT NOT NULL, requested_at TEXT NOT NULL,
  completed_at TEXT, payload_json TEXT NOT NULL, provider_instance_id TEXT);
+CREATE TABLE orchestration_v2_projection_run_attempts(
+ attempt_id TEXT PRIMARY KEY, run_id TEXT, thread_id TEXT, provider_thread_id TEXT);
+CREATE TABLE orchestration_v2_projection_provider_turns(
+ provider_thread_id TEXT, run_attempt_id TEXT, payload_json TEXT);
 CREATE TABLE orchestration_v2_projection_messages(message_id TEXT PRIMARY KEY,
  thread_id TEXT NOT NULL, run_id TEXT, node_id TEXT, role TEXT NOT NULL,
  streaming INTEGER NOT NULL, created_at TEXT NOT NULL,
@@ -101,6 +105,11 @@ def write_v2(path, legacy=True):
     def message(mid, tid, at, text, by, source, sender=None, ordinal=1,
                 provider_thread=None):
         run_id = f"run:{tid}:{ordinal}"
+        native_turn = {"vm1": P1, "vm2": P2, "vm3": P3, "vm4": P4,
+                       "vm6": P6, "vm7": "codex-user", "vm8": P7}.get(mid)
+        if provider_thread is None:
+            provider_thread = {ROOT: "provider-thread:" + ROOT + ":" + CL2,
+                               CHILD: "provider-thread:" + CHILD + ":" + CX9}.get(tid)
         payload = {"id": mid, "threadId": tid, "runId": run_id,
                    "role": "user", "createdBy": by, "creationSource": source,
                    "text": text, "createdAt": at}
@@ -118,6 +127,13 @@ def write_v2(path, legacy=True):
             (run_id, tid, ordinal, "claudeAgent", provider_thread,
              "completed", at,
              json.dumps({"id": run_id, "userMessageId": mid})))
+        if native_turn and provider_thread:
+            driver = "codex" if mid == "vm7" else "claudeAgent"
+            native.execute("INSERT INTO orchestration_v2_projection_run_attempts VALUES(?,?,?,?)",
+                           ("attempt:" + mid, run_id, tid, provider_thread))
+            native.execute("INSERT INTO orchestration_v2_projection_provider_turns VALUES(?,?,?)",
+                           (provider_thread, "attempt:" + mid, json.dumps({"nativeTurnRef": {
+                               "driver": driver, "strength": "strong", "nativeId": native_turn}})))
 
     pr5 = {"host": "github.com", "repository": "example/beta", "number": 5,
            "url": PR5, "source": "agent",
@@ -260,21 +276,21 @@ class ChromeriaV2Test(LedgerCase):
                           " WHERE repository='example/beta'")[0]
         self.assertEqual(head["head_branch"], "feat/5-fixture")
 
-    def test_prompt_origin_backfills_by_text_in_session(self):
+    def test_prompt_origin_backfills_by_native_identity_in_session(self):
         claude.import_claude_file(self.con, self.transcript)
-        self.assertEqual(self.kinds()["claude:" + P1]["kind"], "synthetic")
+        self.assertEqual(self.kinds()["claude:" + P1]["kind"], "unknown")
         t3_adapter.sync(self.con, source=self.v2_path)
         kinds = self.kinds()
         self.assertEqual(kinds["claude:" + P1]["kind"], "genuine")
         self.assertEqual(kinds["claude:" + P1]["turn_id"], "claude:" + P1)
-        self.assertEqual(kinds["claude:" + P1]["text_excerpt"], "")
+        self.assertEqual(kinds["claude:" + P1]["text_excerpt"], "please build it")
         self.assertEqual(kinds["claude:" + P2]["kind"], "synthetic")
-        # Same text from a person and an agent: unknown stays unknown.
-        self.assertEqual(kinds["claude:" + P3]["kind"], "synthetic")
+        # Equal text has distinct native identities and distinct actors.
+        self.assertEqual(kinds["claude:" + P3]["kind"], "genuine")
         self.assertEqual(kinds["claude:" + P4]["kind"], "synthetic")
-        self.assertEqual(kinds["claude:" + P5]["kind"], "synthetic")
+        self.assertEqual(kinds["claude:" + P5]["kind"], "unknown")
         self.assertEqual(kinds["claude:" + P6]["kind"], "synthetic")
-        self.assertEqual(kinds["claude:" + P7]["kind"], "synthetic")
+        self.assertEqual(kinds["claude:" + P7]["kind"], "unknown")
         # Responses after the genuine prompt join its turn.
         turn = self.query("SELECT turn_id FROM responses WHERE"
                           " response_id='claude:resp-b1'")[0]["turn_id"]
@@ -307,10 +323,10 @@ class ChromeriaV2Test(LedgerCase):
         # Judge moments (#60) need the origin of Codex, Grok and OpenCode
         # prompts too; the Claude session's prompt stays without evidence.
         t3_adapter.sync(self.con, source=self.v2_path)
-        digest = text_hash("please build it")
-        self.assertEqual(t3_adapter.prompt_actor(self.con, CX8, digest),
+        native_id = "codex:codex-user"
+        self.assertEqual(t3_adapter.prompt_actor(self.con, "codex:" + CX8, native_id),
                          "server")
-        self.assertEqual(t3_adapter.prompt_actor(self.con, CL2, digest),
+        self.assertEqual(t3_adapter.prompt_actor(self.con, "claude:" + CL2, "claude:" + P1),
                          "client")
 
     def test_prompt_origins_store_no_text(self):

@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS sources (
   imported_at REAL NOT NULL,
   import_ms INTEGER,
   privacy_version INTEGER,
+  occurrence_backfill INTEGER,
   UNIQUE (harness, path)
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -234,6 +235,17 @@ CREATE TABLE IF NOT EXISTS outcomes (
 -- skill_invoke, file_change, compaction, lifecycle, assistant_message,
 -- permission, instructions. Natural key is per session so the same native
 -- event read from two snapshots is stored once.
+CREATE TABLE IF NOT EXISTS codex_occurrences (
+  source_id INTEGER NOT NULL REFERENCES sources(id),
+  session_key TEXT NOT NULL,
+  row_kind TEXT NOT NULL,
+  row_key TEXT NOT NULL,
+  record_position INTEGER NOT NULL,
+  native_ordinal INTEGER,
+  model TEXT,
+  effort TEXT,
+  UNIQUE (source_id, row_kind, row_key)
+);
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   source_id INTEGER REFERENCES sources(id),
@@ -663,6 +675,8 @@ def init_db(con: sqlite3.Connection) -> None:
     columns = {row["name"] for row in con.execute("PRAGMA table_info(sources)")}
     if "privacy_version" not in columns:
         con.execute("ALTER TABLE sources ADD COLUMN privacy_version INTEGER")
+    if "occurrence_backfill" not in columns:
+        con.execute("ALTER TABLE sources ADD COLUMN occurrence_backfill INTEGER")
     if "thread_source" not in columns:
         con.execute("ALTER TABLE sources ADD COLUMN thread_source TEXT")
     if "mtime_ns" not in columns:

@@ -276,7 +276,8 @@ def insert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
                  session_key: str, family: str, native_id, ordinal=None,
                  ts=None, turn_id=None, name=None, target=None, status=None,
                  duration_ms=None, size_bytes=None, truncated=None,
-                 fingerprint=None, detail=None, update: bool = False) -> None:
+                 fingerprint=None, detail=None, update: bool = False,
+                 migrate_ordinal: bool = False) -> None:
     """Insert one event under its natural key; a repeat is a no-op.
 
     Every protected field passes through agent_observer/privacy.py rule 6:
@@ -286,7 +287,10 @@ def insert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
     and only allowlisted detail keys with correctly typed values persist.
     When update is true (a source re-imported under newer privacy rules),
     an existing row's name, target, status and detail are corrected in
-    place instead of kept stale.
+    place. The chronology ordinal stays put unless the caller passes
+    migrate_ordinal. Codex does that for the first sight of an event
+    this source already stored. The native id and source are not rewritten
+    here.
     """
     native = privacy.filter_native_id(family, native_id)
     if not native:
@@ -320,11 +324,15 @@ def insert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
          truncated, fingerprint, payload))
     if cur.rowcount == 0:
         if update:
+            fields = "name=?, target=?, status=?, detail_json=?"
+            values = [safe_name, safe_target, safe_status, payload]
+            if migrate_ordinal:
+                fields += ", ordinal_num=?"
+                values.append(ordinal)
             con.execute(
-                "UPDATE events SET name=?, target=?, status=?, detail_json=?"
-                " WHERE session_key=? AND family=? AND native_id=?",
-                (safe_name, safe_target, safe_status, payload, session_key,
-                 family, native))
+                f"UPDATE events SET {fields} WHERE session_key=?"
+                " AND family=? AND native_id=?",
+                values + [session_key, family, native])
             stats["events_updated"] = stats.get("events_updated", 0) + 1
         else:
             stats["events_duplicate"] = stats.get("events_duplicate", 0) + 1

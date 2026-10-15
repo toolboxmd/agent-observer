@@ -29,7 +29,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from . import lookup, privacy
+from . import codex_order, lookup, privacy
 from .ingest import iso_ts
 
 KINDS = ("prompt", "interrupt", "rejection")
@@ -73,9 +73,10 @@ class _Evidence:
     def __init__(self, con: sqlite3.Connection):
         self.turns = self._pairs(
             con, "SELECT message_id, actor_kind FROM t3_turn_origins")
-        self.prompts = self._pairs(
-            con, "SELECT native_session || '/' || text_hash, actor_kind"
-                 " FROM t3_prompt_origins")
+        self.prompts = {(r[0], r[1]): r[2] for r in self._rows(
+            con, "SELECT session_key, native_id, actor_kind FROM t3_native_prompt_origins")}
+        self.restricted_origins = {r[0] for r in self._rows(
+            con, "SELECT native_id FROM claude_native_kinds WHERE origin_allowed=0")}
         # Thread position: root (a top-level thread a person opened),
         # launched (top-level, opened by an agent or without evidence), or
         # child. A session seen in several threads takes the least
@@ -108,11 +109,24 @@ class _Evidence:
     def thread(self, session_native) -> str:
         return self.threads.get(session_native, "none")
 
-    def prompt_actor(self, harness, native_id, session_native, digest):
+    def prompt_actor(self, harness, native_id, session_native, turn_id):
         actor = None
         if harness == "claude":
             actor = self.turns.get(native_id.partition(":")[2])
-        return actor or self.prompts.get(f"{session_native}/{digest}")
+            # Claude inputs keep the preceding conversational turn even
+            # when their own UUID has no origin. It is not author evidence.
+            turn_id = None
+        actors = {self.prompts.get((f"{harness}:{session_native}", identity))
+                  for identity in (native_id, turn_id)} - {None}
+        return actor or (next(iter(actors)) if len(actors) == 1 else None)
+
+    def origin_restricted(self, harness, native_id) -> bool:
+        """Claude sidechain and scaffolding rows stay uncounted.
+
+        A server origin would otherwise admit the synthetic row as another
+        agent's message. Ordinary SDK messages keep origin_allowed and
+        still count."""
+        return harness == "claude" and native_id in self.restricted_origins
 
 
 def _created_by(kind: str, actor, entrypoint, thread: str, denial=None) -> str:
@@ -171,12 +185,15 @@ def _from_submission(row, ev: _Evidence) -> dict | None:
     kind = "interrupt" if row["kind"] == "interrupt" else "prompt"
     thread = ev.thread(row["session_native"])
     actor = ev.prompt_actor(row["harness"], row["native_id"],
-                            row["session_native"], row["text_hash"]) \
+                            row["session_native"], row["turn_id"]) \
         if kind == "prompt" else None
-    if row["kind"] == "synthetic" and actor != "server":
+    if row["kind"] == "synthetic" and (
+            actor != "server" or ev.origin_restricted(row["harness"], row["native_id"])):
         return None
+    created_by = "unknown" if row["kind"] == "unknown" and not actor \
+        else _created_by(kind, actor, row["entrypoint"], thread)
     return _base(row, f"sub:{row['native_id']}", kind, row["ts"],
-                 _created_by(kind, actor, row["entrypoint"], thread), thread)
+                 created_by, thread)
 
 
 def _denial(row):
@@ -210,16 +227,16 @@ def _from_event(row, ev: _Evidence, kind: str) -> dict:
     return intervention
 
 
-_SUB_KINDS = "('genuine', 'interrupt', 'synthetic')"
-_SUB_SQL = ("SELECT u.native_id, u.kind, u.ts, u.text_hash, u.ordinal_num,"
+_SUB_KINDS = "('genuine', 'interrupt', 'synthetic', 'unknown')"
+_SUB_SQL = ("SELECT u.native_id, u.kind, u.ts, u.turn_id, u.ordinal_num,"
             " u.source_id,"
             f" {_SESSION_COLS} FROM user_messages u"
             " JOIN sessions s ON s.session_key = u.session_key")
 _EVENT_SQL = ("SELECT e.id, e.family, e.name, e.native_id, e.ts,"
               f" e.detail_json, {_SESSION_COLS} FROM events e"
               " JOIN sessions s ON s.session_key = e.session_key")
-_EVENT_WHERE = ("((e.family = 'lifecycle' AND e.name = 'turn_aborted'"
-                " AND e.status = 'cancelled') OR (e.family = 'permission'"
+_EVENT_WHERE = ("((e.family = 'lifecycle' AND e.name IN ('turn_aborted','turn_ended')"
+                " AND e.status IN ('cancelled','interrupted')) OR (e.family = 'permission'"
                 f" AND e.status IN ({','.join(repr(d) for d in DENIED)})))")
 
 
@@ -396,6 +413,36 @@ def _claude_text(content) -> str:
     return "\n".join(parts)
 
 
+def _codex_identity_keys(native_id) -> list:
+    """Exact native id, then its filename and complete-record position."""
+    if not isinstance(native_id, str) or not native_id:
+        return []
+    keys = [native_id]
+    bare = native_id[6:] if native_id.startswith("codex:") else native_id
+    if bare != native_id:
+        keys.append(bare)
+    at = bare.rfind(":file:")
+    if at >= 0:
+        keys.append(bare[at + 1:])
+    elif bare.startswith("file:"):
+        keys.append(bare)
+    return keys
+
+
+def _codex_submission_record(index, ordinal, native_id):
+    """The user record named by native identity. Ordinals are legacy only.
+
+    Id-less rollouts reuse metadata ordinals, so index.records[ordinal]
+    can name a different input than the one stored under that ordinal.
+    """
+    for key in _codex_identity_keys(native_id):
+        found = index.records.get(key)
+        if isinstance(found, dict):
+            return found
+    found = index.records.get(ordinal)
+    return found if isinstance(found, dict) else None
+
+
 def _record_text(harness: str, path: str, index, ordinal, native_id):
     """The full user text of one submission record, or None."""
     if harness == "claude":
@@ -404,8 +451,10 @@ def _record_text(harness: str, path: str, index, ordinal, native_id):
         return _claude_text(message.get("content")) \
             if isinstance(message, dict) else None
     if harness == "codex":
-        rec = index.records.get(ordinal)
-        payload = rec.get("payload") if isinstance(rec, dict) else None
+        rec = _codex_submission_record(index, ordinal, native_id)
+        if not isinstance(rec, dict):
+            return None
+        payload = rec.get("payload")
         if not isinstance(payload, dict):
             return None
         if isinstance(payload.get("message"), str):
@@ -525,8 +574,8 @@ def _timeline(con, session_key: str, ev: _Evidence) -> list:
             f" IN ({','.join('?' * len(_TIMELINE_FAMILIES))})",
             (session_key, *_TIMELINE_FAMILIES)):
         family = row["family"]
-        if family == "lifecycle" and not (row["name"] == "turn_aborted"
-                                          and row["status"] == "cancelled"):
+        if family == "lifecycle" and not (row["name"] in ("turn_aborted", "turn_ended")
+                                          and row["status"] in ("cancelled", "interrupted")):
             continue
         if family == "permission" and row["status"] not in DENIED:
             continue
@@ -536,8 +585,30 @@ def _timeline(con, session_key: str, ev: _Evidence) -> list:
                       "what": family,
                       "intervention": _from_event(row, ev, "interrupt")
                       if family == "lifecycle" else None})
-    items.sort(key=lambda i: (i["ts"] or 0, i["ordinal"] or 0))
-    return items
+    wanted = set()
+    for item in items:
+        row = item["row"]
+        if item["what"] == "submission":
+            wanted.add(("user", row["native_id"]))
+        else:
+            wanted.add(("event", str(row["id"])))
+    state, order, sequences = codex_order.resolve(con, session_key, wanted)
+    if state == "known":
+        index = {}
+        for place, group in enumerate(order):
+            for ident in group:
+                index[ident] = place
+
+        def sort_key(item):
+            row = item["row"]
+            ident = (("user", row["native_id"]) if item["what"] == "submission"
+                     else ("event", str(row["id"])))
+            return (index.get(ident, len(index)), item["key"])
+
+        items.sort(key=sort_key)
+    elif state == "absent":
+        items.sort(key=lambda i: (i["ts"] or 0, i["ordinal"] or 0))
+    return items, state, sequences
 
 
 def _agent_item(item, content: dict, chars: int) -> dict:
@@ -639,7 +710,8 @@ def show(con: sqlite3.Connection, intervention_ids: list,
     after it (each a prompt from a person or agent plus the agent's
     messages and tool calls). The window is a parameter, echoed back, so a
     judge can measure accuracy against context size. Status per intervention is
-    ok, source_missing, source_changed, not_found or no_such_intervention."""
+    ok, source_missing, source_changed, not_found, no_such_intervention, or
+    order_unknown when no source sequence covers the turn."""
     window = {"turns_before": turns_before, "turns_after": turns_after,
               "items": items, "chars": chars, "text_chars": text_chars}
     if min(window.values()) < 0:
@@ -656,7 +728,7 @@ def show(con: sqlite3.Connection, intervention_ids: list,
         session = intervention["session"]
         if session not in timelines:
             timelines[session] = _timeline(con, session, ev)
-        line = timelines[session]
+        line, order_state, sequences = timelines[session]
         at = next(i for i, item in enumerate(line) if item["key"] == intervention_id)
         status, text = "ok", None
         if intervention_id.startswith("sub:"):
@@ -670,6 +742,16 @@ def show(con: sqlite3.Connection, intervention_ids: list,
         item = dict(intervention)
         item["status"] = status
         item["window"] = window
+        if order_state in ("partial", "conflict"):
+            if status == "ok":
+                item["status"] = "order_unknown"
+                if text is not None:
+                    item["text"] = clip(text, text_chars)
+            item["source_sequences"] = [
+                [[list(ident) for ident in sorted(group)] for group in sequence]
+                for sequence in sequences]
+            out.append(item)
+            continue
         if status != "ok":
             out.append(item)
             continue

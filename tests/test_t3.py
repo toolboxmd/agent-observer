@@ -223,8 +223,8 @@ class T3SyncTest(LedgerCase):
             os.path.join(self.tmp.name, "router-sess.jsonl"))
         claude.import_claude_file(self.con, router_transcript)
         before = self.kinds()
-        self.assertEqual(before["claude:" + U1][0], "synthetic")
-        self.assertEqual(before["claude:" + U2][0], "synthetic")
+        self.assertEqual(before["claude:" + U1][0], "unknown")
+        self.assertEqual(before["claude:" + U2][0], "unknown")
         self.assertEqual(before["claude:" + U6][0], "synthetic")
         totals = t3_adapter.sync(self.con, source=self.t3_path)
         self.assertGreaterEqual(totals["user_messages_reclassified"], 1)
@@ -232,9 +232,9 @@ class T3SyncTest(LedgerCase):
         # Client turn typed by a person: genuine with its turn for joining.
         self.assertEqual(kinds["claude:" + U1][0], "genuine")
         self.assertEqual(kinds["claude:" + U1][1], "claude:" + U1)
-        # Server dispatch: synthetic. No event: unknown stays synthetic.
+        # Server dispatch: synthetic. Without origin evidence it stays unknown.
         self.assertEqual(kinds["claude:" + U2][0], "synthetic")
-        self.assertEqual(kinds["claude:" + U3][0], "synthetic")
+        self.assertEqual(kinds["claude:" + U3][0], "unknown")
         # Contradictory scaffolding fails closed even when T3 lists it.
         self.assertEqual(kinds["claude:" + U4][0], "scaffolding")
         # Router-style typed prompts outside T3 are unaffected.
@@ -248,11 +248,11 @@ class T3SyncTest(LedgerCase):
             "SELECT response_id, turn_id FROM responses")}
         self.assertEqual(turns["claude:resp-a1"], "claude:" + U1)
         self.assertEqual(turns["claude:resp-a2"], "claude:" + U1)
-        # Backfill never invents excerpts: it never reads prompt text.
+        # Backfill restores the permitted excerpt through the native adapter.
         excerpt = self.query(
             "SELECT text_excerpt FROM user_messages WHERE native_id=?",
             ("claude:" + U1,))[0]["text_excerpt"]
-        self.assertEqual(excerpt, "")
+        self.assertEqual(excerpt, "first question")
 
     def test_fresh_import_classifies_directly_with_excerpt(self):
         t3_adapter.sync(self.con, source=self.t3_path)

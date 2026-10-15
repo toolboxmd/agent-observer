@@ -159,20 +159,43 @@ def _parsed(value):
 
 
 def _index_codex(path: str) -> _Index:
+    from .adapters.codex import _fallback_native_id
+
     index = _Index()
     for line, obj in _lines(path):
+        # Integer keys are the complete-line index only. A metadata ordinal
+        # shares that namespace and would hide a different physical record.
+        index.records[line] = obj
         if not isinstance(obj, dict):
-            index.records[line] = obj
             continue
-        index.records[obj.get("ordinal", line)] = obj
+        fallback = _fallback_native_id(path, line)
+        index.records[fallback] = obj
         p = obj.get("payload")
         if not isinstance(p, dict):
             continue
         ptype = p.get("type")
+        if obj.get("type") == "event_msg" and ptype == "turn_aborted":
+            if p.get("turn_id"):
+                index.records[f"turn_aborted:{p['turn_id']}"] = obj
+            else:
+                index.records[f"turn_aborted:{fallback}"] = obj
+                # The legacy turn_aborted:None key collapsed distinct aborts.
+                # Leave it to _content's retained file-position lookup.
+        elif obj.get("type") == "event_msg" and ptype == "task_complete":
+            index.records[f"task_complete:{p.get('turn_id')}"] = obj
         if obj.get("type") == "response_item":
             if ptype == "message" and p.get("role") == "assistant":
-                index.text(p.get("id"), _codex_text(p.get("content")))
+                text = _codex_text(p.get("content"))
+                index.text(p.get("id") or fallback, text)
+                if not p.get("id"):
+                    raw = obj.get("ordinal")
+                    if text and isinstance(raw, int) and not isinstance(raw, bool):
+                        # A lookup alias is not another native text unit.
+                        index.texts.setdefault(f"ordinal:{raw}", text)
             elif ptype == "message" and p.get("role") == "user":
+                message_id = p.get("id")
+                if isinstance(message_id, str) and message_id:
+                    index.records[message_id] = obj
                 index.boundary()
             elif ptype == "function_call":
                 index.call(p.get("call_id") or p.get("id"), p.get("name"),
@@ -216,10 +239,11 @@ def _grok_name(update: dict):
 
 
 def _index_grok(path: str) -> _Index:
+    from .adapters.grok import _content_text, _valid_native_id
     index = _Index(joiner="")
     updates = os.path.join(os.path.dirname(path), "updates.jsonl")
     if os.path.exists(updates):
-        for _, obj in _lines(updates):
+        for ordinal, obj in _lines(updates):
             params = obj.get("params") if isinstance(obj, dict) else None
             update = params.get("update") if isinstance(params, dict) else None
             if not isinstance(update, dict):
@@ -227,9 +251,10 @@ def _index_grok(path: str) -> _Index:
             kind = update.get("sessionUpdate")
             call = update.get("toolCallId")
             if kind == "agent_message_chunk":
-                content = update.get("content")
-                if isinstance(content, dict):
-                    index.text(None, content.get("text"))
+                content = _content_text(update.get("content"))
+                if content:
+                    meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+                    index.text(_valid_native_id(meta.get("eventId")) or f"ordinal:{ordinal}", content)
             elif kind == "user_message_chunk":
                 index.boundary()
             elif kind in ("tool_call", "tool_call_update"):
@@ -278,7 +303,7 @@ def _index_opencode(path: str) -> _Index:
         index.records[part_id] = data
         if data.get("type") == "text":
             if role == "assistant":
-                index.text(None, data.get("text"))
+                index.text(part_id, data.get("text"))
             else:
                 index.boundary()
         elif data.get("type") == "tool":
@@ -502,7 +527,8 @@ def _backing_without_events(con, event_rows, *, session_key, session_keys,
     """
     selects = []
     args: list = []
-    for table in ("sessions", "events", "user_messages", "responses", "turns"):
+    for table in ("sessions", "events", "user_messages", "responses", "turns",
+                  "codex_occurrences"):
         clause, key_args = _key_filter("session_key", session_key, session_keys)
         selects.append(
             f"SELECT session_key, source_id FROM {table}"
@@ -771,7 +797,7 @@ def _content(event, index: _Index) -> dict | None:
                 if key in index.context:
                     out["assistant_text"] = index.context[key]
                 return out
-    for key in (event["ordinal_num"], native):
+    for key in (native, event["ordinal_num"]):
         if key in index.records:
             return {"record": index.records[key]}
     return None

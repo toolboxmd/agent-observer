@@ -16,6 +16,8 @@ import sqlite3
 import statistics
 from collections import defaultdict
 
+from . import codex_order
+
 TEST_COMMAND_RE = re.compile(
     r"(\bpytest\b|\bunittest\b|scripts/test\.py|\bnpm (run )?test\b|\bpnpm (run )?test\b"
     r"|\byarn test\b|\bgo test\b|\bcargo test\b|\bjest\b|\bvitest\b|\bmocha\b|\bphpunit\b"
@@ -123,6 +125,82 @@ def _events(con, session_key: str) -> list:
         (session_key,)).fetchall()
 
 
+def _at(event) -> int:
+    """Position in a supported sequence, else the stored timestamp."""
+    try:
+        if "seq" in event.keys():
+            return event["seq"]
+    except AttributeError:
+        pass
+    return event["ts"] or 0
+
+
+def _detector_groups(con, session_key: str, events) -> list:
+    """One group when the requested events have one agreed order.
+
+    Without occurrences, the timestamp order stands. When no source covers
+    the set, each source is its own group and the groups are not merged.
+    """
+    wanted = {("event", str(event["id"])) for event in events}
+    state, order, sequences = codex_order.resolve(con, session_key, wanted)
+    if state == "absent":
+        return [events]
+    by_id = {event["id"]: event for event in events}
+
+    def materialize(groups) -> list:
+        out = []
+        for place, group in enumerate(groups):
+            members = []
+            for kind, key in group:
+                if kind != "event":
+                    continue
+                try:
+                    event_id = int(key)
+                except (TypeError, ValueError):
+                    continue
+                event = by_id.get(event_id)
+                if event is None:
+                    continue
+                copied = dict(event)
+                copied["seq"] = place
+                members.append(copied)
+            members.sort(key=lambda event: event["id"])
+            out.extend(members)
+        return out
+
+    if state == "known":
+        return [materialize(order)]
+    groups = [materialize(sequence) for sequence in sequences]
+    seen = {event["id"] for group in groups for event in group}
+    rest = [event for event in events if event["id"] not in seen]
+    if rest:
+        groups.append(rest)
+    return [group for group in groups if group]
+
+
+def _once_per_evidence(incidents: list) -> list:
+    """One incident per native evidence, across source projections.
+
+    Separate projections stay separate while they are built. The same
+    event ids are one piece of native work in either order. When the
+    projections disagree on that order, the direction stays unknown.
+    """
+    seen = {}
+    out = []
+    for incident in incidents:
+        refs = incident.get("event_refs") or ()
+        key = (incident["detector"], frozenset(refs))
+        prior = seen.get(key)
+        if prior is None:
+            seen[key] = incident
+            out.append(incident)
+            continue
+        if tuple(prior.get("event_refs") or ()) != tuple(refs):
+            prior["event_refs"] = sorted(refs)
+            prior["direction"] = "unknown"
+    return out
+
+
 def _incident(session, detector, ts, summary, refs, extra=None) -> dict:
     return {"detector": detector, "heuristic": detector in HEURISTIC,
             "session": session["session_key"], "harness": session["harness"],
@@ -134,10 +212,12 @@ def detect_session(con, session) -> list:
     """All incidents for one session, in time order."""
     events = _events(con, session["session_key"])
     incidents: list = []
-    incidents += _repeated_reads(session, events)
-    incidents += _repeated_skills(session, events)
-    incidents += _repeated_commands(session, events)
-    incidents += _test_edits_after_failure(session, events)
+    for group in _detector_groups(con, session["session_key"], events):
+        incidents += _repeated_reads(session, group)
+        incidents += _repeated_skills(session, group)
+        incidents += _repeated_commands(session, group)
+        incidents += _test_edits_after_failure(session, group)
+    incidents = _once_per_evidence(incidents)
     incidents += _permission_seeking(session, events)
     incidents += _human_corrections(con, session, events)
     incidents += _large_outputs(session, events)
@@ -145,7 +225,32 @@ def detect_session(con, session) -> list:
 
 
 def _boundaries(events) -> list:
-    return [e["ts"] or 0 for e in events if e["family"] == "compaction"]
+    return [_at(e) for e in events if e["family"] == "compaction"]
+
+
+def _edited(prev, marker, current) -> bool:
+    """An edit separates two reads only from a strictly earlier group."""
+    try:
+        if "seq" in prev.keys() and "seq" in current.keys():
+            return prev["seq"] < marker < current["seq"]
+    except AttributeError:
+        pass
+    return marker > (prev["ts"] or 0)
+
+
+def _splits(prev, marker, current) -> bool:
+    """Whether marker sits strictly between two events.
+
+    Rows that share a sequence position were emitted from one native
+    record. That group is not a boundary in either direction. Timestamp
+    order, where no sequence position exists, keeps its previous rule.
+    """
+    try:
+        if "seq" in prev.keys() and "seq" in current.keys():
+            return prev["seq"] < marker < current["seq"]
+    except AttributeError:
+        pass
+    return (prev["ts"] or 0) < marker <= (current["ts"] or 0)
 
 
 def _repeated_reads(session, events) -> list:
@@ -159,7 +264,7 @@ def _repeated_reads(session, events) -> list:
     for e in events:
         if e["family"] == "file_change":
             for path in _changed_paths(e):
-                changed_since[path] = e["ts"] or 0
+                changed_since[path] = _at(e)
             continue
         if e["family"] != "read" or not e["target"]:
             continue
@@ -167,10 +272,9 @@ def _repeated_reads(session, events) -> list:
         key = (e["target"], detail.get("start_line"), detail.get("num_lines"),
                detail.get("cmd"))
         prev = last.get(key)
-        ts = e["ts"] or 0
         if prev is not None:
-            edited = changed_since.get(e["target"], -1) > (prev["ts"] or 0)
-            compacted = any((prev["ts"] or 0) < c <= ts for c in compactions)
+            edited = _edited(prev, changed_since.get(e["target"], -1), e)
+            compacted = any(_splits(prev, c, e) for c in compactions)
             if not edited and not compacted:
                 out.append(_incident(session, "repeated_read", e["ts"],
                                      f"re-read {e['target']}",
@@ -228,13 +332,25 @@ def _repeated_skills(session, events) -> list:
     so a reload after the edit is a counterexample, not a candidate."""
     out = []
     seen: dict = {}
+    held: dict = {}
     compactions = _boundaries(events)
     for e in events:
         if e["family"] == "file_change":
-            for path in _changed_paths(e):
-                for key in [k for k in seen if _skill_key_touched(k, path)]:
-                    del seen[key]
+            # A change co-recorded with this load is not before it. Hold
+            # sequence-position changes until a later group.
+            if "seq" in e.keys():
+                for path in _changed_paths(e):
+                    held.setdefault(e["seq"], []).append(path)
+            else:
+                for path in _changed_paths(e):
+                    for key in [k for k in seen if _skill_key_touched(k, path)]:
+                        del seen[key]
             continue
+        if "seq" in e.keys():
+            for at in [at for at in held if at < e["seq"]]:
+                for path in held.pop(at):
+                    for key in [k for k in seen if _skill_key_touched(k, path)]:
+                        del seen[key]
         if e["family"] not in ("skill_read", "skill_invoke"):
             continue
         name = (e["name"] or e["target"] or "").lower()
@@ -249,8 +365,7 @@ def _repeated_skills(session, events) -> list:
                 skill_path = detail_path
         key = (e["family"], name, skill_path)
         prev = seen.get(key)
-        ts = e["ts"] or 0
-        if prev is not None and not any((prev["ts"] or 0) < c <= ts for c in compactions):
+        if prev is not None and not any(_splits(prev, c, e) for c in compactions):
             out.append(_incident(session, "repeated_skill_load", e["ts"],
                                  f"loaded {name} again ({e['family']})",
                                  [prev["id"], e["id"]], {"skill": name}))

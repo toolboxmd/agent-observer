@@ -294,11 +294,13 @@ class CodexLookupTest(LookupCase):
         self.assertNotIn("hunter2value", json.dumps(item))
         self.assertNotIn("plainvalue1", json.dumps(item))
 
-    def test_lifecycle_record_by_native_ordinal(self):
+    def test_lifecycle_record_by_native_key(self):
         row = self.con.execute(
             "SELECT id, ordinal_num FROM events WHERE family='lifecycle'"
             " AND native_id LIKE 'task_complete:%'").fetchone()
-        self.assertEqual(row["ordinal_num"], 20)
+        # The file line is the chronology. Metadata ordinal 20 is a
+        # different sequence and must not be required to find the record.
+        self.assertEqual(row["ordinal_num"], 8)
         [item] = self.show(row["id"])
         self.assertEqual(item["status"], "ok")
         self.assertEqual(item["record"]["payload"]["type"], "task_complete")
@@ -334,6 +336,29 @@ class CodexLookupTest(LookupCase):
         os.replace(copy, self.path)
         [item] = self.show(call)
         self.assertEqual(item["status"], "source_changed")
+
+
+class CodexAliasContextTest(LookupCase):
+    def test_historical_assistant_alias_does_not_repeat_tool_context(self):
+        path = os.path.join(self.root, "alias-context.jsonl")
+        _write(path, [
+            {"type": "session_meta", "ordinal": 0, "payload": {
+                "id": "alias-context", "thread_source": "user"}},
+            {"type": "response_item", "ordinal": 20, "payload": {
+                "type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "one native answer"}]}},
+            {"type": "response_item", "ordinal": 30, "payload": {
+                "type": "function_call", "call_id": "call-a",
+                "name": "exec_command", "arguments": '{"cmd":"echo x"}'}},
+        ])
+        for full in (False, True, False):
+            with self.subTest(full=full):
+                codex.import_codex_file(self.con, path, full=full)
+                [item] = self.show(self.event_id("tool_call", "call-a"))
+                self.assertEqual(item["status"], "ok")
+                self.assertEqual(item["assistant_text"], "one native answer")
+                self.assertEqual(self.con.execute(
+                    "SELECT COUNT(*) FROM import_errors").fetchone()[0], 0)
 
 
 class GrokLookupTest(LookupCase):

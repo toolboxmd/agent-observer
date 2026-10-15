@@ -326,6 +326,8 @@ def render(report: dict) -> str:
         f"problems {report['problems']}, recurring (2+ sessions)"
         f" {report['recurring_problems']}, repeats {report['repeats']},"
         f" ungrouped {report['ungrouped']}",
+        "actor coverage: " + ", ".join(
+            f"{k} {v}" for k, v in cov["by_created_by"].items()),
         "unjudged by created_by: " + ", ".join(
             f"{k} {v}" for k, v in cov["unjudged_by_created_by"].items()),
         "policy denials (not corrections): " + ", ".join(

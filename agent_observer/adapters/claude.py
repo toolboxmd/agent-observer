@@ -106,6 +106,92 @@ def _valid_counter(value) -> bool:
 
 
 _FINALITY_TABLE = "claude_response_finality"
+_NATIVE_KINDS_TABLE = "claude_native_kinds"
+
+
+def _ensure_native_kinds(con) -> None:
+    con.execute(
+        f"CREATE TABLE IF NOT EXISTS {_NATIVE_KINDS_TABLE}("
+        " native_id TEXT PRIMARY KEY REFERENCES user_messages(native_id) ON DELETE CASCADE,"
+        " kind TEXT NOT NULL CHECK(kind IN"
+        " ('genuine','synthetic','unknown','interrupt','command','scaffolding')),"
+        " origin_allowed INTEGER NOT NULL CHECK(origin_allowed IN (0,1)))")
+
+
+def native_kind(con, native_id: str) -> str | None:
+    """Transcript classification before any mutable Chromeria origin evidence."""
+    try:
+        row = con.execute(f"SELECT kind FROM {_NATIVE_KINDS_TABLE} WHERE native_id=?",
+                          (native_id,)).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return None  # A ledger that has not imported this native fact yet.
+        raise
+    return row[0] if row else None
+
+
+def prompt_origin_allowed(con, native_id: str) -> bool:
+    """Native sidechain/scaffolding restrictions also govern mirror backfill."""
+    try:
+        row = con.execute(f"SELECT origin_allowed FROM {_NATIVE_KINDS_TABLE} WHERE native_id=?",
+                          (native_id,)).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return False
+        raise
+    return bool(row and row[0])
+
+
+def restore_native_excerpts(con, native_ids: list[str]) -> None:
+    """Recover permitted excerpts from affected native sources, never a text cache."""
+    by_path = {}
+    for native_id in native_ids:
+        row = con.execute(
+            "SELECT u.native_id,s.path,s.session_id,s.thread_id,se.entrypoint"
+            " FROM user_messages u JOIN sources s ON s.id=u.source_id"
+            " LEFT JOIN sessions se ON se.session_key=u.session_key"
+            " WHERE u.native_id=? AND u.kind='genuine' AND u.text_excerpt=''",
+            (native_id,)).fetchone()
+        if row:
+            by_path.setdefault(row["path"], {})[native_id] = row
+    for path, wanted in by_path.items():
+        try:
+            with open(path, "rb") as fh:
+                ordinal = 0
+                for raw in fh:
+                    if not raw.endswith(b"\n"):
+                        break
+                    if not raw.strip():
+                        continue
+                    position = ordinal
+                    ordinal += 1
+                    try:
+                        obj = json.loads(raw)
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(obj, dict) or obj.get("type") != "user":
+                        continue
+                    native_id = f"{HARNESS}:{obj.get('uuid') or f'ordinal:{position}'}"
+                    row = wanted.get(native_id)
+                    if not row or (obj.get("sessionId") or row["session_id"]) != row["session_id"]:
+                        continue
+                    message = obj.get("message")
+                    try:
+                        text = _text(message.get("content")) if isinstance(message, dict) else ""
+                    except TypeError:
+                        continue  # The same malformed text is quarantined by native import.
+                    native_kind = _native_user_kind(obj, text, agent_id=row["thread_id"],
+                                                    entrypoint=row["entrypoint"])
+                    kind = _user_kind(con, row["session_id"], row["thread_id"], obj, native_kind)
+                    excerpt = privacy.submission_excerpt(
+                        text, is_genuine=kind == "genuine",
+                        is_main_session=row["thread_id"] is None and row["session_id"] is not None)
+                    con.execute("UPDATE user_messages SET text_excerpt=? WHERE native_id=?",
+                                (excerpt, native_id))
+        except OSError:
+            # Classification can be restored from metadata even if native
+            # text is unavailable. No other source or text store is consulted.
+            continue
 
 
 def _ensure_finality_table(con) -> None:
@@ -291,6 +377,7 @@ def import_claude_file(con: sqlite3.Connection, path: str,
         return stats
     r = _Reader(con, src, stats)
     _ensure_finality_table(con)
+    _ensure_native_kinds(con)
     # Durable per-response finality is authoritative for accepted final
     # rows. It covers copied sources, full reimports and incremental
     # appends. The file prefix is never authority on its own, so a malformed
@@ -537,16 +624,6 @@ def _assistant(r: _Reader, obj: dict, ordinal: int, ts) -> None:
         raise ValueError("unsupported message shape")
     mid = message.get("id")
     model = message.get("model")
-    if mid and "usage" in message and model != "<synthetic>":
-        usage_raw = message.get("usage")
-        if usage_raw is None or (isinstance(usage_raw, dict) and not usage_raw):
-            pass
-        else:
-            # Validated before any SQL; malformed buckets quarantine here and
-            # never finalize, so a later valid block still inserts normally.
-            values = _usage_values(usage_raw)
-            _ingest_usage_row(r, obj, ordinal, ts, mid, model, values,
-                              message.get("stop_reason") is not None)
     for index, block in enumerate(message.get("content") or []):
         if not isinstance(block, dict):
             continue
@@ -583,8 +660,20 @@ def _assistant(r: _Reader, obj: dict, ordinal: int, ts) -> None:
                     fingerprint=text_hash(text),
                     detail={"excerpt": excerpt} if excerpt else None)
 
+    if mid and "usage" in message and model != "<synthetic>":
+        usage_raw = message.get("usage")
+        if usage_raw is None or (isinstance(usage_raw, dict) and not usage_raw):
+            pass
+        else:
+            # Validated before any SQL; malformed buckets quarantine here and
+            # never finalize, so a later valid block still inserts normally.
+            values = _usage_values(usage_raw)
+            _ingest_usage_row(r, obj, ordinal, ts, mid, model, values,
+                              message.get("stop_reason") is not None)
 
-def _submission(r: _Reader, native_id, ordinal, ts, kind: str, text: str) -> None:
+
+def _submission(r: _Reader, native_id, ordinal, ts, kind: str, text: str,
+                native_kind: str | None = None, *, origin_allowed: bool = False) -> None:
     # Privacy rule 1 via agent_observer/privacy.py: only a genuine
     # main-session human submission keeps an excerpt. Interrupt, synthetic,
     # command and scaffolding kinds keep an empty excerpt, as does any text
@@ -604,8 +693,9 @@ def _submission(r: _Reader, native_id, ordinal, ts, kind: str, text: str) -> Non
          ts, kind, text_hash(text), excerpt, genuine))
     if cur.rowcount:
         r.stats["user_messages_inserted"] += 1
-    elif r.src.privacy_stale:
-        # Rule 3: a privacy version change corrects rows in place.
+    else:
+        # Parsed native evidence refreshes derived classification and
+        # privacy fields even when the source's privacy version is current.
         r.con.execute(
             "UPDATE user_messages SET source_id=?, session_key=?, turn_id=?,"
             " ordinal_num=?, ts=?, kind=?, text_hash=?, text_excerpt=?,"
@@ -614,6 +704,9 @@ def _submission(r: _Reader, native_id, ordinal, ts, kind: str, text: str) -> Non
              text_hash(text), excerpt, genuine, f"{HARNESS}:{native_id}"))
         r.stats["user_messages_updated"] = \
             r.stats.get("user_messages_updated", 0) + 1
+    r.con.execute(f"INSERT INTO {_NATIVE_KINDS_TABLE}(native_id,kind,origin_allowed) VALUES(?,?,?)"
+                  " ON CONFLICT(native_id) DO UPDATE SET kind=excluded.kind,origin_allowed=excluded.origin_allowed",
+                  (f"{HARNESS}:{native_id}", native_kind or kind, int(origin_allowed)))
 
 
 def _t3_actor(con, uuid: str) -> str | None:
@@ -633,21 +726,17 @@ def _t3_actor(con, uuid: str) -> str | None:
     return _t3.turn_actor(con, uuid)
 
 
-def _t3_prompt_actor(con, native_session, text: str) -> str | None:
-    """The Chromeria V2 origin of a main-session prompt, by text hash.
-
-    V2 records no native turn ids, so T3 mirrors who sent each prompt per
-    native session and text hash. Unknown stays unknown.
-    """
+def _t3_prompt_actor(con, native_session, uuid: str) -> str | None:
+    """The Chromeria V2 origin by native session and user-message uuid."""
     try:
         from . import t3 as _t3
     except ImportError:
         return None
-    return _t3.prompt_actor(con, native_session, text_hash(text))
+    return _t3.prompt_actor(con, f"claude:{native_session}", f"claude:{uuid}")
 
 
-def _user_kind(r: _Reader, obj: dict, text: str) -> str:
-    if obj.get("isSidechain") or r.agent_id:
+def _native_user_kind(obj: dict, text: str, *, agent_id=None, entrypoint=None) -> str:
+    if obj.get("isSidechain") or agent_id:
         return "synthetic"
     stripped = text.lstrip()
     if stripped.startswith(INTERRUPT_PREFIX):
@@ -662,26 +751,28 @@ def _user_kind(r: _Reader, obj: dict, text: str) -> str:
         return "scaffolding"
     if obj.get("isMeta") or stripped.startswith(SCAFFOLD_PREFIXES):
         return "command" if stripped.startswith("<command-name>") else "scaffolding"
-    uuid = obj.get("uuid")
-    if isinstance(uuid, str) and uuid:
-        # T3 turn evidence outranks the generic sdk fallthrough below: a
-        # listed turn start is genuine when a person typed it and
-        # synthetic when a dispatch sent it. Scaffolding and interrupt
-        # verdicts above already failed closed, and unlisted records
-        # (typed prompts, Router sdk-cli workers) fall through unchanged.
-        actor = _t3_actor(r.con, uuid) \
-            or _t3_prompt_actor(r.con, r.native_session, text)
-        if actor == "client":
-            return "genuine"
-        if actor == "server":
-            return "synthetic"
     origin = obj.get("origin") if isinstance(obj.get("origin"), dict) else {}
     if origin.get("kind") == "human" or obj.get("promptSource") == "typed":
         return "genuine"
     if obj.get("origin") is None and obj.get("promptSource") is None and stripped:
         # Older transcripts carry no origin: plain typed text is genuine.
         return "genuine"
+    if obj.get("promptSource") == "sdk" and entrypoint != "sdk-cli":
+        return "unknown"
     return "synthetic"
+
+
+def _user_kind(con, native_session, agent_id, obj: dict, native_kind: str) -> str:
+    if obj.get("isSidechain") or agent_id or native_kind in ("interrupt", "command", "scaffolding"):
+        return native_kind
+    uuid = obj.get("uuid")
+    if isinstance(uuid, str) and uuid:
+        actor = _t3_actor(con, uuid) or _t3_prompt_actor(con, native_session, uuid)
+        if actor == "client":
+            return "genuine"
+        if actor == "server":
+            return "synthetic"
+    return native_kind
 
 
 def _user(r: _Reader, obj: dict, ordinal: int, ts) -> None:
@@ -691,12 +782,10 @@ def _user(r: _Reader, obj: dict, ordinal: int, ts) -> None:
         if isinstance(content, list) else []
     for result in results:
         _tool_result(r, obj, result, ordinal, ts)
-    if results:
-        return
     text = _text(content)
     for value in _strings(content):
         r.identity.observe_text(value)
-    if not text:
+    if not text and (results or not content):
         return
     if text.startswith(SKILL_BASE_PREFIX):
         # The loaded Skill body arrives as a meta message naming its
@@ -714,11 +803,19 @@ def _user(r: _Reader, obj: dict, ordinal: int, ts) -> None:
                 name=skill, target=skill, size_bytes=len(text),
                 detail={"skill": raw_skill, "skill_path": skill_file}
                 if (raw_skill or skill_file) else None)
-    kind = _user_kind(r, obj, text)
+    native_kind = _native_user_kind(obj, text, agent_id=r.agent_id,
+                                   entrypoint=r.meta.get("entrypoint"))
+    kind = _user_kind(r.con, r.native_session, r.agent_id, obj, native_kind)
+    if not text and kind == "synthetic" and not (obj.get("isSidechain") or r.agent_id):
+        kind = "unknown"  # A file/image-only native input still has an identity.
+    if not text and native_kind == "synthetic" and not (obj.get("isSidechain") or r.agent_id):
+        native_kind = "unknown"
     native = obj.get("uuid") or f"ordinal:{ordinal}"
     if kind == "genuine":
         r.turn = f"{HARNESS}:{obj.get('promptId') or native}"
-    _submission(r, native, ordinal, ts, kind, text)
+    _submission(r, native, ordinal, ts, kind, text, native_kind,
+                origin_allowed=not (obj.get("isSidechain") or r.agent_id
+                                    or native_kind in ("interrupt", "command", "scaffolding")))
 
 
 # Claude's toolDenialKind values seen in native records; any other value
