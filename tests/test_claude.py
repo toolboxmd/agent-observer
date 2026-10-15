@@ -212,12 +212,9 @@ class ClaudeContradictoryMarkersTest(LedgerCase):
 
 
 class ClaudeQueueOperationTest(LedgerCase):
-    """Queue-operation handling is descoped for release 0.2.0: every
-    queue-operation record falls through to unsupported_schema
-    quarantine, stores nothing and creates no submission, until a
-    follow-up implements correct queued-prompt handling."""
+    """A queue without source authorship evidence stays unknown and private."""
 
-    def test_queue_operation_is_quarantined_with_nothing_stored(self):
+    def test_queue_operation_without_entrypoint_keeps_no_excerpt(self):
         dst = os.path.join(self.tmp.name, "sess-queue.jsonl")
         _write(dst, [
             '{"sessionId": "sess-queue", "cwd": "/redacted/repo",'
@@ -227,13 +224,11 @@ class ClaudeQueueOperationTest(LedgerCase):
             ' "timestamp": "2026-09-14T10:00:01Z"}\n',
         ])
         stats = claude.import_claude_file(self.con, dst)
-        self.assertEqual(stats["malformed"], 1)
-        errors = self.query(
-            "SELECT error, line_excerpt FROM import_errors")
-        self.assertEqual(len(errors), 1)
-        self.assertEqual(errors[0]["error"], "unsupported_schema")
-        self.assertEqual(
-            self.query("SELECT COUNT(*) n FROM user_messages")[0]["n"], 0)
+        self.assertEqual(stats["malformed"], 0)
+        self.assertEqual(self.query("SELECT * FROM import_errors"), [])
+        row = self.query("SELECT kind,text_excerpt FROM user_messages")[0]
+        self.assertEqual(row["kind"], "unknown")
+        self.assertEqual(row["text_excerpt"], "")
         blob = "".join(r["text_excerpt"] or "" for r in self.query(
             "SELECT text_excerpt FROM user_messages"))
         blob += "".join(r["detail_json"] or "" for r in self.query(

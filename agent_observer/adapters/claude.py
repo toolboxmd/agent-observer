@@ -63,11 +63,6 @@ CAPABILITIES = [
 # reconciliation with assistant usage is an open follow-up, so it stays
 # quarantined as unsupported_schema (nothing stored) instead of being
 # silently dropped.
-#
-# queue-operation is NOT ignored either: queued-prompt handling is
-# descoped for release 0.2.0, so every queue-operation record falls
-# through to unsupported_schema quarantine (nothing stored, no
-# submission) until a follow-up implements it correctly.
 IGNORED_METADATA_TYPES = frozenset({
     "agent-name",
     "atis-latch",
@@ -107,6 +102,7 @@ def _valid_counter(value) -> bool:
 
 _FINALITY_TABLE = "claude_response_finality"
 _NATIVE_KINDS_TABLE = "claude_native_kinds"
+_IMPORT_VERSION = 2
 
 
 def _ensure_native_kinds(con) -> None:
@@ -116,6 +112,8 @@ def _ensure_native_kinds(con) -> None:
         " kind TEXT NOT NULL CHECK(kind IN"
         " ('genuine','synthetic','unknown','interrupt','command','scaffolding')),"
         " origin_allowed INTEGER NOT NULL CHECK(origin_allowed IN (0,1)))")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_claude_message_alias"
+                " ON user_messages(alias_id) WHERE alias_id IS NOT NULL")
 
 
 def native_kind(con, native_id: str) -> str | None:
@@ -147,13 +145,13 @@ def restore_native_excerpts(con, native_ids: list[str]) -> None:
     by_path = {}
     for native_id in native_ids:
         row = con.execute(
-            "SELECT u.native_id,s.path,s.session_id,s.thread_id,se.entrypoint"
+            "SELECT u.native_id,u.alias_id,s.path,s.session_id,s.thread_id,se.entrypoint"
             " FROM user_messages u JOIN sources s ON s.id=u.source_id"
             " LEFT JOIN sessions se ON se.session_key=u.session_key"
             " WHERE u.native_id=? AND u.kind='genuine' AND u.text_excerpt=''",
             (native_id,)).fetchone()
         if row:
-            by_path.setdefault(row["path"], {})[native_id] = row
+            by_path.setdefault(row["path"], {})[prompt_native_id(row)] = row
     for path, wanted in by_path.items():
         try:
             with open(path, "rb") as fh:
@@ -187,7 +185,7 @@ def restore_native_excerpts(con, native_ids: list[str]) -> None:
                         text, is_genuine=kind == "genuine",
                         is_main_session=row["thread_id"] is None and row["session_id"] is not None)
                     con.execute("UPDATE user_messages SET text_excerpt=? WHERE native_id=?",
-                                (excerpt, native_id))
+                                (excerpt, row["native_id"]))
         except OSError:
             # Classification can be restored from metadata even if native
             # text is unavailable. No other source or text store is consulted.
@@ -313,6 +311,7 @@ class _Reader:
         # prefix. A row is updated while its message streams; once final,
         # every later same-ID repeat is validation only.
         self.finalized: set = set()
+        self.native_user_ids: set[str] = set()
 
     @property
     def session_key(self) -> str:
@@ -336,7 +335,7 @@ def import_claude_file(con: sqlite3.Connection, path: str,
              "user_messages_inserted": 0, "events_inserted": 0,
              "events_duplicate": 0, "compactions": 0, "malformed": 0}
     src = JsonlSource(con, HARNESS, path, full=full)
-    if (src.row["claude_usage_version"] != 1
+    if (src.row["claude_usage_version"] != _IMPORT_VERSION
             or src.row["claude_usage_offset"] != src.row["read_offset"]):
         src.start_offset = src.end_offset = 0
         src.unchanged = False
@@ -378,6 +377,7 @@ def import_claude_file(con: sqlite3.Connection, path: str,
     r = _Reader(con, src, stats)
     _ensure_finality_table(con)
     _ensure_native_kinds(con)
+    _seed_queue_identity(r)
     # Durable per-response finality is authoritative for accepted final
     # rows. It covers copied sources, full reimports and incremental
     # appends. The file prefix is never authority on its own, so a malformed
@@ -406,6 +406,10 @@ def import_claude_file(con: sqlite3.Connection, path: str,
             continue
         try:
             _ingest(r, obj, ordinal)
+            if obj.get("type") == "queue-operation":
+                con.execute("DELETE FROM import_errors WHERE harness=? AND source_path=?"
+                            " AND ordinal_num=? AND error='unsupported_schema'",
+                            (HARNESS, path, ordinal))
         except _UsageConflict:
             stats["malformed"] += 1
             src.error(ordinal, "usage_conflict", line)
@@ -431,8 +435,8 @@ def import_claude_file(con: sqlite3.Connection, path: str,
                           r.session_key.split(":", 1)[1], src.source_id,
                           **fields)
     stats.update(src.finish(session_id=r.native_session, thread_id=r.agent_id))
-    con.execute("UPDATE sources SET claude_usage_version=1,claude_usage_offset=? WHERE id=?",
-                (src.end_offset, src.source_id))
+    con.execute("UPDATE sources SET claude_usage_version=?,claude_usage_offset=? WHERE id=?",
+                (_IMPORT_VERSION, src.end_offset, src.source_id))
     stats["session_key"] = r.session_key
     con.commit()
     return stats
@@ -458,6 +462,8 @@ def _ingest(r: _Reader, obj: dict, ordinal: int) -> None:
         _user(r, obj, ordinal, ts)
     elif kind == "attachment":
         _attachment(r, obj, ordinal, ts)
+    elif kind == "queue-operation":
+        _queue_operation(r, obj, ordinal, ts)
     elif kind == "system":
         _system(r, obj, ordinal, ts)
     elif kind == "ai-title":
@@ -709,6 +715,131 @@ def _submission(r: _Reader, native_id, ordinal, ts, kind: str, text: str,
                   (f"{HARNESS}:{native_id}", native_kind or kind, int(origin_allowed)))
 
 
+def _seed_queue_identity(r: _Reader) -> None:
+    """Resolve the available source identity before accepting queued text.
+
+    Native enqueue records omit entrypoint and child identity. Inspect the
+    complete new portion, and use persisted metadata for incremental suffixes.
+    A later child identity also corrects earlier queued rows in place.
+    """
+    session = r.con.execute("SELECT entrypoint FROM sessions WHERE session_key=?",
+                            (r.session_key,)).fetchone()
+    stored_entrypoint = session["entrypoint"] if session else None
+    if os.path.basename(os.path.dirname(r.src.path)) == "subagents":
+        name = os.path.basename(r.src.path)
+        if name.startswith("agent-") and name.endswith(".jsonl"):
+            r.agent_id = name[len("agent-"):-len(".jsonl")]
+    for ordinal, obj, _ in r.src.records():
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") == "user":
+            native = obj.get("uuid") or f"ordinal:{ordinal}"
+            r.native_user_ids.add(f"{HARNESS}:{native}")
+        if isinstance(obj.get("sessionId"), str) and obj["sessionId"] and not r.native_session:
+            r.native_session = obj["sessionId"]
+        if obj.get("isSidechain") and isinstance(obj.get("agentId"), str) and obj["agentId"]:
+            r.agent_id = obj["agentId"]
+        if isinstance(obj.get("entrypoint"), str) and obj["entrypoint"] and "entrypoint" not in r.meta:
+            r.meta["entrypoint"] = obj["entrypoint"]
+    if "entrypoint" not in r.meta and stored_entrypoint:
+        r.meta["entrypoint"] = stored_entrypoint
+    if r.src.incremental and r.meta.get("entrypoint") != stored_entrypoint:
+        # Recover old queue text through the parser and privacy gate when
+        # late entrypoint metadata resolves an earlier unknown.
+        r.src.start_offset = r.src.end_offset = 0
+    if r.agent_id:
+        r.con.execute(
+            "UPDATE user_messages SET session_key=?,kind='synthetic',is_genuine=0,text_excerpt=''"
+            " WHERE source_id=? AND (native_id LIKE 'claude:queue:%' OR alias_id LIKE 'claude:queue:%')",
+            (r.session_key, r.src.source_id))
+        r.con.execute(
+            f"UPDATE {_NATIVE_KINDS_TABLE} SET kind='synthetic',origin_allowed=0 WHERE native_id IN"
+            " (SELECT native_id FROM user_messages WHERE source_id=?"
+            " AND (native_id LIKE 'claude:queue:%' OR alias_id LIKE 'claude:queue:%'))",
+            (r.src.source_id,))
+
+
+def _queue_operation(r: _Reader, obj: dict, ordinal: int, ts) -> None:
+    operation = obj.get("operation")
+    if operation in ("dequeue", "remove"):
+        return  # No new input: the enqueue remains the input evidence.
+    if operation != "enqueue":
+        raise _UnsupportedSchema("unsupported queue operation")
+    text = obj.get("content")
+    if text is None or text == "":
+        return  # Native queues can carry a non-text command without content.
+    if not isinstance(text, str):
+        raise ValueError("unsupported queued content")
+    native = f"queue:{r.native_session or 'file'}:{os.path.basename(r.src.path)}:{ordinal}"
+    full = f"{HARNESS}:{native}"
+    existing = r.con.execute(
+        "SELECT native_id,alias_id FROM user_messages WHERE native_id=? OR alias_id=?",
+        (full, full)).fetchone()
+    if existing and (existing["native_id"] != full or existing["alias_id"]):
+        return  # A matched user's classification and source location win.
+    # On adapter upgrade, the later user record may already be indexed.
+    # Keep that existing primary key, just as a queue-first import keeps its key.
+    candidates = r.con.execute(
+        "SELECT u.native_id FROM user_messages u LEFT JOIN claude_native_kinds k ON k.native_id=u.native_id"
+        " WHERE session_key=? AND text_hash=? AND ordinal_num>? AND alias_id IS NULL"
+        " AND u.native_id NOT LIKE 'claude:queue:%'"
+        " AND (?=0 OR (k.kind='synthetic' AND k.origin_allowed=0))"
+        " ORDER BY ordinal_num,u.native_id",
+        (r.session_key, text_hash(text), ordinal, bool(obj.get("isSidechain") or r.agent_id))).fetchall()
+    user = next((row for row in candidates if row["native_id"] in r.native_user_ids), None)
+    if user and not existing:
+        r.con.execute("UPDATE user_messages SET alias_id=? WHERE native_id=?",
+                      (full, user["native_id"]))
+        return
+    entrypoint = r.meta.get("entrypoint")
+    evidence = obj
+    if isinstance(entrypoint, str) and entrypoint.startswith("sdk"):
+        evidence = {**obj, "promptSource": "sdk"}
+    kind = _native_user_kind(evidence, text, agent_id=r.agent_id,
+                             entrypoint=entrypoint)
+    origin = obj.get("origin") if isinstance(obj.get("origin"), dict) else {}
+    explicit_human = origin.get("kind") == "human" or obj.get("promptSource") == "typed"
+    if kind == "genuine" and entrypoint != "cli" and not explicit_human:
+        kind = "unknown"  # Queue presence is not proof of a human CLI session.
+    _submission(r, native, ordinal, ts, kind, text, origin_allowed=not (
+        obj.get("isSidechain") or r.agent_id
+        or kind in ("interrupt", "command", "scaffolding")))
+
+
+def _queued_user_id(r: _Reader, native: str, ordinal: int, text: str, *, is_sidechain: bool) -> str:
+    """Pair the earliest unpaired enqueue with a later equal user record.
+
+    Session, hash and native order define the pair, independently of turns.
+    The first stored primary key never changes, including when assignments or
+    delegations already refer to it. alias_id carries the other native identity.
+    """
+    full = f"{HARNESS}:{native}"
+    existing = r.con.execute(
+        "SELECT native_id FROM user_messages WHERE native_id=? OR alias_id=?",
+        (full, full)).fetchone()
+    if existing:
+        return existing["native_id"][len(HARNESS) + 1:]
+    queued = r.con.execute(
+        "SELECT native_id FROM user_messages WHERE session_key=? AND text_hash=?"
+        " AND ordinal_num<? AND alias_id IS NULL AND native_id LIKE 'claude:queue:%'"
+        " AND (?=1 OR NOT EXISTS (SELECT 1 FROM claude_native_kinds k"
+        " WHERE k.native_id=user_messages.native_id AND k.kind='synthetic' AND k.origin_allowed=0))"
+        " ORDER BY ordinal_num,native_id LIMIT 1",
+        (r.session_key, text_hash(text), ordinal, is_sidechain)).fetchone()
+    if queued:
+        r.con.execute("UPDATE user_messages SET alias_id=? WHERE native_id=?",
+                      (full, queued["native_id"]))
+        return queued["native_id"][len(HARNESS) + 1:]
+    return native
+
+
+def prompt_native_id(row) -> str:
+    """The consumed user uuid behind a stable queue-first primary key."""
+    if row["native_id"].startswith("claude:queue:") and row["alias_id"]:
+        return row["alias_id"]
+    return row["native_id"]
+
+
 def _t3_actor(con, uuid: str) -> str | None:
     """The T3 turn origin for one user-record uuid, if T3 recorded it.
 
@@ -813,7 +944,9 @@ def _user(r: _Reader, obj: dict, ordinal: int, ts) -> None:
     native = obj.get("uuid") or f"ordinal:{ordinal}"
     if kind == "genuine":
         r.turn = f"{HARNESS}:{obj.get('promptId') or native}"
-    _submission(r, native, ordinal, ts, kind, text, native_kind,
+    stored_native = _queued_user_id(r, native, ordinal, text,
+                                    is_sidechain=bool(obj.get("isSidechain") or r.agent_id))
+    _submission(r, stored_native, ordinal, ts, kind, text, native_kind,
                 origin_allowed=not (obj.get("isSidechain") or r.agent_id
                                     or native_kind in ("interrupt", "command", "scaffolding")))
 

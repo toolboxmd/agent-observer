@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.6] - 2026-10-15
+
+### Changed
+
+- Count Claude queued inputs once without changing message identities
+
 ## [1.2.5] - 2026-10-15
 
 ### Changed
