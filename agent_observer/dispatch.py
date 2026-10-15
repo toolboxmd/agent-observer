@@ -221,14 +221,7 @@ def thread_sessions(con: sqlite3.Connection, thread_id: str) -> set:
                 " OR (harness IN ('codex','opencode') AND native_id=?)",
                 (native, len(native) + 1, native + ":", native)):
             keys.add(row["session_key"])
-    try:
-        for row in con.execute(
-                "SELECT DISTINCT s.session_key FROM user_messages s"
-                " JOIN t3_turn_origins o ON s.native_id='claude:' || o.message_id"
-                " WHERE o.thread_id=?", (thread_id,)):
-            keys.add(row["session_key"])
-    except sqlite3.DatabaseError:
-        pass
+    keys.update(_t3.claude_turn_sessions(con, thread_id))
     return keys
 
 

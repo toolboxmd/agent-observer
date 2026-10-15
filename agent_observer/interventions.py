@@ -184,7 +184,11 @@ def _from_submission(row, ev: _Evidence) -> dict | None:
     None for other synthetic input such as reminders."""
     kind = "interrupt" if row["kind"] == "interrupt" else "prompt"
     thread = ev.thread(row["session_native"])
-    actor = ev.prompt_actor(row["harness"], row["native_id"],
+    identity = row["native_id"]
+    if row["harness"] == "claude":
+        from .adapters.claude import prompt_native_id
+        identity = prompt_native_id(row)
+    actor = ev.prompt_actor(row["harness"], identity,
                             row["session_native"], row["turn_id"]) \
         if kind == "prompt" else None
     if row["kind"] == "synthetic" and (
@@ -228,7 +232,7 @@ def _from_event(row, ev: _Evidence, kind: str) -> dict:
 
 
 _SUB_KINDS = "('genuine', 'interrupt', 'synthetic', 'unknown')"
-_SUB_SQL = ("SELECT u.native_id, u.kind, u.ts, u.turn_id, u.ordinal_num,"
+_SUB_SQL = ("SELECT u.native_id, u.alias_id, u.kind, u.ts, u.turn_id, u.ordinal_num,"
             " u.source_id,"
             f" {_SESSION_COLS} FROM user_messages u"
             " JOIN sessions s ON s.session_key = u.session_key")
@@ -447,6 +451,9 @@ def _record_text(harness: str, path: str, index, ordinal, native_id):
     """The full user text of one submission record, or None."""
     if harness == "claude":
         rec = index.records.get(ordinal)
+        if isinstance(rec, dict) and rec.get("type") == "queue-operation" \
+                and rec.get("operation") == "enqueue":
+            return rec.get("content") if isinstance(rec.get("content"), str) else None
         message = rec.get("message") if isinstance(rec, dict) else None
         return _claude_text(message.get("content")) \
             if isinstance(message, dict) else None

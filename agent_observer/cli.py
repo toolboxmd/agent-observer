@@ -925,8 +925,9 @@ def _resolve_submission(con, given: str) -> str:
     if con.execute("SELECT 1 FROM user_messages WHERE native_id=?",
                    (given,)).fetchone():
         return given
-    rows = con.execute("SELECT native_id FROM user_messages WHERE native_id LIKE ?",
-                       ("%:" + given,)).fetchall()
+    rows = con.execute("SELECT native_id FROM user_messages WHERE alias_id=?"
+                       " OR native_id LIKE ? OR alias_id LIKE ?",
+                       (given, "%:" + given, "%:" + given)).fetchall()
     return rows[0]["native_id"] if len(rows) == 1 else given
 
 
