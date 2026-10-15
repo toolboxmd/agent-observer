@@ -904,9 +904,12 @@ def import_codex_file(con: sqlite3.Connection, path: str,
                             thread_id=reader.thread_id,
                             cli_version=reader.cli_version,
                             thread_source=reader.thread_source))
+    backfill = 1 if _backfill_complete(
+        con, src.source_id, getattr(src, "last_ordinal", None)) else 0
     con.execute("UPDATE sources SET codex_context_version=2,codex_context_offset=?,"
-                "codex_model=?,codex_effort=?,occurrence_backfill=1 WHERE id=?",
-                (src.end_offset, reader.model, reader.effort, src.source_id))
+                "codex_model=?,codex_effort=?,occurrence_backfill=? WHERE id=?",
+                (src.end_offset, reader.model, reader.effort, backfill,
+                 src.source_id))
     for key, (native, lost_rows) in settle.items():
         _settle(con, key, native, lost_rows)
     if settle:
@@ -974,20 +977,50 @@ def _copied_identities(r: _Reader, obj: dict, position: int):
             yield ("event", "compaction", payload["window_id"])
         return
     if rtype == "response_item":
-        yield from _copied_response_item(payload, raw)
+        yield from _copied_response_item(r, payload, raw, position)
         return
     if rtype == "event_msg":
         yield from _copied_event_msg(r, obj, payload, position)
 
 
-def _copied_response_item(payload: dict, raw):
+def _backfill_complete(con, source_id: int, ceiling) -> bool:
+    """Every retained locator for this source is inside the file.
+
+    A metadata ordinal left outside the file means a copied row was not
+    adopted. The marker stays unset so the next read tries again.
+    """
+    if isinstance(ceiling, bool) or not isinstance(ceiling, int):
+        return True
+    row = con.execute(
+        "SELECT 1 FROM events WHERE source_id=? AND ordinal_num>?"
+        " UNION ALL SELECT 1 FROM user_messages WHERE source_id=?"
+        " AND ordinal_num>?"
+        " UNION ALL SELECT 1 FROM responses WHERE source_id=?"
+        " AND ordinal_num>? LIMIT 1",
+        (source_id, ceiling, source_id, ceiling, source_id, ceiling)).fetchone()
+    return row is None
+
+
+def _copied_user_ids(r: _Reader, payload: dict, raw, position: int):
+    native = payload.get("id")
+    if isinstance(native, str) and native:
+        yield f"{HARNESS}:{native}"
+        return
+    if raw is not None:
+        yield f"{HARNESS}:ordinal:{raw}"
+    fallback = _fallback_native_id(r.src.path, position)
+    threads = [r.session_key.split(":", 1)[1]]
+    if r.own is not None and r.own.parent and r.own.parent not in threads:
+        threads.append(r.own.parent)
+    for thread in threads:
+        yield f"{HARNESS}:{thread}:{fallback}"
+
+
+def _copied_response_item(r: _Reader, payload: dict, raw, position: int):
     ptype = payload.get("type")
     if ptype == "message" and payload.get("role") == "user":
-        native = payload.get("id")
-        if isinstance(native, str) and native:
-            yield ("user", f"{HARNESS}:{native}")
-        elif raw is not None:
-            yield ("user", f"{HARNESS}:ordinal:{raw}")
+        for native in _copied_user_ids(r, payload, raw, position):
+            yield ("user", native)
         return
     if ptype == "message" and payload.get("role") == "assistant":
         if not _text_of_message(payload):
@@ -995,8 +1028,11 @@ def _copied_response_item(payload: dict, raw):
         native = payload.get("id")
         if isinstance(native, str) and native:
             yield ("event", "assistant_message", native)
-        elif raw is not None:
-            yield ("event", "assistant_message", f"ordinal:{raw}")
+        else:
+            if raw is not None:
+                yield ("event", "assistant_message", f"ordinal:{raw}")
+            yield ("event", "assistant_message",
+                   _fallback_native_id(r.src.path, position))
         return
     if ptype in ("function_call", "custom_tool_call",
                  "function_call_output", "custom_tool_call_output"):
@@ -1018,10 +1054,11 @@ def _copied_event_msg(r: _Reader, obj: dict, payload: dict, position: int):
         return
     if etype == "turn_aborted":
         if payload.get("turn_id"):
-            native = f"turn_aborted:{payload['turn_id']}"
+            yield ("event", "lifecycle", f"turn_aborted:{payload['turn_id']}")
         else:
-            native = "turn_aborted:" + _fallback_native_id(r.src.path, position)
-        yield ("event", "lifecycle", native)
+            yield ("event", "lifecycle", "turn_aborted:None")
+            yield ("event", "lifecycle",
+                   "turn_aborted:" + _fallback_native_id(r.src.path, position))
         return
     if etype == "token_count":
         info = payload.get("info")

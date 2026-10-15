@@ -624,5 +624,61 @@ class CliTest(InterventionsCase):
         self.assertEqual(code, 0, out)
 
 
+class CopiedContextOrderTest(unittest.TestCase):
+    def test_copied_answer_is_not_a_before_window(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            meta = {"type": "session_meta", "payload": {
+                "id": "copied-context", "thread_source": "user"}}
+
+            def msg(role, name, text):
+                payload = {"type": "message", "role": role, "id": name,
+                           "content": [{"type": "text", "text": text}]}
+                if role == "user":
+                    payload["internal_chat_message_metadata_passthrough"] = {
+                        "content_item_kinds": ["user.text"]}
+                return {"type": "response_item", "payload": payload}
+
+            original = os.path.join(tmp.name, "copied-a.jsonl")
+            copy = os.path.join(tmp.name, "copied-b.jsonl")
+            _write(original, [meta, msg("user", "u1", "original question"),
+                              msg("assistant", "a1", "original answer")])
+            _write(copy, [meta, msg("user", "u2", "new question"),
+                          msg("assistant", "a2", "new answer"),
+                          msg("user", "u1", "original question"),
+                          msg("assistant", "a1", "original answer")])
+            for reverse in (False, True):
+                con = db.connect(os.path.join(tmp.name, f"copied-{reverse}.db"))
+                db.init_db(con)
+                try:
+                    for full in (False, True, False):
+                        for path in ((copy, original) if reverse else (original, copy)):
+                            codex.import_codex_file(con, path, full=full)
+                        shown = interventions.show(
+                            con, ["sub:codex:u1", "sub:codex:u2"],
+                            turns_before=1, turns_after=1)
+                        for item in shown:
+                            self.assertEqual(item["status"], "order_unknown", item)
+                            self.assertNotIn("before", item)
+                        sequences = shown[0]["source_sequences"]
+                        orders = []
+                        for sequence in sequences:
+                            users = []
+                            for group in sequence:
+                                for ident in group:
+                                    if ident[0] == "user":
+                                        users.append(ident[1])
+                            orders.append(users)
+                        self.assertIn(["codex:u1"], orders)
+                        self.assertTrue(any(
+                            order.index("codex:u2") < order.index("codex:u1")
+                            for order in orders
+                            if "codex:u2" in order and "codex:u1" in order))
+                finally:
+                    con.close()
+        finally:
+            tmp.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()

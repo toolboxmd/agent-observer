@@ -869,6 +869,139 @@ class OccurrenceReplayFailureTest(unittest.TestCase):
             tmp.cleanup()
 
 
+class RetainedFallbackFamilyTest(unittest.TestCase):
+    """Id-less copied history keeps the id its writer stored.
+
+    A base ledger uses ordinal:N and turn_aborted:None. A current ledger
+    uses the file-position fallback. Replay adopts either row, rewrites a
+    pre-privacy-9 locator to the file position, and leaves the native id
+    and event row in place. Lookup still reads the historical id.
+    """
+
+    BASE = "a4ba7cea0b15d6afb2926a931477e5dece1b4d61"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _rows(self, seed, history_start):
+        child = {"id": "c-" + seed, "parent_thread_id": "p-" + seed,
+                 "thread_source": "subagent"}
+        if history_start is not None:
+            child["subagent_history_start_ordinal"] = history_start
+        rows = [
+            {"type": "session_meta", "ordinal": 0, "payload": child},
+            {"type": "session_meta", "ordinal": 10, "payload": {
+                "id": "p-" + seed, "thread_source": "user"}},
+            {"type": "response_item", "ordinal": 20, "payload": {
+                "type": "message", "role": "user", "id": "u-" + seed,
+                "content": [{"type": "input_text", "text": "parent question"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "content_item_kinds": ["user.text"]}}},
+            {"type": "response_item", "ordinal": 30, "payload": {
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "parent answer"}]}},
+            {"type": "event_msg", "ordinal": 40, "payload": {
+                "type": "turn_aborted", "duration_ms": 123}},
+            {"type": "response_item", "ordinal": 50, "payload": {
+                "type": "message", "role": "assistant",
+                "id": "child-answer-" + seed,
+                "content": [{"type": "output_text", "text": "child answer"}]}},
+        ]
+        return rows
+
+    def test_base_and_current_seeds_keep_answer_and_abort(self):
+        for seed in ("base", "current"):
+            with self.subTest(seed=seed):
+                path = os.path.join(self.tmp.name, f"retained-{seed}.jsonl")
+                db_path = os.path.join(self.tmp.name, f"retained-{seed}.db")
+                _dump(path, self._rows(seed, None))
+                if seed == "base":
+                    _import_at_revision(self.BASE, db_path, path)
+                    con = db.connect(db_path)
+                    db.init_db(con)
+                else:
+                    con = db.connect(db_path)
+                    db.init_db(con)
+                    import_codex_file(con, path)
+                try:
+                    _dump(path, self._rows(seed, 50))
+                    parent = "codex:p-" + seed
+                    ids = None
+                    natives = None
+                    for full in (False, True, False):
+                        import_codex_file(con, path, full=full)
+                        rows = list(con.execute(
+                            "SELECT id, native_id, session_key, ordinal_num,"
+                            " family FROM events ORDER BY id"))
+                        by_native = {row["native_id"]: row for row in rows}
+                        abort = next(row for row in rows
+                                     if row["family"] == "lifecycle"
+                                     and row["session_key"] == parent)
+                        assistant = next(
+                            row for row in rows
+                            if row["family"] == "assistant_message"
+                            and row["session_key"] == parent)
+                        self.assertEqual(abort["ordinal_num"], 4, abort["native_id"])
+                        self.assertEqual(assistant["ordinal_num"], 3)
+                        if seed == "base":
+                            self.assertEqual(abort["native_id"], "turn_aborted:None")
+                            self.assertEqual(assistant["native_id"], "ordinal:30")
+                        else:
+                            self.assertTrue(
+                                abort["native_id"].startswith("turn_aborted:file:"))
+                            self.assertTrue(
+                                assistant["native_id"].startswith("file:"))
+                        shown = lookup.show(
+                            con, [abort["id"], assistant["id"]])
+                        by_id = {item["id"]: item for item in shown}
+                        self.assertEqual(by_id[abort["id"]]["status"], "ok")
+                        self.assertEqual(
+                            by_id[abort["id"]]["record"]["payload"]["type"],
+                            "turn_aborted")
+                        self.assertEqual(by_id[assistant["id"]]["status"], "ok")
+                        self.assertEqual(
+                            by_id[assistant["id"]]["text"], "parent answer")
+                        for row in (abort, assistant):
+                            noted = con.execute(
+                                "SELECT record_position FROM codex_occurrences"
+                                " WHERE row_kind='event' AND row_key=?",
+                                (str(row["id"]),)).fetchone()
+                            self.assertIsNotNone(noted, row["native_id"])
+                            self.assertEqual(
+                                noted["record_position"], row["ordinal_num"])
+                        context = interventions.show(
+                            con, ["sub:codex:u-" + seed],
+                            turns_before=0, turns_after=1)[0]
+                        self.assertEqual(context["status"], "ok", context)
+                        after = [entry.get("text")
+                                 for turn in context["after"]
+                                 for entry in turn["activity"]]
+                        self.assertIn("parent answer", after)
+                        self.assertEqual(con.execute(
+                            "SELECT session_key FROM events"
+                            " WHERE native_id=?",
+                            ("child-answer-" + seed,)).fetchone()[0],
+                            "codex:c-" + seed)
+                        self.assertEqual(con.execute(
+                            "SELECT occurrence_backfill, privacy_version"
+                            " FROM sources").fetchone()[:], (1, 9))
+                        self.assertEqual(con.execute(
+                            "SELECT COUNT(*) FROM import_errors").fetchone()[0], 0)
+                        current_ids = [row["id"] for row in rows]
+                        current_natives = [row["native_id"] for row in rows]
+                        if ids is None:
+                            ids = current_ids
+                            natives = current_natives
+                        else:
+                            self.assertEqual(current_ids, ids)
+                            self.assertEqual(current_natives, natives)
+                finally:
+                    con.close()
+
+
 def _import_at_revision(rev: str, db_path: str, rollout: str) -> None:
     """Import one rollout with the adapter at an exact historical commit."""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

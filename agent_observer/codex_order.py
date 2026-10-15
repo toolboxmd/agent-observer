@@ -3,9 +3,11 @@
 A source sequence is the first occurrence of each identity in that file.
 Identities emitted from the same native record share a record position and
 stay one group: insertion order inside that record is not a cause. A flat
-order of the requested set is known when one source covers the set and
-every other source's projection of the set agrees. Anything else stays
-unknown. This does not build an order over the rest of the session.
+order of the requested set is known when one source covers the set,
+every other source's projection of the set agrees, and no requested
+identity precedes a shared identity in only one source that holds it.
+Anything else stays unknown. This does not build an order over the rest
+of the session.
 """
 
 from __future__ import annotations
@@ -45,6 +47,39 @@ def _groups(con, session_key: str) -> list:
         bucket.append((row["row_kind"], row["row_key"]))
     flush_source()
     return sources
+
+
+def _prefix_conflict(sources, wanted) -> bool:
+    """A requested identity sits before a shared identity in one source
+    and does not sit before it in another source that also holds it.
+
+    The projection drops groups outside the requested set, so that prefix
+    would otherwise disappear. Absence is not precedence, and neither
+    source becomes the clock.
+    """
+    holders: dict = {}
+    for index, groups in enumerate(sources):
+        for group in groups:
+            for ident in group:
+                holders.setdefault(ident, set()).add(index)
+    for ident, present in holders.items():
+        if len(present) < 2:
+            continue
+        prefixes = []
+        for index in present:
+            before: set = set()
+            for group in sources[index]:
+                if ident in group:
+                    break
+                before.update(group)
+            prefixes.append(before)
+        preceded = set()
+        for before in prefixes:
+            preceded.update(item for item in before if item in wanted)
+        for before in prefixes:
+            if preceded - before:
+                return True
+    return False
 
 
 def resolve(con, session_key: str, wanted: set):
@@ -92,4 +127,6 @@ def resolve(con, session_key: str, wanted: set):
                 filtered.append(hit)
         if projected != filtered:
             return "conflict", None, sequences
+    if _prefix_conflict(sources, wanted):
+        return "conflict", None, sequences
     return "known", span, sequences

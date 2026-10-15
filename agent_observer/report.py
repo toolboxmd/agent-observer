@@ -844,27 +844,39 @@ def timeline(con: sqlite3.Connection, task_id: str | None = None,
     sessions = {}
     for event in out:
         sessions.setdefault(event["session_key"], []).append(event)
-    unknown = {}
-    ordered = []
-    # Each session keeps a supported source order. Representative ordinals
-    # are not a clock across sessions, so a multi-session view says so
-    # and still applies the limit after those per-session orders.
+    resolved = {}
     for key, events in sessions.items():
         wanted = {("event", str(event["id"])) for event in events}
-        state, order, sequences = codex_order.resolve(con, key, wanted)
+        resolved[key] = codex_order.resolve(con, key, wanted)
+    unknown = {}
+    ordered = []
+    placed = set()
+    # Sessions with no Codex order stay in the timestamp order above.
+    # A supported Codex order is one block, emitted at that session's
+    # first row, and the limit applies after that block. Representative
+    # ordinals are not a clock across sessions.
+    for event in out:
+        key = event["session_key"]
+        if key in placed:
+            continue
+        state, order, sequences = resolved[key]
+        events = sessions[key]
         if state == "known" and order is not None:
             index = {}
             for place, group in enumerate(order):
                 for ident in group:
                     index[ident] = place
-            events.sort(key=lambda event: (
-                index.get(("event", str(event["id"])), len(index)),
-                event["id"]))
+            block = sorted(events, key=lambda item: (
+                index.get(("event", str(item["id"])), len(index)),
+                item["id"]))
             if len(sessions) > 1:
                 unknown[key] = [order]
-        elif state in ("partial", "conflict"):
-            unknown[key] = sequences
-        ordered.extend(events)
+            ordered.extend(block)
+            placed.add(key)
+        else:
+            if state in ("partial", "conflict"):
+                unknown[key] = sequences
+            ordered.append(event)
     out = ordered
     out = out[:limit]
     # Tool join status: calls joined to results only on equal call_id.

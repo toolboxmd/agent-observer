@@ -82,6 +82,48 @@ class RepeatedReadTest(AnalysisCase):
                     self.assertEqual(len(refs), 1)
                     self.assertEqual(len(set(map(tuple, refs))), 1)
 
+    def test_reversed_copy_is_one_native_pair(self):
+        from agent_observer.adapters.codex import import_codex_file
+        read = lambda name: {
+            "type": "event_msg", "payload": {
+                "type": "item_completed", "item": {
+                    "type": "CommandExecution", "id": name,
+                    "command": ["cat /fabricated/same.py"],
+                    "status": "completed", "exit_code": 0,
+                    "parsed_cmd": [{"type": "read",
+                                    "path": "/fabricated/same.py",
+                                    "cmd": "cat"}]}}}
+        text = lambda name: {
+            "type": "response_item", "payload": {
+                "type": "message", "role": "assistant", "id": name,
+                "content": [{"type": "output_text", "text": name}]}}
+        meta = {"type": "session_meta", "payload": {
+            "id": "dedup", "thread_source": "user", "originator": "codex-tui"}}
+        a = os.path.join(self.tmp.name, "rev-a.jsonl")
+        b = os.path.join(self.tmp.name, "rev-b.jsonl")
+        rows_a = [meta, read("read1"), read("read2"), text("a-only")]
+        rows_b = [meta, read("read2"), read("read1"), text("b-only")]
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                self.con.close()
+                self.con = db.connect(os.path.join(
+                    self.tmp.name, f"reversed-{reverse}.db"))
+                db.init_db(self.con)
+                for path, rows in ((a, rows_a), (b, rows_b)):
+                    with open(path, "w") as fh:
+                        for row in rows:
+                            fh.write(json.dumps(row) + "\n")
+                for full in (False, True, False):
+                    for path in ((b, a) if reverse else (a, b)):
+                        import_codex_file(self.con, path, full=full)
+                    found = analysis.diagnose(
+                        self.con, detectors=["repeated_read"])
+                    self.assertEqual(found["counts"].get("repeated_read"), 1)
+                    incidents = found["incidents"]
+                    self.assertEqual(len(incidents), 1)
+                    self.assertEqual(incidents[0]["direction"], "unknown")
+                    self.assertEqual(len(set(incidents[0]["event_refs"])), 2)
+
     def test_same_range_twice_is_a_candidate(self):
         self.session("claude:a")
         for _ in range(2):

@@ -175,14 +175,21 @@ def _index_codex(path: str) -> _Index:
             continue
         ptype = p.get("type")
         if obj.get("type") == "event_msg" and ptype == "turn_aborted":
-            index.records[f"turn_aborted:{p['turn_id']}" if p.get("turn_id")
-                          else f"turn_aborted:{fallback}"] = obj
+            if p.get("turn_id"):
+                index.records[f"turn_aborted:{p['turn_id']}"] = obj
+            else:
+                index.records[f"turn_aborted:{fallback}"] = obj
+                index.records["turn_aborted:None"] = obj
         elif obj.get("type") == "event_msg" and ptype == "task_complete":
             index.records[f"task_complete:{p.get('turn_id')}"] = obj
         if obj.get("type") == "response_item":
             if ptype == "message" and p.get("role") == "assistant":
-                index.text(p.get("id") or fallback,
-                           _codex_text(p.get("content")))
+                text = _codex_text(p.get("content"))
+                index.text(p.get("id") or fallback, text)
+                if not p.get("id"):
+                    raw = obj.get("ordinal")
+                    if isinstance(raw, int) and not isinstance(raw, bool):
+                        index.text(f"ordinal:{raw}", text)
             elif ptype == "message" and p.get("role") == "user":
                 message_id = p.get("id")
                 if isinstance(message_id, str) and message_id:

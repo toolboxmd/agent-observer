@@ -182,17 +182,22 @@ def _once_per_evidence(incidents: list) -> list:
     """One incident per native evidence, across source projections.
 
     Separate projections stay separate while they are built. The same
-    event ids are one piece of native work even when a copied file makes
-    the projection partial.
+    event ids are one piece of native work in either order. When the
+    projections disagree on that order, the direction stays unknown.
     """
-    seen = set()
+    seen = {}
     out = []
     for incident in incidents:
-        key = (incident["detector"], tuple(incident.get("event_refs") or ()))
-        if key in seen:
+        refs = incident.get("event_refs") or ()
+        key = (incident["detector"], frozenset(refs))
+        prior = seen.get(key)
+        if prior is None:
+            seen[key] = incident
+            out.append(incident)
             continue
-        seen.add(key)
-        out.append(incident)
+        if tuple(prior.get("event_refs") or ()) != tuple(refs):
+            prior["event_refs"] = sorted(refs)
+            prior["direction"] = "unknown"
     return out
 
 
