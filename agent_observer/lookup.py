@@ -540,13 +540,29 @@ def _backing_without_events(con, event_rows, *, session_key, session_keys,
         # Older schema-3 ledgers acquire occurrence metadata only on sync.
         if table == "codex_occurrences" and not _has_table(con, table):
             continue
-        clause, key_args = _key_filter("session_key", session_key, session_keys)
+        clause, key_args = _key_filter("e.session_key", session_key, session_keys)
+        joins = ""
+        if harness is not None:
+            # Filter before UNION builds backing evidence. Preserve source-first
+            # harness ownership, including dangling-source/session fallbacks.
+            joins = (
+                " LEFT JOIN sources src ON src.id = e.source_id"
+                " LEFT JOIN sessions sess ON sess.session_key = e.session_key")
+            clause += (
+                " AND COALESCE(src.harness, sess.harness,"
+                " substr(e.session_key, 1, instr(e.session_key, ':') - 1))=?")
+            key_args.append(harness)
         selects.append(
-            f"SELECT session_key, source_id FROM {table}"
-            f" WHERE source_id IS NOT NULL{clause}")
+            f"SELECT e.session_key, e.source_id FROM {table} e{joins}"
+            f" WHERE e.source_id IS NOT NULL{clause}")
         args.extend(key_args)
     clause, key_args = _key_filter(
         "sess.session_key", session_key, session_keys)
+    if harness is not None:
+        # This join otherwise compares every session with every same-harness
+        # source, even when the caller requested a different, small harness.
+        clause += " AND sess.harness=?"
+        key_args.append(harness)
     selects.append(
         "SELECT sess.session_key, src.id FROM sessions sess"
         " JOIN sources src ON src.harness = sess.harness"
