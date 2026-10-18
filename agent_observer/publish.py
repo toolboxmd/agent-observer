@@ -10,13 +10,13 @@ prompts, tool arguments or file contents.
 from __future__ import annotations
 
 import json
-import os
 import re
 import shlex
 import subprocess
 from datetime import datetime, timezone
 
 from . import analysis, report
+from .gh import structured_env
 
 MARKER = "<!-- agent-observer:summary v1 -->"
 
@@ -572,15 +572,13 @@ def render(summary: dict, target: str | None = None) -> str:
 def _gh(args: list, payload: dict | None = None) -> dict | list:
     """Run `gh api` and parse one JSON document.
 
-    CLICOLOR_FORCE makes gh colorize JSON even on a pipe and even when
-    NO_COLOR is set. That stdout is not JSON. This call turns the force
-    off. Empty or non-JSON stdout names the command and its stderr.
+    Child terminal forcing is disabled so stdout stays machine-readable.
+    Empty or non-JSON stdout names the command and its stderr.
     """
     cmd = ["gh", "api", *args] + (["--input", "-"] if payload else [])
-    env = os.environ.copy()
-    env["CLICOLOR_FORCE"] = "0"
     proc = subprocess.run(cmd, input=json.dumps(payload) if payload else None,
-                          capture_output=True, text=True, check=False, env=env)
+                          capture_output=True, text=True, check=False,
+                          env=structured_env())
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or f"gh api failed: {args}")
     stdout = proc.stdout or ""

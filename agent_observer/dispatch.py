@@ -27,11 +27,13 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import sqlite3
 import statistics
 import subprocess
 
 from . import pricing
+from .gh import structured_env
 from .adapters import t3 as _t3
 from .ingest import iso_ts
 
@@ -251,11 +253,20 @@ def _share(acc: dict, rows: list, weight: float, schedule: dict) -> None:
 
 
 def _gh_json(args: list):
-    proc = subprocess.run(["gh", *args], capture_output=True, text=True,
-                          timeout=60)
+    cmd = ["gh", *args]
+    proc = subprocess.run(cmd, capture_output=True, text=True,
+                          timeout=60, env=structured_env())
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "gh failed")
-    return json.loads(proc.stdout or "null")
+    stdout = proc.stdout or ""
+    stderr = (proc.stderr or "").strip() or "(no stderr)"
+    command = shlex.join(cmd)
+    if not stdout.strip():
+        raise RuntimeError(f"{command} returned empty output: {stderr}")
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{command} returned non-JSON output: {stderr}") from exc
 
 
 def fetch_approval(item: str) -> dict:
