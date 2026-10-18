@@ -366,6 +366,9 @@ CREATE INDEX IF NOT EXISTS idx_responses_session ON responses(session_key);
 CREATE INDEX IF NOT EXISTS idx_responses_reconcile ON responses(session_key, semantics, is_overlap, thread_total_tokens, total_tokens);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_key, ts);
 CREATE INDEX IF NOT EXISTS idx_events_family ON events(family);
+-- Session order resolution must not scan every source's occurrences.
+CREATE INDEX IF NOT EXISTS idx_codex_occurrences_session
+  ON codex_occurrences(session_key, source_id, record_position);
 CREATE INDEX IF NOT EXISTS idx_user_messages_session ON user_messages(session_key);
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_dir);
 CREATE INDEX IF NOT EXISTS idx_router_inv_request ON router_invocations(request_id);
