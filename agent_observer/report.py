@@ -810,7 +810,9 @@ def timeline(con: sqlite3.Connection, task_id: str | None = None,
             "SELECT session_key FROM session_assignments WHERE task_id=?",
             (task_id,)))
         if not task_turns and not whole:
-            return {"events": [], "note": "no bound turns; timeline empty",
+            return {"events": [], "returned": 0, "total": 0,
+                    "truncated": False,
+                    "note": "no bound turns; timeline empty",
                     "join": {"calls": 0, "results": 0, "joined_call_ids": [],
                              "unmatched_results": [], "unanswered_calls": []}}
         clauses = []
@@ -864,12 +866,16 @@ def timeline(con: sqlite3.Connection, task_id: str | None = None,
     out = [next(ordered_sessions[event["session_key"]])
            if event["session_key"] in ordered_sessions else event
            for event in out]
+    total = len(out)
     out = out[:limit]
     # Tool join status: calls joined to results only on equal call_id.
     calls = {e["native_id"] for e in out if e["family"] == "tool_call"}
     results = {e["native_id"] for e in out if e["family"] == "tool_result"}
     result = {
         "events": out,
+        "returned": len(out),
+        "total": total,
+        "truncated": len(out) < total,
         "join": {
             "calls": len(calls),
             "results": len(results),
@@ -880,6 +886,8 @@ def timeline(con: sqlite3.Connection, task_id: str | None = None,
         "coverage_note": ("Native evidence absent stays unknown; unmatched "
                           "items are retained, never guessed into a match."),
     }
+    if result["truncated"]:
+        result["truncation_hint"] = "Increase --limit to show more events."
     if unknown:
         result["chronology"] = "unknown"
         result["source_sequences"] = {
