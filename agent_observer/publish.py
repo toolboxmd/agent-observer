@@ -594,6 +594,53 @@ def _gh(args: list, payload: dict | None = None) -> dict | list:
         raise RuntimeError(f"{command} returned non-JSON output: {stderr}") from None
 
 
+def empty_scope_message(task: str | None) -> str:
+    """Explain Issue-shaped empty tasks without changing their attribution.
+
+    Only the first 100 timeline events are inspected: suggestions are cheap,
+    best-effort hints, never a claim to enumerate an Issue's whole outcome.
+    """
+    empty = "nothing to publish: no sessions in scope"
+    match = re.fullmatch(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([1-9][0-9]*)", task or "")
+    if not match:
+        return empty
+    repo, number = match.groups()
+    hint = f"use --task {repo}#<PR> for work attributed to a PR"
+    try:
+        issue = _gh([f"repos/{repo}/issues/{number}"])
+    except (RuntimeError, OSError):
+        return f"{empty}; GitHub lookup failed; {hint}"
+    if not isinstance(issue, dict):
+        return f"{empty}; GitHub lookup failed; {hint}"
+    if "pull_request" in issue:
+        return empty
+    message = f"{empty}; Issues are not tasks here for PR-attributed work; {hint}"
+    try:
+        events = _gh([f"repos/{repo}/issues/{number}/timeline?per_page=100"])
+    except (RuntimeError, OSError):
+        return message
+    refs = set()
+    for event in events if isinstance(events, list) else []:
+        if not isinstance(event, dict) or event.get("event") != "cross-referenced":
+            continue
+        source = event.get("source") or {}
+        linked = source.get("issue") if isinstance(source, dict) else None
+        if not isinstance(linked, dict) or "pull_request" not in linked:
+            continue
+        pr = linked["pull_request"]
+        if linked.get("state") != "open" and not (
+                isinstance(pr, dict) and pr.get("merged_at")):
+            continue
+        url = linked.get("html_url")
+        ref = re.fullmatch(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)",
+                           url) if isinstance(url, str) else None
+        if ref:
+            refs.add(f"{ref[1]}#{ref[2]}")
+    if refs:
+        message += "; referencing PRs found: " + ", ".join(sorted(refs))
+    return message
+
+
 def _authenticated_login() -> str:
     """The GitHub user Observer posts as, via the existing gh login."""
     me = _gh(["user"])

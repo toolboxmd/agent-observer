@@ -1191,7 +1191,7 @@ def _publish(con, ns) -> int:
         keys = set(ns.session)
         label = f"{len(keys)} session(s)"
     if not keys:
-        print("nothing to publish: no sessions in scope", file=sys.stderr)
+        print(_publish_mod.empty_scope_message(ns.task), file=sys.stderr)
         return 2
     schedule = None
     if getattr(ns, "prices", None):
