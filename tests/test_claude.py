@@ -1,6 +1,9 @@
 """Claude Code adapter: usage once per message, human input kinds, events,
 instruction identity, subagents."""
 
+import contextlib
+import io
+import json
 import os
 
 from agent_observer import report
@@ -102,6 +105,59 @@ class ClaudeMetadataTest(LedgerCase):
     carries per-model counters pending reconciliation, so it stays
     quarantined as unsupported_schema with nothing stored. Genuinely
     unknown types stay quarantined as unsupported_schema."""
+
+    def test_request_replay_metadata_is_private_and_does_not_change_counts(self):
+        path = os.path.join(self.tmp.name, "replay.jsonl")
+        records = [
+            {"type": "assistant", "sessionId": "replay-session",
+             "uuid": "assistant-1", "message": {
+                 "id": "response-1", "model": "synthetic-model",
+                 "usage": {"input_tokens": 10, "output_tokens": 5,
+                           "cache_creation_input_tokens": 0,
+                           "cache_read_input_tokens": 0},
+                 "content": [{"type": "tool_use", "id": "call-1",
+                              "name": "Read", "input": {"file_path": "/synthetic/file"}}]}},
+            {"type": "user", "sessionId": "replay-session", "uuid": "result-1",
+             "message": {"content": [{"type": "tool_result", "tool_use_id": "call-1",
+                                      "content": "synthetic result"}]}},
+        ]
+        _write(path, [json.dumps(record) + "\n" for record in records])
+        claude.import_claude_file(self.con, path)
+        responses = [tuple(row) for row in self.query("SELECT * FROM responses")]
+        events = [tuple(row) for row in self.query("SELECT * FROM events ORDER BY id")]
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(self.query("SELECT total_tokens FROM responses")[0][0], 15)
+        self.assertEqual(self.query(
+            "SELECT COUNT(*) FROM events WHERE family IN ('tool_call','tool_result')")[0][0], 2)
+
+        sentinels = []
+        for kind in ("api-request", "api-request-blob", "api-request-shape",
+                     "api-request-future"):
+            with self.subTest(kind=kind):
+                sentinel = "SYNTHETIC-PRIVATE-" + kind
+                sentinels.append(sentinel)
+                record = {"type": kind, "sessionId": "replay-session",
+                          "request": {"messages": [{"content": sentinel}],
+                                      "system": sentinel, "tools": [{"description": sentinel}]},
+                          "blob": sentinel, "shape": {"text": sentinel}}
+                with open(path, "a") as fh:
+                    fh.write(json.dumps(record) + "\n")
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                    stats = claude.import_claude_file(self.con, path)
+                unknown = kind == "api-request-future"
+                self.assertEqual(stats["malformed"], int(unknown))
+                errors = self.query("SELECT error FROM import_errors")
+                self.assertEqual([row[0] for row in errors],
+                                 ["unsupported_schema"] if unknown else [])
+                self.assertEqual([tuple(row) for row in self.query("SELECT * FROM responses")],
+                                 responses)
+                self.assertEqual([tuple(row) for row in self.query("SELECT * FROM events ORDER BY id")],
+                                 events)
+                ledger = "\n".join(self.con.iterdump())
+                for value in sentinels:
+                    self.assertNotIn(value, ledger)
+                    self.assertNotIn(value, output.getvalue())
 
     def test_cost_state_is_quarantined_with_nothing_stored(self):
         stats = claude.import_claude_file(

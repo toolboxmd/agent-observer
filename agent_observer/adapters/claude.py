@@ -65,6 +65,9 @@ CAPABILITIES = [
 # silently dropped.
 IGNORED_METADATA_TYPES = frozenset({
     "agent-name",
+    "api-request",
+    "api-request-blob",
+    "api-request-shape",
     "atis-latch",
     "bridge-session",
     "custom-title",
