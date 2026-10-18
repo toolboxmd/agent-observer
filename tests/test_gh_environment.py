@@ -27,6 +27,24 @@ sys.stdout.write(output + "\n")
 
 
 class StructuredGhEnvironmentTests(unittest.TestCase):
+    def test_dispatch_invalid_stdout_names_command_and_stderr(self):
+        for stdout, kind in (("", "empty"), (" \n", "empty"),
+                             ("not-json", "non-JSON")):
+            for stderr in ("wrapper diagnostic\n", ""):
+                with self.subTest(stdout=stdout, stderr=stderr):
+                    proc = mock.Mock(returncode=0, stdout=stdout, stderr=stderr)
+                    with mock.patch.dict(os.environ, {"GH_TOKEN": "synthetic-secret"}), \
+                            mock.patch.object(dispatch.subprocess, "run", return_value=proc):
+                        with self.assertRaises(RuntimeError) as caught:
+                            dispatch._gh_json(["pr", "view", "93", "--json", "number"])
+                    message = str(caught.exception)
+                    self.assertIn("gh pr view 93 --json number", message)
+                    self.assertIn(f"returned {kind} output", message)
+                    self.assertIn(stderr.strip() or "(no stderr)", message)
+                    self.assertNotIn("synthetic-secret", message)
+                    if kind == "non-JSON":
+                        self.assertIsInstance(caught.exception.__cause__, json.JSONDecodeError)
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
