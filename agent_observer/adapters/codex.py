@@ -1618,6 +1618,27 @@ def _ingest_turn(r: _Reader, obj: dict) -> None:
         (p.get("model"), p.get("effort"), turn_id))
 
 
+def _merge_legacy_user_message(con, legacy: str, target: str) -> None:
+    """Keep the existing current identity and fold its proven legacy copy into it.
+
+    Existing target evidence wins a duplicate task/child/judge key; distinct
+    evidence is moved intact. The legacy id remains usable as a CLI alias.
+    """
+    con.execute("UPDATE user_messages SET alias_id=COALESCE(alias_id, ?) WHERE native_id=?",
+                (legacy, target))
+    for table, column, old, new in (
+        ("assignments", "user_message_id", legacy, target),
+        ("delegations", "owning_user_message", legacy, target),
+        ("verdicts", "intervention_id", f"sub:{legacy}", f"sub:{target}"),
+    ):
+        con.execute(f"UPDATE OR IGNORE {table} SET {column}=? WHERE {column}=?", (new, old))
+        con.execute(f"DELETE FROM {table} WHERE {column}=?", (old,))
+    con.execute("UPDATE OR IGNORE codex_occurrences SET row_key=?"
+                " WHERE row_kind='user' AND row_key=?", (target, legacy))
+    con.execute("DELETE FROM codex_occurrences WHERE row_kind='user' AND row_key=?", (legacy,))
+    con.execute("DELETE FROM user_messages WHERE native_id=?", (legacy,))
+
+
 def _ingest_response_item(r: _Reader, obj: dict, native_ordinal, position: int) -> None:
     p = obj["payload"]
     ptype = p.get("type")
@@ -1638,8 +1659,18 @@ def _ingest_response_item(r: _Reader, obj: dict, native_ordinal, position: int) 
         native = p.get("id") or f"{r.session_key.partition(':')[2]}:{fallback}"
         if not p.get("id") and r.src.privacy_stale:
             legacy = f"{HARNESS}:ordinal:{native_ordinal}"
-            prior = r.con.execute("SELECT source_id FROM user_messages WHERE native_id=? AND session_key=?",
+            prior = r.con.execute("SELECT * FROM user_messages WHERE native_id=? AND session_key=?",
                                   (legacy, r.session_key)).fetchone()
+            target = r.con.execute("SELECT * FROM user_messages WHERE native_id=?",
+                                   (f"{HARNESS}:{native}",)).fetchone()
+            if (prior and target and r._legacy_source_matches(prior["source_id"])
+                    and all(prior[field] == target[field] for field in
+                            ("source_id", "session_key", "ordinal_num",
+                             "turn_id", "text_hash", "ts"))):
+                # A mixed-version ledger can already hold both identities.
+                # Renaming the legacy row would violate the primary key.
+                _merge_legacy_user_message(r.con, legacy, f"{HARNESS}:{native}")
+                prior = None
             if prior and r._legacy_source_matches(prior["source_id"]):
                 # Preserve captured ownership for every source-owned old
                 # fallback, including the first collapsed None identity.
