@@ -181,6 +181,9 @@ def _text(payload) -> str:
                  f"joined call_ids: {len(payload['join']['joined_call_ids'])}",
                  f"unmatched results: {len(payload['join']['unmatched_results'])}",
                  f"unanswered calls: {len(payload['join']['unanswered_calls'])}"]
+        if payload.get("truncated"):
+            lines[0] = (f"events: {payload['returned']} of {payload['total']} "
+                        f"(truncated). {payload['truncation_hint']}")
         for e in payload["events"][:50]:
             lines.append(
                 f"  #{e.get('ordinal_num')} {e.get('family')} "
