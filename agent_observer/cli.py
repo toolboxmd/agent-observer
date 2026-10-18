@@ -93,6 +93,9 @@ def _text(payload) -> str:
                     f"{h.get('events_inserted', 0)} new events, "
                     f"{h.get('user_messages_inserted', 0)} new user messages, "
                     f"{h.get('malformed', 0)} malformed records kept in import_errors")
+            if h.get("identity_conflicts"):
+                line += (f", {h['identity_conflicts']} user message identity"
+                         " conflicts kept in import_errors")
             if h.get("failed"):
                 line += f", {len(h['failed'])} sources failed"
             if h.get("skipped"):
