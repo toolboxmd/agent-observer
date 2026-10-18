@@ -439,6 +439,70 @@ class HumanSignalsTest(AnalysisCase):
         self.assertEqual(len(self.found("grok:u", "human_correction")), 1)
 
 
+class UserConfusionTest(AnalysisCase):
+    """A user asking the agent to restate what it just said, in any wording."""
+
+    def reply_then(self, key, text):
+        self.event(key, "assistant_message", detail={"excerpt": "Synthetic agent report."})
+        agent = self.seq
+        self.prompt(key, text)
+        return agent, f"s{self.seq}"
+
+    def test_varied_wording_links_the_message_and_the_agent_reply(self):
+        self.session("claude:c")
+        pairs = [self.reply_then("claude:c", text) for text in (
+            "huh?", "bro", "What do you mean by that?",
+            "i dont really get it, explain it better",
+            "simpler please", "too much detail for a non programmer",
+            "nie rozumiem, wyjaśnij prościej", "Was meinst du?",
+            "no entiendo", "je ne comprends pas", "że co?")]
+        found = sorted(self.found("claude:c", "user_confusion"), key=lambda i: i["ts"])
+        self.assertEqual(len(found), len(pairs))
+        ids = {e["native_id"]: e["id"] for e in self.con.execute(
+            "SELECT id, native_id FROM events WHERE session_key='claude:c'")}
+        for incident, (agent_seq, user_ref) in zip(found, pairs):
+            agent_id = ids[f"e{agent_seq}"]
+            self.assertTrue(incident["heuristic"])
+            self.assertEqual(incident["user_message"], user_ref)
+            self.assertEqual(incident["agent_message"], agent_id)
+            self.assertEqual(incident["event_refs"], [agent_id, user_ref])
+            self.assertIn(incident["signal"], ("phrase", "bare"))
+            self.assertNotIn("?", incident["summary"])
+        self.assertEqual([i["signal"] for i in found[:2]], ["bare", "bare"])
+
+    def test_near_misses_are_not_confusion(self):
+        self.session("claude:n")
+        for text in ("what about the tests?", "no, that's wrong, revert it",
+                     "explain how the parser works", "what do we do next",
+                     "you crazy bruh, use the proxy", "I don't get any errors now",
+                     "continue", "yes"):
+            self.reply_then("claude:n", text)
+        self.assertEqual(self.found("claude:n", "user_confusion"), [])
+
+    def test_needs_an_agent_message_directly_before(self):
+        self.session("claude:s")
+        self.prompt("claude:s", "what?")
+        self.event("claude:s", "assistant_message", detail={"excerpt": "Synthetic reply."})
+        self.prompt("claude:s", "please also add a test")
+        self.prompt("claude:s", "what do you mean")
+        self.assertEqual(self.found("claude:s", "user_confusion"), [])
+
+    def test_long_messages_quoting_the_wording_do_not_count(self):
+        self.session("claude:l")
+        self.reply_then("claude:l", "Judge this transcript. " * 10 + "The user said: what do you mean?")
+        self.assertEqual(self.found("claude:l", "user_confusion"), [])
+
+    def test_compare_counts_per_version_with_unknown_kept(self):
+        self.session("claude:v1", version="12.1.0")
+        self.session("claude:v2", version=None)
+        self.reply_then("claude:v1", "huh?")
+        self.reply_then("claude:v2", "what do you mean?")
+        self.reply_then("claude:v2", "ok, continue")
+        groups = {g["group"]: g for g in analysis.compare(self.con, by="agentsmd")["groups"]}
+        self.assertEqual(groups["12.1.0"]["user_confusion"], {"incidents": 1, "per_session": 1.0})
+        self.assertEqual(groups["unknown"]["user_confusion"], {"incidents": 1, "per_session": 1.0})
+
+
 class DiagnoseWindowTest(AnalysisCase):
     def test_incidents_outside_the_window_are_dropped(self):
         # A session spanning the window boundary keeps only in-window incidents.

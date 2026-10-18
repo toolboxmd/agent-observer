@@ -292,6 +292,7 @@ FLAG_PHRASES = {
     "test_edit_after_failure": ("test edited after a failure", "tests edited after a failure"),
     "permission_seeking": ("permission request", "permission requests"),
     "human_correction": ("human correction", "human corrections"),
+    "user_confusion": ("clarification request", "clarification requests"),
     "large_tool_output": ("large tool output", "large tool outputs"),
 }
 

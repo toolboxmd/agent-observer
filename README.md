@@ -94,7 +94,15 @@ the exact interventions:
 | `repeated_command`, `repeated_failure` | a command run three or more times, or failing twice in a row |
 | `permission_seeking` (heuristic) | a turn ending with a question asking permission |
 | `human_correction` (heuristic for wording) | interrupts, permission denials, and prompts that open with a correction |
+| `user_confusion` (heuristic) | a short prompt, directly after an agent message, asking the agent to restate or explain it ("huh?", "what do you mean", "explain it simpler", and Polish, German, Spanish, French, Italian and Portuguese equivalents); it links both messages by reference and keeps no text |
 | `large_tool_output` | tool results of 50 KB or more, or truncated |
+
+`user_confusion` uses fixed multilingual patterns plus structure, with no
+model call: the prompt is at most 200 characters, and the latest agent
+message comes after the previous genuine prompt. On a labeled sample of 173
+real prompts from one machine (5 confusion requests) it found 4 of 5 with no
+false positives. That sample held no non-English prompts, so non-English
+wording is covered by synthetic tests only.
 
 Comparisons are observational: groups differ in period, projects and task
 mix, so differences are leads to inspect, not causal effects. Detector

@@ -14,6 +14,7 @@ import json
 import re
 import sqlite3
 import statistics
+import unicodedata
 from collections import defaultdict
 
 from . import codex_order
@@ -32,13 +33,42 @@ PERMISSION_RE = re.compile(
 CORRECTION_RE = re.compile(
     r"^\s*(no\b|nope\b|stop\b|wrong\b|that'?s not\b|not what i\b|don'?t\b|why did you\b"
     r"|you didn'?t\b|bro\b|bruh\b|wtf\b|i said\b|again\?|this is wrong\b)", re.I)
+# A request to restate or explain what the agent just said. Matched on a
+# lowercased, accent-folded message (see _fold), so the patterns stay ASCII.
+CONFUSION_PHRASE_RE = re.compile(
+    r"\bwhat (?:do|did) (?:you|u|ya) (?:mean|meant)\b|\bwhat does (?:that|this|it) mean\b"
+    r"|\bwhat (?:are|r) (?:you|u) (?:talking about|saying)\b|\bwhat(?:'s| is) that supposed to mean\b"
+    r"|\b(?:i|we) (?:still )?(?:do not|don'?t|didn'?t|did not|can'?t|cannot)(?: really| quite| fully)?"
+    r" (?:understand|follow|get (?:it|this|that|what|you|any of))\b"
+    r"|\b(?:i'?m|i am) (?:confused|lost)\b|\bno idea what (?:you|u) mean\b"
+    r"|\b(?:explain|say|put|write) (?:it |that |this )?(?:again|better|simpler|more simply|differently"
+    r"|in (?:plain|simple|simpler|normal)|like i'?m)\b|\bexplain (?:it|that|this|yourself)(?: to me)?\s*[?.!]*$"
+    r"|\b(?:plain|simple|simpler|normal|human) (?:english|words|terms|language)\b|\beli5\b"
+    r"|^\s*(?:much |a bit |way )?simpler\b|\bmore simply\b|\btoo (?:much detail|technical|complicated|dense|jargony)\b"
+    r"|\bnon[- ]?(?:programmer|developer|technical|engineer)\b|\belaborate\b|\bcome again\b"
+    r"|\bsay (?:that|it) again\b|\brephrase\b|\bmake (?:it|this|that) (?:simpler|clearer)\b"
+    # Polish, German, Spanish, French, Italian, Portuguese.
+    r"|\bco (?:masz|mial[eo]s|miales) na mysli\b|\bco to (?:znaczy|oznacza)\b|\bnie (?:rozumiem|kumam|lapie|czaje)\b"
+    r"|\bo co (?:ci |wam )?chodzi\b|\b(?:wytlumacz|wyjasnij|wytlumaczysz|wyjasnisz)\b|\b(?:prosciej|jasniej|po ludzku)\b"
+    r"|\bwas (?:meinst du|meinen sie|heisst das|soll das heissen)\b|\b(?:ich )?versteh(?:e)? (?:das |dich |es )?nicht\b"
+    r"|\bwie bitte\b|\berklar(?:e|en sie)? (?:das |es )?(?:nochmal|einfacher|besser)\b|\beinfacher\b"
+    r"|\bque (?:quieres|quiere) decir\b|\bno (?:te |lo )?entiendo\b|\bexplica(?:me|melo)\b|\bmas (?:simple|sencillo|claro)\b"
+    r"|\bqu'?est-ce que (?:tu veux|vous voulez) dire\b|\bque veux-tu dire\b|\bje (?:ne )?(?:te |vous )?comprends pas\b"
+    r"|\bj'?ai pas compris\b|\bexplique(?:-moi|z)\b|\bplus simplement\b"
+    r"|\b(?:cosa|che) intendi\b|\bnon (?:capisco|ho capito)\b|\bspiegami\b|\bpiu semplice\b"
+    r"|\bo que (?:voce|tu) quer dizer\b|\bnao (?:entendi|entendo)\b|\bexplica melhor\b|\bmais simples\b")
+# The whole message is a short interjection, optionally with bro/bruh.
+CONFUSION_BARE_RE = re.compile(
+    r"^(?:(?:bro|bruh)\W*)?(?:huh|what|wut|wat|wha|eh|hm+|sorry|pardon|meaning|co|ze co|slucham"
+    r"|was|hae|wie|que|como|quoi|hein|comment|cosa|come|o que|bro|bruh)?[\s?!.]*$")
+CONFUSION_MAX_CHARS = 200
 LARGE_OUTPUT_BYTES = 50_000
 AGENTSMD_PATH = "/agentsmd/"
 
 DETECTORS = ("repeated_read", "repeated_skill_load", "repeated_command",
              "repeated_failure", "test_edit_after_failure", "permission_seeking",
-             "human_correction", "large_tool_output")
-HEURISTIC = {"permission_seeking", "human_correction"}
+             "human_correction", "user_confusion", "large_tool_output")
+HEURISTIC = {"permission_seeking", "human_correction", "user_confusion"}
 
 
 def _detail(row) -> dict:
@@ -220,6 +250,7 @@ def detect_session(con, session) -> list:
     incidents = _once_per_evidence(incidents)
     incidents += _permission_seeking(session, events)
     incidents += _human_corrections(con, session, events)
+    incidents += _user_confusion(con, session, events)
     incidents += _large_outputs(session, events)
     return sorted(incidents, key=lambda i: (i["ts"] or 0))
 
@@ -500,6 +531,53 @@ def _human_corrections(con, session, events) -> list:
                 or (denial is None and session["harness"] != "claude")):
             out.append(_incident(session, "human_correction", e["ts"],
                                  f"denied {e['name']}", [e["id"]], {"signal": "denial"}))
+    return out
+
+
+def _fold(text: str) -> str:
+    """Lowercase without accents, so one ASCII pattern covers both spellings."""
+    text = text.replace("\u2019", "'").replace("\u0142", "l").replace("\u0141", "l")
+    text = unicodedata.normalize("NFKD", text.lower())
+    return " ".join("".join(c for c in text if not unicodedata.combining(c)).split())
+
+
+def _confusion_signal(text: str) -> str | None:
+    folded = _fold(text)
+    if not folded or len(folded) > CONFUSION_MAX_CHARS:
+        return None
+    if CONFUSION_BARE_RE.match(folded) and any(c.isalnum() or c == "?" for c in folded):
+        return "bare"
+    if CONFUSION_PHRASE_RE.search(folded):
+        return "phrase"
+    return None
+
+
+def _user_confusion(con, session, events) -> list:
+    """A short genuine prompt asking the agent to restate what it just said.
+
+    It must directly follow an agent message: the latest assistant message
+    comes after the previous genuine prompt. The finding carries references
+    to both messages and no text.
+    """
+    agent = [e for e in events if e["family"] == "assistant_message" and e["ts"] is not None]
+    out = []
+    last_prompt = None
+    for row in con.execute(
+            "SELECT native_id, ts, text_excerpt FROM user_messages"
+            " WHERE session_key=? AND kind='genuine' AND ts IS NOT NULL ORDER BY ts",
+            (session["session_key"],)):
+        before = [e for e in agent if e["ts"] < row["ts"]
+                  and (last_prompt is None or e["ts"] > last_prompt)]
+        last_prompt = row["ts"]
+        signal = _confusion_signal(row["text_excerpt"] or "")
+        if not before or signal is None:
+            continue
+        reply = before[-1]
+        out.append(_incident(session, "user_confusion", row["ts"],
+                             "asked the agent to restate or explain its message",
+                             [reply["id"], row["native_id"]],
+                             {"signal": signal, "user_message": row["native_id"],
+                              "agent_message": reply["id"]}))
     return out
 
 
