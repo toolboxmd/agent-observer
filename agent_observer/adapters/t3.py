@@ -707,10 +707,15 @@ def _import_threads(con: sqlite3.Connection, native: sqlite3.Connection,
     # Without V2 creation evidence (V1 threads, legacy imports), the first
     # turn start says who opened the thread.
     first_turn = {}
-    for r in con.execute(
-            "SELECT thread_id, actor_kind FROM t3_turn_origins"
-            " ORDER BY occurred_at DESC"):
-        first_turn[r["thread_id"]] = r["actor_kind"]
+    if "orchestration_events" in _tables(native):
+        for r in native.execute(
+                "SELECT stream_id, actor_kind FROM orchestration_events"
+                " WHERE event_type=? AND occurred_at IS NOT NULL"
+                " ORDER BY occurred_at, sequence", (TURN_START_EVENT,)):
+            # Read the raw first turn even when it has no projection/native
+            # mapping. An unknown first actor cannot be replaced by a later one.
+            first_turn.setdefault(r["stream_id"],
+                                  r["actor_kind"] if r["actor_kind"] in ACTORS else None)
 
     def opened_by(thread_id):
         evidence = (lineage.get(thread_id) or {}).get("opened_by")

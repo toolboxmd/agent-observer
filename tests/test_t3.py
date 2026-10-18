@@ -189,6 +189,40 @@ class T3SyncTest(LedgerCase):
         return {r["native_id"]: (r["kind"], r["turn_id"]) for r in self.query(
             "SELECT native_id, kind, turn_id FROM user_messages")}
 
+    def test_opener_fallback_uses_raw_first_turn(self):
+        # Earliest event is unmapped; projection_turns only maps later turns.
+        for scenario, first_at, first_sequence in (
+                ("unmapped", "2026-09-27T09:00:00Z", 3),
+                ("equal-time", "2026-09-27T10:00:00Z", 1)):
+            with self.subTest(scenario=scenario):
+                write_state(self.t3_path)
+                with sqlite3.connect(self.t3_path) as native:
+                    native.execute("UPDATE orchestration_events SET sequence=2")
+                    for actor, stamp, sequence in (
+                            ("server", first_at, first_sequence),
+                            ("client", None, 0)):
+                        native.execute(
+                            "INSERT INTO orchestration_events(stream_id,event_type,"
+                            "occurred_at,sequence,actor_kind,payload_json)"
+                            " VALUES(?,?,?,?,?,?)",
+                            (T1, "thread.turn-start-requested", stamp, sequence, actor,
+                             json.dumps({"threadId": T1, "messageId": "unmapped"})))
+                totals = t3_adapter.sync(self.con, source=self.t3_path)
+                self.assertEqual(totals["failed"], [])
+                opened = self.query("SELECT opened_by FROM t3_threads WHERE thread_id=?",
+                                    (T1,))[0]["opened_by"]
+                self.assertEqual(opened, "server")
+
+    def test_opener_fallback_skips_null_time(self):
+        with sqlite3.connect(self.t3_path) as native:
+            native.execute("UPDATE orchestration_events SET occurred_at=NULL"
+                           " WHERE actor_kind='server'")
+        totals = t3_adapter.sync(self.con, source=self.t3_path)
+        self.assertEqual(totals["failed"], [])
+        opened = self.query("SELECT opened_by FROM t3_threads WHERE thread_id=?",
+                            (T1,))[0]["opened_by"]
+        self.assertEqual(opened, "client")
+
     def test_missing_state_is_skipped_not_failed(self):
         totals = t3_adapter.sync(
             self.con, source=os.path.join(self.tmp.name, "absent.sqlite"))
