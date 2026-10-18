@@ -143,14 +143,19 @@ class NativeEventsTest(LedgerCase):
         self.con.execute("UPDATE sources SET privacy_version=8")
         codex.sync(self.con, source=path)
         self.assertEqual(self.query("SELECT id FROM events WHERE native_id='file:rollout-native.jsonl:ordinal:3'")[0][0], first)
+        # Both user records derive the collapsed id, so neither may take it:
+        # the stored row stays and the gap is recorded (#108).
         self.assertEqual({r[0] for r in self.query("SELECT native_id FROM user_messages")},
-                         {"codex:native:file:rollout-native.jsonl:ordinal:1", "codex:native:file:rollout-native.jsonl:ordinal:2"})
+                         {"codex:ordinal:None", "codex:native:file:rollout-native.jsonl:ordinal:1",
+                          "codex:native:file:rollout-native.jsonl:ordinal:2"})
+        self.assertEqual([tuple(r) for r in self.query("SELECT error, ordinal_num FROM import_errors")],
+                         [("identity_conflict", 1)])
         second = os.path.join(self.tmp.name, "rollout-second.jsonl")
         self.jsonl(second, [record("session_meta", {"id": "second", "source": "cli"}),
                            record("response_item", {"type": "message", "role": "user",
                                                      "content": [{"type": "input_text", "text": "prompt one"}]})])
         codex.sync(self.con, source=second)
-        self.assertEqual(len(self.query("SELECT * FROM user_messages")), 3)
+        self.assertEqual(len(self.query("SELECT * FROM user_messages")), 4)
 
     def test_claude_message_blocks_and_interrupt_have_stable_identity(self):
         path = os.path.join(self.tmp.name, "claude.jsonl")
@@ -363,10 +368,12 @@ class NativeEventsTest(LedgerCase):
         path = self.jsonl(os.path.join(self.tmp.name, "rollout-native.jsonl"), records[:1])
         codex.sync(self.con, source=path)
         source = self.query("SELECT id FROM sources")[0][0]
-        for native, ordinal in (("None", None), ("1", 1)):
+        # The pre-privacy-9 writer: metadata ordinal in id and ordinal_num,
+        # and the hash of the record's own text.
+        for native, ordinal, text in (("None", None, "first input"), ("1", 1, "second input")):
             self.con.execute("INSERT INTO user_messages(native_id,source_id,session_key,ordinal_num,kind,text_hash,text_excerpt,is_genuine)"
-                             " VALUES(?,?,'codex:native',?,'genuine','0123456789abcdef','old',1)",
-                             ("codex:ordinal:" + native, source, ordinal))
+                             " VALUES(?,?,'codex:native',?,'genuine',?,'old',1)",
+                             ("codex:ordinal:" + native, source, ordinal, text_hash(text)))
             self.con.execute("INSERT INTO verdicts(intervention_id,behavior,judge,verdict,recorded_at) VALUES(?,'correction','judge','yes',0)",
                              ("sub:codex:ordinal:" + native,))
         self.con.execute("INSERT INTO tasks(task_id,title,created_at) VALUES('T-85','T-85',0)")

@@ -94,7 +94,7 @@ def _text(payload) -> str:
                     f"{h.get('user_messages_inserted', 0)} new user messages, "
                     f"{h.get('malformed', 0)} malformed records kept in import_errors")
             if h.get("identity_conflicts"):
-                line += (f", {h['identity_conflicts']} user message identity"
+                line += (f", {h['identity_conflicts']} unresolved user message identity"
                          " conflicts kept in import_errors")
             if h.get("failed"):
                 line += f", {len(h['failed'])} sources failed"
@@ -682,7 +682,17 @@ def main(argv=None) -> int:
 
 def _health_check(ns) -> int:
     from . import health as _health
-    result = _health.check()
+    con = None
+    if os.path.exists(ns.db):
+        try:
+            con = _db.connect_read_only(ns.db)
+        except (RuntimeError, sqlite3.Error):
+            con = None
+    try:
+        result = _health.check(con=con)
+    finally:
+        if con is not None:
+            con.close()
     if ns.as_json:
         _emit(result, True)
     else:
@@ -691,6 +701,14 @@ def _health_check(ns) -> int:
               f"{len(result['findings'])} invisible")
         for f in result["findings"]:
             print(f"- {f['host']} pid {f['pid']} in {f['cwd']}: {f['problem']}. Fix: {f['fix']}")
+        conflicts = result.get("identity_conflicts")
+        if conflicts is None:
+            print("ledger not read: identity conflicts unknown")
+        else:
+            print(f"{len(conflicts)} unresolved user message identity conflicts")
+            for c in conflicts:
+                print(f"- {c['harness']} {c['source_path']} record {c['ordinal_num']}:"
+                      " legacy and current rows both kept")
     return 4 if result["findings"] else 0
 
 

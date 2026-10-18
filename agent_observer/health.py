@@ -155,11 +155,19 @@ def check_codex(processes: list[dict], sessions_root: str | None = None) -> list
     return findings
 
 
-def check(processes=None, registry=None) -> dict:
+def identity_conflicts(con) -> list[dict]:
+    """Stored user-message identity gaps a privacy replay could not resolve."""
+    return [dict(row) for row in con.execute(
+        "SELECT harness, source_path, ordinal_num FROM import_errors"
+        " WHERE error='identity_conflict' ORDER BY harness, source_path, ordinal_num")]
+
+
+def check(processes=None, registry=None, con=None) -> dict:
     processes = process_table() if processes is None else processes
     registry = claude_registry() if registry is None else registry
     findings = check_claude(registry) + check_opencode(processes) + check_codex(processes)
     return {"findings": findings,
+            "identity_conflicts": identity_conflicts(con) if con is not None else None,
             "checked": {"claude_sessions": len(registry),
                         "processes": len(processes)},
             "note": ("Codex app-server and exec sessions and OpenCode servers are not "

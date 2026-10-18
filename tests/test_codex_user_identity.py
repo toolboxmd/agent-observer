@@ -9,7 +9,7 @@ record by file position. A ledger can hold both rows for one record.
 import json
 import os
 
-from agent_observer import cli, privacy, report
+from agent_observer import cli, health, privacy, report
 from agent_observer.adapters import codex
 from agent_observer.ingest import iso_ts, text_hash
 from tests.helpers import LedgerCase
@@ -34,11 +34,15 @@ def _usage(total):
             "reasoning_output_tokens": 0, "total_tokens": total}
 
 
-USAGE = {"type": "token_usage_record", "timestamp": "2026-10-18T10:00:05Z",
-         "payload": {"response_id": "resp-1", "session_id": "mixed",
-                     "thread_id": "mixed", "turn_id": TURN, "root_turn_id": TURN,
-                     "usage": _usage(100), "turn_token_usage": _usage(100),
-                     "thread_token_usage": _usage(100)}}
+def _response(rid, turn, total):
+    return {"type": "token_usage_record", "timestamp": "2026-10-18T10:00:05Z",
+            "payload": {"response_id": rid, "session_id": "mixed",
+                        "thread_id": "mixed", "turn_id": turn, "root_turn_id": turn,
+                        "usage": _usage(total), "turn_token_usage": _usage(total),
+                        "thread_token_usage": _usage(total)}}
+
+
+USAGE = _response("resp-1", TURN, 100)
 
 
 def _old_writer_row(con, record, source_id, session_key="codex:mixed",
@@ -116,6 +120,7 @@ class CodexUserIdentityTest(LedgerCase):
     def test_legacy_copy_merges_across_ordinal_namespace_drift_and_archive(self):
         cases = {
             "rocky clone": dict(ordinal=1),
+            "single missing ordinal": dict(ordinal=None),
             "metadata ordinal": dict(ordinal=10),
             "timestamp drift": dict(ordinal=10, ts_shift=0.001),
             "archived basename": dict(ordinal=10, archived=True),
@@ -137,16 +142,85 @@ class CodexUserIdentityTest(LedgerCase):
                 self._make_stale()
                 self._assert_merged(path, f"codex:ordinal:{case['ordinal']}", self._current(1))
 
-    def test_earlier_none_sibling_does_not_roll_back_the_exact_copy(self):
-        first, second = _user("first input"), _user("second input", turn="turn-2")
-        path = self._rollout(first, second)
-        # The old stale update rewrote the collapsed row with the last record.
+    def _shared_legacy_case(self, texts, ordinal=None, current_rows=True):
+        """Two id-less records deriving one legacy id, with the old writer's row.
+
+        The old stale update left the collapsed row holding the last record;
+        a later task assignment, delegation and verdict name that row.
+        """
+        first = _user(texts[0], ordinal=ordinal)
+        second = _user(texts[1], ordinal=ordinal, turn="turn-2")
+        records = (first, _response("resp-1", TURN, 100),
+                   second, _response("resp-2", "turn-2", 50))
+        path = self._rollout(*(records if current_rows else ()))
+        legacy = f"codex:ordinal:{ordinal}"
         _old_writer_row(self.con, second, self.source_id)
+        self._task("parser")
+        self.con.execute(self.ASSIGN, (legacy, "parser", "build", "legacy evidence", 300))
+        self.con.execute(self.DELEGATE, (legacy, "child-review", "codex:turn-2", "legacy reason", 300))
+        self.con.execute(self.VERDICT, (legacy, "no", "not a correction", "parser-bug", 300))
         self._make_stale()
-        self._resync(path)
-        self.assertEqual([tuple(r) for r in self.query(
-            "SELECT native_id, alias_id FROM user_messages ORDER BY ordinal_num")],
-            [(self._current(1), None), (self._current(2), "codex:ordinal:None")])
+        if not current_rows:
+            with open(path, "a") as stream:
+                stream.writelines(json.dumps(record) + "\n" for record in records)
+        return path, legacy
+
+    def _assert_shared_legacy_kept(self, path, legacy, before, buckets):
+        result = codex.sync(self.con, source=path)
+        self.assertEqual(result["failed"], [])
+        self.assertEqual(result["identity_conflicts"], 1)
+        self._resync(path, conflicts=1)
+        for table in ("assignments", "delegations", "verdicts"):
+            self.assertEqual(self._snapshot(table), before[table])
+        self.assertEqual(self.query("SELECT native_id, alias_id FROM user_messages"
+                                    " WHERE native_id=?", (legacy,))[0][1], None)
+        self.assertEqual(cli._resolve_submission(self.con, legacy), legacy)
+        self.assertEqual(self.query("SELECT COUNT(*) FROM user_messages WHERE alias_id=?",
+                                    (legacy,))[0][0], 0)
+        if buckets is not None:
+            self.assertEqual(self._buckets("parser"), buckets)
+
+    def test_shared_legacy_id_is_never_folded_into_one_record(self):
+        cases = {
+            "same text, missing ordinal": (("continue", "continue"), None),
+            "different text, missing ordinal": (("first input", "second input"), None),
+            "same text, repeated ordinal": (("continue", "continue"), 7),
+        }
+        for label, (texts, ordinal) in cases.items():
+            with self.subTest(label):
+                self.tearDown()
+                self.setUp()
+                path, legacy = self._shared_legacy_case(texts, ordinal)
+                before = {t: self._snapshot(t) for t in ("assignments", "delegations", "verdicts")}
+                buckets = self._buckets("parser")
+                self._assert_shared_legacy_kept(path, legacy, before, buckets)
+                self.assertEqual(len(self.query("SELECT * FROM user_messages")), 3)
+
+    def test_shared_legacy_id_is_not_renamed_when_current_rows_are_absent(self):
+        path, legacy = self._shared_legacy_case(("continue", "continue"), current_rows=False)
+        before = {t: self._snapshot(t) for t in ("assignments", "delegations", "verdicts")}
+        self._assert_shared_legacy_kept(path, legacy, before, None)
+        self.assertEqual(len(self.query("SELECT * FROM user_messages")), 3)
+        # The kept row still owns its own turn, and only once.
+        buckets = self._buckets("parser")
+        self.assertEqual(buckets["parser"][0], (1, 50))
+        self.assertLessEqual(buckets["parser"][0][1] + buckets["parser"][1][1], 50)
+
+    def test_unresolved_conflict_stays_visible_in_sync_and_health(self):
+        record = _user("synthetic input", ordinal=1)
+        path = self._rollout(record)
+        _old_writer_row(self.con, _user("other input", ordinal=1), self.source_id)
+        self._make_stale()
+        for full in (False, True, False):
+            result = codex.sync(self.con, source=path, full=full)
+            self.assertEqual(result["identity_conflicts"], 1)
+            text = cli._text({"_view": "sync", "harnesses": [result]})
+            self.assertIn("1 unresolved user message identity conflicts", text)
+        found = health.check(processes=[], registry=[], con=self.con)
+        self.assertEqual(found["identity_conflicts"],
+                         [{"harness": "codex", "source_path": path, "ordinal_num": 1}])
+        self.assertEqual(found["findings"], [])
+        self.assertIsNone(health.check(processes=[], registry=[])["identity_conflicts"])
 
     def test_unmatched_collision_keeps_both_rows_and_records_a_gap(self):
         record = _user("synthetic input", ordinal=1)

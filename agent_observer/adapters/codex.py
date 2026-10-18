@@ -268,8 +268,15 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
         totals["sources"] += 1
         totals["unchanged"] += 1 if stats.get("unchanged") else 0
         for key in ("responses_inserted", "events_inserted",
-                    "user_messages_inserted", "malformed", "identity_conflicts"):
+                    "user_messages_inserted", "malformed"):
             totals[key] += stats.get(key, 0)
+    # A stored gap stays reported on every sync until a replay resolves it.
+    synced = set(paths)
+    totals["identity_conflicts"] = sum(
+        row["n"] for row in con.execute(
+            "SELECT source_path, COUNT(*) n FROM import_errors"
+            " WHERE harness=? AND error='identity_conflict' GROUP BY source_path",
+            (HARNESS,)) if row["source_path"] in synced)
     return totals
 
 
@@ -342,9 +349,10 @@ class _Reader:
         # file records its own occurrence and does not take this one.
         self.events_seen: set[tuple] = set()
         self.user_messages_seen: set[str] = set()
-        # Legacy user-message ids whose current row already exists but which
-        # this replay could not fold in, with the first record position.
-        self.legacy_collisions: dict[str, int] = {}
+        # Privacy-stale replay: each legacy user-message id with every
+        # (position, current id, text hash) of the id-less records deriving it.
+        self.legacy_candidates: dict[str, list[tuple]] = {}
+        self.user_messages_inserted: set[str] = set()
         # Compaction context for deferred token_count flushing: token_count
         # usage snapshots are collected during ingestion and reconciled only at
         # flush, so each usage snapshot captures whether a compaction boundary
@@ -869,10 +877,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
             reader.first_ts = ts if reader.first_ts is None else min(reader.first_ts, ts)
             reader.last_ts = ts if reader.last_ts is None else max(reader.last_ts, ts)
     _flush_token_counts(reader)
-    for legacy, position in reader.legacy_collisions.items():
-        if con.execute("SELECT 1 FROM user_messages WHERE native_id=?", (legacy,)).fetchone():
-            stats["identity_conflicts"] = stats.get("identity_conflicts", 0) + 1
-            src.error(position, "identity_conflict")
+    _resolve_legacy_user_messages(reader)
     if not src.privacy_stale:
         # Same-version imports reconcile this source's submissions with the
         # final rollout identity: rows stored before the native thread
@@ -1682,6 +1687,33 @@ def _merge_legacy_user_message(con, legacy: str, target: str) -> bool:
     return True
 
 
+def _resolve_legacy_user_messages(r: _Reader) -> None:
+    """Fold each legacy user-message row into the one record that wrote it.
+
+    The pre-privacy-9 writer keyed an id-less user message by its metadata
+    ordinal, so a missing or repeated ordinal collapsed several records onto
+    one row whose ownership cannot be traced to any of them. Only a legacy id
+    derived by exactly one record of this file, with that record's text,
+    is folded in. Anything else keeps every row as stored and records one
+    identity_conflict gap at the first such record.
+    """
+    for legacy, candidates in r.legacy_candidates.items():
+        prior = r.con.execute("SELECT source_id, text_hash FROM user_messages"
+                              " WHERE native_id=? AND session_key=?",
+                              (legacy, r.session_key)).fetchone()
+        if not prior or not r._legacy_source_matches(prior["source_id"]):
+            continue
+        position, current, digest = candidates[0]
+        if (len(candidates) == 1 and prior["text_hash"] == digest
+                and _merge_legacy_user_message(r.con, legacy, current)):
+            if current in r.user_messages_inserted:
+                # The legacy row already held this message.
+                r.stats["user_messages_inserted"] -= 1
+            continue
+        r.stats["identity_conflicts_found"] = r.stats.get("identity_conflicts_found", 0) + 1
+        r.src.error(position, "identity_conflict")
+
+
 def _ingest_response_item(r: _Reader, obj: dict, native_ordinal, position: int) -> None:
     p = obj["payload"]
     ptype = p.get("type")
@@ -1701,39 +1733,10 @@ def _ingest_response_item(r: _Reader, obj: dict, native_ordinal, position: int) 
         kind = _submission_kind(p)
         native = p.get("id") or f"{r.session_key.partition(':')[2]}:{fallback}"
         if not p.get("id") and r.src.privacy_stale:
-            legacy = f"{HARNESS}:ordinal:{native_ordinal}"
-            current = f"{HARNESS}:{native}"
-            prior = r.con.execute("SELECT * FROM user_messages WHERE native_id=? AND session_key=?",
-                                  (legacy, r.session_key)).fetchone()
-            if prior and r._legacy_source_matches(prior["source_id"]):
-                if not r.con.execute("SELECT 1 FROM user_messages WHERE native_id=?",
-                                     (current,)).fetchone():
-                    # Preserve captured ownership for every source-owned old
-                    # fallback, including the first collapsed None identity.
-                    r.con.execute("PRAGMA defer_foreign_keys=ON")
-                    r.con.execute(
-                        "UPDATE user_messages SET native_id=?, source_id=?, ordinal_num=?"
-                        " WHERE native_id=?",
-                        (current, r.src.source_id, r.record_position, legacy))
-                    r.con.execute("UPDATE assignments SET user_message_id=? WHERE user_message_id=?",
-                                  (current, legacy))
-                    r.con.execute("UPDATE delegations SET owning_user_message=? WHERE owning_user_message=?",
-                                  (current, legacy))
-                    r.con.execute("UPDATE verdicts SET intervention_id=? WHERE intervention_id=?",
-                                  (f"sub:{current}", f"sub:{legacy}"))
-                    r.legacy_collisions.pop(legacy, None)
-                elif (prior["text_hash"] == text_hash(text)
-                      and _merge_legacy_user_message(r.con, legacy, current)):
-                    # A mixed-version ledger already holds both identities of
-                    # this record: the legacy id is this record's metadata
-                    # ordinal and its text matches. Positions, timestamps and
-                    # source ids can differ between the two writers.
-                    r.legacy_collisions.pop(legacy, None)
-                else:
-                    # Another record sharing this metadata ordinal (the
-                    # collapsed None id) may still match; what remains after
-                    # the file is a visible gap with both rows intact.
-                    r.legacy_collisions.setdefault(legacy, position)
+            # The legacy writer keyed this record by its metadata ordinal.
+            # Which stored row it was is decided once the whole file is read.
+            r.legacy_candidates.setdefault(f"{HARNESS}:ordinal:{native_ordinal}", []).append(
+                (position, f"{HARNESS}:{native}", text_hash(text)))
         # Privacy rule 1 via agent_observer/privacy.py: only a genuine
         # human submission of a proven main session keeps an excerpt,
         # truncated at the first tag-like marker. The main-session gate
@@ -1765,6 +1768,7 @@ def _ingest_response_item(r: _Reader, obj: dict, native_ordinal, position: int) 
              text_hash(text), excerpt, genuine))
         if cur.rowcount:
             r.stats["user_messages_inserted"] += 1
+            r.user_messages_inserted.add(native_key)
         elif r.src.privacy_stale and (same_source or claims):
             # Rule 3: a privacy version change corrects rows in place.
             fields = ("source_id=?, session_key=?, turn_id=?, ts=?, kind=?,"
