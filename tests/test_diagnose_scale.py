@@ -63,6 +63,9 @@ class DiagnoseScaleTest(AnalysisCase):
             self.con.execute("UPDATE events SET size_bytes=60000 WHERE native_id=?",
                              (f'e{self.seq}',))
             self.prompt(key, 'no, wrong')
+            self.prompt(key, 'huh?')
+            self.con.execute("UPDATE user_messages SET ts=1010.5 WHERE native_id=?",
+                             (f's{self.seq}',))
             if not key.startswith('codex:'):
                 continue
             events = self.con.execute(

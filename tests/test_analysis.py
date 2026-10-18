@@ -453,8 +453,7 @@ class UserConfusionTest(AnalysisCase):
         pairs = [self.reply_then("claude:c", text) for text in (
             "huh?", "bro", "What do you mean by that?",
             "i dont really get it, explain it better",
-            "simpler please", "too much detail for a non programmer",
-            "nie rozumiem, wyjaśnij prościej", "Was meinst du?",
+            "simpler please", "nie rozumiem", "Was meinst du?",
             "no entiendo", "je ne comprends pas", "że co?")]
         found = sorted(self.found("claude:c", "user_confusion"), key=lambda i: i["ts"])
         self.assertEqual(len(found), len(pairs))
@@ -479,6 +478,35 @@ class UserConfusionTest(AnalysisCase):
             self.reply_then("claude:n", text)
         self.assertEqual(self.found("claude:n", "user_confusion"), [])
 
+    def test_ordinary_instructions_and_other_speech_acts_are_not_confusion(self):
+        for text in ("write better commit messages next time", "elaborate the migration plan",
+                     "don't elaborate, just merge", "rephrase the error for the changelog",
+                     "simpler function names", "use simple words in the commit",
+                     "explain better how caching works", "too complicated, skip it",
+                     "ask a non-programmer to read the paragraph",
+                     "put it in plain text in the log", "I don't understand why the test fails",
+                     "sorry", "hmm", "pardon", "meaning", "come", "was", "comment", "??",
+                     "huh, the third row", "so did it ship or not?"):
+            self.assertIsNone(analysis._confusion_signal(text), text)
+
+    def test_unambiguous_confusion_shapes_and_unicode_forms(self):
+        for text, signal in (("hä?", "bare"), ("HÄ?", "bare"), ("ha\u0308?", "bare"),
+                             ("wait what", "bare"), ("bro what?", "bare"),
+                             ("what do you want me to do?", "phrase"),
+                             ("explain that again please", "phrase"),
+                             ("I don't understand", "phrase")):
+            self.assertEqual(analysis._confusion_signal(text), signal, text)
+
+    def test_confusion_wording_counts_once_not_also_as_a_correction(self):
+        self.session("claude:o")
+        self.reply_then("claude:o", "bro what?")
+        self.reply_then("claude:o", "no, revert it")
+        self.assertEqual(len(self.found("claude:o", "user_confusion")), 1)
+        corrections = self.found("claude:o", "human_correction")
+        self.assertEqual(len(corrections), 1)
+        self.assertNotEqual(corrections[0]["event_refs"],
+                            self.found("claude:o", "user_confusion")[0]["event_refs"][1:])
+
     def test_needs_an_agent_message_directly_before(self):
         self.session("claude:s")
         self.prompt("claude:s", "what?")
@@ -501,6 +529,7 @@ class UserConfusionTest(AnalysisCase):
         groups = {g["group"]: g for g in analysis.compare(self.con, by="agentsmd")["groups"]}
         self.assertEqual(groups["12.1.0"]["user_confusion"], {"incidents": 1, "per_session": 1.0})
         self.assertEqual(groups["unknown"]["user_confusion"], {"incidents": 1, "per_session": 1.0})
+        self.assertIn("census", analysis.compare(self.con, by="agentsmd")["note"])
 
 
 class DiagnoseWindowTest(AnalysisCase):
