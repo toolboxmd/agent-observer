@@ -47,6 +47,10 @@ Behavior: correction. Judge id: <model>/correction-v1.
    that agent. Read only its text (`--turns-before 0 --turns-after 0`):
    it is no unless the text itself says an earlier agent or attempt got
    something wrong (a retry brief naming the failure), which is yes.
+   `opening: null` means unknown, including sessions with no recorded
+   assistant messages or tool calls. Read the available context and judge
+   normally; null is not evidence of a first prompt or a reason to answer no.
+   Only prompts can have `opening: true`; interrupts and rejections are false.
    Not understanding the agent is yes only when the person says the
    explanation itself failed ("I don't understand a word", "talk
    simpler", "still don't get it" after a re-explanation). A first plain

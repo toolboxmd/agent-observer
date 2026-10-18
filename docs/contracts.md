@@ -282,7 +282,9 @@ are counted separately and excluded from useful-work comparisons.
   `interventions`, `recurrence` and `verdict groups` default to
   `created_by` `user` and `agent`; `recurrence` headline numbers combine them,
   `by_created_by` gives each alone, and yes verdicts outside the chosen
-  values appear only under `other_created_by`.
+  values appear only under `other_created_by`. Per-origin recurrence numbers
+  are not additive with the headline when a group mixes origins: the combined
+  group can span multiple sessions even when neither origin does alone.
   A verdict batch is validated whole; `recurrence` counts a group as
   recurring when its yes verdicts span two or more sessions.
 - `publish --task ID|--session KEY [--prices schedule.json] --repo owner/name --pr N|--commit SHA`:

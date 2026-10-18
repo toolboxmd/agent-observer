@@ -268,12 +268,13 @@ def _all(con, harness=None, project=None, attrs=None):
     where, args = _scope(harness, project, attrs)
     found, policy = [], []
     echoes = _echoes(con)
+    first = _first_activity(con)
     for row in con.execute(f"{_SUB_SQL} WHERE u.kind IN {_SUB_KINDS}"
                            f" AND {where}", args):
         intervention = None if row["native_id"] in echoes \
             else _from_submission(row, ev)
         if intervention is not None:
-            found.append(intervention)
+            found.append(_mark_opening(intervention, first, row))
     for row in con.execute(f"{_EVENT_SQL} WHERE {_EVENT_WHERE} AND {where}",
                            args):
         kind = _event_kind(row)
@@ -283,31 +284,54 @@ def _all(con, harness=None, project=None, attrs=None):
             policy.append((row["ts"], kind[len("policy:"):],
                            row["session_key"]))
         else:
-            found.append(_from_event(row, ev, kind))
-    first = _first_activity(con)
-    for m in found:
-        _mark_opening(m, first)
+            found.append(_mark_opening(_from_event(row, ev, kind), first, row))
     found.sort(key=lambda m: (m["ts"] or 0, m["id"]))
     return found, policy
 
 
-_ACTIVITY_SQL = ("SELECT session_key, MIN(ts) FROM events WHERE family IN"
-                 " ('assistant_message', 'tool_call')")
-
-
 def _first_activity(con, session_key=None) -> dict:
+    # Keep all events at the earliest timestamp: ordinal_num orders a tie
+    # only inside the same source, never across different source files.
+    where = "family IN ('assistant_message', 'tool_call')"
+    args = ()
     if session_key:
-        return {r[0]: r[1] for r in con.execute(
-            _ACTIVITY_SQL + " AND session_key = ?", (session_key,))}
-    return {r[0]: r[1] for r in con.execute(
-        _ACTIVITY_SQL + " GROUP BY session_key")}
+        where += " AND session_key = ?"
+        args = (session_key,)
+    rows = con.execute(
+        "SELECT session_key, ts, source_id, ordinal_num FROM ("
+        " SELECT session_key, ts, source_id, ordinal_num,"
+        " RANK() OVER (PARTITION BY session_key ORDER BY ts) AS position"
+        f" FROM events WHERE {where}) WHERE position = 1", args)
+    first = {}
+    for row in rows:
+        first.setdefault(row["session_key"], []).append(row)
+    return first
 
 
-def _mark_opening(intervention: dict, first: dict) -> dict:
-    """opening: nothing the agent did precedes the intervention in its session,
-    so it cannot correct that agent (a first prompt or brief)."""
-    start = first.get(intervention["session"])
-    intervention["opening"] = start is None or (intervention["ts"] or 0) <= start
+def _mark_opening(intervention: dict, first: dict, prompt) -> dict:
+    """Only prompts proven to precede all agent activity are opening.
+
+    Missing activity or incomparable ordering leaves a prompt unknown.
+    Interrupts and rejections are never opening prompts.
+    """
+    opening = False
+    if intervention["kind"] == "prompt":
+        comparisons = []
+        for activity in first.get(intervention["session"], []):
+            if prompt["ts"] is None or activity["ts"] is None:
+                comparisons.append(None)
+            elif prompt["ts"] != activity["ts"]:
+                comparisons.append(prompt["ts"] < activity["ts"])
+            elif (prompt["source_id"] is not None
+                  and prompt["source_id"] == activity["source_id"]
+                  and prompt["ordinal_num"] is not None
+                  and activity["ordinal_num"] is not None):
+                comparisons.append(prompt["ordinal_num"] < activity["ordinal_num"])
+            else:
+                comparisons.append(None)
+        opening = False if False in comparisons else (
+            True if comparisons and None not in comparisons else None)
+    intervention["opening"] = opening
     return intervention
 
 
@@ -372,7 +396,7 @@ def resolve(con: sqlite3.Connection, intervention_id, ev=None) -> dict | None:
             return None
         intervention = _from_submission(row, ev)
         return None if intervention is None else _mark_opening(
-            intervention, _first_activity(con, row["session_key"]))
+            intervention, _first_activity(con, row["session_key"]), row)
     if intervention_id.startswith("ev:"):
         session, _, rest = intervention_id[3:].partition("/")
         family, _, native = rest.partition("/")
@@ -388,7 +412,7 @@ def resolve(con: sqlite3.Connection, intervention_id, ev=None) -> dict | None:
         if kind is None or kind.startswith("policy:"):
             return None
         return _mark_opening(_from_event(row, ev, kind),
-                             _first_activity(con, session))
+                             _first_activity(con, session), row)
     return None
 
 
@@ -797,7 +821,7 @@ def render(items: list[dict]) -> str:
             continue
         lines.append(f"{item['kind']} by {item['created_by']} in {item['session']}"
                      f" ({item['harness']}, thread {item['thread']}) at"
-                     f" {item['at']}")
+                     f" {item['at']} opening={json.dumps(item['opening'])}")
         for turn in item.get("before", []):
             if turn["prompt"]:
                 lines.append(_render_prompt(turn["prompt"]))

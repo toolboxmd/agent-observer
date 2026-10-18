@@ -249,6 +249,50 @@ class SelectTest(InterventionsCase):
             found["ev:claude:sess-four/permission/toolu_cp"]["created_by"],
             "unknown")
 
+    def test_no_activity_prompts_have_unknown_opening(self):
+        self.con.execute("DELETE FROM events WHERE session_key='claude:sess-one'"
+                         " AND family IN ('assistant_message','tool_call')")
+        found = {m["id"]: m for m in self.select()["interventions"]}
+        for identity in ("sub:claude:u1", "sub:claude:u2", "sub:claude:u4"):
+            self.assertIsNone(found[identity]["opening"])
+            self.assertIsNone(interventions.resolve(self.con, identity)["opening"])
+
+    def test_equal_timestamps_use_source_ordinals(self):
+        row = self.con.execute("SELECT ts FROM user_messages WHERE"
+                               " native_id='claude:u2'").fetchone()
+        self.con.execute("UPDATE events SET ts=? WHERE"
+                         " session_key='claude:sess-one' AND"
+                         " family IN ('assistant_message','tool_call')", (row[0],))
+        found = {m["id"]: m for m in self.select()["interventions"]}
+        self.assertTrue(found["sub:claude:u1"]["opening"])
+        self.assertFalse(found["sub:claude:u2"]["opening"])
+        self.assertFalse(interventions.resolve(self.con, "sub:claude:u2")["opening"])
+        # An ordinal can prove the prompt came first at the same timestamp.
+        self.con.execute("UPDATE user_messages SET ts=? WHERE"
+                         " native_id='claude:u1'", (row[0],))
+        self.assertTrue(interventions.resolve(self.con, "sub:claude:u1")["opening"])
+
+    def test_equal_time_across_sources_is_unknown(self):
+        prompt = self.con.execute("SELECT ts FROM user_messages WHERE"
+                                  " native_id='claude:u2'").fetchone()
+        self.con.execute("UPDATE events SET ts=?,source_id=(SELECT source_id FROM user_messages"
+                         " WHERE native_id='codex:msg-u1') WHERE"
+                         " session_key='claude:sess-one' AND"
+                         " family IN ('assistant_message','tool_call')", (prompt[0],))
+        found = {m["id"]: m for m in self.select()["interventions"]}
+        self.assertIsNone(found["sub:claude:u2"]["opening"])
+        self.assertIsNone(interventions.resolve(self.con, "sub:claude:u2")["opening"])
+
+    def test_only_prompts_can_be_opening(self):
+        self.con.execute("DELETE FROM events WHERE family IN"
+                         " ('assistant_message','tool_call')")
+        found = self.select(created_by=None)["interventions"]
+        nonprompts = [m for m in found if m["kind"] != "prompt"]
+        self.assertEqual({m["kind"] for m in nonprompts}, {"interrupt", "rejection"})
+        for moment in nonprompts:
+            self.assertIs(moment["opening"], False)
+            self.assertIs(interventions.resolve(self.con, moment["id"])["opening"], False)
+
     def test_opening_marks_moments_before_any_agent_activity(self):
         found = self.ids(self.select(created_by=None))
         self.assertTrue(found["sub:claude:u1"]["opening"])
@@ -585,6 +629,21 @@ class CliTest(InterventionsCase):
             code = cli.main(["--db", os.path.join(self.root, "observer.db"),
                              *argv])
         return code, out.getvalue()
+
+    def test_text_commands_show_opening(self):
+        self.con.execute("DELETE FROM events WHERE session_key='claude:sess-two'")
+        self.con.commit()
+        code, out = self.run_cli("moments", "--origin", "all")
+        self.assertEqual(code, 0)
+        self.assertIn("opening=true", out)
+        self.assertIn("opening=false", out)
+        self.assertIn("opening=null", out)
+        for identity, value in (("sub:claude:u1", "true"),
+                                ("sub:claude:u2", "false"),
+                                ("sub:claude:v1", "null")):
+            code, out = self.run_cli("moment", "show", identity)
+            self.assertEqual(code, 0)
+            self.assertIn("opening=" + value, out)
 
     def test_judge_round_trip_through_json_commands(self):
         self.con.commit()

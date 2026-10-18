@@ -332,8 +332,13 @@ agent-observer session-attr add --json < arms.jsonl     # {"session": "claude:<i
 
 `interventions` lists the selected interventions and counts every intervention in scope by
 `created_by` and kind, so filtered interventions stay visible as numbers. An intervention
-marked `opening` comes before anything the agent did in its session (a
-first prompt, a child's brief), so it cannot correct that agent. `intervention show`
+with `opening: true` is a prompt that comes before any recorded agent activity
+in its session (a first prompt or a child's brief). Equal timestamps use
+`ordinal_num` only within the same source. `opening: null` means unknown:
+there are no agent-activity events or the ordering cannot be established.
+Unknown prompts still need context; do not treat them as first prompts.
+Interrupts and rejections have `opening: false`. Both text and JSON output
+show `opening`. `intervention show`
 reads each intervention from the native log: its full text (including text
 inside Chromeria wrapper tags) and whole turns around it. A turn is a
 prompt or interrupt (with its `created_by`) plus the agent's messages and
@@ -359,7 +364,10 @@ sessions, and repeats per group, with first and last seen, sessions and
 hosts, plus judge coverage by `created_by` and the policy denials. Its
 headline numbers combine `user` and `agent` interventions (each group shows
 how many of each), and `by_created_by` repeats the counts for each source
-alone; `--created-by` narrows or widens the set. When more than one judge labeled the scope, it requires
+alone. Per-origin recurrence numbers are not additive with the headline
+when a group mixes origins: one combined group can recur across sessions even
+when neither origin recurs alone. `--created-by` narrows or widens the set.
+When more than one judge labeled the scope, it requires
 `--judge`. `interventions --unjudged B --judge J` lists the work left for one
 judge; `verdict list` returns stored verdicts with their problem lines,
 which the grouping pass reads. A batch that names the same intervention,

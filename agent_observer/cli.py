@@ -1072,7 +1072,8 @@ def _judge(con, ns) -> int:
                       + "; policy denials: "
                       + ", ".join(f"{k} {v}" for k, v in payload["policy_denials"].items()))
                 for m in payload["interventions"]:
-                    print(f"{m['id']}  {m['kind']} {m['created_by']} {m['at']} {m['project'] or ''}")
+                    print(f"{m['id']}  {m['kind']} {m['created_by']} {m['at']} {m['project'] or ''}"
+                          f" opening={json.dumps(m['opening'])}")
             return 0
         if ns.cmd == "intervention":
             ids = list(ns.ids)
