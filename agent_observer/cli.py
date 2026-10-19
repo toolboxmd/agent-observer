@@ -701,6 +701,9 @@ def _health_check(ns) -> int:
               f"{len(result['findings'])} invisible")
         for f in result["findings"]:
             print(f"- {f['host']} pid {f['pid']} in {f['cwd']}: {f['problem']}. Fix: {f['fix']}")
+        for gap in result["unavailable"]:
+            subject = f"{gap['host']} pid {gap['pid']}: " if "pid" in gap else ""
+            print(f"- {subject}{gap['check']} unavailable: {gap['reason']}")
         conflicts = result.get("identity_conflicts")
         if conflicts is None:
             print("ledger not read: identity conflicts unknown")
@@ -709,7 +712,7 @@ def _health_check(ns) -> int:
             for c in conflicts:
                 print(f"- {c['harness']} {c['source_path']} record {c['ordinal_num']}:"
                       " legacy and current rows both kept")
-    return 4 if result["findings"] else 0
+    return 4 if result["findings"] or result["unavailable"] else 0
 
 
 def _capabilities(ns) -> int:

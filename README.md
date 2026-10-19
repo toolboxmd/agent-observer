@@ -565,7 +565,13 @@ A session is visible only if its harness writes its records:
 | Grok Build | Keep `GROK_HOME/sessions` reachable. |
 
 `agent-observer health` reports live sessions that break these rules, with
-the process, directory and fix.
+the process, directory and fix. Missing, failed, malformed or timed-out process
+scans are reported as unavailable with a reason; each `ps` or `lsof` invocation
+has a five-second timeout, and other health checks continue.
+
+Health exits 0 when it finds no invisible sessions or unavailable scans, 4 when
+either is reported, and 2 for invalid command-line arguments. An unread ledger
+is reported as unknown and does not by itself change the exit status.
 
 ## Ledger schema 3
 
