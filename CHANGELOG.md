@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.3.0] - 2026-10-19
+
+### Added
+
+- Discover Chromeria bare Codex and Grok homes by default; report trace truncation, unresolved Codex identity conflicts and unavailable health scans; recognize Claude request-replay metadata; faster availability and diagnose queries
+
 ## [1.2.6] - 2026-10-15
 
 ### Changed
