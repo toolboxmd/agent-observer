@@ -709,7 +709,8 @@ def init_db(con: sqlite3.Connection) -> None:
          str(CAPTURE_CONTRACT_VERSION)),
     )
     # One-time correction also covers ledger-only events whose source is gone.
-    if not con.execute("SELECT 1 FROM schema_meta WHERE key='pr_checks_pending_version'").fetchone():
+    if not con.execute("SELECT 1 FROM schema_meta WHERE key='pr_checks_pending_version'"
+                       " AND value='2'").fetchone():
         for event in con.execute(
                 "SELECT id, family, target, detail_json FROM events"
                 " WHERE family='tool_result' AND detail_json LIKE '%8%'"):
@@ -720,7 +721,8 @@ def init_db(con: sqlite3.Connection) -> None:
             if isinstance(detail, dict) and pending_pr_checks(
                     event["family"], event["target"], detail):
                 con.execute("UPDATE events SET status='pending' WHERE id=?", (event["id"],))
-        con.execute("INSERT INTO schema_meta(key, value) VALUES ('pr_checks_pending_version', '1')")
+        con.execute("INSERT OR REPLACE INTO schema_meta(key, value)"
+                    " VALUES ('pr_checks_pending_version', '2')")
     con.commit()
     try:
         row = con.execute("PRAGMA database_list").fetchone()
