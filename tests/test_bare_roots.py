@@ -372,6 +372,57 @@ class FirstSyncAliasesTest(BareRootCase):
         self.assert_sync_once(grok, [first], 2,
                               ("sources", "sessions", "responses", "events"))
 
+    def test_grok_shared_updates_keeps_distinct_events(self):
+        self.grok_session(self.grok_root, GROK_NORMAL)
+        first = os.path.join(self.grok_root, GROK_GROUP, GROK_NORMAL)
+        second = os.path.join(self.grok_root, "z-other-group", GROK_NORMAL)
+        shutil.copytree(first, second)
+        shared = os.path.join(second, "updates.jsonl")
+        os.unlink(shared)
+        os.link(os.path.join(first, "updates.jsonl"), shared)
+        events = os.path.join(second, "events.jsonl")
+        with open(events, "a") as fh:
+            fh.write(json.dumps({"ts": "2026-09-01T10:00:09Z",
+                                 "type": "tool_completed",
+                                 "tool_name": "read_file",
+                                 "tool_call_id": "distinct-event",
+                                 "duration_ms": 17, "outcome": "success"})
+                     + "\n")
+
+        with patch.object(grok, "_load_jsonl_records",
+                          wraps=grok._load_jsonl_records) as load:
+            stats = grok.sync(self.con, root=self.grok_root)
+        self.assertEqual(stats["failed"], [])
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM sources"), 3)
+        self.assertEqual(self.scalar(
+            "SELECT COUNT(*) FROM events WHERE duration_ms=17"), 1)
+        self.assertEqual({row[0] for row in self.con.execute(
+            "SELECT path FROM sources")},
+            {os.path.join(first, "updates.jsonl"),
+             os.path.join(first, "events.jsonl"), events})
+        self.assertEqual([call.args[0] for call in load.call_args_list].count(
+            os.path.join(first, "updates.jsonl")), 1)
+        self.assertNotIn(shared, [call.args[0] for call in load.call_args_list])
+
+        before = list(self.con.iterdump())
+        again = grok.sync(self.con, root=self.grok_root)
+        self.assertEqual(again["failed"], [])
+        self.assertEqual((again["sources"], again["unchanged"]), (2, 2))
+        self.assertEqual(again["responses_inserted"], 0)
+        self.assertEqual(again["events_inserted"], 0)
+        self.assertEqual(list(self.con.iterdump()), before)
+
+        with patch.object(grok, "_load_jsonl_records",
+                          wraps=grok._load_jsonl_records) as load:
+            full = grok.sync(self.con, root=self.grok_root, full=True)
+        self.assertEqual(full["failed"], [])
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM sources"), 3)
+        self.assertEqual(self.scalar(
+            "SELECT COUNT(*) FROM events WHERE duration_ms=17"), 1)
+        self.assertEqual([call.args[0] for call in load.call_args_list],
+                         [os.path.join(first, "updates.jsonl"),
+                          os.path.join(first, "events.jsonl"), events])
+
     def test_codex_hardlinks_in_an_explicit_root_import_once(self):
         root = os.path.join(self.base, "hardlinks")
         first = self.rollout(root, "thr-hardlink", "resp-hardlink", 100)
