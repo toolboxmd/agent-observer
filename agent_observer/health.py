@@ -21,6 +21,7 @@ import time
 CLAUDE_FIX = ("start the session with the parent's CLAUDE_CODE_*, CLAUDECODE, CLAUDE_PID "
               "and CLAUDE_EFFORT variables unset, or with CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1")
 GRACE_SECONDS = 120
+SCAN_TIMEOUT_SECONDS = 5
 
 
 def _alive(pid: int) -> bool:
@@ -73,25 +74,31 @@ def check_claude(registry: list[dict], projects_root: str | None = None,
 def process_table() -> list[dict]:
     """Live agent CLI processes with start time and working directory."""
     out = subprocess.run(["ps", "-Ao", "pid=,lstart=,command="],
-                         capture_output=True, text=True, check=True).stdout
+                         capture_output=True, text=True, check=True,
+                         timeout=SCAN_TIMEOUT_SECONDS).stdout
+    if not out.strip():
+        raise OSError("unparseable ps output: empty process table")
     rows = []
     for line in out.splitlines():
         parts = line.split(None, 6)
         if len(parts) < 7:
-            continue
+            raise OSError("unparseable ps output: incomplete process row")
         pid, command = parts[0], parts[6]
-        name = os.path.basename(command.split()[0]) if command.split() else ""
+        try:
+            pid = int(pid)
+            if pid <= 0:
+                raise ValueError("PID must be positive")
+            started = time.mktime(time.strptime(" ".join(parts[1:6]), "%a %b %d %H:%M:%S %Y"))
+        except (ValueError, OverflowError) as exc:
+            raise OSError("unparseable ps output: invalid PID or start time") from exc
+        name = os.path.basename(command.split()[0])
         if name not in ("opencode", "codex"):
             continue
-        try:
-            started = time.mktime(time.strptime(" ".join(parts[1:6]), "%a %b %d %H:%M:%S %Y"))
-        except ValueError:
-            started = None
-        row = {"pid": int(pid), "name": name, "command": command,
+        row = {"pid": pid, "name": name, "command": command,
                "started": started, "cwd": None}
         try:
-            row["cwd"] = _cwd(int(pid))
-        except (OSError, subprocess.SubprocessError) as exc:
+            row["cwd"] = _cwd(pid)
+        except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
             row["cwd_error"] = _scan_error(exc)
         rows.append(row)
     return rows
@@ -103,10 +110,16 @@ def _scan_error(exc) -> str:
 
 def _cwd(pid: int) -> str:
     out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-                         capture_output=True, text=True, check=True).stdout
+                         capture_output=True, text=True, check=True,
+                         timeout=SCAN_TIMEOUT_SECONDS).stdout
+    cwd = None
     for line in out.splitlines():
-        if line.startswith("n") and line[1:]:
-            return line[1:]
+        if line.startswith("n/"):
+            cwd = line[1:]
+        elif not (line.startswith("p") and line[1:].isdigit() or line == "fcwd"):
+            raise OSError("unparseable lsof output: invalid working-directory record")
+    if cwd is not None:
+        return cwd
     raise OSError("lsof returned no working directory (process exited or access unavailable)")
 
 
@@ -176,7 +189,7 @@ def check(processes=None, registry=None, con=None) -> dict:
     if processes is None:
         try:
             processes = process_table()
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
             processes = []
             unavailable.append({"check": "process scan", "reason": _scan_error(exc)})
     for proc in processes:

@@ -60,6 +60,26 @@ class ScanAvailabilityTest(unittest.TestCase):
         self.tool("ps", "echo 'scan denied' >&2; exit 1")
         self.check_unavailable("scan denied")
 
+    def test_malformed_ps_output_is_unavailable(self):
+        for row in ("garbage", "nope Mon Oct 19 10:00:00 2026 codex",
+                    "201 bad date from ps output codex", ""):
+            with self.subTest(row=row):
+                self.tool("ps", f"printf '%s\\n' '{row}'")
+                self.check_unavailable("unparseable ps output")
+
+    def test_malformed_lsof_cwd_is_unavailable(self):
+        self.tool("lsof", "printf 'nnot-a-working-directory\\n'")
+        self.check_unavailable("lsof")
+
+    def test_hung_scan_tools_are_unavailable(self):
+        for name in ("ps", "lsof"):
+            with self.subTest(tool=name):
+                self.tool("ps", "printf '201 Mon Oct 19 10:00:00 2026 codex\\n'")
+                self.tool(name, "exec /bin/sleep 0.3")
+                with patch.object(health, "SCAN_TIMEOUT_SECONDS", 0.05, create=True):
+                    result = self.check_unavailable("timed out")
+                self.assertIn(name, result["unavailable"][0]["reason"])
+
     def test_readable_cwd_still_finds_invisible_process(self):
         self.tool("lsof", "printf 'p201\\nn/p/unseen\\n'")
         check_codex = health.check_codex
