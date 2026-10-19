@@ -404,6 +404,36 @@ class HealthBareRootsTest(BareRootCase):
                          [{"root": gone, "reason": "missing on this machine"}])
         self.assertEqual(result["bare_roots"]["grok"]["state"], "unused")
 
+    def test_health_without_lsof_reports_both_gaps_in_one_run(self):
+        gone = self.bare_sessions("codex", "gone")
+        self.receipts(("codex", gone))
+        tools = os.path.join(self.base, "bin")
+        os.makedirs(tools)
+        ps = os.path.join(tools, "ps")
+        with open(ps, "w") as fh:
+            fh.write("#!/bin/sh\nprintf '201 Mon Oct 19 10:00:00 2026 codex\\n'\n")
+        os.chmod(ps, 0o700)
+        for as_json in (False, True):
+            out = io.StringIO()
+            args = ["--db", os.path.join(self.base, "missing.db"), "health"]
+            with self.subTest(as_json=as_json), \
+                    patch.dict(os.environ, {"PATH": tools}), \
+                    patch.object(health, "claude_registry", return_value=[]), \
+                    redirect_stdout(out):
+                code = cli.main(args + (["--json"] if as_json else []))
+            self.assertEqual(code, 4)
+            if as_json:
+                result = json.loads(out.getvalue())
+                self.assertIn("lsof", result["unavailable"][0]["reason"])
+                self.assertEqual(result["bare_roots"]["codex"]["gaps"], [
+                    {"root": gone, "reason": "missing on this machine"}])
+            else:
+                text = out.getvalue()
+                self.assertIn("working directory unavailable:", text)
+                self.assertIn("lsof", text)
+                self.assertIn(f"- codex gap codex bare root {gone}:"
+                              " missing on this machine", text)
+
 
 if __name__ == "__main__":
     unittest.main()
