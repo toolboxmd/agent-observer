@@ -37,8 +37,8 @@ DEFAULT_ROOT = os.path.expanduser("~/.grok/sessions")
 CAPABILITIES = [
     ("model_usage", True, "one responses row per turn_completed prompt_id; input includes cached reads, output includes reasoning"),
     ("tool_calls", True, "tool_call records with validated native tool name, safe target and argument fingerprint; raw input never stored"),
-    ("tool_results", True, "tool_call_update status joined with events.jsonl tool_completed duration and outcome on toolCallId"),
-    ("read_evidence", True, "tool_call_update kind=read locations as read events with paths and line metadata"),
+    ("tool_results", True, "tool_call_update and tool_completed plus MCP start/completion records joined by call ID; duration, success, timeout and retries retained"),
+    ("read_evidence", True, "tool_call_update kind=read locations with attempted/pending/failed/ok state"),
     ("skill_file_reads", True, "reads under an installed Skill directory as skill_read with the skill name"),
     ("skill_invocation", False, "no native skill-invocation event observed in Grok records; stays unknown"),
     ("compaction", True, "auto_compact_started and auto_compact_completed as compaction events"),
@@ -2625,8 +2625,9 @@ def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
                 continue
             paths.append(path)
         if paths:
-            for path in paths:
-                r.identity.observe_path(path)
+            if _read_state(update.get("status")) == "ok":
+                for path in paths:
+                    r.identity.observe_path(path)
             raw_skill = skill_from_path(paths[0])
             skill_path = paths[0]
             # A second location in the same call may name the Skill while the
@@ -2651,7 +2652,7 @@ def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
                 r.event(src, family, call_id,
                         ordinal, ts, turn_id=turn_id,
                         name=safe_skill or os.path.basename(paths[0]),
-                        target=safe_skill,
+                        target=safe_skill, status=_read_state(update.get("status")),
                         fingerprint=fingerprint(call_id, paths),
                         detail={"skill": raw_skill, "skill_path": skill_path})
             else:
@@ -2660,10 +2661,15 @@ def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
                 r.event(src, family, call_id,
                         ordinal, ts, turn_id=turn_id,
                         name=os.path.basename(paths[0]),
-                        target=paths[0],
+                        target=paths[0], status=_read_state(update.get("status")),
                         fingerprint=fingerprint(call_id, paths),
                         detail=None)
     status = update.get("status")
+    # A terminal update often omits locations. Join the prior read by call ID.
+    if status is not None:
+        r.con.execute("UPDATE events SET status=? WHERE session_key=? AND native_id=?"
+                      " AND family IN ('read','skill_read')",
+                      (_read_state(status), r.session_key, call_id))
     if isinstance(status, str) and status in TERMINAL_TOOL_STATUS:
         # Tool results keep no detail under privacy.py rule 6; the mapped
         # terminal status is the ledger column.
@@ -2724,6 +2730,21 @@ def _ingest_event(r: _Reader, src: JsonlSource, obj: dict,
         outcome = _valid_enum(obj.get("outcome"), _OUTCOME_VALUES)
         r.event(src, "lifecycle", f"turn_ended:{ordinal}", ordinal, ts,
                 name="turn_ended", status=outcome)
+    elif kind == "mcp_tool_call_started":
+        call_id = _safe_token(obj.get("call_id"))
+        if call_id is None:
+            raise _AdapterError("schema_error")
+        prior = r.con.execute("SELECT id FROM events WHERE session_key=? AND family='tool_call' AND native_id=?",
+                              (r.session_key, call_id)).fetchone()
+        timeout = obj.get("timeout_sec")
+        detail = {"timeout_sec": timeout} if type(timeout) is int and timeout >= 0 else {}
+        if prior:
+            r.con.execute("UPDATE events SET detail_json=? WHERE id=?", (json.dumps(detail) if detail else None, prior['id']))
+        else:
+            r.event(src, "tool_call", call_id, ordinal, ts,
+                    name=_safe_token(obj.get("tool_name")) or "unknown", detail=detail)
+    elif kind == "mcp_tool_call_completed":
+        _tool_completed(r, src, obj, ordinal, ts)
     elif kind == "tool_started":
         tool_s = _safe_token(obj.get("tool_name")) or "unknown"
         r.event(src, "lifecycle", f"tool_started:{ordinal}", ordinal, ts,
@@ -2761,14 +2782,24 @@ def _ingest_event(r: _Reader, src: JsonlSource, obj: dict,
 
 def _tool_completed(r: _Reader, src: JsonlSource, obj: dict, ordinal: int,
                     ts) -> None:
-    raw_call = obj.get("tool_call_id")
+    is_mcp = obj.get("type") == "mcp_tool_call_completed"
+    raw_call = obj.get("call_id") if is_mcp else obj.get("tool_call_id")
     if not isinstance(raw_call, str) or _safe_token(raw_call) is None:
         raise _AdapterError("schema_error")
     call_id = raw_call
     outcome = obj.get("outcome")
-    status = "ok" if outcome in ("success", "completed") else "error"
+    if is_mcp and type(obj.get("success")) is bool:
+        status = "ok" if obj["success"] else "error"
+    elif outcome in ("success", "completed"):
+        status = "ok"
+    elif outcome in ("error", "failed", "failure", "cancelled"):
+        status = "error"
+    else:
+        status = None
+    mcp_detail = {k: obj[k] for k in ("is_timeout", "auth_retry_attempted", "reconnect_attempted")
+                  if type(obj.get(k)) is bool}
     duration = obj.get("duration_ms")
-    if isinstance(duration, bool) or not isinstance(duration, int):
+    if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
         duration = None
     row = r.con.execute(
         "SELECT id, status, duration_ms, detail_json FROM events"
@@ -2777,7 +2808,7 @@ def _tool_completed(r: _Reader, src: JsonlSource, obj: dict, ordinal: int,
     if row is None:
         tool_s = _safe_token(obj.get("tool_name")) or "unknown"
         r.event(src, "tool_result", call_id, ordinal, ts,
-                name=tool_s, status=status, duration_ms=duration)
+                name=tool_s, status=status, duration_ms=duration, detail=mcp_detail)
         return
     try:
         loaded = json.loads(row["detail_json"]) if row["detail_json"] else {}
@@ -2786,16 +2817,24 @@ def _tool_completed(r: _Reader, src: JsonlSource, obj: dict, ordinal: int,
     # Scrub any legacy values through privacy.py rule 6: only allowlisted
     # tool_result keys with correctly typed values survive, so unknown keys
     # and free text are dropped, never stringified.
-    detail = privacy.filter_detail("tool_result", loaded)
+    detail = privacy.filter_detail("tool_result", {**loaded, **mcp_detail})
     payload = json.dumps(detail, sort_keys=True) if detail else None
     changed = payload != row["detail_json"]
     if row["duration_ms"] is None and duration is not None:
         changed = True
-    if row["status"] is None and status:
+    if status is not None and (row["status"] is None or is_mcp and row["status"] != status):
         changed = True
     if changed:
         r.con.execute(
             "UPDATE events SET duration_ms=COALESCE(duration_ms, ?),"
-            " status=COALESCE(status, ?), detail_json=? WHERE id=?",
-            (duration, status, payload,
+            " status=?, detail_json=? WHERE id=?",
+            (duration, status if is_mcp and status is not None else row["status"] or status, payload,
              row["id"]))
+
+
+def _read_state(status):
+    if status in ("completed", "success"):
+        return "ok"
+    if status in ("failed", "error", "cancelled"):
+        return "failed"
+    return "pending" if status in ("in_progress", "pending", "running") else "attempted"

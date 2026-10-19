@@ -358,8 +358,8 @@ def insert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
          truncated, fingerprint, payload))
     if cur.rowcount == 0:
         if update:
-            fields = "name=?, target=?, status=?, detail_json=?"
-            values = [safe_name, safe_target, safe_status, payload]
+            fields = "name=?, target=?, status=?, detail_json=?, duration_ms=?"
+            values = [safe_name, safe_target, safe_status, payload, duration_ms]
             if migrate_ordinal:
                 fields += ", ordinal_num=?"
                 values.append(ordinal)

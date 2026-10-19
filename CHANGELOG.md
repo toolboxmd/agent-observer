@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Parse sectioned AgentsMD direction identity, Codex native durations and Read calls, and Grok MCP timing and outcomes. Retain read success state and count only successful procedure reads; replay older sources to repair stored evidence (#128).
+
 ## [1.3.0] - 2026-10-19
 
 ### Added

@@ -102,7 +102,7 @@ class CodexUserIdentityTest(LedgerCase):
             result = codex.sync(self.con, source=path, full=full)
             self.assertEqual(result["failed"], [])
             self.assertEqual(result["user_messages_inserted"], 0)
-            self.assertEqual(self.query("SELECT privacy_version FROM sources")[0][0], 9)
+            self.assertEqual(self.query("SELECT privacy_version FROM sources")[0][0], 10)
             self.assertEqual(self.query("PRAGMA foreign_key_check"), [])
             self.assertEqual([tuple(r) for r in self.query(
                 "SELECT error, COUNT(*) FROM import_errors GROUP BY error")],

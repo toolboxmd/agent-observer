@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import os
 import sqlite3
 
@@ -78,11 +79,11 @@ CAPABILITIES = [
     ("lifecycle_task", True, "event_msg task_started/task_complete with turn timing; turn_aborted marks cancelled turns"),
     ("lifecycle_dispatch", True, "collaboration.spawn_agent call plus SubAgentActivity started; child join needs explicit delegation capture"),
     ("file_change", True, "FileChange items with path, change kind, content size/hash; contents never stored"),
-    ("read_evidence", True, "CommandExecution parsed_cmd entries of type read; target/size/owner/window preserved"),
+    ("read_evidence", True, "CommandExecution parsed_cmd reads and Read function calls; attempted/pending/failed/ok state retained"),
     ("skill_file_reads", True, "read events under an installed Skill directory; mentions never count"),
     ("skill_invocation", False, "no native skill-invocation event observed in Codex sample; stays unknown"),
-    ("timing_tool", True, "CommandExecution duration when reported; otherwise unknown, never invented"),
-    ("instruction_identity", True, "AgentsMD direction block in injected messages and versioned plugin paths read"),
+    ("timing_tool", True, "CommandExecution numeric and {secs,nanos} durations; otherwise unknown"),
+    ("instruction_identity", True, "AgentsMD legacy and nonce-section direction blocks; successfully read versioned plugin paths"),
     ("quota", False, "rate-limit snapshots are account evidence, not task attribution; stays unknown at task level"),
 ]
 
@@ -1850,6 +1851,11 @@ def _ingest_response_item(r: _Reader, obj: dict, native_ordinal, position: int) 
                     args, custom=ptype == "custom_tool_call"),
                 status=p.get("status"),
                 fingerprint=fingerprint(name, str(args)[:2000]))
+        if name == "Read":
+            target = _call_target(args)
+            if target:
+                _function_read(r, obj, call_id or p.get("id"), target, "attempted", turn_id)
+
     elif ptype in ("function_call_output", "custom_tool_call_output"):
         call_id = p.get("call_id")
         out = p.get("output")
@@ -1860,6 +1866,19 @@ def _ingest_response_item(r: _Reader, obj: dict, native_ordinal, position: int) 
             size = len(str(out or ""))
         r.event(obj, "tool_result", call_id or p.get("id"), turn_id=turn_id,
                 name=ptype, size_bytes=size)
+        prior = r.con.execute(
+            "SELECT family,target,detail_json FROM events WHERE session_key=? AND native_id=?"
+            " AND family IN ('read','skill_read')", (r.session_key, call_id)).fetchone()
+        if prior:
+            state = "failed" if p.get("is_error") is True else _read_output_state(out)
+            if state == "ok":
+                path = (json.loads(prior["detail_json"] or "{}").get("skill_path")
+                        if prior["family"] == "skill_read" else prior["target"])
+                if path:
+                    r.identity.observe_path(path)
+            r.con.execute("UPDATE events SET status=?,size_bytes=? WHERE session_key=?"
+                          " AND native_id=? AND family IN ('read','skill_read')",
+                          (state, size, r.session_key, call_id))
 
 
 _PATH_KEYS = ("file_path", "path", "filePath", "target_file", "filename")
@@ -2075,7 +2094,8 @@ def _ingest_command(r: _Reader, obj: dict, item: dict, turn_id) -> None:
                 target = entry.get("name")
             if not isinstance(target, str) or not target:
                 continue
-            r.identity.observe_path(target)
+            if _command_read_state(item) == "ok":
+                r.identity.observe_path(target)
             raw_skill = skill_from_path(target)
             safe_skill = privacy.filter_target(raw_skill, family="skill_read") \
                 if raw_skill else None
@@ -2088,7 +2108,7 @@ def _ingest_command(r: _Reader, obj: dict, item: dict, turn_id) -> None:
                 # only in detail skill_path.
                 r.event(obj, fam, f"{item.get('id')}:{target}", turn_id=turn_id,
                         name=os.path.basename(target), target=safe_skill,
-                        status=item.get("status"),
+                        status=_command_read_state(item),
                         duration_ms=_duration(item), size_bytes=size,
                         fingerprint=fingerprint(target),
                         detail={"cmd": entry.get("cmd"), "skill": raw_skill,
@@ -2096,7 +2116,7 @@ def _ingest_command(r: _Reader, obj: dict, item: dict, turn_id) -> None:
             else:
                 r.event(obj, fam, f"{item.get('id')}:{target}", turn_id=turn_id,
                         name=os.path.basename(target), target=target,
-                        status=item.get("status"),
+                        status=_command_read_state(item),
                         duration_ms=_duration(item), size_bytes=size,
                         fingerprint=fingerprint(target),
                         detail={"cmd": entry.get("cmd")})
@@ -2120,7 +2140,51 @@ def _ingest_compacted(r: _Reader, obj: dict) -> None:
 
 
 def _duration(item: dict):
-    d = item.get("duration") or item.get("duration_ms") or item.get("elapsed")
-    if isinstance(d, (int, float)):
+    d = next((item[k] for k in ("duration", "duration_ms", "elapsed")
+              if item.get(k) is not None), None)
+    if isinstance(d, dict):
+        secs, nanos = d.get("secs"), d.get("nanos")
+        if type(secs) is int and type(nanos) is int and secs >= 0 and 0 <= nanos < 10**9:
+            return secs * 1000 + nanos // 10**6
+        return None
+    if type(d) in (int, float) and math.isfinite(d) and d >= 0:
         return int(d * 1000) if d < 100000 and d != int(d) else int(d)
     return None
+
+
+def _command_read_state(item):
+    code = item.get("exit_code")
+    if type(code) is int:
+        return "ok" if code == 0 else "failed"
+    status = item.get("status")
+    if status in ("failed", "error", "cancelled", "denied"):
+        return "failed"
+    if status in ("in_progress", "running", "pending"):
+        return "pending"
+    return "attempted"
+
+
+def _read_output_state(output):
+    if isinstance(output, str):
+        try:
+            output = json.loads(output)
+        except ValueError:
+            # A terminal native Read result is file text unless the tool
+            # explicitly reports an error. Never retain its contents.
+            return "failed" if output.startswith(("Error:", "Error reading file:")) else "ok"
+    if isinstance(output, dict):
+        if output.get("is_error") is True or output.get("error") or output.get("status") in ("failed", "error"):
+            return "failed"
+        if output.get("is_error") is False or output.get("status") in ("success", "completed", "ok") or "content" in output:
+            return "ok"
+    if isinstance(output, list) and output and all(isinstance(x, dict) and x.get("type") == "text" for x in output):
+        return "ok"
+    return "attempted"
+
+
+def _function_read(r, obj, call_id, path, state, turn_id):
+    skill = skill_from_path(path)
+    family = "skill_read" if skill or path.endswith("SKILL.md") or "/skills/" in path else "read"
+    r.event(obj, family, call_id, turn_id=turn_id, name=os.path.basename(path),
+            target=skill if family == "skill_read" else path, status=state,
+            detail={"skill": skill, "skill_path": path} if family == "skill_read" else None)

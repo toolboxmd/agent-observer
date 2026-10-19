@@ -28,7 +28,8 @@ import re
 
 # Rule 3: bump when any rule in this module changes meaning. A stored source
 # version that differs forces a full re-import with in-place correction.
-PRIVACY_VERSION = 9
+# Re-derive native parser evidence and successful-read state on old sources.
+PRIVACY_VERSION = 10
 
 SUBMISSION_EXCERPT_CHARS = 300
 ASSISTANT_EXCERPT_CHARS = 400
@@ -188,12 +189,14 @@ def line_excerpt(line: object) -> str:
 # or other free text.
 EVENT_DETAIL_ALLOWLIST: dict[str, dict[str, str]] = {
     "file_change": {"paths": "paths"},
-    "tool_result": {"exit_code": "int", "exitCode": "int"},
+    "tool_result": {"exit_code": "int", "exitCode": "int",
+                    "is_timeout": "bool", "auth_retry_attempted": "bool",
+                    "reconnect_attempted": "bool"},
     "read": {"start_line": "int", "num_lines": "int", "cmd": "command"},
     "skill_read": {"start_line": "int", "num_lines": "int", "cmd": "command",
                    "skill": "identifier", "skill_path": "path"},
     "assistant_message": {"excerpt": "excerpt"},
-    "tool_call": {},
+    "tool_call": {"timeout_sec": "int"},
     "skill_invoke": {"skill_path": "path"},
     "compaction": {},
     "lifecycle": {},
@@ -612,7 +615,10 @@ def filter_detail(family: str, detail: object) -> dict:
         if key not in detail:
             continue
         value = detail[key]
-        if kind == "int":
+        if kind == "bool":
+            if type(value) is bool:
+                out[key] = value
+        elif kind == "int":
             if _valid_int(value):
                 out[key] = value
         elif kind == "identifier":
@@ -728,8 +734,8 @@ _HTTP_STATUS_FAMILIES = frozenset({"lifecycle", "tool_result"})
 EVENT_STATUS_ENUMS: dict[str, frozenset] = {
     "tool_call": _COMMON_STATUS | frozenset({"cancelled"}),
     "tool_result": _COMMON_STATUS | frozenset({"cancelled"}),
-    "read": _COMMON_STATUS | frozenset({"cancelled"}),
-    "skill_read": _COMMON_STATUS | frozenset({"cancelled"}),
+    "read": _COMMON_STATUS | frozenset({"cancelled", "attempted", "pending"}),
+    "skill_read": _COMMON_STATUS | frozenset({"cancelled", "attempted", "pending"}),
     "lifecycle": frozenset(
         {"completed", "cancelled", "interrupted", "denied", "ok", "error",
          "success", "failed"}),
