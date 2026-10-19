@@ -22,7 +22,7 @@ import sqlite3
 import subprocess
 
 BLOCK_RE = re.compile(
-    r"<<<AGENTSMD_PROJECT_DIRECTION_V1>>>\s*(\{.*?\})\s*<<<END_AGENTSMD_PROJECT_DIRECTION_V1>>>",
+    r"<<<AGENTSMD_PROJECT_DIRECTION_V1>>>\s*(\{.*?\})(?=\s*<<<(?:END_AGENTSMD_PROJECT_DIRECTION_V1>>>|AGENTSMD_SECTION ))",
     re.S)
 VERSION_PATH_RE = re.compile(r"/agentsmd/(\d+\.\d+\.\d+)/")
 SKILL_PATH_RE = re.compile(r"(?:/|^)skills/([A-Za-z0-9_.-]+)/")
@@ -123,6 +123,16 @@ def parse_direction_block(text: str) -> dict | None:
     except json.JSONDecodeError:
         return {"status": "unparsed"}
     if not isinstance(block, dict):
+        return {"status": "unparsed"}
+    suffix = text[match.end():].lstrip()
+    nonce = block.get("sections")
+    if nonce is not None:
+        if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{16}", nonce):
+            return {"status": "unparsed"}
+        if not suffix.startswith(f"<<<AGENTSMD_SECTION {nonce} ") or \
+                f"<<<END_AGENTSMD_PROJECT_DIRECTION_V1 {nonce}>>>" not in suffix:
+            return {"status": "unparsed"}
+    elif not suffix.startswith("<<<END_AGENTSMD_PROJECT_DIRECTION_V1>>>"):
         return {"status": "unparsed"}
     result: dict = {}
     status = block.get("status")

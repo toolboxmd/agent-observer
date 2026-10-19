@@ -37,8 +37,8 @@ DEFAULT_ROOT = os.path.expanduser("~/.grok/sessions")
 CAPABILITIES = [
     ("model_usage", True, "one responses row per turn_completed prompt_id; input includes cached reads, output includes reasoning"),
     ("tool_calls", True, "tool_call records with validated native tool name, safe target and argument fingerprint; raw input never stored"),
-    ("tool_results", True, "tool_call_update status joined with events.jsonl tool_completed duration and outcome on toolCallId"),
-    ("read_evidence", True, "tool_call_update kind=read locations as read events with paths and line metadata"),
+    ("tool_results", True, "tool_call_update and tool_completed plus MCP start/completion records joined by call ID; duration, success, timeout and retries retained"),
+    ("read_evidence", True, "tool_call_update kind=read locations with attempted/pending/failed/ok state"),
     ("skill_file_reads", True, "reads under an installed Skill directory as skill_read with the skill name"),
     ("skill_invocation", False, "no native skill-invocation event observed in Grok records; stays unknown"),
     ("compaction", True, "auto_compact_started and auto_compact_completed as compaction events"),
@@ -435,6 +435,8 @@ class _Reader:
         self.native_sid = native_sid
         self.stats = stats
         self.identity = SessionIdentity()
+        self.read_identity_seen: set[tuple[str, str]] = set()
+        self.read_paths: dict[str, dict[str, None]] = {}
         self.first_ts = None
         self.last_ts = None
         self.meta: dict = {}
@@ -448,6 +450,33 @@ class _Reader:
             return
         self.first_ts = ts if self.first_ts is None else min(self.first_ts, ts)
         self.last_ts = ts if self.last_ts is None else max(self.last_ts, ts)
+
+    def observe_read_path(self, call_id: str, path: str) -> None:
+        key = (call_id, path)
+        if key not in self.read_identity_seen:
+            self.read_identity_seen.add(key)
+            self.identity.observe_path(path)
+
+    def remember_read_update(self, update: dict) -> list[str]:
+        call_id = update.get("toolCallId")
+        if not isinstance(call_id, str) or _safe_token(call_id) is None:
+            return []
+        paths = []
+        locations = update.get("locations")
+        if update.get("kind") == "read" and isinstance(locations, list):
+            for loc in locations:
+                if not isinstance(loc, dict) or any(k in loc for k in _FREE_TEXT_LOCATION_KEYS):
+                    continue
+                path = loc.get("path")
+                if isinstance(path, str) and path:
+                    paths.append(path)
+        if paths:
+            remembered = self.read_paths.setdefault(call_id, {})
+            remembered.update(dict.fromkeys(paths))
+        if _read_state(update.get("status")) == "ok":
+            for path in self.read_paths.get(call_id, {}):
+                self.observe_read_path(call_id, path)
+        return paths
 
     def event(self, src: JsonlSource, family, native_id, ordinal, ts, **kw):
         # Every target and detail mapping passes through
@@ -1729,6 +1758,20 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             updates_records, events_records,
             (_prompts, _order, _completions, _turn_models_cached))
         _advance_source_to_cached(updates_src, updates_path, updates_records)
+        # The complete cached prefix is already loaded for usage replay.
+        # Restore pending locations and successful identity evidence before
+        # ingesting an appended locationless completion, without new I/O or
+        # widening the stored event detail allowlist.
+        if updates_src.incremental:
+            for ordinal, obj, _line in updates_records:
+                if ordinal > updates_src.row["ordinal_max"]:
+                    break
+                if not isinstance(obj, dict) or obj.get("method") not in METHODS:
+                    continue
+                params = obj.get("params")
+                update = params.get("update") if isinstance(params, dict) else None
+                if isinstance(update, dict) and update.get("sessionUpdate") == "tool_call_update":
+                    r.remember_read_update(update)
         for ordinal, obj, line in _delta_records(
                 updates_records, updates_src):
             stats["lines"] += 1
@@ -1794,6 +1837,26 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                       updates_src.source_id if updates_src is not None
                       else (events_src.source_id if events_src is not None
                             else None), **fields)
+    if replayed_updates:
+        # This reader rebuilt read evidence from the whole cached source.
+        # Replace derived path counts instead of retaining the first sync's
+        # counts through upsert_session's fill-unknown policy. Other identity
+        # evidence stays intact; a resolved instruction hash still wins.
+        stored = con.execute("SELECT identity_json FROM sessions WHERE session_key=?",
+                             (r.session_key,)).fetchone()
+        evidence = json.loads(stored["identity_json"] or "{}")
+        if r.identity.path_versions or "plugin_paths" in evidence:
+            if r.identity.path_versions:
+                evidence["plugin_paths"] = r.identity.path_versions
+            else:
+                evidence.pop("plugin_paths", None)
+            version = max(r.identity.path_versions, key=r.identity.path_versions.get) \
+                if r.identity.path_versions else None
+            con.execute(
+                "UPDATE sessions SET identity_json=?, agentsmd_version=COALESCE("
+                "(SELECT version FROM agentsmd_versions WHERE sha256=sessions.instructions_sha256), ?)"
+                " WHERE session_key=?",
+                (json.dumps(evidence, sort_keys=True) if evidence else None, version, r.session_key))
     _store_meta(con, r.session_key, summary_fp, chat_fp_current, chat)
     if updates_src is not None:
         stats.update(updates_src.finish(session_id=r.native_sid))
@@ -2607,63 +2670,51 @@ def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
         raise _AdapterError("schema_error")
     call_id = raw_call
     turn_id = _turn_id(r, params)
-    locations = update.get("locations")
-    if update.get("kind") == "read" and isinstance(locations, list) \
-            and locations:
-        # Fail closed: every location must be a plain {"path": str} shape
-        # with an optional integer line. A location bearing message/output
-        # style free-text keys, a non-string path, or a non-integer line is
-        # dropped entirely and never stringified into any ledger column.
-        paths: list[str] = []
-        for loc in locations:
-            if not isinstance(loc, dict):
-                continue
-            if any(k in loc for k in _FREE_TEXT_LOCATION_KEYS):
-                continue
-            path = loc.get("path")
-            if not isinstance(path, str) or not path:
-                continue
-            paths.append(path)
-        if paths:
-            for path in paths:
-                r.identity.observe_path(path)
-            raw_skill = skill_from_path(paths[0])
-            skill_path = paths[0]
-            # A second location in the same call may name the Skill while the
-            # first does not; the Skill read is the identity evidence.
-            if raw_skill is None:
-                for path in paths[1:]:
-                    raw_skill = skill_from_path(path)
-                    if raw_skill is not None:
-                        skill_path = path
-                        break
-            if raw_skill is not None and _safe_token(raw_skill) is None:
-                raw_skill = None
-            safe_skill = privacy.filter_target(raw_skill, family="skill_read") \
-                if raw_skill else None
-            looks_like_skill = any(
-                p.endswith("SKILL.md") or "/skills/" in p for p in paths)
-            family = "skill_read" if (safe_skill or looks_like_skill) else "read"
-            if family == "skill_read":
-                # Rule 6: skill_read target holds only the validated skill
-                # identifier, never the installed path. The file path lives
-                # only in detail skill_path.
-                r.event(src, family, call_id,
-                        ordinal, ts, turn_id=turn_id,
-                        name=safe_skill or os.path.basename(paths[0]),
-                        target=safe_skill,
-                        fingerprint=fingerprint(call_id, paths),
-                        detail={"skill": raw_skill, "skill_path": skill_path})
-            else:
-                # Read events keep no detail under privacy.py rule 6; the
-                # first validated path is the target.
-                r.event(src, family, call_id,
-                        ordinal, ts, turn_id=turn_id,
-                        name=os.path.basename(paths[0]),
-                        target=paths[0],
-                        fingerprint=fingerprint(call_id, paths),
-                        detail=None)
+    # Keep every validated location until a later terminal update, rather
+    # than relying on the single representative path stored on the read row.
+    paths = r.remember_read_update(update)
+    if paths:
+        raw_skill = skill_from_path(paths[0])
+        skill_path = paths[0]
+        # A second location in the same call may name the Skill while the
+        # first does not; the Skill read is the identity evidence.
+        if raw_skill is None:
+            for path in paths[1:]:
+                raw_skill = skill_from_path(path)
+                if raw_skill is not None:
+                    skill_path = path
+                    break
+        if raw_skill is not None and _safe_token(raw_skill) is None:
+            raw_skill = None
+        safe_skill = privacy.filter_target(raw_skill, family="skill_read") \
+            if raw_skill else None
+        looks_like_skill = any(
+            p.endswith("SKILL.md") or "/skills/" in p for p in paths)
+        family = "skill_read" if (safe_skill or looks_like_skill) else "read"
+        if family == "skill_read":
+            # Rule 6: skill_read target holds only the validated skill
+            # identifier, never the installed path. The file path lives
+            # only in detail skill_path.
+            r.event(src, family, call_id,
+                    ordinal, ts, turn_id=turn_id,
+                    name=safe_skill or os.path.basename(paths[0]),
+                    target=safe_skill, status=_read_state(update.get("status")),
+                    fingerprint=fingerprint(call_id, paths),
+                    detail={"skill": raw_skill, "skill_path": skill_path})
+        else:
+            # Read events keep no detail under privacy.py rule 6; the
+            # first validated path is the target.
+            r.event(src, family, call_id,
+                    ordinal, ts, turn_id=turn_id,
+                    name=os.path.basename(paths[0]),
+                    target=paths[0], status=_read_state(update.get("status")),
+                    fingerprint=fingerprint(call_id, paths),
+                    detail=None)
     status = update.get("status")
+    if status is not None:
+        r.con.execute("UPDATE events SET status=? WHERE session_key=? AND native_id=?"
+                      " AND family IN ('read','skill_read')",
+                      (_read_state(status), r.session_key, call_id))
     if isinstance(status, str) and status in TERMINAL_TOOL_STATUS:
         # Tool results keep no detail under privacy.py rule 6; the mapped
         # terminal status is the ledger column.
@@ -2724,6 +2775,21 @@ def _ingest_event(r: _Reader, src: JsonlSource, obj: dict,
         outcome = _valid_enum(obj.get("outcome"), _OUTCOME_VALUES)
         r.event(src, "lifecycle", f"turn_ended:{ordinal}", ordinal, ts,
                 name="turn_ended", status=outcome)
+    elif kind == "mcp_tool_call_started":
+        call_id = _safe_token(obj.get("call_id"))
+        if call_id is None:
+            raise _AdapterError("schema_error")
+        prior = r.con.execute("SELECT id FROM events WHERE session_key=? AND family='tool_call' AND native_id=?",
+                              (r.session_key, call_id)).fetchone()
+        timeout = obj.get("timeout_sec")
+        detail = {"timeout_sec": timeout} if type(timeout) is int and timeout >= 0 else {}
+        if prior:
+            r.con.execute("UPDATE events SET detail_json=? WHERE id=?", (json.dumps(detail) if detail else None, prior['id']))
+        else:
+            r.event(src, "tool_call", call_id, ordinal, ts,
+                    name=_safe_token(obj.get("tool_name")) or "unknown", detail=detail)
+    elif kind == "mcp_tool_call_completed":
+        _tool_completed(r, src, obj, ordinal, ts)
     elif kind == "tool_started":
         tool_s = _safe_token(obj.get("tool_name")) or "unknown"
         r.event(src, "lifecycle", f"tool_started:{ordinal}", ordinal, ts,
@@ -2761,14 +2827,24 @@ def _ingest_event(r: _Reader, src: JsonlSource, obj: dict,
 
 def _tool_completed(r: _Reader, src: JsonlSource, obj: dict, ordinal: int,
                     ts) -> None:
-    raw_call = obj.get("tool_call_id")
+    is_mcp = obj.get("type") == "mcp_tool_call_completed"
+    raw_call = obj.get("call_id") if is_mcp else obj.get("tool_call_id")
     if not isinstance(raw_call, str) or _safe_token(raw_call) is None:
         raise _AdapterError("schema_error")
     call_id = raw_call
     outcome = obj.get("outcome")
-    status = "ok" if outcome in ("success", "completed") else "error"
+    if is_mcp and type(obj.get("success")) is bool:
+        status = "ok" if obj["success"] else "error"
+    elif outcome in ("success", "completed"):
+        status = "ok"
+    elif outcome in ("error", "failed", "failure", "cancelled"):
+        status = "error"
+    else:
+        status = None
+    mcp_detail = {k: obj[k] for k in ("is_timeout", "auth_retry_attempted", "reconnect_attempted")
+                  if type(obj.get(k)) is bool}
     duration = obj.get("duration_ms")
-    if isinstance(duration, bool) or not isinstance(duration, int):
+    if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
         duration = None
     row = r.con.execute(
         "SELECT id, status, duration_ms, detail_json FROM events"
@@ -2777,7 +2853,7 @@ def _tool_completed(r: _Reader, src: JsonlSource, obj: dict, ordinal: int,
     if row is None:
         tool_s = _safe_token(obj.get("tool_name")) or "unknown"
         r.event(src, "tool_result", call_id, ordinal, ts,
-                name=tool_s, status=status, duration_ms=duration)
+                name=tool_s, status=status, duration_ms=duration, detail=mcp_detail)
         return
     try:
         loaded = json.loads(row["detail_json"]) if row["detail_json"] else {}
@@ -2786,16 +2862,24 @@ def _tool_completed(r: _Reader, src: JsonlSource, obj: dict, ordinal: int,
     # Scrub any legacy values through privacy.py rule 6: only allowlisted
     # tool_result keys with correctly typed values survive, so unknown keys
     # and free text are dropped, never stringified.
-    detail = privacy.filter_detail("tool_result", loaded)
+    detail = privacy.filter_detail("tool_result", {**loaded, **mcp_detail})
     payload = json.dumps(detail, sort_keys=True) if detail else None
     changed = payload != row["detail_json"]
     if row["duration_ms"] is None and duration is not None:
         changed = True
-    if row["status"] is None and status:
+    if status is not None and (row["status"] is None or is_mcp and row["status"] != status):
         changed = True
     if changed:
         r.con.execute(
             "UPDATE events SET duration_ms=COALESCE(duration_ms, ?),"
-            " status=COALESCE(status, ?), detail_json=? WHERE id=?",
-            (duration, status, payload,
+            " status=?, detail_json=? WHERE id=?",
+            (duration, status if is_mcp and status is not None else row["status"] or status, payload,
              row["id"]))
+
+
+def _read_state(status):
+    if status in ("completed", "success"):
+        return "ok"
+    if status in ("failed", "error", "cancelled"):
+        return "failed"
+    return "pending" if status in ("in_progress", "pending", "running") else "attempted"

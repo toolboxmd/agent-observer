@@ -970,7 +970,7 @@ class NativeEventsTest(LedgerCase):
                 self.assertEqual(ledger.execute(
                     "PRAGMA foreign_key_check").fetchall(), [])
                 self.assertEqual(ledger.execute(
-                    "SELECT privacy_version FROM sources").fetchone()[0], 9)
+                    "SELECT privacy_version FROM sources").fetchone()[0], 10)
         finally:
             ledger.close()
 
@@ -1150,7 +1150,7 @@ class NativeEventsTest(LedgerCase):
                     "PRAGMA foreign_key_check").fetchall(), [])
                 self.assertEqual(ledger.execute(
                     "SELECT privacy_version FROM sources WHERE id=?",
-                    (moved_source,)).fetchone()[0], 9)
+                    (moved_source,)).fetchone()[0], 10)
         finally:
             ledger.close()
 

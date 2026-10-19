@@ -934,7 +934,7 @@ def _user(r: _Reader, obj: dict, ordinal: int, ts) -> None:
         skill = privacy.filter_target(raw_skill,
                                       family="skill_read")
         r.event("skill_read", obj.get("uuid") or f"ordinal:{ordinal}", ordinal, ts,
-                name=skill, target=skill, size_bytes=len(text),
+                name=skill, target=skill, status="ok", size_bytes=len(text),
                 detail={"skill": raw_skill, "skill_path": skill_file}
                 if (raw_skill or skill_file) else None)
     native_kind = _native_user_kind(obj, text, agent_id=r.agent_id,
@@ -997,13 +997,13 @@ def _tool_result(r: _Reader, obj: dict, result: dict, ordinal: int, ts) -> None:
         lines = (file_info or {}).get("numLines")
         if family == "skill_read":
             r.event(family, f"{call_id}:read", ordinal, ts, name=os.path.basename(path),
-                    target=safe_skill, size_bytes=size,
+                    target=safe_skill, status="ok", size_bytes=size,
                     fingerprint=fingerprint(path, start, lines),
                     detail={"start_line": start, "num_lines": lines,
                             "skill": raw_skill, "skill_path": path})
         else:
             r.event(family, f"{call_id}:read", ordinal, ts, name=os.path.basename(path),
-                    target=path, size_bytes=size,
+                    target=path, status="ok", size_bytes=size,
                     fingerprint=fingerprint(path, start, lines),
                     detail={"start_line": start, "num_lines": lines})
 

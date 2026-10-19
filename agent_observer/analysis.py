@@ -353,6 +353,8 @@ def _repeated_skills(session, events) -> list:
                         del seen[key]
         if e["family"] not in ("skill_read", "skill_invoke"):
             continue
+        if e["family"] == "skill_read" and e["status"] not in ("ok", "success", "completed"):
+            continue
         name = (e["name"] or e["target"] or "").lower()
         if e["family"] == "skill_read":
             name = (_detail(e).get("skill") or name).lower()
@@ -605,7 +607,7 @@ def _session_metrics(con, s) -> dict:
         "SELECT kind, COUNT(*) n FROM user_messages WHERE session_key=? GROUP BY kind", (key,))}
     reading = con.execute(
         "SELECT COUNT(*) n, COALESCE(SUM(size_bytes), 0) b FROM events WHERE session_key=?"
-        " AND family IN ('read', 'skill_read')"
+        " AND family IN ('read', 'skill_read') AND status IN ('ok','success','completed')"
         " AND (target LIKE ? OR detail_json LIKE ?)",
         (key, f"%{AGENTSMD_PATH}%", f"%{AGENTSMD_PATH}%")
     ).fetchone()

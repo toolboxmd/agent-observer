@@ -16,6 +16,8 @@ class AnalysisCase(LedgerCase):
 
     def event(self, key, family, name=None, target=None, status=None, ts=None,
               detail=None):
+        if status is None and family == "skill_read":
+            status = "ok"
         self.seq += 1
         self.con.execute(
             "INSERT INTO events(session_key, ts, family, native_id, name, target,"

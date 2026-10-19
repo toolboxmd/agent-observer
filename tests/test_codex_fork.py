@@ -517,7 +517,7 @@ class SparseForkCutoffTest(unittest.TestCase):
             "SELECT COUNT(*) FROM events WHERE native_id='parent-text'"
         ).fetchone()[0], 1)
         self.assertEqual(self.con.execute(
-            "SELECT privacy_version FROM sources").fetchone()[0], 9)
+            "SELECT privacy_version FROM sources").fetchone()[0], 10)
         self.assert_child_owns_its_rows()
 
 
@@ -809,7 +809,7 @@ class SharedOrdinalUpgradeTest(unittest.TestCase):
                 self.assertEqual(
                     index.records[found[key]]["payload"]["id"], bare, key)
             self.assertEqual(con.execute(
-                "SELECT privacy_version FROM sources").fetchone()[0], 9)
+                "SELECT privacy_version FROM sources").fetchone()[0], 10)
         finally:
             con.close()
 
@@ -1047,7 +1047,7 @@ class RetainedFallbackFamilyTest(unittest.TestCase):
                             "codex:c-" + seed)
                         self.assertEqual(con.execute(
                             "SELECT occurrence_backfill, privacy_version"
-                            " FROM sources").fetchone()[:], (1, 9))
+                            " FROM sources").fetchone()[:], (1, 10))
                         self.assertEqual(con.execute(
                             "SELECT COUNT(*) FROM import_errors").fetchone()[0], 0)
                         current_ids = [row["id"] for row in rows]
