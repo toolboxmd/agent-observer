@@ -159,6 +159,18 @@ def _parse(src: JsonlSource, totals: dict) -> _State:
         src.error(ordinal, category, raw)
         totals["malformed"] += 1
 
+    def extend(ts):
+        if ts is not None:
+            state.started_at = ts if state.started_at is None else min(state.started_at, ts)
+            state.ended_at = ts if state.ended_at is None else max(state.ended_at, ts)
+
+    def accept(sid, ts):
+        """A consumed record passed validation: only now may it establish
+        the session identity or widen the span. A rejected one does neither."""
+        if state.session is None:
+            state.session = sid
+        extend(ts)
+
     for ordinal, obj, raw in src.records():
         if obj is None:
             bad(ordinal, "malformed_json", raw)
@@ -169,9 +181,6 @@ def _parse(src: JsonlSource, totals: dict) -> _State:
         payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
         event = payload.get("event") if isinstance(payload.get("event"), dict) else {}
         ts = _ts(obj.get("recorded_at"))
-        if ts is not None:
-            state.started_at = ts if state.started_at is None else min(state.started_at, ts)
-            state.ended_at = ts if state.ended_at is None else max(state.ended_at, ts)
         # Discriminators are checked for type before any membership test,
         # so a malformed consumed record is quarantined, never a crash.
         run_frame = ptype == "runtime.session" and payload.get("kind") == "run"
@@ -180,6 +189,7 @@ def _parse(src: JsonlSource, totals: dict) -> _State:
             continue
         consumed = (run_frame and event["kind"] in _RUN_KINDS) or ptype in _CONSUMED
         if not consumed:
+            extend(ts)  # Unconsumed but well-formed frames still date the session.
             continue  # Deliberately unconsumed: envelope, kind=task, usage, others.
         if obj.get("schema_version") != 1 or obj.get("payload_schema_version") != 1:
             bad(ordinal, "unsupported_schema", raw)
@@ -189,9 +199,7 @@ def _parse(src: JsonlSource, totals: dict) -> _State:
         if sid is None:
             bad(ordinal, "missing_id", raw)
             continue
-        if state.session is None:
-            state.session = sid
-        elif sid != state.session:
+        if state.session is not None and sid != state.session:
             bad(ordinal, "identity_conflict", raw)
             continue
         seq = obj.get("sequence") if type(obj.get("sequence")) is int else None
@@ -202,6 +210,7 @@ def _parse(src: JsonlSource, totals: dict) -> _State:
             if not isinstance(entries, list):
                 bad(ordinal, "schema_error", raw)
                 continue
+            accept(sid, ts)
             state.catalog_seen = True
             for entry in entries:
                 if not isinstance(entry, dict):
@@ -212,15 +221,17 @@ def _parse(src: JsonlSource, totals: dict) -> _State:
                 if name and server and tool:
                     state.catalog.setdefault(name, set()).add((server, tool))
         elif ptype == "runtime.session.metadata":
+            accept(sid, ts)
             state.project_dir = state.project_dir or _str(record.get("workspace_root"))
             state.model = state.model or _str(record.get("model_id"))
         elif ptype == "session.workspace_branch.observed":
+            accept(sid, ts)
             ref = record.get("reference") if isinstance(record.get("reference"), dict) else {}
             if ref.get("kind") == "branch" and _str(ref.get("name")):
                 state.branch = ref["name"]
         elif ptype in ("session.end", "session.opened.observed",
                        "tool_batch.effect.started"):
-            pass  # Version gated only; recorded_at already extends the span.
+            accept(sid, ts)  # Version gated only; adds no evidence beyond the span.
         elif ptype == "tool_batch.effect.terminal":
             call = _str(record.get("call_id"))
             outcome = record.get("outcome")
@@ -231,6 +242,7 @@ def _parse(src: JsonlSource, totals: dict) -> _State:
                 # No usable outcome: the result's status stays unknown.
                 bad(ordinal, "schema_error", raw)
                 continue
+            accept(sid, ts)
             state.terminals[call] = {**at, "status": _STATUS.get(outcome["kind"])}
         else:
             run_id = _str(payload.get("run_id"))
@@ -244,15 +256,18 @@ def _parse(src: JsonlSource, totals: dict) -> _State:
                 if frame is None:
                     bad(ordinal, "missing_id", raw)
                     continue
+                accept(sid, ts)
                 state.runs.setdefault(run_id, {})["start"] = {**at, "frame": frame}
             elif kind == "terminal":
                 frame = _str(obj.get("id"))
                 if frame is None:
                     bad(ordinal, "missing_id", raw)
                     continue
+                accept(sid, ts)
                 state.runs.setdefault(run_id, {})["end"] = {
                     **at, "frame": frame, "terminal": _str(event.get("terminal"))}
             elif kind == "model_request_configured":
+                accept(sid, ts)
                 toolset = event.get("toolset") if isinstance(event.get("toolset"), dict) else {}
                 active = toolset.get("active_tools")
                 if isinstance(active, list):
@@ -263,6 +278,7 @@ def _parse(src: JsonlSource, totals: dict) -> _State:
                 if not isinstance(items, list):
                     bad(ordinal, "schema_error", raw)
                     continue
+                accept(sid, ts)
                 for item in items:
                     call = _str(item.get("call_id")) if isinstance(item, dict) else None
                     name = _str(item.get("name")) if isinstance(item, dict) else None
@@ -282,6 +298,7 @@ def _parse(src: JsonlSource, totals: dict) -> _State:
                 if not isinstance(items, list):
                     bad(ordinal, "schema_error", raw)
                     continue
+                accept(sid, ts)
                 for item in items:
                     call = _str(item.get("tool_call_id")) if isinstance(item, dict) else None
                     if call is None:
@@ -296,6 +313,7 @@ def _parse(src: JsonlSource, totals: dict) -> _State:
                 if child is None:
                     bad(ordinal, "missing_id", raw)
                     continue
+                accept(sid, ts)
                 state.links.setdefault(child, at)
     return state
 

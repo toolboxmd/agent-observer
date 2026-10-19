@@ -269,6 +269,43 @@ class ImportTest(MuseCase):
                     if k != ("lifecycle", "0b000000-0000-7000-8000-000000000004")}
         self.assertEqual(events, expected)
 
+    def test_rejected_first_record_cannot_claim_the_session(self):
+        # A malformed terminal from another invented stream, inserted before
+        # every valid consumed frame, is quarantined alone.
+        tree = self.copy_tree()
+        path = os.path.join(tree, DAY, ROOT, "session.jsonl")
+        with open(path) as fh:
+            records = [json.loads(text) for text in fh]
+        bad = json.loads(json.dumps(records[9]))
+        bad["payload"]["record"]["outcome"]["kind"] = []
+        bad["stream"]["id"] = "0a000000-0000-7000-8000-0000000000ee"
+        records.insert(1, bad)
+        with open(path, "w") as fh:
+            fh.writelines(json.dumps(r, sort_keys=True) + "\n" for r in records)
+        result = run(self.db, "sync", "--harness", "muse", "--source", path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        con = sqlite3.connect(self.db)
+        errors = con.execute("SELECT error, ordinal_num, line_excerpt FROM import_errors").fetchall()
+        sessions = [r[0] for r in con.execute("SELECT session_key FROM sessions ORDER BY 1")]
+        source_session = con.execute("SELECT session_id FROM sources").fetchone()[0]
+        con.close()
+        self.assertEqual(errors, [("schema_error", 1, self.FRAME_KEYS)])
+        self.assertEqual(sessions, [ROOT_KEY, "muse:" + C1, "muse:" + C2])
+        self.assertEqual(source_session, ROOT)
+        self.assertEqual(root_events(self.db), EXPECTED)
+
+    def test_rejected_record_does_not_move_the_span(self):
+        errors, events = self.edited_import(9, lambda r: (
+            r["payload"]["record"]["outcome"].update(kind=[]), r.update(recorded_at=1)))
+        self.assertEqual(errors, [("schema_error", 9, self.FRAME_KEYS)])
+        self.assertEqual(events[("tool_result", "call_r1")][2:4], (None, 7))
+        con = sqlite3.connect(self.db)
+        span = con.execute("SELECT started_at, ended_at FROM sessions WHERE session_key=?",
+                           (ROOT_KEY,)).fetchone()
+        con.close()
+        # The valid frames span sequence 1 to 26 at one second each.
+        self.assertEqual(span, (1792442401.0, 1792442426.0))
+
     def test_unconsumed_task_frame_stays_silent_even_when_odd(self):
         # Line 6 is an internal kind=task start: deliberately not consumed.
         errors, events = self.edited_import(6, lambda r: r["payload"]["event"].update(kind=[]))

@@ -596,7 +596,8 @@ Default root `~/.local/share/muse/sessions`: each
   A run frame whose `event.kind` is not a string, or a terminal without an
   outcome `kind` string, is a `schema_error`; that terminal's result keeps
   an unknown status. Each bad record is quarantined alone at its line number
-  with key names only, and the rest of the file still imports. Unconsumed
+  with key names only: it neither sets the session identity nor widens the
+  session span, and the rest of the file still imports. Unconsumed
   kinds (the envelope, `kind=task`, usage) are skipped silently. Prompts, result
   text, outcome reasons, hooks, memory and usage are never stored.
 - T3 maps `driver: muse` strong `nativeThreadRef` to `muse:<native id>`.
