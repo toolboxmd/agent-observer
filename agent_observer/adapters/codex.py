@@ -250,8 +250,9 @@ def _default_paths() -> tuple[list[str], dict]:
 
 
 def _stored(con: sqlite3.Connection, paths: list[str]) -> list[str]:
-    """Each path as an existing source row already spells it, once each."""
-    return sorted({stored_path(con, HARNESS, path) for path in paths})
+    """Reuse stored rows, else keep the first path in sorted discovery order."""
+    seen: dict[tuple[int, int], str] = {}
+    return sorted({stored_path(con, HARNESS, path, seen) for path in paths})
 
 
 def discover(root: str | None = None) -> list[str]:

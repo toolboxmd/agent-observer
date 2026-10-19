@@ -241,18 +241,19 @@ def _default_paths() -> tuple[list[str], dict]:
     return _sessions_under(DEFAULT_ROOT) + found, report
 
 
-def _stored(con: sqlite3.Connection, paths: list[str]) -> list[str]:
-    """Each session as existing source rows already spell it, once each."""
+def _stored(con: sqlite3.Connection, paths: list[str]
+            ) -> list[tuple[str, dict[str, str]]]:
+    """Resolve each file independently, keeping discovery order's spelling."""
+    seen: dict[tuple[int, int], str] = {}
     out = []
     for session_dir in paths:
+        files = {}
         for name in ("updates.jsonl", "events.jsonl"):
             path = os.path.join(session_dir, name)
-            stored = stored_path(con, HARNESS, path)
-            if stored != path:
-                session_dir = os.path.dirname(stored)
-                break
-        out.append(session_dir)
-    return list(dict.fromkeys(out))
+            if os.path.isfile(path):
+                files[name] = stored_path(con, HARNESS, path, seen)
+        out.append((session_dir, files))
+    return out
 
 
 def discover(root: str | None = None) -> list[str]:
@@ -324,7 +325,7 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
         paths = discover(root)
     else:
         paths, report = _default_paths()
-    paths = _stored(con, paths)
+    sources = _stored(con, paths)
     totals = {"harness": HARNESS, "sources": 0, "unchanged": 0,
               "responses_inserted": 0, "events_inserted": 0,
               "user_messages_inserted": 0, "malformed": 0, "failed": []}
@@ -338,12 +339,20 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
         # missing its parent link, and the link may live only in a sibling
         # file outside the sync set.
         _build_source_tree_index(con, ctx, paths)
-    for path in paths:
+    imported: set[str] = set()
+    for path, files in sources:
+        new_files = {name: stored for name, stored in files.items()
+                     if stored not in imported}
+        if files and not new_files:
+            continue
         try:
-            stats = import_grok_session(con, path, full=full, _sync_ctx=ctx)
+            stats = import_grok_session(con, path, full=full, _sync_ctx=ctx,
+                                        _source_paths=new_files)
         except (OSError, sqlite3.DatabaseError, UnicodeDecodeError) as exc:
             totals["failed"].append({"path": path, "error": str(exc)})
             continue
+        if "session_key" in stats:
+            imported.update(new_files.values())
         totals["sources"] += 1
         totals["unchanged"] += 1 if stats.get("unchanged") else 0
         for key in ("responses_inserted", "events_inserted",
@@ -1371,7 +1380,8 @@ def _delta_records(records: list, src) -> list:
 
 def import_grok_session(con: sqlite3.Connection, session_dir: str,
                         full: bool = False, parent_index=None,
-                        _sync_ctx=None) -> dict:
+                        _sync_ctx=None,
+                        _source_paths: dict[str, str] | None = None) -> dict:
     """Import one Grok session directory. Idempotent; growing logs resume.
 
     Change detection runs before any updates.jsonl/events.jsonl parse: the
@@ -1383,12 +1393,18 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     return, so a file that grows in between still parses on this sync.
     The caller supplies the operation parent index (sync() builds it once
     per operation); per-session code never scans sibling files.
+    When supplied, _source_paths names only the files this sync has not
+    already imported, using their resolved source spelling. Metadata still
+    comes from session_dir; sharing one file never redirects the other.
     """
     stats = {"lines": 0, "responses_inserted": 0, "responses_duplicate": 0,
              "user_messages_inserted": 0, "events_inserted": 0,
              "events_duplicate": 0, "compactions": 0, "malformed": 0}
-    updates_path = os.path.join(session_dir, "updates.jsonl")
-    events_path = os.path.join(session_dir, "events.jsonl")
+    source_paths = (_source_paths if _source_paths is not None else {
+        name: os.path.join(session_dir, name)
+        for name in ("updates.jsonl", "events.jsonl")})
+    updates_path = source_paths.get("updates.jsonl")
+    events_path = source_paths.get("events.jsonl")
     summary = _read_json(os.path.join(session_dir, "summary.json")) or {}
     info = summary.get("info") if isinstance(summary.get("info"), dict) else {}
     # Fail closed on unsafe identifiers: the native session id comes only
@@ -1473,9 +1489,9 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     # Change state before any full parse. JsonlSource does a stat plus a
     # small tail read, never a full parse.
     updates_src = (JsonlSource(con, HARNESS, updates_path, full=full)
-                   if os.path.isfile(updates_path) else None)
+                   if updates_path and os.path.isfile(updates_path) else None)
     events_src = (JsonlSource(con, HARNESS, events_path, full=full)
-                  if os.path.isfile(events_path) else None)
+                  if events_path and os.path.isfile(events_path) else None)
     r.updates_src = updates_src
     r.events_src = events_src
     known_row = con.execute("SELECT 1 FROM sessions WHERE session_key=?",
@@ -1488,8 +1504,8 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         updates_src.recheck_unchanged()
     if events_src is not None and events_src.unchanged:
         events_src.recheck_unchanged()
-    updates_new = full or updates_src is None or not updates_src.unchanged
-    events_new = full or events_src is None or not events_src.unchanged
+    updates_new = updates_src is not None and (full or not updates_src.unchanged)
+    events_new = events_src is not None and (full or not events_src.unchanged)
     privacy_stale = bool(
         (updates_src is not None and updates_src.privacy_stale)
         or (events_src is not None and events_src.privacy_stale))
@@ -1571,10 +1587,8 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                 updates_src.recheck_unchanged()
             if events_src is not None and events_src.unchanged:
                 events_src.recheck_unchanged()
-            updates_new = (full or updates_src is None
-                           or not updates_src.unchanged)
-            events_new = (full or events_src is None
-                          or not events_src.unchanged)
+            updates_new = updates_src is not None and not updates_src.unchanged
+            events_new = events_src is not None and not events_src.unchanged
             if not updates_new and not events_new:
                 stats["unchanged"] = True
                 stats["session_key"] = r.session_key
@@ -1592,10 +1606,8 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                 updates_src.recheck_unchanged()
             if events_src is not None and events_src.unchanged:
                 events_src.recheck_unchanged()
-            updates_new = (full or updates_src is None
-                           or not updates_src.unchanged)
-            events_new = (full or events_src is None
-                          or not events_src.unchanged)
+            updates_new = updates_src is not None and not updates_src.unchanged
+            events_new = events_src is not None and not events_src.unchanged
             if not updates_new and not events_new:
                 chat = stored_marks
                 _force_child_synthetic(con, stats, r.session_key)
@@ -1644,9 +1656,9 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     load_events = ((not known) or full or privacy_stale or events_new
                    or meta_changed or updates_will_replay)
     updates_records = _load_jsonl_records(updates_path) \
-        if (load_updates and os.path.isfile(updates_path)) else None
+        if (load_updates and updates_path and os.path.isfile(updates_path)) else None
     events_records = _load_jsonl_records(events_path) \
-        if (load_events and os.path.isfile(events_path)) else None
+        if (load_events and events_path and os.path.isfile(events_path)) else None
     if updates_records is None and events_records is not None and known \
             and not full and not privacy_stale and not meta_changed:
         # Events-only growth: the events parse may itself prove a new
@@ -1655,7 +1667,7 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         if stored_role != "subagent" and r.meta.get("role") != "subagent" \
                 and _has_subagent_in_records(events_records):
             updates_records = _load_jsonl_records(updates_path) \
-                if os.path.isfile(updates_path) else []
+                if updates_path and os.path.isfile(updates_path) else []
         elif _turn_models_from_records(
                 _delta_records(events_records, events_src)):
             # Events-only model change: a new valid turn_started in the
@@ -1664,7 +1676,7 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             # reconciliation. Unrelated event growth (turn_ended only)
             # yields no turn model and keeps updates unparsed.
             updates_records = _load_jsonl_records(updates_path) \
-                if os.path.isfile(updates_path) else []
+                if updates_path and os.path.isfile(updates_path) else []
     if updates_records is not None:
         try:
             _spawns = _extract_spawns_from_records(updates_records)
