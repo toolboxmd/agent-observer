@@ -141,6 +141,7 @@ ERROR_CATEGORIES = frozenset({
     "usage_conflict",
     "source_unreadable",
     "unsupported_schema",
+    "identity_conflict",
 })
 ERROR_FALLBACK = "import_error"
 

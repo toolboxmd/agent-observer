@@ -252,7 +252,8 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
     paths = [source] if source else discover(root)
     totals = {"harness": HARNESS, "sources": 0, "unchanged": 0,
               "responses_inserted": 0, "events_inserted": 0,
-              "user_messages_inserted": 0, "malformed": 0, "failed": []}
+              "user_messages_inserted": 0, "malformed": 0,
+              "identity_conflicts": 0, "failed": []}
     for path in paths:
         try:
             stats = import_codex_file(con, path, full=full)
@@ -269,6 +270,13 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
         for key in ("responses_inserted", "events_inserted",
                     "user_messages_inserted", "malformed"):
             totals[key] += stats.get(key, 0)
+    # A stored gap stays reported on every sync until a replay resolves it.
+    synced = set(paths)
+    totals["identity_conflicts"] = sum(
+        row["n"] for row in con.execute(
+            "SELECT source_path, COUNT(*) n FROM import_errors"
+            " WHERE harness=? AND error='identity_conflict' GROUP BY source_path",
+            (HARNESS,)) if row["source_path"] in synced)
     return totals
 
 
@@ -341,6 +349,10 @@ class _Reader:
         # file records its own occurrence and does not take this one.
         self.events_seen: set[tuple] = set()
         self.user_messages_seen: set[str] = set()
+        # Privacy-stale replay: each legacy user-message id with every
+        # (position, current id, text hash) of the id-less records deriving it.
+        self.legacy_candidates: dict[str, list[tuple]] = {}
+        self.user_messages_inserted: set[str] = set()
         # Compaction context for deferred token_count flushing: token_count
         # usage snapshots are collected during ingestion and reconciled only at
         # flush, so each usage snapshot captures whether a compaction boundary
@@ -865,6 +877,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
             reader.first_ts = ts if reader.first_ts is None else min(reader.first_ts, ts)
             reader.last_ts = ts if reader.last_ts is None else max(reader.last_ts, ts)
     _flush_token_counts(reader)
+    _resolve_legacy_user_messages(reader)
     if not src.privacy_stale:
         # Same-version imports reconcile this source's submissions with the
         # final rollout identity: rows stored before the native thread
@@ -1618,6 +1631,89 @@ def _ingest_turn(r: _Reader, obj: dict) -> None:
         (p.get("model"), p.get("effort"), turn_id))
 
 
+# Rows that hang off a user message, with the columns naming one fact.
+_USER_REFERENCES = (
+    ("assignments", "user_message_id", "{}", ("task_id",)),
+    ("delegations", "owning_user_message", "{}", ("child_thread",)),
+    ("verdicts", "intervention_id", "sub:{}", ("behavior", "judge")),
+)
+
+
+def _reference_facts(con, table: str, column: str, owner: str, key: tuple) -> dict:
+    """The rows of one reference table for one owner, keyed by their fact key."""
+    found = {}
+    for row in con.execute(f"SELECT * FROM {table} WHERE {column}=?", (owner,)):
+        fact = {k: row[k] for k in row.keys() if k not in (column, "id")}
+        found[tuple(fact[k] for k in key)] = fact
+    return found
+
+
+def _merge_legacy_user_message(con, legacy: str, target: str) -> bool:
+    """Fold a legacy copy of one record into its current row, or refuse.
+
+    The merge never drops or rewrites evidence. A copy of a row the target
+    already holds is removed; anything else moves only where it cannot
+    disagree with the target. Task ownership (assignments and delegations)
+    moves only when one side has none or both sides hold the same rows, so a
+    merge never puts two owners on one message. A disagreement returns False
+    with nothing written, and the legacy id stays its own resolvable row.
+    """
+    alias = con.execute("SELECT alias_id FROM user_messages WHERE native_id=?",
+                        (target,)).fetchone()["alias_id"]
+    if alias not in (None, legacy):
+        return False
+    facts = {}
+    for table, column, form, key in _USER_REFERENCES:
+        old, new = facts[table] = (
+            _reference_facts(con, table, column, form.format(legacy), key),
+            _reference_facts(con, table, column, form.format(target), key))
+        if any(k in new and new[k] != fact for k, fact in old.items()):
+            return False
+    ownership = [facts[t] for t in ("assignments", "delegations")]
+    old_own = [old for old, _ in ownership]
+    new_own = [new for _, new in ownership]
+    if any(old_own) and any(new_own) and old_own != new_own:
+        return False
+    con.execute("UPDATE user_messages SET alias_id=? WHERE native_id=?", (legacy, target))
+    for table, column, form, _ in _USER_REFERENCES:
+        # Only exact copies remain behind to be ignored and deleted.
+        con.execute(f"UPDATE OR IGNORE {table} SET {column}=? WHERE {column}=?",
+                    (form.format(target), form.format(legacy)))
+        con.execute(f"DELETE FROM {table} WHERE {column}=?", (form.format(legacy),))
+    con.execute("UPDATE OR IGNORE codex_occurrences SET row_key=?"
+                " WHERE row_kind='user' AND row_key=?", (target, legacy))
+    con.execute("DELETE FROM codex_occurrences WHERE row_kind='user' AND row_key=?", (legacy,))
+    con.execute("DELETE FROM user_messages WHERE native_id=?", (legacy,))
+    return True
+
+
+def _resolve_legacy_user_messages(r: _Reader) -> None:
+    """Fold each legacy user-message row into the one record that wrote it.
+
+    The pre-privacy-9 writer keyed an id-less user message by its metadata
+    ordinal, so a missing or repeated ordinal collapsed several records onto
+    one row whose ownership cannot be traced to any of them. Only a legacy id
+    derived by exactly one record of this file, with that record's text,
+    is folded in. Anything else keeps every row as stored and records one
+    identity_conflict gap at the first such record.
+    """
+    for legacy, candidates in r.legacy_candidates.items():
+        prior = r.con.execute("SELECT source_id, text_hash FROM user_messages"
+                              " WHERE native_id=? AND session_key=?",
+                              (legacy, r.session_key)).fetchone()
+        if not prior or not r._legacy_source_matches(prior["source_id"]):
+            continue
+        position, current, digest = candidates[0]
+        if (len(candidates) == 1 and prior["text_hash"] == digest
+                and _merge_legacy_user_message(r.con, legacy, current)):
+            if current in r.user_messages_inserted:
+                # The legacy row already held this message.
+                r.stats["user_messages_inserted"] -= 1
+            continue
+        r.stats["identity_conflicts_found"] = r.stats.get("identity_conflicts_found", 0) + 1
+        r.src.error(position, "identity_conflict")
+
+
 def _ingest_response_item(r: _Reader, obj: dict, native_ordinal, position: int) -> None:
     p = obj["payload"]
     ptype = p.get("type")
@@ -1637,23 +1733,10 @@ def _ingest_response_item(r: _Reader, obj: dict, native_ordinal, position: int) 
         kind = _submission_kind(p)
         native = p.get("id") or f"{r.session_key.partition(':')[2]}:{fallback}"
         if not p.get("id") and r.src.privacy_stale:
-            legacy = f"{HARNESS}:ordinal:{native_ordinal}"
-            prior = r.con.execute("SELECT source_id FROM user_messages WHERE native_id=? AND session_key=?",
-                                  (legacy, r.session_key)).fetchone()
-            if prior and r._legacy_source_matches(prior["source_id"]):
-                # Preserve captured ownership for every source-owned old
-                # fallback, including the first collapsed None identity.
-                r.con.execute("PRAGMA defer_foreign_keys=ON")
-                r.con.execute(
-                    "UPDATE user_messages SET native_id=?, source_id=?, ordinal_num=?"
-                    " WHERE native_id=?",
-                    (f"{HARNESS}:{native}", r.src.source_id, r.record_position, legacy))
-                r.con.execute("UPDATE assignments SET user_message_id=? WHERE user_message_id=?",
-                              (f"{HARNESS}:{native}", legacy))
-                r.con.execute("UPDATE delegations SET owning_user_message=? WHERE owning_user_message=?",
-                              (f"{HARNESS}:{native}", legacy))
-                r.con.execute("UPDATE verdicts SET intervention_id=? WHERE intervention_id=?",
-                              (f"sub:{HARNESS}:{native}", f"sub:{legacy}"))
+            # The legacy writer keyed this record by its metadata ordinal.
+            # Which stored row it was is decided once the whole file is read.
+            r.legacy_candidates.setdefault(f"{HARNESS}:ordinal:{native_ordinal}", []).append(
+                (position, f"{HARNESS}:{native}", text_hash(text)))
         # Privacy rule 1 via agent_observer/privacy.py: only a genuine
         # human submission of a proven main session keeps an excerpt,
         # truncated at the first tag-like marker. The main-session gate
@@ -1685,6 +1768,7 @@ def _ingest_response_item(r: _Reader, obj: dict, native_ordinal, position: int) 
              text_hash(text), excerpt, genuine))
         if cur.rowcount:
             r.stats["user_messages_inserted"] += 1
+            r.user_messages_inserted.add(native_key)
         elif r.src.privacy_stale and (same_source or claims):
             # Rule 3: a privacy version change corrects rows in place.
             fields = ("source_id=?, session_key=?, turn_id=?, ts=?, kind=?,"

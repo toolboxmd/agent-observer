@@ -89,7 +89,8 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
    replacing that source's `import_errors`. `import_errors.error` is
    exactly one closed category (`malformed_json`, `unknown_record`,
    `schema_error`, `missing_id`, `malformed_usage`, `usage_conflict`,
-   `source_unreadable`, `unsupported_schema`, fallback `import_error`);
+   `source_unreadable`, `unsupported_schema`, `identity_conflict`,
+   fallback `import_error`);
    `line_excerpt` holds only sorted top-level JSON key names (200 chars
    max). `events.detail_json` keeps only per-family allowlisted keys with
    correctly typed values (numbers, booleans, fixed-length hashes, native
