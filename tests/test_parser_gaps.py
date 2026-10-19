@@ -174,3 +174,22 @@ class ParserGapsTest(LedgerCase):
         grok.sync(self.con, source=path)
         self.assertEqual(self.query("SELECT agentsmd_version FROM sessions")[0][0], '17.3.1')
         self.assertEqual(self.query("SELECT status FROM events WHERE family='skill_read'")[0][0], 'ok')
+
+    def test_grok_each_successful_read_contributes_version_once(self):
+        updates = []
+        for call, version, with_locations in [('a', '17.1.0', True),
+                                               ('b1', '17.3.1', False),
+                                               ('b2', '17.3.1', False)]:
+            location = {'path': f'/plugins/agentsmd/{version}/skills/operations/SKILL.md'}
+            updates.append({'sessionUpdate': 'tool_call_update', 'toolCallId': call,
+                'kind': 'read', 'status': 'completed' if with_locations else 'in_progress',
+                'locations': [location]})
+            # Repeated witnesses of the same successful read must count once.
+            updates.append({'sessionUpdate': 'tool_call_update', 'toolCallId': call,
+                            'status': 'completed'})
+        path = self.grok_fixture(updates, [])
+        grok.sync(self.con, source=path)
+        session = self.query('SELECT agentsmd_version,identity_json FROM sessions')[0]
+        self.assertEqual(session['agentsmd_version'], '17.3.1')
+        self.assertEqual(json.loads(session['identity_json'])['plugin_paths'],
+                         {'17.1.0': 1, '17.3.1': 2})

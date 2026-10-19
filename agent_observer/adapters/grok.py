@@ -435,6 +435,7 @@ class _Reader:
         self.native_sid = native_sid
         self.stats = stats
         self.identity = SessionIdentity()
+        self.read_identity_seen: set[tuple[str, str]] = set()
         self.first_ts = None
         self.last_ts = None
         self.meta: dict = {}
@@ -448,6 +449,12 @@ class _Reader:
             return
         self.first_ts = ts if self.first_ts is None else min(self.first_ts, ts)
         self.last_ts = ts if self.last_ts is None else max(self.last_ts, ts)
+
+    def observe_read_path(self, call_id: str, path: str) -> None:
+        key = (call_id, path)
+        if key not in self.read_identity_seen:
+            self.read_identity_seen.add(key)
+            self.identity.observe_path(path)
 
     def event(self, src: JsonlSource, family, native_id, ordinal, ts, **kw):
         # Every target and detail mapping passes through
@@ -2627,7 +2634,7 @@ def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
         if paths:
             if _read_state(update.get("status")) == "ok":
                 for path in paths:
-                    r.identity.observe_path(path)
+                    r.observe_read_path(call_id, path)
             raw_skill = skill_from_path(paths[0])
             skill_path = paths[0]
             # A second location in the same call may name the Skill while the
@@ -2674,7 +2681,7 @@ def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
             path = (json.loads(read["detail_json"] or "{}").get("skill_path")
                     if read["family"] == "skill_read" else read["target"])
             if path:
-                r.identity.observe_path(path)
+                r.observe_read_path(call_id, path)
     if status is not None:
         r.con.execute("UPDATE events SET status=? WHERE session_key=? AND native_id=?"
                       " AND family IN ('read','skill_read')",
