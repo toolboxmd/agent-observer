@@ -1857,14 +1857,14 @@ def _ingest_response_item(r: _Reader, obj: dict, native_ordinal, position: int) 
                 _function_read(r, obj, call_id or p.get("id"), target, "attempted", turn_id)
 
     elif ptype in ("function_call_output", "custom_tool_call_output"):
-        call_id = p.get("call_id")
+        call_id = p.get("call_id") or p.get("id")
         out = p.get("output")
         if isinstance(out, list):
             size = sum(len(str(c.get("text", ""))) for c in out
                        if isinstance(c, dict))
         else:
             size = len(str(out or ""))
-        r.event(obj, "tool_result", call_id or p.get("id"), turn_id=turn_id,
+        r.event(obj, "tool_result", call_id, turn_id=turn_id,
                 name=ptype, size_bytes=size)
         prior = r.con.execute(
             "SELECT family,target,detail_json FROM events WHERE session_key=? AND native_id=?"

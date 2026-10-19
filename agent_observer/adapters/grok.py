@@ -436,6 +436,7 @@ class _Reader:
         self.stats = stats
         self.identity = SessionIdentity()
         self.read_identity_seen: set[tuple[str, str]] = set()
+        self.read_paths: dict[str, dict[str, None]] = {}
         self.first_ts = None
         self.last_ts = None
         self.meta: dict = {}
@@ -455,6 +456,27 @@ class _Reader:
         if key not in self.read_identity_seen:
             self.read_identity_seen.add(key)
             self.identity.observe_path(path)
+
+    def remember_read_update(self, update: dict) -> list[str]:
+        call_id = update.get("toolCallId")
+        if not isinstance(call_id, str) or _safe_token(call_id) is None:
+            return []
+        paths = []
+        locations = update.get("locations")
+        if update.get("kind") == "read" and isinstance(locations, list):
+            for loc in locations:
+                if not isinstance(loc, dict) or any(k in loc for k in _FREE_TEXT_LOCATION_KEYS):
+                    continue
+                path = loc.get("path")
+                if isinstance(path, str) and path:
+                    paths.append(path)
+        if paths:
+            remembered = self.read_paths.setdefault(call_id, {})
+            remembered.update(dict.fromkeys(paths))
+        if _read_state(update.get("status")) == "ok":
+            for path in self.read_paths.get(call_id, {}):
+                self.observe_read_path(call_id, path)
+        return paths
 
     def event(self, src: JsonlSource, family, native_id, ordinal, ts, **kw):
         # Every target and detail mapping passes through
@@ -1736,6 +1758,20 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             updates_records, events_records,
             (_prompts, _order, _completions, _turn_models_cached))
         _advance_source_to_cached(updates_src, updates_path, updates_records)
+        # The complete cached prefix is already loaded for usage replay.
+        # Restore pending locations and successful identity evidence before
+        # ingesting an appended locationless completion, without new I/O or
+        # widening the stored event detail allowlist.
+        if updates_src.incremental:
+            for ordinal, obj, _line in updates_records:
+                if ordinal > updates_src.row["ordinal_max"]:
+                    break
+                if not isinstance(obj, dict) or obj.get("method") not in METHODS:
+                    continue
+                params = obj.get("params")
+                update = params.get("update") if isinstance(params, dict) else None
+                if isinstance(update, dict) and update.get("sessionUpdate") == "tool_call_update":
+                    r.remember_read_update(update)
         for ordinal, obj, line in _delta_records(
                 updates_records, updates_src):
             stats["lines"] += 1
@@ -2614,74 +2650,47 @@ def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
         raise _AdapterError("schema_error")
     call_id = raw_call
     turn_id = _turn_id(r, params)
-    locations = update.get("locations")
-    if update.get("kind") == "read" and isinstance(locations, list) \
-            and locations:
-        # Fail closed: every location must be a plain {"path": str} shape
-        # with an optional integer line. A location bearing message/output
-        # style free-text keys, a non-string path, or a non-integer line is
-        # dropped entirely and never stringified into any ledger column.
-        paths: list[str] = []
-        for loc in locations:
-            if not isinstance(loc, dict):
-                continue
-            if any(k in loc for k in _FREE_TEXT_LOCATION_KEYS):
-                continue
-            path = loc.get("path")
-            if not isinstance(path, str) or not path:
-                continue
-            paths.append(path)
-        if paths:
-            if _read_state(update.get("status")) == "ok":
-                for path in paths:
-                    r.observe_read_path(call_id, path)
-            raw_skill = skill_from_path(paths[0])
-            skill_path = paths[0]
-            # A second location in the same call may name the Skill while the
-            # first does not; the Skill read is the identity evidence.
-            if raw_skill is None:
-                for path in paths[1:]:
-                    raw_skill = skill_from_path(path)
-                    if raw_skill is not None:
-                        skill_path = path
-                        break
-            if raw_skill is not None and _safe_token(raw_skill) is None:
-                raw_skill = None
-            safe_skill = privacy.filter_target(raw_skill, family="skill_read") \
-                if raw_skill else None
-            looks_like_skill = any(
-                p.endswith("SKILL.md") or "/skills/" in p for p in paths)
-            family = "skill_read" if (safe_skill or looks_like_skill) else "read"
-            if family == "skill_read":
-                # Rule 6: skill_read target holds only the validated skill
-                # identifier, never the installed path. The file path lives
-                # only in detail skill_path.
-                r.event(src, family, call_id,
-                        ordinal, ts, turn_id=turn_id,
-                        name=safe_skill or os.path.basename(paths[0]),
-                        target=safe_skill, status=_read_state(update.get("status")),
-                        fingerprint=fingerprint(call_id, paths),
-                        detail={"skill": raw_skill, "skill_path": skill_path})
-            else:
-                # Read events keep no detail under privacy.py rule 6; the
-                # first validated path is the target.
-                r.event(src, family, call_id,
-                        ordinal, ts, turn_id=turn_id,
-                        name=os.path.basename(paths[0]),
-                        target=paths[0], status=_read_state(update.get("status")),
-                        fingerprint=fingerprint(call_id, paths),
-                        detail=None)
+    # Keep every validated location until a later terminal update, rather
+    # than relying on the single representative path stored on the read row.
+    paths = r.remember_read_update(update)
+    if paths:
+        raw_skill = skill_from_path(paths[0])
+        skill_path = paths[0]
+        # A second location in the same call may name the Skill while the
+        # first does not; the Skill read is the identity evidence.
+        if raw_skill is None:
+            for path in paths[1:]:
+                raw_skill = skill_from_path(path)
+                if raw_skill is not None:
+                    skill_path = path
+                    break
+        if raw_skill is not None and _safe_token(raw_skill) is None:
+            raw_skill = None
+        safe_skill = privacy.filter_target(raw_skill, family="skill_read") \
+            if raw_skill else None
+        looks_like_skill = any(
+            p.endswith("SKILL.md") or "/skills/" in p for p in paths)
+        family = "skill_read" if (safe_skill or looks_like_skill) else "read"
+        if family == "skill_read":
+            # Rule 6: skill_read target holds only the validated skill
+            # identifier, never the installed path. The file path lives
+            # only in detail skill_path.
+            r.event(src, family, call_id,
+                    ordinal, ts, turn_id=turn_id,
+                    name=safe_skill or os.path.basename(paths[0]),
+                    target=safe_skill, status=_read_state(update.get("status")),
+                    fingerprint=fingerprint(call_id, paths),
+                    detail={"skill": raw_skill, "skill_path": skill_path})
+        else:
+            # Read events keep no detail under privacy.py rule 6; the
+            # first validated path is the target.
+            r.event(src, family, call_id,
+                    ordinal, ts, turn_id=turn_id,
+                    name=os.path.basename(paths[0]),
+                    target=paths[0], status=_read_state(update.get("status")),
+                    fingerprint=fingerprint(call_id, paths),
+                    detail=None)
     status = update.get("status")
-    # A terminal update often omits locations. Join the prior read by call ID.
-    if _read_state(status) == "ok":
-        for read in r.con.execute(
-                "SELECT family,target,detail_json FROM events WHERE session_key=?"
-                " AND native_id=? AND family IN ('read','skill_read')",
-                (r.session_key, call_id)):
-            path = (json.loads(read["detail_json"] or "{}").get("skill_path")
-                    if read["family"] == "skill_read" else read["target"])
-            if path:
-                r.observe_read_path(call_id, path)
     if status is not None:
         r.con.execute("UPDATE events SET status=? WHERE session_key=? AND native_id=?"
                       " AND family IN ('read','skill_read')",

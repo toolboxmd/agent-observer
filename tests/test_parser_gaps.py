@@ -193,3 +193,44 @@ class ParserGapsTest(LedgerCase):
         self.assertEqual(session['agentsmd_version'], '17.3.1')
         self.assertEqual(json.loads(session['identity_json'])['plugin_paths'],
                          {'17.1.0': 1, '17.3.1': 2})
+
+    def test_grok_pending_multiple_paths_survive_locationless_success(self):
+        path = self.grok_fixture([
+            {'sessionUpdate': 'tool_call_update', 'toolCallId': 'multi', 'kind': 'read',
+             'status': 'in_progress', 'locations': [
+                 {'path': '/plugins/agentsmd/17.1.0/README.md'},
+                 {'path': '/plugins/agentsmd/17.3.1/skills/operations/SKILL.md'}]},
+            {'sessionUpdate': 'tool_call_update', 'toolCallId': 'multi', 'status': 'completed'},
+            {'sessionUpdate': 'tool_call_update', 'toolCallId': 'multi', 'status': 'completed'}], [])
+        for full in (False, True, False):
+            grok.sync(self.con, source=path, full=full)
+            session = self.query('SELECT identity_json FROM sessions')[0]
+            self.assertEqual(json.loads(session['identity_json'])['plugin_paths'],
+                             {'17.1.0': 1, '17.3.1': 1})
+
+    def test_grok_pending_multiple_paths_survive_incremental_completion(self):
+        path = self.grok_fixture([
+            {'sessionUpdate': 'tool_call_update', 'toolCallId': 'multi', 'kind': 'read',
+             'status': 'in_progress', 'locations': [
+                 {'path': '/plugins/agentsmd/17.1.0/README.md'},
+                 {'path': '/plugins/agentsmd/17.3.1/skills/operations/SKILL.md'}]}], [])
+        grok.sync(self.con, source=path)
+        with open(os.path.join(path, 'updates.jsonl'), 'a') as f:
+            f.write(json.dumps({'method': 'session/update', 'params': {'sessionId': 'grok-gaps',
+                '_meta': {'eventId': 'late', 'promptId': 'p1'}, 'update': {
+                'sessionUpdate': 'tool_call_update', 'toolCallId': 'multi', 'status': 'completed'}}}) + '\n')
+        grok.sync(self.con, source=path)
+        session = self.query('SELECT identity_json FROM sessions')[0]
+        self.assertEqual(json.loads(session['identity_json'])['plugin_paths'],
+                         {'17.1.0': 1, '17.3.1': 1})
+
+    def test_codex_read_output_id_fallback_matches_event_identity(self):
+        path = self.write('rollout-id-only.jsonl', [
+            {'type': 'session_meta', 'payload': {'id': 'id-only', 'source': 'cli'}},
+            {'type': 'response_item', 'payload': {'type': 'function_call', 'id': 'read-id',
+                'name': 'Read', 'arguments': '{"file_path":"/repo/a.py"}'}},
+            {'type': 'response_item', 'payload': {'type': 'function_call_output',
+                'id': 'read-id', 'output': 'fixture'}}])
+        codex.sync(self.con, source=path)
+        self.assertEqual(self.query("SELECT native_id,status FROM events WHERE family='read'")[0][:],
+                         ('read-id', 'ok'))
