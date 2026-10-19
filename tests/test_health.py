@@ -61,11 +61,48 @@ class ScanAvailabilityTest(unittest.TestCase):
         self.check_unavailable("scan denied")
 
     def test_malformed_ps_output_is_unavailable(self):
-        for row in ("garbage", "nope Mon Oct 19 10:00:00 2026 codex",
+        for row in ("nope Mon Oct 19 10:00:00 2026 codex",
                     "201 bad date from ps output codex", ""):
             with self.subTest(row=row):
                 self.tool("ps", f"printf '%s\\n' '{row}'")
                 self.check_unavailable("unparseable ps output")
+
+    def test_skipped_commands_never_need_a_working_directory(self):
+        for command in ("/bin/codex app-server", "codex exec --json", "opencode serve"):
+            with self.subTest(command=command):
+                self.tool("ps", f"printf '201 Mon Oct 19 10:00:00 2026 {command}\\n'")
+                # There is no lsof on PATH: any lookup would report unavailable.
+                result = health.check(registry=[], bare={})
+                self.assertEqual(result["unavailable"], [])
+                self.assertEqual(result["findings"], [])
+
+    def test_irrelevant_malformed_rows_do_not_hide_a_needed_process(self):
+        check_codex = health.check_codex
+        for row in ("garbage", "nope bad date from ps output /bin/unrelated",
+                    "201 bad date from ps output codex app-server",
+                    "201 bad date from ps output codex exec --json",
+                    "201 bad date from ps output opencode serve"):
+            with self.subTest(row=row):
+                self.tool("ps", f"printf '{row}\\n202 Mon Oct 19 10:00:00 2026 codex\\n'")
+                self.tool("lsof", "printf 'n/p/unseen\\n'")
+                with patch.object(health, "check_codex", side_effect=lambda processes:
+                                  check_codex(processes, self.tmp.name)):
+                    result = health.check(registry=[], bare={})
+                self.assertEqual(result["unavailable"], [])
+                self.assertEqual([f["pid"] for f in result["findings"]], [202])
+
+    def test_ps_uses_c_locale_without_changing_parent_environment(self):
+        self.tool("ps", 'if [ "$LC_ALL" = C ]; then '
+                  "printf '201 Mon Oct 19 10:00:00 2026 codex\\n'; "
+                  "else printf '201 lun oct 19 10:00:00 2026 codex\\n'; fi")
+        self.tool("lsof", "printf 'n/p/unseen\\n'")
+        with patch.dict(os.environ, {"LC_ALL": "fr_FR.UTF-8", "LC_TIME": "fr_FR.UTF-8"}):
+            rows = health.process_table()
+            self.assertEqual(os.environ["LC_ALL"], "fr_FR.UTF-8")
+            self.assertEqual(os.environ["LC_TIME"], "fr_FR.UTF-8")
+        self.assertEqual(rows[0]["pid"], 201)
+        self.assertTrue(rows[0]["started"])
+        self.assertEqual(rows[0]["cwd"], "/p/unseen")
 
     def test_malformed_lsof_cwd_is_unavailable(self):
         self.tool("lsof", "printf 'nnot-a-working-directory\\n'")

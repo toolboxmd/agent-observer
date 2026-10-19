@@ -71,19 +71,30 @@ def check_claude(registry: list[dict], projects_root: str | None = None,
     return findings
 
 
+def _checked_process(name: str, command: str) -> bool:
+    """Whether a command is evaluated by the process visibility checks."""
+    if name == "codex":
+        return " exec" not in f" {command}" and "app-server" not in command
+    return name == "opencode" and "serve" not in command
+
+
 def process_table() -> list[dict]:
     """Live agent CLI processes with start time and working directory."""
     out = subprocess.run(["ps", "-Ao", "pid=,lstart=,command="],
                          capture_output=True, text=True, check=True,
-                         timeout=SCAN_TIMEOUT_SECONDS).stdout
+                         timeout=SCAN_TIMEOUT_SECONDS,
+                         env={**os.environ, "LC_ALL": "C"}).stdout
     if not out.strip():
         raise OSError("unparseable ps output: empty process table")
     rows = []
     for line in out.splitlines():
         parts = line.split(None, 6)
         if len(parts) < 7:
-            raise OSError("unparseable ps output: incomplete process row")
+            continue
         pid, command = parts[0], parts[6]
+        name = os.path.basename(command.split()[0])
+        if not _checked_process(name, command):
+            continue
         try:
             pid = int(pid)
             if pid <= 0:
@@ -91,9 +102,6 @@ def process_table() -> list[dict]:
             started = time.mktime(time.strptime(" ".join(parts[1:6]), "%a %b %d %H:%M:%S %Y"))
         except (ValueError, OverflowError) as exc:
             raise OSError("unparseable ps output: invalid PID or start time") from exc
-        name = os.path.basename(command.split()[0])
-        if name not in ("opencode", "codex"):
-            continue
         row = {"pid": pid, "name": name, "command": command,
                "started": started, "cwd": None}
         try:
@@ -127,7 +135,7 @@ def check_opencode(processes: list[dict], db_path: str | None = None) -> list[di
     db_path = db_path or os.path.expanduser("~/.local/share/opencode/opencode.db")
     findings = []
     live = [p for p in processes if p["name"] == "opencode" and p.get("cwd")
-            and "serve" not in p["command"]]
+            and _checked_process(p["name"], p["command"])]
     if not live:
         return findings
     try:
@@ -154,7 +162,7 @@ def check_codex(processes: list[dict], sessions_root: str | None = None) -> list
     sessions_root = sessions_root or os.path.expanduser("~/.codex/sessions")
     findings = []
     live = [p for p in processes if p["name"] == "codex" and p.get("cwd")
-            and " exec" not in f" {p['command']}" and "app-server" not in p["command"]]
+            and _checked_process(p["name"], p["command"])]
     for proc in live:
         newest = 0.0
         for path in glob.glob(os.path.join(sessions_root, "**", "rollout-*.jsonl"),
