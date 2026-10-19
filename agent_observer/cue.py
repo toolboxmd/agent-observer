@@ -99,7 +99,8 @@ def _path(value):
 
 
 def _number(value):
-    return type(value) in (int, float) and math.isfinite(value)
+    # Integers are finite without a potentially overflowing float conversion.
+    return type(value) is int or (type(value) is float and math.isfinite(value))
 
 
 def _targets(roots):
@@ -385,7 +386,7 @@ def export(con, machine=None):
     """Optional aggregate extension; old ledgers retain their existing export shape."""
     if _stored_health(con)['status'] == 'not_imported':
         return None
-    value = report(con, machine=machine)
+    value = report(con, machine=machine, check_source=False)
     return {k: value.get(k, {}) for k in EXPORT_FIELDS}
 
 

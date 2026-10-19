@@ -130,7 +130,8 @@ are explicit gaps, not unread procedures. Missing databases, incompatible schema
 and machines without successful Cue moments show gaps in both `health` and the
 report. `cue` exits 4 for unavailable evidence; `health` also exits 4 for a Cue gap.
 No prompt, window, entry body or served text is imported. `export` carries only
-this report's aggregates, without read paths, session ids or individual moments.
+the imported snapshot's aggregates, without read paths, session ids or individual
+moments; it does not require the original database to remain available.
 
 ## Evaluating AgentsMD releases
 

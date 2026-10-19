@@ -219,3 +219,21 @@ class CueTests(LedgerCase):
         self.candidate(2,1,entry='/private/path')
         self.refresh()
         self.assertEqual(self.con.execute('SELECT count(*) FROM cue_candidates').fetchone()[0],1)
+
+    def test_export_keeps_custom_source_snapshot_without_default_database(self):
+        self.refresh()
+        missing = Path(self.tmp.name) / 'absent-default.sqlite'
+        with patch.object(cue, 'source_path', return_value=missing):
+            self.assertEqual(cue.report(self.con)['status'], 'missing_database')
+            exported = fleet.export(self.con, machine='test')['cue']
+        self.assertEqual(exported['status'], 'ok')
+        self.assertEqual(exported['groups'][0]['arms']['served']['read'], 1)
+
+    def test_oversized_json_rate_is_a_validation_error(self):
+        self.refresh()
+        with patch.object(cue, 'source_path', return_value=self.source):
+            exported = fleet.export(self.con, machine='test')
+        exported['cue']['groups'][0]['arms']['served']['read_rate'] = 10**400
+        # Exercise JSON's real integer decoding before the fleet trust boundary.
+        with self.assertRaisesRegex(ValueError, 'Cue aggregate'):
+            fleet.validate(json.loads(json.dumps(exported)))
