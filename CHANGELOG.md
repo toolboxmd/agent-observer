@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.3.0] - 2026-10-19
+
+### Added
+
+- Discover Chromeria bare Codex and Grok homes by default; report trace truncation, unresolved Codex identity conflicts and unavailable health scans; recognize Claude request-replay metadata; faster availability and diagnose queries
+
+### Changed
+
+- Judge moments JSON `opening` is `null` when unknown, and `false` for interrupts and rejections (was wrongly `true`)
+- `health` exits 4 when its process scan is unavailable (previously it crashed)
+
+### Fixed
+
+- `health` scans only processes its checks use, so T3 or a non-English locale cannot make it unavailable
+- A file reached through two paths in one sync is imported under one source row
+
 ## [1.2.6] - 2026-10-15
 
 ### Changed
