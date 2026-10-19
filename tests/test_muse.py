@@ -224,6 +224,63 @@ class ImportTest(MuseCase):
         self.assertNotIn(("tool_result", "call_p1"), root_events(self.db))
         con.close()
 
+    def edited_import(self, line, edit):
+        """Sync a copy of the root log whose 0-based line was edited."""
+        tree = self.copy_tree()
+        path = os.path.join(tree, DAY, ROOT, "session.jsonl")
+        with open(path) as fh:
+            records = [json.loads(text) for text in fh]
+        edit(records[line])
+        with open(path, "w") as fh:
+            fh.writelines(json.dumps(r, sort_keys=True) + "\n" for r in records)
+        result = run(self.db, "sync", "--harness", "muse", "--source", path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        con = sqlite3.connect(self.db)
+        errors = con.execute("SELECT error, ordinal_num, line_excerpt FROM import_errors").fetchall()
+        con.close()
+        return errors, root_events(self.db)
+
+    FRAME_KEYS = ("causation_id,durability,id,payload,payload_schema_version,payload_type,"
+                  "record_type,recorded_at,schema_version,sequence,stream")
+
+    def test_wrong_type_terminal_outcome_is_quarantined(self):
+        # Line 9 is call_r1's failed terminal.
+        errors, events = self.edited_import(
+            9, lambda r: r["payload"]["record"]["outcome"].update(kind=[]))
+        self.assertEqual(errors, [("schema_error", 9, self.FRAME_KEYS)])
+        expected = dict(EXPECTED)
+        expected[("tool_result", "call_r1")] = ("read_file", None, None, 7, "builtin", None, None)
+        expected[("read", "call_r1")] = ("read_file", "/work/project/missing.md", None, None,
+                                         None, None, None)
+        self.assertEqual(events, expected)
+
+    def test_missing_terminal_outcome_leaves_status_unknown(self):
+        errors, events = self.edited_import(
+            9, lambda r: r["payload"]["record"].update(outcome={}))
+        self.assertEqual(errors, [("schema_error", 9, self.FRAME_KEYS)])
+        self.assertEqual(events[("tool_result", "call_r1")][2:4], (None, 7))
+        self.assertEqual(events[("tool_result", "call_m1")][2:4], ("ok", 18))
+
+    def test_wrong_type_run_discriminator_is_quarantined(self):
+        # Line 4 is the run's start frame; every other event survives.
+        errors, events = self.edited_import(4, lambda r: r["payload"]["event"].update(kind=[]))
+        self.assertEqual(errors, [("schema_error", 4, self.FRAME_KEYS)])
+        expected = {k: v for k, v in EXPECTED.items()
+                    if k != ("lifecycle", "0b000000-0000-7000-8000-000000000004")}
+        self.assertEqual(events, expected)
+
+    def test_unconsumed_task_frame_stays_silent_even_when_odd(self):
+        # Line 6 is an internal kind=task start: deliberately not consumed.
+        errors, events = self.edited_import(6, lambda r: r["payload"]["event"].update(kind=[]))
+        self.assertEqual(errors, [])
+        self.assertEqual(events, EXPECTED)
+
+    def test_effect_started_is_version_gated(self):
+        # Line 8 is call_r1's started effect; it adds no evidence itself.
+        errors, events = self.edited_import(8, lambda r: r.update(schema_version=2))
+        self.assertEqual(errors, [("unsupported_schema", 8, self.FRAME_KEYS)])
+        self.assertEqual(events, EXPECTED)
+
     def test_no_free_text_reaches_the_ledger(self):
         self.sync_tree()
         con = sqlite3.connect(self.db)

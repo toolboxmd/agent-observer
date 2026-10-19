@@ -590,8 +590,14 @@ Default root `~/.local/share/muse/sessions`: each
   matches its `stream.id`; a mismatch is an `identity_conflict`. Record-supplied
   log paths are never opened or stored. A linked child with no backing source
   reads `ledger_only` (`no_source`) in `sessions availability`.
-- Consumed variants need `schema_version` and `payload_schema_version` 1,
-  else `unsupported_schema`; unconsumed kinds are skipped. Prompts, result
+- Consumed variants (catalog, session metadata, opened, branch and end,
+  effect started and terminal, and the listed `kind=run` events) need
+  `schema_version` and `payload_schema_version` 1, else `unsupported_schema`.
+  A run frame whose `event.kind` is not a string, or a terminal without an
+  outcome `kind` string, is a `schema_error`; that terminal's result keeps
+  an unknown status. Each bad record is quarantined alone at its line number
+  with key names only, and the rest of the file still imports. Unconsumed
+  kinds (the envelope, `kind=task`, usage) are skipped silently. Prompts, result
   text, outcome reasons, hooks, memory and usage are never stored.
 - T3 maps `driver: muse` strong `nativeThreadRef` to `muse:<native id>`.
 

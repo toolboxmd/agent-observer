@@ -73,6 +73,13 @@ _RUN_KINDS = frozenset({
     "assistant_tool_calls_committed", "tool_result_batch_committed",
     "memory_reminder_child_session_linked"})
 _STATUS = {"completed": "ok", "failed": "error"}
+# Consumed non-run payload types; each needs schema and payload version 1.
+# Effect-started and session-opened carry nothing imported but are version
+# gated like the rest.
+_CONSUMED = (
+    "runtime.mcp_tool_identity_catalog", "runtime.session.metadata",
+    "session.opened.observed", "session.workspace_branch.observed",
+    "session.end", "tool_batch.effect.started", "tool_batch.effect.terminal")
 
 
 def _session_id(value) -> str | None:
@@ -161,18 +168,19 @@ def _parse(src: JsonlSource, totals: dict) -> _State:
         ptype = obj.get("payload_type")
         payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
         event = payload.get("event") if isinstance(payload.get("event"), dict) else {}
-        run_kind = ptype == "runtime.session" and payload.get("kind") == "run" \
-            and event.get("kind") in _RUN_KINDS
-        consumed = run_kind or ptype in (
-            "runtime.mcp_tool_identity_catalog", "runtime.session.metadata",
-            "session.workspace_branch.observed", "session.end",
-            "tool_batch.effect.terminal")
         ts = _ts(obj.get("recorded_at"))
         if ts is not None:
             state.started_at = ts if state.started_at is None else min(state.started_at, ts)
             state.ended_at = ts if state.ended_at is None else max(state.ended_at, ts)
-        if not consumed:
+        # Discriminators are checked for type before any membership test,
+        # so a malformed consumed record is quarantined, never a crash.
+        run_frame = ptype == "runtime.session" and payload.get("kind") == "run"
+        if run_frame and not isinstance(event.get("kind"), str):
+            bad(ordinal, "schema_error", raw)
             continue
+        consumed = (run_frame and event["kind"] in _RUN_KINDS) or ptype in _CONSUMED
+        if not consumed:
+            continue  # Deliberately unconsumed: envelope, kind=task, usage, others.
         if obj.get("schema_version") != 1 or obj.get("payload_schema_version") != 1:
             bad(ordinal, "unsupported_schema", raw)
             continue
@@ -210,15 +218,20 @@ def _parse(src: JsonlSource, totals: dict) -> _State:
             ref = record.get("reference") if isinstance(record.get("reference"), dict) else {}
             if ref.get("kind") == "branch" and _str(ref.get("name")):
                 state.branch = ref["name"]
-        elif ptype == "session.end":
-            pass  # recorded_at already extends ended_at.
+        elif ptype in ("session.end", "session.opened.observed",
+                       "tool_batch.effect.started"):
+            pass  # Version gated only; recorded_at already extends the span.
         elif ptype == "tool_batch.effect.terminal":
             call = _str(record.get("call_id"))
-            outcome = record.get("outcome") if isinstance(record.get("outcome"), dict) else {}
+            outcome = record.get("outcome")
             if call is None:
                 bad(ordinal, "missing_id", raw)
                 continue
-            state.terminals[call] = {**at, "status": _STATUS.get(outcome.get("kind"))}
+            if not isinstance(outcome, dict) or not isinstance(outcome.get("kind"), str):
+                # No usable outcome: the result's status stays unknown.
+                bad(ordinal, "schema_error", raw)
+                continue
+            state.terminals[call] = {**at, "status": _STATUS.get(outcome["kind"])}
         else:
             run_id = _str(payload.get("run_id"))
             kind = event["kind"]
