@@ -86,7 +86,8 @@ class CueTests(LedgerCase):
         result = self.refresh()
         self.assertEqual(result['holdout_unit'],'session')
         arm = self.arm(result,'holdout')
-        self.assertEqual((arm['opportunities'],arm['sessions'],arm['partial']),(2,1,2))
+        self.assertEqual((arm['opportunities'],arm['sessions'],arm['partial']),(1,1,1))
+        self.assertEqual(result['groups'][0]['repeats']['holdout']['opportunities'],1)
         self.assertIn('causal', result['interpretation'])
 
     def test_pending_failed_and_duplicate_reads_not_counted(self):
@@ -237,3 +238,115 @@ class CueTests(LedgerCase):
         # Exercise JSON's real integer decoding before the fleet trust boundary.
         with self.assertRaisesRegex(ValueError, 'Cue aggregate'):
             fleet.validate(json.loads(json.dumps(exported)))
+
+    def test_headline_compares_first_judgments_not_repeated_deliveries(self):
+        for id,at in ((4,120),(5,130)):
+            self.moment(id,at)
+            self.candidate(id,id,'deduped' if id==4 else 'injected')
+        for id,at in ((6,100),(7,120),(8,130)):
+            self.moment(id,at,session='h',holdout=1)
+            self.candidate(id,id,'holdout')
+        self.moment(9,110,session='h',holdout=1)
+        self.read(9,110,session='h')
+        result=self.refresh()
+        for arm in ('served','holdout'):
+            self.assertEqual(self.arm(result,arm)['opportunities'],1)
+            self.assertEqual(self.arm(result,arm)['read'],1)
+            self.assertEqual(result['groups'][0]['repeats'][arm]['opportunities'],2)
+        self.assertEqual(result['summary']['arms']['holdout']['sessions'],1)
+
+    def test_hidden_first_judgment_cannot_be_promoted_by_later_injection(self):
+        self.native.execute("UPDATE candidates SET outcome='hidden' WHERE id=1")
+        self.moment(4,120)
+        self.candidate(4,4,'injected')
+        result=self.refresh()
+        self.assertNotIn('served',result['groups'][0]['arms'])
+        self.assertEqual(result['groups'][0]['excluded']['hidden']['opportunities'],1)
+        self.assertEqual(result['groups'][0]['repeats']['served']['opportunities'],1)
+
+    def test_first_judgment_resets_per_epoch_and_ignores_below_threshold(self):
+        self.moment(4,90)
+        self.candidate(4,4,'below_threshold')
+        self.moment(5,120,epoch=1)
+        self.candidate(5,5,'injected')
+        self.moment(6,130,epoch=1)
+        self.candidate(6,6,'deduped')
+        result=self.refresh()
+        self.assertEqual(self.arm(result)['opportunities'],2)
+        self.assertEqual(result['groups'][0]['repeats']['served']['opportunities'],1)
+
+    def test_user_message_boundary_survives_missing_cue_metadata(self):
+        for arm,assignment,outcome in (('served',0,'injected'),('holdout',1,'holdout')):
+            self.native.execute('UPDATE moments SET holdout=? WHERE id=1',(assignment,))
+            self.native.execute('UPDATE candidates SET outcome=? WHERE id=1',(outcome,))
+            for epoch,holdout in ((None,0),(0,None),(None,None),('unknown',None)):
+                with self.subTest(arm=arm,epoch=epoch,holdout=holdout):
+                    self.native.execute('DELETE FROM moments WHERE id=4')
+                    self.moment(4,105,epoch=epoch,holdout=holdout,kind='user_message')
+                    result=self.refresh()
+                    self.assertEqual(self.arm(result,arm)['read'],0)
+                    self.assertEqual(self.arm(result,arm)['boundary_without_cue_metadata'],1)
+
+    def test_summary_sessions_are_distinct_across_entries(self):
+        # Same session reads two different entry targets; the headline has one session.
+        other=self.raw.replace(b'id: research',b'id: other')
+        (self.library/'other.md').write_bytes(other)
+        self.candidate(4,1,entry='other',version=hashlib.sha256(other).hexdigest()[:12])
+        result=self.refresh()
+        self.assertEqual(result['summary']['arms']['served']['opportunities'],2)
+        self.assertEqual(result['summary']['arms']['served']['sessions'],1)
+        self.assertEqual(result['sessions_by_arm']['served'],1)
+
+    def test_cluster_interval_uses_sessions_and_requires_two(self):
+        self.assertIsNone(self.arm(self.refresh())['interval95'])
+        self.moment(4,100,session='no-read')
+        self.candidate(4,4)
+        result=self.refresh()
+        self.assertEqual(self.arm(result)['sessions'],2)
+        # Resampling two one-opportunity sessions can yield all failure or all success.
+        self.assertEqual(self.arm(result)['interval95'],[0.0,1.0])
+        self.assertIn('session_cluster',result['interval_method'])
+
+    def test_first_unavailable_target_is_not_replaced_by_later_delivery(self):
+        self.native.execute("UPDATE candidates SET version='unavailable' WHERE id=1")
+        self.moment(4,120)
+        self.candidate(4,4)
+        result=self.refresh()
+        self.assertEqual(result['groups'][0]['arms'],{})
+        self.assertEqual(result['groups'][0]['repeats']['served']['opportunities'],1)
+        self.assertEqual(result['gaps'],{'version_unavailable':1})
+
+    def test_first_undelivered_judgment_is_not_replaced_by_later_delivery(self):
+        self.native.execute("UPDATE candidates SET outcome='cut_budget' WHERE id=1")
+        self.moment(4,120)
+        self.candidate(4,4)
+        result=self.refresh()
+        self.assertEqual(result['groups'][0]['arms'],{})
+        self.assertEqual(result['groups'][0]['excluded']['not_served']['opportunities'],1)
+        self.assertEqual(result['groups'][0]['repeats']['served']['opportunities'],1)
+
+    def test_later_missing_metadata_boundary_does_not_count_when_not_needed(self):
+        self.moment(4,105,kind='user_message')
+        self.moment(5,106,epoch=None,holdout=None,kind='user_message')
+        arm=self.arm(self.refresh())
+        self.assertEqual(arm['read'],0)
+        self.assertEqual(arm['boundary_without_cue_metadata'],0)
+
+    def test_holdout_gets_a_new_first_judgment_after_compaction(self):
+        self.native.execute("UPDATE moments SET holdout=1 WHERE id=1")
+        self.native.execute("UPDATE candidates SET outcome='holdout' WHERE id=1")
+        self.moment(4,120,epoch=1,holdout=1,kind='compaction')
+        self.candidate(4,4,'holdout')
+        self.moment(5,130,epoch=1,holdout=1)
+        self.candidate(5,5,'holdout')
+        result=self.refresh()
+        self.assertEqual(self.arm(result,'holdout')['opportunities'],2)
+        self.assertEqual(result['groups'][0]['repeats']['holdout']['opportunities'],1)
+
+    def test_assignment_session_count_includes_excluded_first_deliveries(self):
+        self.moment(4,100,session='hidden')
+        self.candidate(4,4,'hidden')
+        result=self.refresh()
+        self.assertEqual(result['sessions_by_arm']['served'],2)
+        self.assertEqual(self.arm(result)['sessions'],1)
+        self.assertEqual(result['summary']['excluded']['hidden']['sessions'],1)

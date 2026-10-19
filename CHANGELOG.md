@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Compare first above-threshold Cue judgments per session, entry and epoch; separate repeats and hidden deliveries, retain all user-message window boundaries and report session-cluster intervals.
+
 ### Added
 
 - Import Cue decisions and settled ContextMD reads read-only; report procedure reads by entry, harness, machine and AgentsMD version against session-wide holdout, with source and target gaps.

@@ -15,13 +15,16 @@ import math
 import os
 from pathlib import Path
 import re
+import random
 import sqlite3
 import time
 
 from . import privacy
 
 WINDOW_SECONDS = 1800
-SERVED = frozenset({'injected', 'truncated', 'unverified', 'awaiting_evidence', 'hidden'})
+SERVED = frozenset({'injected', 'truncated', 'unverified', 'awaiting_evidence'})
+COMPARISON = 'first_above_threshold_per_session_entry_epoch'
+INTERVAL_METHOD = 'session_cluster_bootstrap_percentile_95_2000'
 FULL = frozenset({'read_tool', 'shell_full'})
 KINDS = FULL | {'read_partial', 'shell_partial'}
 IDENT = re.compile(r'^[A-Za-z0-9_.:/@+-]{1,512}$')
@@ -221,20 +224,22 @@ def import_source(con, source=None, libraries=()):
             for table in ('cue_candidates', 'cue_reads', 'cue_moments', 'cue_import'):
                 con.execute('DELETE FROM ' + table)
             for m in moments:
-                if not (_number(m['received_at']) and _id(m['harness']) and _id(m['session'])
-                        and type(m['epoch']) is int and m['holdout'] in (0, 1)):
+                if not (_number(m['received_at']) and _id(m['harness']) and _id(m['session'])):
                     continue
                 con.execute('INSERT INTO cue_moments VALUES(?,?,?,?,?,?,?,?,?)',
-                            (m['id'],m['received_at'],m['harness'],m['session'],m['epoch'],
-                             m['holdout'],_id(m['kind']),_id(m['tool_use_id']),_id(m['cue_status'])))
+                            (m['id'],m['received_at'],m['harness'],m['session'],
+                             m['epoch'] if type(m['epoch']) is int else None,
+                             m['holdout'] if m['holdout'] in (0, 1) else None,
+                             _id(m['kind']),_id(m['tool_use_id']),_id(m['cue_status'])))
             ids = {r[0] for r in con.execute('SELECT id FROM cue_moments')}
+            eligible = {m['id'] for m in moments if type(m['epoch']) is int and m['holdout'] in (0, 1)}
             columns = {r[1] for r in native.execute('PRAGMA table_info(candidates)')}
             delivery = 'COALESCE(c.delivery,m.delivery)' if 'delivery' in columns else 'm.delivery'
             for c in native.execute(f'''SELECT c.id,c.moment_id,c.entry,c.version,c.score,c.outcome,
                     c.stage,c.served_at,d.stage AS delivery_stage FROM candidates c
                     JOIN moments m ON m.id=c.moment_id
                     LEFT JOIN deliveries d ON d.delivery={delivery} WHERE c.matcher='intent' '''):
-                if (c['moment_id'] not in ids or not isinstance(c['entry'], str)
+                if (c['moment_id'] not in ids or c['moment_id'] not in eligible or not isinstance(c['entry'], str)
                         or not ENTRY_ID.fullmatch(c['entry']) or not _id(c['version'])):
                     continue
                 target, target_status = moment_targets[c['moment_id']].get((c['entry'], c['version']),
@@ -278,37 +283,88 @@ def health(con=None, source=None):
     return dict(row) if row else {'status': 'not_imported'}
 
 
+def _cluster_interval(sessions):
+    """Resample whole harness sessions, keeping their entry/epoch opportunities together."""
+    clusters = sorted(sessions.values())
+    if len(clusters) < 2:
+        return None
+    rng = random.Random(0)
+    rates = []
+    for _ in range(2000):
+        sample = rng.choices(clusters, k=len(clusters))
+        rates.append(sum(r for r, n in sample) / sum(n for r, n in sample))
+    rates.sort()
+    return [rates[49], rates[1949]]
+
+
+def _bucket():
+    return {**{k: 0 for k in ARM_COUNTS if k != 'sessions'}, 'sessions': {}}
+
+
+def _add(bucket, session, metrics):
+    for k, value in metrics.items():
+        bucket[k] += value
+    cluster = bucket['sessions'].setdefault(session, [0, 0])
+    cluster[0] += metrics['read']
+    cluster[1] += 1
+
+
+def _finish_buckets(container):
+    for section in ('arms', 'repeats', 'excluded'):
+        for bucket in container[section].values():
+            bucket['interval95'] = _cluster_interval(bucket['sessions'])
+            bucket['sessions'] = len(bucket['sessions'])
+            bucket['read_rate'] = bucket['read'] / bucket['opportunities']
+
+
 def report(con, machine=None, check_source=True, source=None):
     from .fleet import machine_name
     state = health(con, source) if check_source else _stored_health(con)
     result = {'status': state['status'], 'import': state, 'window_seconds': WINDOW_SECONDS,
-              'holdout_unit': 'session',
-              'interpretation': 'Observational session-wide Cue holdout; read evidence is not proof of following a procedure or a per-procedure causal effect.',
-              'window': 'After the moment, before the next user message or context epoch, capped at 30 minutes and the imported source watermark. Earlier reads are separate; incomplete windows are pending.',
-              'groups': [], 'gaps': {}}
+              'holdout_unit': 'session', 'comparison': COMPARISON, 'interval_method': INTERVAL_METHOD,
+              'interpretation': 'Compare first above-threshold judgments per harness session, entry and context epoch. Hidden and other undelivered first judgments are excluded; repeats are separate. Holdout withholds all Cue entries for a session. Read evidence proves neither following a procedure nor a per-procedure causal effect. Small holdout session samples limit precision.',
+              'window': 'After the judgment, before every next user message (even with missing Cue metadata) or known context epoch change, capped at 30 minutes and the imported watermark. Earlier reads are separate; incomplete windows are pending.',
+              'interval_note': '95% percentile intervals resample whole observed harness sessions 2000 times with a fixed seed. Fewer than two sessions gives no interval; small samples and all-equal outcomes can give unstable or degenerate intervals. These are descriptive, not causal.',
+              'summary': {'arms': {}, 'repeats': {}, 'excluded': {}},
+              'sessions_by_arm': {}, 'groups': [], 'gaps': {}}
     if state['status'] != 'ok':
         return result
     moments = {r['id']: dict(r) for r in con.execute('SELECT * FROM cue_moments')}
-    boundaries = defaultdict(list)
+    boundaries = {}
     by_session = defaultdict(list)
     for m in moments.values():
         by_session[(m['harness'],m['session'])].append(m)
     for key, ms in by_session.items():
         prior_epoch = None
+        flags = {}
         for m in sorted(ms, key=lambda m: (m['at'], m['id'])):
-            if m['kind'] == 'user_message' or (prior_epoch is not None and m['epoch'] != prior_epoch):
-                boundaries[key].append(m['at'])
-            prior_epoch = m['epoch']
+            known_epoch = type(m['epoch']) is int
+            epoch_changed = known_epoch and prior_epoch is not None and m['epoch'] != prior_epoch
+            if m['kind'] == 'user_message' or epoch_changed:
+                missing = not known_epoch or m['holdout'] not in (0, 1)
+                # If another valid boundary has this timestamp, missing metadata was not needed.
+                flags[m['at']] = flags.get(m['at'], True) and missing
+            if known_epoch:
+                prior_epoch = m['epoch']
+        boundaries[key] = (sorted(flags), flags)
     reads = defaultdict(list)
     provenance = Counter()
     for r in con.execute('SELECT * FROM cue_reads ORDER BY at'):
         reads[(r['harness'],r['session'],r['epoch'],r['path'])].append(dict(r))
         provenance['native_and_contextmd' if r['native_event_id'] else 'contextmd_only'] += 1
     versions = {r[0]: r[1] or 'unknown' for r in con.execute('SELECT session_key,agentsmd_version FROM sessions')}
-    groups = {}
+    groups, seen = {}, set()
+    coverage = defaultdict(set)
     gaps = Counter()
-    for c in con.execute('SELECT * FROM cue_candidates'):
+    # Source ordering, not import order or the first successful delivery, defines the judgment.
+    for c in con.execute('SELECT c.* FROM cue_candidates c JOIN cue_moments m ON m.id=c.moment_id ORDER BY m.at,m.id,c.id'):
         m = moments[c['moment_id']]
+        above = (c['score'] is not None and c['outcome'] not in ('below_threshold','not_scored')
+                 and type(m['epoch']) is int and m['holdout'] in (0, 1))
+        unit = (m['harness'],m['session'],c['entry'],m['epoch'])
+        first = above and unit not in seen
+        if above:
+            seen.add(unit)
         if not c['target']:
             gaps[c['target_status']] += 1
             continue
@@ -316,40 +372,55 @@ def report(con, machine=None, check_source=True, source=None):
                versions.get(f"{m['harness']}:{m['session']}", 'unknown'))
         if key not in groups:
             groups[key] = {'entry': key[0], 'harness': key[1], 'machine': key[2],
-                           'agentsmd_version': key[3], 'outcomes': Counter(), 'arms': {}}
+                           'agentsmd_version': key[3], 'outcomes': Counter(),
+                           'arms': {}, 'repeats': {}, 'excluded': {}}
         g = groups[key]
         g['outcomes'][c['outcome']] += 1
-        arm = 'holdout' if c['outcome'] == 'holdout' and m['holdout'] == 1 else (
-            'served' if c['outcome'] in SERVED and m['holdout'] == 0 else None)
-        if arm is None:
+        if not above:
             continue
-        a = g['arms'].setdefault(arm, {'opportunities': 0, 'sessions': set(), 'read': 0,
-            'full': 0, 'partial': 0, 'already_read': 0, 'already_full': 0, 'already_partial': 0,
-            'pending_window': 0, 'native_matched_reads': 0})
-        a['opportunities'] += 1
-        a['sessions'].add(m['session'])
-        bs = boundaries[(m['harness'],m['session'])]
+        arm = 'holdout' if m['holdout'] == 1 else 'served'
+        # An inconsistent holdout row cannot turn a serving-enabled session into holdout.
+        if arm == 'served' and c['outcome'] == 'holdout':
+            continue
+        coverage[arm].add((m['harness'],m['session']))
+        if not first:
+            section = 'repeats'
+        elif arm == 'served' and c['outcome'] not in SERVED:
+            section, arm = 'excluded', 'hidden' if c['outcome'] == 'hidden' else 'not_served'
+        elif arm == 'holdout' and c['outcome'] != 'holdout':
+            section, arm = 'excluded', 'not_served'
+        else:
+            section = 'arms'
+        session = (m['harness'],m['session'])
+        bs, flags = boundaries[session]
         index = bisect_right(bs, m['at'])
-        end = min(m['at'] + WINDOW_SECONDS, bs[index] if index < len(bs) else math.inf)
+        boundary = bs[index] if index < len(bs) else math.inf
+        cap = m['at'] + WINDOW_SECONDS
+        end = min(cap, boundary)
         watermark = state.get('watermark') or 0
-        a['pending_window'] += end > watermark
+        metrics = {k: 0 for k in ARM_COUNTS if k != 'sessions'}
+        metrics['opportunities'] = 1
+        metrics['pending_window'] = int(end > watermark)
+        metrics['boundary_without_cue_metadata'] = int(boundary <= cap and flags.get(boundary, False))
         end = min(end, math.nextafter(watermark, math.inf))
         rs = reads[(m['harness'],m['session'],m['epoch'],c['target'])]
         times = [r['at'] for r in rs]
         earlier = rs[:bisect_right(times,m['at'])]
         if earlier:
-            a['already_read'] += 1
-            a['already_full' if any(r['kind'] in FULL for r in earlier) else 'already_partial'] += 1
+            metrics['already_read'] = 1
+            metrics['already_full' if any(r['kind'] in FULL for r in earlier) else 'already_partial'] = 1
         after = rs[bisect_right(times,m['at']):bisect_left(times,end)]
         if after:
-            a['read'] += 1
-            a['full' if any(r['kind'] in FULL for r in after) else 'partial'] += 1
-            a['native_matched_reads'] += sum(r['native_event_id'] is not None for r in after)
+            metrics['read'] = 1
+            metrics['full' if any(r['kind'] in FULL for r in after) else 'partial'] = 1
+            metrics['native_matched_reads'] = sum(r['native_event_id'] is not None for r in after)
+        for container in (g,result['summary']):
+            _add(container[section].setdefault(arm,_bucket()),session,metrics)
     for g in groups.values():
-        for a in g['arms'].values():
-            a['sessions'] = len(a['sessions'])
-            a['read_rate'] = a['read'] / a['opportunities']
+        _finish_buckets(g)
         g['outcomes'] = dict(g['outcomes'])
+    _finish_buckets(result['summary'])
+    result['sessions_by_arm'] = {arm: len(sessions) for arm,sessions in coverage.items()}
     result.update(groups=sorted(groups.values(),key=lambda g:(g['entry'],g['harness'],g['agentsmd_version'])),
                   gaps=dict(gaps), read_sources=dict(provenance),
                   cue_statuses=dict(Counter(m['cue_status'] or 'unknown' for m in moments.values())))
@@ -364,22 +435,31 @@ def _stored_health(con):
 
 
 def render(result):
-    lines = [f"Cue procedure reads: {result['status']}", result['interpretation'], result['window']]
+    lines = [f"Cue procedure reads: {result['status']}", result['interpretation'], result['window'], result['interval_note']]
+    lines.append('Observed session assignment coverage: ' + json.dumps(result['sessions_by_arm'],sort_keys=True))
+    def buckets(container, prefix=''):
+        for section in ('arms', 'repeats', 'excluded'):
+            for arm,a in container[section].items():
+                interval = a['interval95']
+                ci = (f"{interval[0]:.1%} to {interval[1]:.1%}" if interval is not None else 'unavailable (<2 sessions)')
+                label = 'first judgments' if section == 'arms' else section
+                lines.append(f"{prefix}{label} {arm}: {a['read']}/{a['opportunities']} ({a['read_rate']:.1%}) read, {a['sessions']} sessions, 95% interval {ci}; "
+                             f"full {a['full']}, partial {a['partial']}, earlier {a['already_read']}, pending {a['pending_window']}, "
+                             f"boundaries needing missing metadata {a['boundary_without_cue_metadata']}")
+    buckets(result['summary'])
     for g in result['groups']:
         lines.append(f"{g['entry']} | {g['harness']} | {g['machine']} | AgentsMD {g['agentsmd_version']}")
-        for arm,a in g['arms'].items():
-            lines.append(f"  {arm}: {a['read']}/{a['opportunities']} read, {a['sessions']} sessions; "
-                         f"full {a['full']}, partial {a['partial']}, earlier {a['already_read']}, "
-                         f"pending windows {a['pending_window']}")
+        buckets(g, '  ')
     if result['gaps']:
         lines.append('Target gaps: ' + json.dumps(result['gaps'],sort_keys=True))
     return '\n'.join(lines)
 
 
 EXPORT_FIELDS = frozenset({'status', 'window_seconds', 'holdout_unit', 'groups',
-                           'gaps', 'read_sources', 'cue_statuses'})
+                           'gaps', 'read_sources', 'cue_statuses', 'summary', 'comparison', 'interval_method',
+                           'sessions_by_arm'})
 ARM_COUNTS = frozenset({'opportunities', 'sessions', 'read', 'full', 'partial',
-    'already_read', 'already_full', 'already_partial', 'pending_window', 'native_matched_reads'})
+    'already_read', 'already_full', 'already_partial', 'pending_window', 'native_matched_reads', 'boundary_without_cue_metadata'})
 
 
 def export(con, machine=None):
@@ -403,28 +483,41 @@ def validate_export(value):
                     and (allowed is None or k in allowed)
                     and type(v) is int and 0 <= v <= 2**53)
 
+    def validate_buckets(container):
+        require(isinstance(container, dict))
+        for section, allowed in (('arms', {'served','holdout'}), ('repeats', {'served','holdout'}),
+                                 ('excluded', {'hidden','not_served'})):
+            require(isinstance(container.get(section), dict) and set(container[section]) <= allowed)
+            for arm in container[section].values():
+                require(isinstance(arm, dict) and set(arm) == ARM_COUNTS | {'read_rate','interval95'})
+                counts({k: arm[k] for k in ARM_COUNTS}, ARM_COUNTS)
+                require(_number(arm['read_rate']) and 0 <= arm['read_rate'] <= 1)
+                interval = arm['interval95']
+                require(interval is None or (isinstance(interval, list) and len(interval) == 2
+                        and all(_number(v) and 0 <= v <= 1 for v in interval) and interval[0] <= interval[1]))
+                require(arm['read'] == arm['full'] + arm['partial'] <= arm['opportunities'])
+                require(arm['already_read'] == arm['already_full'] + arm['already_partial'] <= arm['opportunities'])
+
     require(isinstance(value, dict) and set(value) == EXPORT_FIELDS)
     require(isinstance(value['status'], str) and value['status'] in {'ok','missing_database','schema_drift','no_cue',
                                 'unreadable_database','not_imported'})
     require(value['window_seconds'] == WINDOW_SECONDS and value['holdout_unit'] == 'session')
+    require(value['comparison'] == COMPARISON and value['interval_method'] == INTERVAL_METHOD)
+    require(isinstance(value['summary'], dict) and set(value['summary']) == {'arms','repeats','excluded'})
+    counts(value['sessions_by_arm'], {'served','holdout'})
     counts(value['gaps'], {'version_unavailable','no_target','ambiguous_target'})
     counts(value['read_sources'], {'native_and_contextmd','contextmd_only'})
     counts(value['cue_statuses'])
     require(isinstance(value['groups'], list))
     for g in value['groups']:
         require(isinstance(g, dict) and set(g) == {'entry','harness','machine',
-                                                    'agentsmd_version','outcomes','arms'})
+                                                    'agentsmd_version','outcomes','arms','repeats','excluded'})
         require(isinstance(g['entry'], str) and ENTRY_ID.fullmatch(g['entry']))
         require(isinstance(g['harness'], str) and g['harness'] in {'codex','claude','grok','opencode'})
         require(isinstance(g['machine'], str) and re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', g['machine']))
         require(isinstance(g['agentsmd_version'], str)
                 and re.fullmatch(r'(?:[0-9]+\.[0-9]+\.[0-9]+|unknown)', g['agentsmd_version']))
         counts(g['outcomes'])
-        require(isinstance(g['arms'], dict) and set(g['arms']) <= {'served','holdout'})
-        for arm in g['arms'].values():
-            require(isinstance(arm, dict) and set(arm) == ARM_COUNTS | {'read_rate'})
-            counts({k: arm[k] for k in ARM_COUNTS}, ARM_COUNTS)
-            require(_number(arm['read_rate']) and 0 <= arm['read_rate'] <= 1)
-            require(arm['read'] == arm['full'] + arm['partial'] <= arm['opportunities'])
-            require(arm['already_read'] == arm['already_full'] + arm['already_partial'] <= arm['opportunities'])
+        validate_buckets(g)
+    validate_buckets(value['summary'])
     return value

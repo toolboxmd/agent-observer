@@ -102,26 +102,48 @@ agent-observer cue report --source /path/to/contextmd.sqlite
 agent-observer cue report --source /path/to/contextmd.sqlite --json
 ```
 
-Reports group Cue entries by harness, machine and observed AgentsMD version
-(`unknown` when the ledger cannot identify it). Each arm shows candidate
-opportunities, distinct sessions, target reads, full versus partial reads,
-and reads already present in that context epoch. A read must be settled and
-successful in ContextMD; pending calls are excluded. Matching native read events
-are linked by exact session, call id and path, without inserting duplicate events.
+The headline compares the **first above-threshold judgment per harness session,
+entry and context epoch** in each arm. It does not count repeated injections in
+the serving arm against every repeated score in holdout. The first judgment is
+chosen in source order, before filtering delivery outcomes or target availability;
+a later delivery or entry version cannot replace it. `below_threshold` and
+`not_scored` rows do not consume the first judgment.
+
+Only delivered first judgments enter the served denominator. `hidden` first
+judgments have their own excluded group, and other undelivered first judgments
+are excluded as `not_served`. Every later above-threshold judgment is reported
+under repeats, including serving-enabled `deduped` rows, never in headline rates.
+Repeat arm labels describe the session's assignment, not proof of a fresh delivery.
+All source outcome counts remain visible.
+
+The summary gives distinct harness-session counts per arm across all entries,
+both observed assignment coverage (`sessions_by_arm`) and sessions contributing
+to each first-judgment denominator. Excluded first deliveries can make these differ;
+groups split by entry, harness, machine and observed AgentsMD version (`unknown`
+when unidentifiable). Each group and summary separates full/partial target reads,
+reads already present in that epoch and pending observation windows. Reads must
+be settled and successful in ContextMD; pending calls are excluded. Native reads
+link by exact session, call id and path without inserting duplicate events.
 ContextMD-only and native-matched read counts remain visible.
 
-The observation window begins strictly after the moment and ends before the next
-user message, context epoch or 30 minutes, whichever comes first. It is clipped
-to the imported source watermark; incomplete windows are counted as pending, so
-read rates are lower bounds while evidence is still arriving. Full wins over
-partial when both occur in a window. Earlier reads are separate and can overlap
-a later reread. Repeated candidates produce repeated opportunities, not independent
-samples; distinct session counts show the comparison group's size.
+The observation window begins strictly after the judgment and ends before the
+next user message, known context epoch change or 30 minutes, whichever is first.
+Every user message ends it, including rows with missing epoch or holdout metadata;
+`boundary_without_cue_metadata` counts windows that needed such a boundary. Missing
+epochs do not create invented epoch changes. The window is clipped to the imported
+watermark; pending windows make current rates lower bounds. Full wins over partial
+within a window; earlier reads are separate and can overlap a later reread.
 
-Holdout withholds all Cue entries for the session. Delivery outcomes are not
-proof the model saw a rule, and reads do not prove it followed the procedure.
-This observational comparison does not establish a per-procedure causal effect
-or label a serve `ignored`, as ContextMD's outcome judge does.
+95% percentile intervals resample whole observed harness sessions 2,000 times with
+a fixed seed, keeping all their entry/epoch opportunities together. They are
+unavailable with fewer than two sessions; small samples or all-equal observed
+outcomes can yield unstable or degenerate intervals. Distinct session counts must
+accompany the rates, particularly for the small holdout sample.
+
+Holdout withholds all Cue entries for the session. Delivery outcomes do not prove
+model receipt, and reads do not prove the agent followed a procedure. These
+observed first-judgment rates and intervals do not establish a per-procedure
+causal effect or assign the ContextMD outcome judge's `ignored` label.
 
 Targets are resolved from version-matching Library files named by the moment's
 owners, with optional extra directories supplied by `cue import --library DIR`.
