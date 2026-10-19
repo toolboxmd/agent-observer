@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.4.2] - 2026-10-19
+
+### Changed
+
+- Credit intervention senders, preserve grouped verdicts and retain unknown actor reasons
+
 ## [1.4.1] - 2026-10-19
 
 ### Changed

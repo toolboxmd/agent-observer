@@ -77,6 +77,12 @@ class _Evidence:
             con, "SELECT session_key, native_id, actor_kind FROM t3_native_prompt_origins")}
         self.restricted_origins = {r[0] for r in self._rows(
             con, "SELECT native_id FROM claude_native_kinds WHERE origin_allowed=0")}
+        self.native = {r[0]: (r[1], r[2], r[3]) for r in self._rows(
+            con, "SELECT native_id,transport_kind,actor_kind,actor_reason"
+                 " FROM intervention_prompt_evidence")}
+        self.related: dict[str, list[str]] = {}
+        self.grouped: dict[str, str] = {}
+        self._group_steers(con)
         # Thread position: root (a top-level thread a person opened),
         # launched (top-level, opened by an agent or without evidence), or
         # child. A session seen in several threads takes the least
@@ -95,6 +101,34 @@ class _Evidence:
                      " ELSE 'launched' END FROM t3_threads"):
             if rank[position] >= rank.get(self.threads.get(session), -1):
                 self.threads[session] = position
+
+    def _group_steers(self, con):
+        # The next substantive native input after Claude's interrupt marker
+        # must be an explicit T3 steer. Same-source positions establish the
+        # link; proximity alone must never turn a real refusal into a steer.
+        previous = {}
+        for row in con.execute(
+                "SELECT native_id,source_id,session_key,ordinal_num,kind,ts"
+                " FROM user_messages WHERE kind NOT IN ('scaffolding','command')"
+                " ORDER BY source_id,ordinal_num"):
+            prior = previous.get(row['source_id'])
+            previous[row['source_id']] = row
+            if self.native.get(row['native_id'], (None,))[0] != 'steer' or prior is None \
+                    or row['source_id'] is None or row['ordinal_num'] is None \
+                    or prior['ordinal_num'] is None or prior['kind'] != 'interrupt' \
+                    or prior['session_key'] != row['session_key']:
+                continue
+            canonical = 'sub:' + row['native_id']
+            related = ['sub:' + prior['native_id']]
+            for event in con.execute(
+                    "SELECT session_key,native_id FROM events WHERE source_id=?"
+                    " AND session_key=? AND family='permission' AND status IN ('denied','deny')"
+                    " AND json_extract(detail_json,'$.denial')='user-rejected'"
+                    " AND ? - ts BETWEEN 0 AND 1.0 AND ordinal_num < ?",
+                    (row['source_id'], row['session_key'], prior['ts'], prior['ordinal_num'])):
+                related.append(f"ev:{event['session_key']}/permission/{event['native_id']}")
+            self.related[canonical] = related
+            self.grouped.update((identity, canonical) for identity in related)
 
     @staticmethod
     def _rows(con, sql) -> list:
@@ -173,31 +207,44 @@ def _scope(harness=None, project=None, attrs=None) -> tuple[str, list]:
 
 
 def _base(row, intervention_id: str, kind: str, ts, created_by: str, thread: str) -> dict:
-    return {"id": intervention_id, "kind": kind, "created_by": created_by, "thread": thread,
-            "ts": ts, "at": _iso(ts), "session": row["session_key"],
-            "harness": row["harness"], "project": row["project_dir"]}
+    out = {"id": intervention_id, "kind": kind, "created_by": created_by, "thread": thread,
+           "ts": ts, "at": _iso(ts), "session": row["session_key"],
+           "harness": row["harness"], "project": row["project_dir"]}
+    if created_by == 'unknown':
+        out['actor_reason'] = 'actor_evidence_missing'
+    return out
 
 
 def _from_submission(row, ev: _Evidence) -> dict | None:
     """An intervention for a genuine prompt, an interrupt, or a message another
     agent sent (a synthetic user message Chromeria records as agent-sent);
     None for other synthetic input such as reminders."""
-    kind = "interrupt" if row["kind"] == "interrupt" else "prompt"
+    transport, sender, reason = ev.native.get(
+        row['native_id'], (None, None, 'origin_evidence_not_imported'))
+    kind = "interrupt" if row["kind"] == "interrupt" or transport == 'steer' else "prompt"
     thread = ev.thread(row["session_native"])
     identity = row["native_id"]
     if row["harness"] == "claude":
         from .adapters.claude import prompt_native_id
         identity = prompt_native_id(row)
     actor = ev.prompt_actor(row["harness"], identity,
-                            row["session_native"], row["turn_id"]) \
-        if kind == "prompt" else None
+                            row["session_native"], row["turn_id"]) or sender \
+        if kind == "prompt" or transport == 'steer' else None
+    if transport == 'completion':
+        # A complete notice contains no user instruction. Codex can attach
+        # its preceding human turn id to this separate system input.
+        actor = sender
     if row["kind"] == "synthetic" and (
             actor != "server" or ev.origin_restricted(row["harness"], row["native_id"])):
         return None
     created_by = "unknown" if row["kind"] == "unknown" and not actor \
         else _created_by(kind, actor, row["entrypoint"], thread)
-    return _base(row, f"sub:{row['native_id']}", kind, row["ts"],
-                 created_by, thread)
+    out = _base(row, f"sub:{row['native_id']}", kind, row["ts"], created_by, thread)
+    if created_by == 'unknown':
+        out['actor_reason'] = reason
+    if out['id'] in ev.related:
+        out['related_ids'] = ev.related[out['id']]
+    return out
 
 
 def _denial(row):
@@ -271,12 +318,14 @@ def _all(con, harness=None, project=None, attrs=None):
     first = _first_activity(con)
     for row in con.execute(f"{_SUB_SQL} WHERE u.kind IN {_SUB_KINDS}"
                            f" AND {where}", args):
-        intervention = None if row["native_id"] in echoes \
+        intervention = None if row["native_id"] in echoes or 'sub:' + row['native_id'] in ev.grouped \
             else _from_submission(row, ev)
         if intervention is not None:
             found.append(_mark_opening(intervention, first, row))
     for row in con.execute(f"{_EVENT_SQL} WHERE {_EVENT_WHERE} AND {where}",
                            args):
+        if f"ev:{row['session_key']}/{row['family']}/{row['native_id']}" in ev.grouped:
+            continue
         kind = _event_kind(row)
         if kind is None:
             continue
@@ -346,7 +395,8 @@ def judged_ids(con, behavior: str, judge=None) -> set:
     if judge:
         sql += " AND judge=?"
         args.append(judge)
-    return {r[0] for r in con.execute(sql, args)}
+    ev = _Evidence(con)
+    return {ev.grouped.get(r[0], r[0]) for r in con.execute(sql, args)}
 
 
 def select(con: sqlite3.Connection, since=None, until=None, harness=None,
@@ -389,6 +439,7 @@ def resolve(con: sqlite3.Connection, intervention_id, ev=None) -> dict | None:
     if not isinstance(intervention_id, str):
         return None
     ev = ev or _Evidence(con)
+    intervention_id = ev.grouped.get(intervention_id, intervention_id)
     if intervention_id.startswith("sub:"):
         row = con.execute(f"{_SUB_SQL} WHERE u.native_id = ? AND u.kind IN"
                           f" {_SUB_KINDS}", (intervention_id[4:],)).fetchone()
@@ -590,7 +641,7 @@ def _timeline(con, session_key: str, ev: _Evidence) -> list:
     for row in con.execute(
             f"{_SUB_SQL} WHERE u.session_key = ? AND u.kind IN {_SUB_KINDS}",
             (session_key,)):
-        intervention = None if row["native_id"] in echoes \
+        intervention = None if row["native_id"] in echoes or 'sub:' + row['native_id'] in ev.grouped \
             else _from_submission(row, ev)
         if intervention is None:
             continue
@@ -756,6 +807,7 @@ def show(con: sqlite3.Connection, intervention_ids: list,
         if intervention is None:
             out.append({"id": intervention_id, "status": "no_such_intervention"})
             continue
+        intervention_id = intervention['id']
         session = intervention["session"]
         if session not in timelines:
             timelines[session] = _timeline(con, session, ev)
@@ -822,6 +874,8 @@ def render(items: list[dict]) -> str:
         lines.append(f"{item['kind']} by {item['created_by']} in {item['session']}"
                      f" ({item['harness']}, thread {item['thread']}) at"
                      f" {item['at']} opening={json.dumps(item['opening'])}")
+        if item.get('actor_reason'):
+            lines.append(f"actor_reason={item['actor_reason']}")
         for turn in item.get("before", []):
             if turn["prompt"]:
                 lines.append(_render_prompt(turn["prompt"]))

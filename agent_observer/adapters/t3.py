@@ -360,6 +360,8 @@ def sync(con: sqlite3.Connection, root: str | None = None,
         _import_messages(con, native, totals, lineage)
         _import_prompt_origins(con, native, totals)
         totals["user_messages_reclassified"] = _backfill_prompt_origins(con)
+        from .. import intervention_evidence
+        intervention_evidence.backfill_root_reasons(con)
         totals["responses_retouched"] = _retouch_response_turns(con)
         bound = _bind_trees(con, threads, links, lineage)
         totals["tasks"] = bound["tasks"]
