@@ -120,6 +120,8 @@ def _text(payload) -> str:
                     f"  failed {h['harness']} {item['path']}: {item['error']}")
             if h.get("bare_roots"):
                 lines += _bare_lines(h["harness"], h["bare_roots"])
+        if "cue" in payload:
+            lines.append(f"Cue evidence: {payload['cue']['status']}")
         if payload.get("agentsmd_versions") is not None:
             lines.append(f"agentsmd versions mapped: {payload['agentsmd_versions']}")
         return "\n".join(lines)
@@ -235,6 +237,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--agentsmd-repo", default=None,
                    help="AgentsMD repository for the version map")
     s.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
+
+    cue = sub.add_parser("cue", help="import Cue evidence or report procedure reads")
+    cues = cue.add_subparsers(dest="op", required=True)
+    ci = cues.add_parser("import", help="refresh Cue metadata and settled reads, source read-only")
+    ci.add_argument("--source", default=None, help="ContextMD database")
+    ci.add_argument("--library", action="append", default=[], help="additional Library directory")
+    cr = cues.add_parser("report", help="aggregate target reads after Cue decisions")
+    cr.add_argument("--source", default=None, help="ContextMD database for availability check")
+    for cp in (ci, cr):
+        cp.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
     ss = sub.add_parser("sessions", help="list or show imported sessions")
     ssub = ss.add_subparsers(dest="op", required=True)
@@ -513,7 +525,7 @@ WRITERS = ("sync", "capture", "session-attr")
 
 
 def _writes(ns) -> bool:
-    return ns.cmd in WRITERS or (ns.cmd, getattr(ns, "op", None)) == (
+    return ns.cmd in WRITERS or (ns.cmd == "cue" and ns.op == "import") or (ns.cmd, getattr(ns, "op", None)) == (
         "verdict", "add")
 
 
@@ -527,6 +539,17 @@ def _run_command(con, ns) -> int:
     try:
         if ns.cmd == "sync":
             return _sync(con, ns)
+
+        if ns.cmd == "cue":
+            from . import cue
+            if ns.op == "import":
+                result = cue.import_source(con, source=ns.source, libraries=ns.library)
+                con.commit()
+                _emit(result, ns.as_json)
+            else:
+                result = cue.report(con, source=ns.source)
+                print(json.dumps(result, indent=2, sort_keys=True) if ns.as_json else cue.render(result))
+            return 0 if result["status"] == "ok" else 4
 
         if ns.cmd == "sessions":
             return _sessions(con, ns)
@@ -720,6 +743,7 @@ def _health_check(ns) -> int:
         for gap in result["unavailable"]:
             subject = f"{gap['host']} pid {gap['pid']}: " if "pid" in gap else ""
             print(f"- {subject}{gap['check']} unavailable: {gap['reason']}")
+        print(f"Cue evidence: {result['cue']['status']}")
         conflicts = result.get("identity_conflicts")
         if conflicts is None:
             print("ledger not read: identity conflicts unknown")
@@ -731,7 +755,7 @@ def _health_check(ns) -> int:
         for harness, roots in result["bare_roots"].items():
             for line in _bare_lines(harness, roots):
                 print(f"- {harness} {line.strip()}")
-    return 4 if result["findings"] or result["unavailable"] else 0
+    return 4 if result["findings"] or result["unavailable"] or result["cue"]["status"] in {"schema_drift", "unreadable_database"} else 0
 
 
 def _capabilities(ns) -> int:
@@ -1036,6 +1060,11 @@ def _sync(con, ns) -> int:
             if row.get("harness") == "t3" and "skipped" not in row:
                 row["shared_sessions"] = placement.record_shared_checkouts(con)
                 break
+    cue_result = None
+    if not ns.source and "t3" in wanted:
+        from . import cue
+        cue_source = os.path.join(ns.root, "userdata", "contextmd.sqlite") if ns.root else None
+        cue_result = cue.import_source(con, source=cue_source)
     _identity.refresh_session_versions(con)
     con.commit()
     payload = {"_view": "sync", "harnesses": results,
@@ -1043,8 +1072,11 @@ def _sync(con, ns) -> int:
                "contract": {"schema": SCHEMA_VERSION,
                             "event": EVENT_CONTRACT_VERSION,
                             "capture": CAPTURE_CONTRACT_VERSION}}
+    if cue_result is not None:
+        payload["cue"] = cue_result
     _emit(payload, ns.as_json)
-    return 1 if any(r.get("failed") for r in results) else 0
+    return 1 if (any(r.get("failed") for r in results) or
+                 cue_result and cue_result["status"] in {"schema_drift", "unreadable_database"}) else 0
 
 
 def _when(value):

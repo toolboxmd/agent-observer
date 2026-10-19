@@ -36,6 +36,9 @@ are committed.
 | `t3_outcome_provenance` (`router_outcome_provenance`) | task id | Last adapter-written outcome snapshot; a row that differs is user-owned and survives re-import. |
 | `router_jobs`, `router_invocations`, `router_readings` | router ids | Model Router ledger rows, copied read-only. |
 | `agentsmd_versions` | AGENTS.md SHA-256 | Release map from the local AgentsMD tags. |
+| `cue_import` | one snapshot | ContextMD import status, time and source watermark; unavailable evidence is a gap. |
+| `cue_moments`, `cue_candidates` | source moment id, candidate id | Moment metadata including user-message boundaries with unknown epoch/arm, Cue scores, all candidate outcomes and delivery stages; version-matched targets, never prompt, window or served text. |
+| `cue_reads` | harness, session, epoch, path, kind, moment, time | Settled successful ContextMD reads with optional exact native event linkage; no duplicate native events are inserted. |
 | `import_errors` | none | Quarantined records; prior valid data is kept. |
 
 Every natural key carries its harness prefix (`t3:`, `codex:`, `claude:`,

@@ -30,7 +30,8 @@ class ScanAvailabilityTest(unittest.TestCase):
 
     def check_unavailable(self, reason):
         with patch.object(health, "check_claude", return_value=[{"host": "claude"}]) as claude, \
-                patch.object(health, "identity_conflicts", return_value=[]) as identity:
+                patch.object(health, "identity_conflicts", return_value=[]) as identity, \
+                patch("agent_observer.cue.health", return_value={"status": "not_imported"}):
             result = health.check(registry=[], con=object())
         self.assertEqual(result["findings"], [{"host": "claude"}])
         self.assertEqual(result["identity_conflicts"], [])
@@ -151,6 +152,27 @@ class ScanAvailabilityTest(unittest.TestCase):
                 else:
                     self.assertIn("working directory unavailable:", output.getvalue())
                     self.assertIn("lsof", output.getvalue())
+
+
+class CueHealthExitTest(unittest.TestCase):
+    def test_each_cue_status_remains_visible_with_appropriate_exit(self):
+        for status,expected in (('ok',0),('missing_database',0),('no_cue',0),
+                                ('not_imported',0),('schema_drift',4),('unreadable_database',4)):
+            for as_json in (False,True):
+                with self.subTest(status=status,json=as_json):
+                    result={'checked': {'claude_sessions':0,'processes':0},
+                            'findings':[],'unavailable':[],'identity_conflicts':[],
+                            'bare_roots':{},'cue':{'status':status}}
+                    output=io.StringIO()
+                    with patch.object(health,'check',return_value=result), \
+                            contextlib.redirect_stdout(output):
+                        code=cli.main(['--db','/nonexistent/cue-test.db','health']+
+                                      (['--json'] if as_json else []))
+                    self.assertEqual(code,expected)
+                    if as_json:
+                        self.assertEqual(json.loads(output.getvalue())['cue']['status'],status)
+                    else:
+                        self.assertIn('Cue evidence: '+status,output.getvalue())
 
 
 class ClaudeVisibilityTest(unittest.TestCase):

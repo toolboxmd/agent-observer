@@ -90,6 +90,85 @@ from AgentsMD's Project Direction hook, the instruction text a host
 embedded, or the versioned plugin path of a Skill it loaded, resolved to a
 release through the AgentsMD repository's tags.
 
+## Cue procedure reads
+
+`sync` (all harnesses, or `--harness t3`) also imports metadata from
+`$T3CODE_HOME/userdata/contextmd.sqlite`, default `~/.t3/userdata/contextmd.sqlite`.
+The source opens read-only. To refresh just this evidence or choose another source:
+
+```sh
+agent-observer cue import --source /path/to/contextmd.sqlite
+agent-observer cue report --source /path/to/contextmd.sqlite
+agent-observer cue report --source /path/to/contextmd.sqlite --json
+```
+
+The headline compares the **first above-threshold judgment per harness session,
+entry and context epoch** in each arm. It does not count repeated injections in
+the serving arm against every repeated score in holdout. The first judgment is
+chosen in source order, before filtering delivery outcomes or target availability;
+a later entry version cannot replace it. A first `carried` judgment uses its
+eventual delivery in the same epoch, even after intervening `deduped` or
+`carry_expired` rows. That print belongs to the original unit. First `hidden`,
+`cut_budget` or missing-target judgments still consume the slot. `below_threshold`
+and `not_scored` rows do not consume the first judgment.
+
+Only delivered first judgments enter the served denominator. `hidden` first
+judgments have their own excluded group, and other undelivered first judgments
+are excluded as `not_served`. Carries that never print have their own excluded
+`carry_unprinted` group. Later above-threshold judgments, except a resolved
+carry's print, are reported under repeats, including serving-enabled `deduped`
+rows, never in headline rates. `carry_prints` counts resolved carries.
+Repeat arm labels describe the session's assignment, not proof of a fresh delivery.
+All source outcome counts remain visible.
+
+The summary gives distinct harness-session counts per arm across all entries,
+both observed assignment coverage (`sessions_by_arm`) and sessions contributing
+to each first-judgment denominator. The `by_harness` summary reports both arms
+for Claude, Codex and Grok separately so differences in harness mix stay visible.
+Excluded first deliveries can make observed and contributing session counts differ;
+groups split by entry, harness, machine and observed AgentsMD version (`unknown`
+when unidentifiable). Each group and summary separates full/partial target reads,
+reads already present in that epoch and pending observation windows. Reads must
+be settled and successful in ContextMD; pending calls are excluded. Native reads
+link by exact session, call id and path without inserting duplicate events.
+ContextMD-only and native-matched read counts remain visible.
+
+The observation window begins strictly after actual delivery, at the print moment
+for a resolved carry. Holdout and excluded diagnostics use the first judgment.
+It ends before the next user message, known context epoch change or 30 minutes,
+whichever is first.
+Every user message ends it, including rows with missing epoch or holdout metadata;
+`boundary_without_cue_metadata` counts windows that needed such a boundary. Missing
+epochs do not create invented epoch changes. The window is clipped to the imported
+watermark; pending windows make current rates lower bounds. Full wins over partial
+within a window; earlier reads are separate and can overlap a later reread.
+
+95% percentile intervals resample whole observed harness sessions 2,000 times with
+a fixed seed, keeping all their entry/epoch opportunities together. They are
+unavailable with fewer than two sessions; small samples or all-equal observed
+outcomes can yield unstable or degenerate intervals. Distinct session counts must
+accompany the rates, particularly for the small holdout sample.
+
+Holdout withholds all Cue entries for the session. Delivery outcomes do not prove
+model receipt, and reads do not prove the agent followed a procedure. These
+observed first-judgment rates and intervals do not establish a per-procedure
+causal effect or assign the ContextMD outcome judge's `ignored` label.
+
+Targets are resolved from version-matching Library files named by the moment's
+owners, with optional extra directories supplied by `cue import --library DIR`.
+Changed or missing entry versions, ambiguous targets and entries without targets
+are explicit gaps, not unread procedures. Missing databases, incompatible schemas
+and machines without successful Cue moments show gaps in both `health` and the
+report. `cue` exits 4 for unavailable evidence. Optional Cue gaps (`missing_database`,
+`no_cue`, `not_imported`) do not fail `health`; Cue causes exit 4 only for
+`schema_drift` or `unreadable_database`. A malformed or unreadable Library file
+leaves only its own candidates unresolved. `sync` imports Cue by default with T3;
+a failed Cue import rolls back only Cue changes, records a gap and finishes the
+remaining sync work before returning exit 1 for schema/read failures.
+No prompt, window, entry body or served text is imported. `export` carries only
+the imported snapshot's aggregates, without read paths, session ids or individual
+moments; it does not require the original database to remain available.
+
 ## Evaluating AgentsMD releases
 
 `compare --by agentsmd` groups sessions from every project by the AgentsMD
@@ -581,8 +660,10 @@ the process, directory and fix. Missing, failed, malformed or timed-out process
 scans are reported as unavailable with a reason; each `ps` or `lsof` invocation
 has a five-second timeout, and other health checks continue.
 
-Health exits 0 when it finds no invisible sessions or unavailable scans, 4 when
-either is reported, and 2 for invalid command-line arguments. An unread ledger
+Health exits 0 when it finds no invisible sessions, unavailable scans or Cue
+schema/read failures; it exits 4 when any is reported, and 2 for invalid
+command-line arguments. Optional missing or unsynced Cue evidence stays visible
+without failing health. An unread ledger
 is reported as unknown and does not by itself change the exit status.
 
 ## Ledger schema 3
