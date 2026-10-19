@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Import Cue decisions and settled ContextMD reads read-only; report procedure reads by entry, harness, machine and AgentsMD version against session-wide holdout, with source and target gaps.
+
 ### Fixed
 
 - Parse sectioned AgentsMD direction identity, Codex native durations and Read calls, and Grok MCP timing and outcomes. Retain read success state and count only successful procedure reads; replay older sources to repair stored evidence (#128).

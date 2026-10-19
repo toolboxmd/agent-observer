@@ -90,6 +90,48 @@ from AgentsMD's Project Direction hook, the instruction text a host
 embedded, or the versioned plugin path of a Skill it loaded, resolved to a
 release through the AgentsMD repository's tags.
 
+## Cue procedure reads
+
+`sync` (all harnesses, or `--harness t3`) also imports metadata from
+`$T3CODE_HOME/userdata/contextmd.sqlite`, default `~/.t3/userdata/contextmd.sqlite`.
+The source opens read-only. To refresh just this evidence or choose another source:
+
+```sh
+agent-observer cue import --source /path/to/contextmd.sqlite
+agent-observer cue report
+agent-observer cue report --json
+```
+
+Reports group Cue entries by harness, machine and observed AgentsMD version
+(`unknown` when the ledger cannot identify it). Each arm shows candidate
+opportunities, distinct sessions, target reads, full versus partial reads,
+and reads already present in that context epoch. A read must be settled and
+successful in ContextMD; pending calls are excluded. Matching native read events
+are linked by exact session, call id and path, without inserting duplicate events.
+ContextMD-only and native-matched read counts remain visible.
+
+The observation window begins strictly after the moment and ends before the next
+user message, context epoch or 30 minutes, whichever comes first. It is clipped
+to the imported source watermark; incomplete windows are counted as pending, so
+read rates are lower bounds while evidence is still arriving. Full wins over
+partial when both occur in a window. Earlier reads are separate and can overlap
+a later reread. Repeated candidates produce repeated opportunities, not independent
+samples; distinct session counts show the comparison group's size.
+
+Holdout withholds all Cue entries for the session. Delivery outcomes are not
+proof the model saw a rule, and reads do not prove it followed the procedure.
+This observational comparison does not establish a per-procedure causal effect
+or label a serve `ignored`, as ContextMD's outcome judge does.
+
+Targets are resolved from version-matching Library files named by the moment's
+owners, with optional extra directories supplied by `cue import --library DIR`.
+Changed or missing entry versions, ambiguous targets and entries without targets
+are explicit gaps, not unread procedures. Missing databases, incompatible schemas
+and machines without successful Cue moments show gaps in both `health` and the
+report. `cue` exits 4 for unavailable evidence; `health` also exits 4 for a Cue gap.
+No prompt, window, entry body or served text is imported. `export` carries only
+this report's aggregates, without read paths, session ids or individual moments.
+
 ## Evaluating AgentsMD releases
 
 `compare --by agentsmd` groups sessions from every project by the AgentsMD

@@ -132,7 +132,8 @@ def export(con: sqlite3.Connection, machine: str | None = None) -> dict:
             "sessions": sorted(report.task_sessions(con, task_id))})
     synced = con.execute("SELECT MAX(imported_at) FROM sources").fetchone()[0]
     counts, judgments = _judgments(con)
-    return {"schema": SCHEMA, "machine": machine,
+    from . import cue
+    return {"cue": cue.report(con, machine=machine), "schema": SCHEMA, "machine": machine,
             "observer_version": __version__, "exported_at": _now(),
             "ledger_synced_at": _iso(synced),
             "sessions": sessions, "tasks": tasks, "withheld_tasks": withheld,

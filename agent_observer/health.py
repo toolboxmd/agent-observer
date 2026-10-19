@@ -218,7 +218,8 @@ def check(processes=None, registry=None, con=None, bare=None) -> dict:
                                 "pid": proc["pid"], "reason": proc["cwd_error"]})
     registry = claude_registry() if registry is None else registry
     findings = check_claude(registry) + check_opencode(processes) + check_codex(processes)
-    return {"findings": findings,
+    from . import cue
+    return {"cue": cue.health(con), "findings": findings,
             "unavailable": unavailable,
             "identity_conflicts": identity_conflicts(con) if con is not None else None,
             "bare_roots": bare_roots() if bare is None else bare,

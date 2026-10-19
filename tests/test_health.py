@@ -30,7 +30,8 @@ class ScanAvailabilityTest(unittest.TestCase):
 
     def check_unavailable(self, reason):
         with patch.object(health, "check_claude", return_value=[{"host": "claude"}]) as claude, \
-                patch.object(health, "identity_conflicts", return_value=[]) as identity:
+                patch.object(health, "identity_conflicts", return_value=[]) as identity, \
+                patch("agent_observer.cue.health", return_value={"status": "not_imported"}):
             result = health.check(registry=[], con=object())
         self.assertEqual(result["findings"], [{"host": "claude"}])
         self.assertEqual(result["identity_conflicts"], [])
