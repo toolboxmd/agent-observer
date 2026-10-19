@@ -401,7 +401,9 @@ def _write(con: sqlite3.Connection, src: JsonlSource, state: _State,
 def import_muse_file(con: sqlite3.Connection, path: str, full: bool = False) -> dict:
     stats = {"events_inserted": 0, "malformed": 0}
     src = JsonlSource(con, HARNESS, path, full=full)
-    if src.unchanged:
+    # Re-stat immediately before the fast path so an append racing the
+    # first check is imported in this sync (ingest contract).
+    if src.unchanged and src.recheck_unchanged():
         return {"unchanged": True}
     # A grown file still needs earlier lines: a result or catalog can follow
     # the call it completes across an append boundary.

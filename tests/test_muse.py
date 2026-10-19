@@ -161,6 +161,53 @@ class ImportTest(MuseCase):
                          (2, 0, 0))
         self.assertEqual(comparable(self.db), before)
 
+    def test_append_after_the_initial_check_is_imported_same_sync(self):
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+        from agent_observer import cli
+        from agent_observer.ingest import JsonlSource
+        tree = self.copy_tree()
+        path = os.path.join(tree, DAY, ROOT, "session.jsonl")
+        with open(ROOT_LOG, "rb") as fh:
+            lines = fh.readlines()
+        with open(path, "wb") as fh:
+            fh.writelines(lines[:8])
+
+        def sync():
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = cli.main(["--db", self.db, "sync", "--harness", "muse",
+                                 "--source", path, "--json"])
+            self.assertEqual(code, 0)
+            row = next(h for h in json.loads(out.getvalue())["harnesses"]
+                       if h["harness"] == "muse")
+            return row["unchanged"], row["events_inserted"], row["events_updated"]
+
+        self.assertEqual(sync(), (0, 4, 0))
+        self.assertEqual(len(root_events(self.db)), 4)
+        original = JsonlSource.__init__
+        appended = []
+
+        def raced(src, *args, **kwargs):
+            # The rest of the log lands right after the real initial check
+            # found the source unchanged, before the adapter's fast path.
+            original(src, *args, **kwargs)
+            if src.path == path and src.unchanged and not appended:
+                with open(path, "ab") as fh:
+                    fh.writelines(lines[8:])
+                appended.append(True)
+
+        with mock.patch.object(JsonlSource, "__init__", raced):
+            self.assertEqual(sync(), (0, 16, 3))
+        self.assertEqual(appended, [True])
+        self.assertEqual(root_events(self.db), EXPECTED)
+        con = sqlite3.connect(self.db)
+        offsets = con.execute("SELECT read_offset, size_bytes FROM sources").fetchone()
+        con.close()
+        self.assertEqual(offsets, (len(b"".join(lines)), len(b"".join(lines))))
+        self.assertEqual(sync(), (1, 0, 0))
+
     def test_split_appends_reach_the_same_literal_result(self):
         tree = self.copy_tree()
         path = os.path.join(tree, DAY, ROOT, "session.jsonl")
