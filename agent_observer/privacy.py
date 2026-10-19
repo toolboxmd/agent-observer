@@ -733,7 +733,7 @@ _COMMON_STATUS = frozenset({
 _HTTP_STATUS_FAMILIES = frozenset({"lifecycle", "tool_result"})
 EVENT_STATUS_ENUMS: dict[str, frozenset] = {
     "tool_call": _COMMON_STATUS | frozenset({"cancelled"}),
-    "tool_result": _COMMON_STATUS | frozenset({"cancelled"}),
+    "tool_result": _COMMON_STATUS | frozenset({"cancelled", "pending"}),
     "read": _COMMON_STATUS | frozenset({"cancelled", "attempted", "pending"}),
     "skill_read": _COMMON_STATUS | frozenset({"cancelled", "attempted", "pending"}),
     "lifecycle": frozenset(

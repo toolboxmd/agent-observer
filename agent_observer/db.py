@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import json
 import os
 import sqlite3
 import sys
@@ -17,6 +18,7 @@ import time
 from pathlib import Path
 
 from . import CAPTURE_CONTRACT_VERSION, EVENT_CONTRACT_VERSION, SCHEMA_VERSION
+from .command_status import pending_pr_checks
 
 DEFAULT_DB = os.path.join(
     os.path.expanduser("~"), ".local", "state", "agent-observer", "observer.db")
@@ -706,6 +708,19 @@ def init_db(con: sqlite3.Connection) -> None:
         (str(SCHEMA_VERSION), str(EVENT_CONTRACT_VERSION),
          str(CAPTURE_CONTRACT_VERSION)),
     )
+    # One-time correction also covers ledger-only events whose source is gone.
+    if not con.execute("SELECT 1 FROM schema_meta WHERE key='pr_checks_pending_version'").fetchone():
+        for event in con.execute(
+                "SELECT id, family, target, detail_json FROM events"
+                " WHERE family='tool_result' AND detail_json LIKE '%8%'"):
+            try:
+                detail = json.loads(event["detail_json"])
+            except (ValueError, TypeError):
+                continue
+            if isinstance(detail, dict) and pending_pr_checks(
+                    event["family"], event["target"], detail):
+                con.execute("UPDATE events SET status='pending' WHERE id=?", (event["id"],))
+        con.execute("INSERT INTO schema_meta(key, value) VALUES ('pr_checks_pending_version', '1')")
     con.commit()
     try:
         row = con.execute("PRAGMA database_list").fetchone()
