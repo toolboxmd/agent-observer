@@ -1837,6 +1837,26 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                       updates_src.source_id if updates_src is not None
                       else (events_src.source_id if events_src is not None
                             else None), **fields)
+    if replayed_updates:
+        # This reader rebuilt read evidence from the whole cached source.
+        # Replace derived path counts instead of retaining the first sync's
+        # counts through upsert_session's fill-unknown policy. Other identity
+        # evidence stays intact; a resolved instruction hash still wins.
+        stored = con.execute("SELECT identity_json FROM sessions WHERE session_key=?",
+                             (r.session_key,)).fetchone()
+        evidence = json.loads(stored["identity_json"] or "{}")
+        if r.identity.path_versions or "plugin_paths" in evidence:
+            if r.identity.path_versions:
+                evidence["plugin_paths"] = r.identity.path_versions
+            else:
+                evidence.pop("plugin_paths", None)
+            version = max(r.identity.path_versions, key=r.identity.path_versions.get) \
+                if r.identity.path_versions else None
+            con.execute(
+                "UPDATE sessions SET identity_json=?, agentsmd_version=COALESCE("
+                "(SELECT version FROM agentsmd_versions WHERE sha256=sessions.instructions_sha256), ?)"
+                " WHERE session_key=?",
+                (json.dumps(evidence, sort_keys=True) if evidence else None, version, r.session_key))
     _store_meta(con, r.session_key, summary_fp, chat_fp_current, chat)
     if updates_src is not None:
         stats.update(updates_src.finish(session_id=r.native_sid))

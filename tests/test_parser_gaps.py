@@ -234,3 +234,34 @@ class ParserGapsTest(LedgerCase):
         codex.sync(self.con, source=path)
         self.assertEqual(self.query("SELECT native_id,status FROM events WHERE family='read'")[0][:],
                          ('read-id', 'ok'))
+
+    def test_grok_late_success_refreshes_existing_version_evidence(self):
+        updates = []
+        for call, version, status in [('a', '17.1.0', 'completed'),
+                                      ('b1', '17.3.1', 'in_progress'),
+                                      ('b2', '17.3.1', 'in_progress')]:
+            updates.append({'sessionUpdate': 'tool_call_update', 'toolCallId': call,
+                'kind': 'read', 'status': status, 'locations': [
+                    {'path': f'/plugins/agentsmd/{version}/skills/operations/SKILL.md'}]})
+        path = self.grok_fixture(updates, [])
+        grok.sync(self.con, source=path)
+        self.assertEqual(self.query('SELECT agentsmd_version FROM sessions')[0][0], '17.1.0')
+        def complete(call, event):
+            with open(os.path.join(path, 'updates.jsonl'), 'a') as f:
+                f.write(json.dumps({'method': 'session/update', 'params': {'sessionId': 'grok-gaps',
+                    '_meta': {'eventId': event, 'promptId': 'p1'}, 'update': {
+                    'sessionUpdate': 'tool_call_update', 'toolCallId': call, 'status': 'completed'}}}) + '\n')
+        complete('b1', 'late-1'); complete('b2', 'late-2')
+        grok.sync(self.con, source=path)
+        row = self.query('SELECT agentsmd_version,identity_json FROM sessions')[0]
+        self.assertEqual(row['agentsmd_version'], '17.3.1')
+        self.assertEqual(json.loads(row['identity_json'])['plugin_paths'],
+                         {'17.1.0': 1, '17.3.1': 2})
+        # An instruction hash resolved to a release outranks path evidence.
+        self.con.execute('INSERT INTO agentsmd_versions(sha256,version) VALUES(?,?)',
+                         ('a' * 64, '16.0.0'))
+        self.con.execute('UPDATE sessions SET instructions_sha256=?', ('a' * 64,))
+        self.con.commit()
+        complete('b1', 'repeat')
+        grok.sync(self.con, source=path)
+        self.assertEqual(self.query('SELECT agentsmd_version FROM sessions')[0][0], '16.0.0')
