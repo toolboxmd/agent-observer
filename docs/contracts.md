@@ -594,7 +594,9 @@ Default root `~/.local/share/muse/sessions`: each
   effect started and terminal, and the listed `kind=run` events) need
   `schema_version` and `payload_schema_version` 1, else `unsupported_schema`.
   A run frame whose `event.kind` is not a string, or a terminal without an
-  outcome `kind` string, is a `schema_error`; that terminal's result keeps
+  outcome `kind` string, is a `schema_error`; a call or result batch with any
+  item lacking its `call_id`/`name` or `tool_call_id` is a `missing_id` and is
+  rejected whole, keeping none of its items; that terminal's result keeps
   an unknown status. Each bad record is quarantined alone at its line number
   with key names only: it neither sets the session identity nor widens the
   session span, and the rest of the file still imports. Unconsumed

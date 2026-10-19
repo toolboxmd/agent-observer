@@ -278,13 +278,15 @@ def _parse(src: JsonlSource, totals: dict) -> _State:
                 if not isinstance(items, list):
                     bad(ordinal, "schema_error", raw)
                     continue
-                accept(sid, ts)
+                # Every item is validated before the record may touch state:
+                # one bad item rejects the whole batch, leaving no prefix.
+                calls = []
                 for item in items:
                     call = _str(item.get("call_id")) if isinstance(item, dict) else None
                     name = _str(item.get("name")) if isinstance(item, dict) else None
                     if call is None or name is None:
-                        bad(ordinal, "missing_id", raw)
-                        continue
+                        calls = None
+                        break
                     args = None
                     if isinstance(item.get("args"), str):
                         try:
@@ -292,22 +294,33 @@ def _parse(src: JsonlSource, totals: dict) -> _State:
                         except ValueError:
                             decoded = None
                         args = decoded if isinstance(decoded, dict) else None
+                    calls.append((call, name, args))
+                if calls is None:
+                    bad(ordinal, "missing_id", raw)
+                    continue
+                accept(sid, ts)
+                for call, name, args in calls:
                     state.calls.setdefault(call, {**at, "name": name, "args": args})
             elif kind == "tool_result_batch_committed":
                 items = event.get("results")
                 if not isinstance(items, list):
                     bad(ordinal, "schema_error", raw)
                     continue
-                accept(sid, ts)
+                results = []
                 for item in items:
                     call = _str(item.get("tool_call_id")) if isinstance(item, dict) else None
                     if call is None:
-                        bad(ordinal, "missing_id", raw)
-                        continue
+                        results = None
+                        break
                     text = item.get("text")
-                    state.results[call] = {
-                        **at, "size": len(text.encode("utf-8"))
-                        if isinstance(text, str) else None}
+                    results.append((call, len(text.encode("utf-8"))
+                                    if isinstance(text, str) else None))
+                if results is None:
+                    bad(ordinal, "missing_id", raw)
+                    continue
+                accept(sid, ts)
+                for call, size in results:
+                    state.results[call] = {**at, "size": size}
             elif kind == "memory_reminder_child_session_linked":
                 child = _session_id(event.get("child_session_id"))
                 if child is None:
