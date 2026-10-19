@@ -11,6 +11,7 @@ import sys
 
 from . import CAPTURE_CONTRACT_VERSION, EVENT_CONTRACT_VERSION, SCHEMA_VERSION
 from . import adapters as _adapters
+from .adapters import bare as _bare
 from . import analysis as _analysis
 from . import db as _db
 from . import identity as _identity
@@ -992,13 +993,14 @@ def _sync(con, ns) -> int:
     if repo and os.path.isdir(repo):
         mapped = _identity.store_version_map(con, _identity.build_version_map(repo))
     results = []
-    for name in wanted:
-        module = registry.get(name)
-        if module is None:
-            results.append({"harness": name, "skipped": "adapter not built"})
-            continue
-        results.append(module.sync(con, root=ns.root, full=ns.full,
-                                   source=ns.source))
+    with _bare.one_read():
+        for name in wanted:
+            module = registry.get(name)
+            if module is None:
+                results.append({"harness": name, "skipped": "adapter not built"})
+                continue
+            results.append(module.sync(con, root=ns.root, full=ns.full,
+                                       source=ns.source))
     if "t3" in wanted and len(wanted) > 1 and "t3" in registry:
         # T3 attribution reads first so transcript imports classify
         # prompts as they land, but sessions imported later in this same

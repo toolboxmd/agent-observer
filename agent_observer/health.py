@@ -191,8 +191,9 @@ def bare_roots() -> dict:
     a running session.
     """
     from .adapters import bare, codex, grok
-    return {codex.HARNESS: bare.discover(codex.HARNESS, codex._bare_home)[1],
-            grok.HARNESS: bare.discover(grok.HARNESS, grok._sessions_under)[1]}
+    with bare.one_read():
+        return {codex.HARNESS: bare.discover(codex.HARNESS, codex._bare_home)[1],
+                grok.HARNESS: bare.discover(grok.HARNESS, grok._sessions_under)[1]}
 
 
 def check(processes=None, registry=None, con=None, bare=None) -> dict:

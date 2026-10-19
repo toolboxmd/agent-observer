@@ -318,8 +318,39 @@ class ReceiptReadCostTest(BareRootCase):
                 redirect_stdout(io.StringIO()):
             cli.main(["--db", os.path.join(self.base, "cli.db"), "sync",
                       "--harness", "codex", "--harness", "grok"])
+            self.assertEqual(len(opened), 1)
             health.bare_roots()
-        self.assertEqual(len(opened), 1)
+            self.assertEqual(len(opened), 2)
+
+    def test_a_receipt_committed_to_the_wal_is_seen_by_the_next_run(self):
+        first = self.bare_sessions("codex", "first")
+        second = self.bare_sessions("codex", "second")
+        self.rollout(first, "thr-first", "resp-first", 100)
+        self.rollout(second, "thr-second", "resp-second", 200)
+        self.receipts(("codex", first))
+        writer = sqlite3.connect(self.state)
+        self.addCleanup(writer.close)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        self.assertEqual(codex.sync(self.con)["bare_roots"]["receipts"], 1)
+        main_file = os.stat(self.state)
+
+        # Chromeria commits a receipt; it stays in the WAL.
+        payload = {"type": "system_notice", "bareReceipt": {"nativeRecord": {
+            "harness": "codex", "sessionId": "s9", "root": second}}}
+        writer.execute(
+            "INSERT INTO orchestration_v2_projection_turn_items"
+            " VALUES('bare-receipt:9', 't9', 0, 'system_notice', 'completed',"
+            " '', ?)", (json.dumps(payload),))
+        writer.commit()
+        self.assertEqual(os.stat(self.state).st_mtime_ns, main_file.st_mtime_ns)
+        self.assertEqual(os.stat(self.state).st_size, main_file.st_size)
+
+        stats = codex.sync(self.con)
+        self.assertEqual(stats["bare_roots"]["receipts"], 2)
+        self.assertEqual(self.scalar(
+            "SELECT COUNT(*) FROM sessions WHERE session_key='codex:thr-second'"),
+            1)
 
     def test_receipt_query_searches_the_primary_key(self):
         self.receipts(("codex", self.bare_sessions("codex", "a")))

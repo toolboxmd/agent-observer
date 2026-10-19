@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import contextmanager
 from typing import Callable
 
 from . import t3
@@ -34,40 +35,43 @@ RECEIPTS = (
     f" AND turn_item_id < 'bare-receipt;' AND type = 'system_notice'"
     f" AND json_extract(payload_json, '$.bareReceipt') IS NOT NULL")
 
-_read: dict = {}
+# Receipts read in the current sync or health run, by state database path.
+# None outside one_read(): every read is fresh, so a receipt committed to
+# the WAL since an earlier run is never missed.
+_run: dict | None = None
 
 
-def _snapshot(path: str) -> tuple:
-    """The state database file as it is now.
-
-    The WAL is left out on purpose: commits Chromeria makes while one sync
-    runs do not trigger a second read, so a sync reads receipts once. A
-    new process always reads afresh.
-    """
+@contextmanager
+def one_read():
+    """Read each state database's receipts at most once inside this block."""
+    global _run
+    outer = _run
+    if outer is None:
+        _run = {}
     try:
-        st = os.stat(path)
-    except OSError:
-        return (path, None)
-    return (path, st.st_ino, st.st_size, st.st_mtime_ns)
+        yield
+    finally:
+        if outer is None:
+            _run = None
 
 
 def _receipts(path: str) -> dict:
-    """Recorded roots per harness, read once per state database file state."""
-    key = _snapshot(path)
-    if key not in _read:
-        roots: dict = {}
-        native = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        try:
-            tables = {r[0] for r in native.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")}
-            if TURN_ITEMS in tables:
-                for harness, root in native.execute(RECEIPTS):
-                    roots.setdefault(harness, []).append(root)
-        finally:
-            native.close()
-        _read.clear()
-        _read[key] = roots
-    return _read[key]
+    """Recorded roots per harness, once per one_read() block."""
+    if _run is not None and path in _run:
+        return _run[path]
+    roots: dict = {}
+    native = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        tables = {r[0] for r in native.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if TURN_ITEMS in tables:
+            for harness, root in native.execute(RECEIPTS):
+                roots.setdefault(harness, []).append(root)
+    finally:
+        native.close()
+    if _run is not None:
+        _run[path] = roots
+    return roots
 
 
 def receipt_roots(harness: str) -> tuple[list, dict]:
