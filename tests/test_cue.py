@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import sqlite3
 from unittest.mock import patch
 
@@ -410,3 +411,72 @@ class CueTests(LedgerCase):
         self.assertEqual(result['groups'][0]['arms'],{})
         self.assertEqual(result['groups'][0]['repeats']['served']['opportunities'],1)
         self.assertEqual(result['gaps'],{'version_unavailable':1})
+
+    def test_bad_library_file_does_not_hide_healthy_targets(self):
+        bad=self.library/'bad.md'
+        for raw in (b'---\nid: bad\ntarget: "unterminated\n---\n',b'\xff'):
+            with self.subTest(raw=raw):
+                bad.write_bytes(raw)
+                version=hashlib.sha256(raw).hexdigest()[:12]
+                self.native.execute("DELETE FROM candidates WHERE id=4")
+                self.candidate(4,1,entry='bad',version=version)
+                # Filesystem enumeration order must not decide which entries survive.
+                with patch.object(Path,'glob',return_value=iter([bad,self.library/'research.md'])):
+                    result=self.refresh()
+                self.assertEqual(self.arm(result)['opportunities'],1)
+                self.assertEqual(result['gaps'],{'version_unavailable':1})
+
+    def test_unreadable_library_file_does_not_hide_healthy_targets(self):
+        bad=self.library/'unreadable.md'
+        read=Path.read_bytes
+        def read_bytes(path):
+            if path==bad:raise PermissionError('fixture')
+            return read(path)
+        self.candidate(4,1,entry='unreadable',version='unavailable')
+        with patch.object(Path,'glob',return_value=iter([bad,self.library/'research.md'])), \
+                patch.object(Path,'read_bytes',read_bytes):
+            result=self.refresh()
+        self.assertEqual(self.arm(result)['opportunities'],1)
+        self.assertEqual(result['gaps'],{'version_unavailable':1})
+
+    def _sync_after_cue_failure(self,expected):
+        def placement(con):
+            con.execute("INSERT INTO schema_meta VALUES('placement-proof','kept')")
+            return 1
+        refresh=cli._identity.refresh_session_versions
+        def refresh_versions(con):
+            refresh(con)
+            con.execute("INSERT INTO schema_meta VALUES('version-proof','kept')")
+        ns=SimpleNamespace(harness=['t3'],source=None,root=None,full=False,
+                           agentsmd_repo=str(self.library/'absent'),as_json=True)
+        adapter=SimpleNamespace(sync=lambda *a,**kw: {'harness':'t3'})
+        output=io.StringIO()
+        with patch.object(cli._adapters,'available',return_value={'t3':adapter}), \
+                patch.object(cli.placement,'record_shared_checkouts',side_effect=placement), \
+                patch.object(cli._identity,'refresh_session_versions',side_effect=refresh_versions), \
+                patch.object(cue,'source_path',return_value=self.source), \
+                contextlib.redirect_stdout(output):
+            code=cli._sync(self.con,ns)
+        self.assertEqual(code,1)
+        self.assertEqual(json.loads(output.getvalue())['cue']['status'],expected)
+        # A new connection proves the non-Cue writes were committed, not just retained in memory.
+        with contextlib.closing(sqlite3.connect(self.db_path)) as other:
+            self.assertEqual(other.execute("SELECT count(*) FROM schema_meta WHERE key IN ('placement-proof','version-proof') AND value='kept'").fetchone()[0],2)
+            self.assertEqual(other.execute('SELECT count(*) FROM cue_candidates').fetchone()[0],1)
+            self.assertEqual(other.execute('SELECT status FROM cue_import').fetchone()[0],expected)
+        self.assertNotIn('PRIVATE',output.getvalue())
+
+    def test_sync_sqlite_failure_rolls_back_only_cue_and_records_gap(self):
+        self.refresh()
+        self.con.commit()
+        self.con.execute("CREATE TRIGGER deny_cue BEFORE INSERT ON cue_candidates BEGIN SELECT RAISE(ABORT,'fixture Cue failure'); END")
+        self._sync_after_cue_failure('unreadable_database')
+
+    def test_sync_nontext_owners_records_gap_and_preserves_other_writes(self):
+        self.refresh()
+        self.con.commit()
+        self.native.execute('ALTER TABLE moments RENAME COLUMN owners_json TO old_owners')
+        self.native.execute('ALTER TABLE moments ADD COLUMN owners_json')
+        self.native.execute('UPDATE moments SET owners_json=17')
+        self.native.commit()
+        self._sync_after_cue_failure('schema_drift')

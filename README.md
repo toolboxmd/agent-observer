@@ -159,7 +159,12 @@ owners, with optional extra directories supplied by `cue import --library DIR`.
 Changed or missing entry versions, ambiguous targets and entries without targets
 are explicit gaps, not unread procedures. Missing databases, incompatible schemas
 and machines without successful Cue moments show gaps in both `health` and the
-report. `cue` exits 4 for unavailable evidence; `health` also exits 4 for a Cue gap.
+report. `cue` exits 4 for unavailable evidence. Optional Cue gaps (`missing_database`,
+`no_cue`, `not_imported`) do not fail `health`; Cue causes exit 4 only for
+`schema_drift` or `unreadable_database`. A malformed or unreadable Library file
+leaves only its own candidates unresolved. `sync` imports Cue by default with T3;
+a failed Cue import rolls back only Cue changes, records a gap and finishes the
+remaining sync work before returning exit 1 for schema/read failures.
 No prompt, window, entry body or served text is imported. `export` carries only
 the imported snapshot's aggregates, without read paths, session ids or individual
 moments; it does not require the original database to remain available.
@@ -655,8 +660,10 @@ the process, directory and fix. Missing, failed, malformed or timed-out process
 scans are reported as unavailable with a reason; each `ps` or `lsof` invocation
 has a five-second timeout, and other health checks continue.
 
-Health exits 0 when it finds no invisible sessions or unavailable scans, 4 when
-either is reported, and 2 for invalid command-line arguments. An unread ledger
+Health exits 0 when it finds no invisible sessions, unavailable scans or Cue
+schema/read failures; it exits 4 when any is reported, and 2 for invalid
+command-line arguments. Optional missing or unsynced Cue evidence stays visible
+without failing health. An unread ledger
 is reported as unknown and does not by itself change the exit status.
 
 ## Ledger schema 3

@@ -116,8 +116,11 @@ def _targets(roots):
     found = {}
     for root in roots:
         try:
-            paths = Path(root).glob('*.md')
-            for file in paths:
+            paths = list(Path(root).glob('*.md'))
+        except OSError:
+            continue
+        for file in paths:
+            try:
                 if file.name.lower() == 'readme.md':
                     continue
                 raw = file.read_bytes()
@@ -152,8 +155,9 @@ def _targets(roots):
                     found[key] = (None, 'ambiguous_target')
                 else:
                     found[key] = value
-        except (OSError, ValueError, UnicodeError):
-            continue
+            except (OSError, ValueError, UnicodeError):
+                # Only candidates for this file remain unresolved, not its siblings.
+                continue
     return found
 
 
@@ -177,14 +181,35 @@ def _native_reads(con):
     return found
 
 
+def _record_gap(con, status):
+    con.execute('DELETE FROM cue_import')
+    con.execute('INSERT INTO cue_import VALUES(?,?,NULL)', (status, time.time()))
+    return {'status': status}
+
+
 def import_source(con, source=None, libraries=()):
-    """Import one consistent source snapshot. A failed refresh preserves prior data."""
+    """Isolate Cue failure from other pending imports, placement and identity writes."""
     _ensure(con)
+    con.execute('SAVEPOINT cue_attempt')
+    try:
+        return _import_snapshot(con, source, libraries)
+    except (sqlite3.Error, TypeError) as exc:
+        con.execute('ROLLBACK TO cue_attempt')
+        # Exception messages can contain source data; retain only a safe gap category.
+        return _record_gap(con, 'schema_drift' if isinstance(exc, TypeError)
+                           else 'unreadable_database')
+    except BaseException:
+        con.execute('ROLLBACK TO cue_attempt')
+        raise
+    finally:
+        con.execute('RELEASE cue_attempt')
+
+
+def _import_snapshot(con, source, libraries):
+    """Import one consistent source snapshot. A failed refresh preserves prior data."""
     status = source_status(source)
     if status != 'ok':
-        con.execute('DELETE FROM cue_import')
-        con.execute('INSERT INTO cue_import VALUES(?,?,NULL)', (status, time.time()))
-        return {'status': status}
+        return _record_gap(con, status)
     with closing(_open(source)) as native:
         native.execute('BEGIN')
         moments = native.execute('SELECT id,received_at,harness,session,epoch,holdout,kind,'

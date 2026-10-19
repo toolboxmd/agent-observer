@@ -755,7 +755,7 @@ def _health_check(ns) -> int:
         for harness, roots in result["bare_roots"].items():
             for line in _bare_lines(harness, roots):
                 print(f"- {harness} {line.strip()}")
-    return 4 if result["findings"] or result["unavailable"] or result["cue"]["status"] != "ok" else 0
+    return 4 if result["findings"] or result["unavailable"] or result["cue"]["status"] in {"schema_drift", "unreadable_database"} else 0
 
 
 def _capabilities(ns) -> int:
@@ -1075,7 +1075,8 @@ def _sync(con, ns) -> int:
     if cue_result is not None:
         payload["cue"] = cue_result
     _emit(payload, ns.as_json)
-    return 1 if any(r.get("failed") for r in results) else 0
+    return 1 if (any(r.get("failed") for r in results) or
+                 cue_result and cue_result["status"] in {"schema_drift", "unreadable_database"}) else 0
 
 
 def _when(value):
