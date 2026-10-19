@@ -155,7 +155,7 @@ def _targets(roots):
                     found[key] = (None, 'ambiguous_target')
                 else:
                     found[key] = value
-            except (OSError, ValueError, UnicodeError):
+            except (OSError, ValueError, UnicodeError, RuntimeError):
                 # Only candidates for this file remain unresolved, not its siblings.
                 continue
     return found
@@ -193,7 +193,7 @@ def import_source(con, source=None, libraries=()):
     con.execute('SAVEPOINT cue_attempt')
     try:
         return _import_snapshot(con, source, libraries)
-    except (sqlite3.Error, TypeError) as exc:
+    except Exception as exc:
         con.execute('ROLLBACK TO cue_attempt')
         # Exception messages can contain source data; retain only a safe gap category.
         return _record_gap(con, 'schema_drift' if isinstance(exc, TypeError)

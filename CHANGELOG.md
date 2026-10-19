@@ -2,14 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Import Cue decisions and settled ContextMD reads read-only; report procedure reads by entry, harness, machine and AgentsMD version against session-wide holdout, with source and target gaps.
+
 ### Changed
 
 - `sync` now reads ContextMD Cue evidence by default alongside the T3 import; a failed Cue import records a gap without discarding other sync writes.
 - `health` shows optional Cue gaps without failing; Cue status causes exit 4 only for `schema_drift` or `unreadable_database`.
-
-### Added
-
-- Import Cue decisions and settled ContextMD reads read-only; report procedure reads by entry, harness, machine and AgentsMD version against session-wide holdout, with source and target gaps.
 
 ### Fixed
 

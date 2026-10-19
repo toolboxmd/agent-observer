@@ -480,3 +480,23 @@ class CueTests(LedgerCase):
         self.native.execute('UPDATE moments SET owners_json=17')
         self.native.commit()
         self._sync_after_cue_failure('schema_drift')
+
+    def test_unknown_target_user_is_a_file_gap_without_hiding_siblings(self):
+        raw=b'---\nid: bad-home\ntarget: ~agent_observer_missing_user_129/x.md\n---\n'
+        bad=self.library/'bad-home.md'
+        bad.write_bytes(raw)
+        self.candidate(4,1,entry='bad-home',version=hashlib.sha256(raw).hexdigest()[:12])
+        with patch.object(Path,'glob',return_value=iter([bad,self.library/'research.md'])):
+            result=self.refresh()
+        self.assertEqual(self.arm(result)['opportunities'],1)
+        self.assertEqual(result['gaps'],{'version_unavailable':1})
+
+    def test_sync_deep_owners_json_records_gap_and_preserves_other_writes(self):
+        self.refresh()
+        self.con.commit()
+        owners='['*100000+'0'+']'*100000
+        with self.assertRaises(RecursionError):
+            json.loads(owners)
+        self.native.execute('UPDATE moments SET owners_json=?',(owners,))
+        self.native.commit()
+        self._sync_after_cue_failure('unreadable_database')
