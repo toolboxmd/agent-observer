@@ -1149,7 +1149,8 @@ def _judge(con, ns) -> int:
                       + ", ".join(f"{k} {v}" for k, v in payload["policy_denials"].items()))
                 for m in payload["interventions"]:
                     print(f"{m['id']}  {m['kind']} {m['created_by']} {m['at']} {m['project'] or ''}"
-                          f" opening={json.dumps(m['opening'])}")
+                          f" opening={json.dumps(m['opening'])}"
+                          + (f" actor_reason={m['actor_reason']}" if m.get('actor_reason') else ''))
             return 0
         if ns.cmd == "intervention":
             ids = list(ns.ids)
@@ -1180,7 +1181,11 @@ def _judge(con, ns) -> int:
             else:
                 for v in listed:
                     print(f"{v['intervention']}  {v['verdict']} {v['group'] or '-'}"
-                          f" {v['problem'] or ''}")
+                          f" {v['problem'] or ''}"
+                          + (f" canonical={v['canonical_intervention']}"
+                             if v['canonical_intervention'] not in (None, v['intervention']) else '')
+                          + (f" canonical_verdict={v['canonical_verdict']}"
+                             if v['canonical_verdict'] not in (None, v['verdict']) else ''))
             return 0
         if ns.cmd == "verdict":
             groups = _verdicts.groups(con, ns.behavior, judge=ns.judge,

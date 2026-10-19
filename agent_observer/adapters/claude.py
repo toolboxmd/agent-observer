@@ -18,7 +18,7 @@ import json
 import os
 import sqlite3
 
-from .. import db, privacy
+from .. import db, privacy, intervention_evidence
 from ..identity import SessionIdentity, skill_from_path
 from ..ingest import (JsonlSource, MissingNativeId, fingerprint, insert_event,
                       iso_ts, text_hash)
@@ -105,7 +105,7 @@ def _valid_counter(value) -> bool:
 
 _FINALITY_TABLE = "claude_response_finality"
 _NATIVE_KINDS_TABLE = "claude_native_kinds"
-_IMPORT_VERSION = 2
+_IMPORT_VERSION = 4
 
 
 def _ensure_native_kinds(con) -> None:
@@ -333,6 +333,7 @@ class _Reader:
 
 def import_claude_file(con: sqlite3.Connection, path: str,
                        full: bool = False) -> dict:
+    intervention_evidence.ensure_table(con)
     stats = {"lines": 0, "responses_inserted": 0, "responses_duplicate": 0,
              "responses_updated": 0,
              "user_messages_inserted": 0, "events_inserted": 0,
@@ -716,6 +717,10 @@ def _submission(r: _Reader, native_id, ordinal, ts, kind: str, text: str,
     r.con.execute(f"INSERT INTO {_NATIVE_KINDS_TABLE}(native_id,kind,origin_allowed) VALUES(?,?,?)"
                   " ON CONFLICT(native_id) DO UPDATE SET kind=excluded.kind,origin_allowed=excluded.origin_allowed",
                   (f"{HARNESS}:{native_id}", native_kind or kind, int(origin_allowed)))
+    intervention_evidence.record(
+        r.con, f"{HARNESS}:{native_id}", text,
+        sdk=r.meta.get('entrypoint') == 'sdk-ts',
+        allowed=origin_allowed)
 
 
 def _seed_queue_identity(r: _Reader) -> None:

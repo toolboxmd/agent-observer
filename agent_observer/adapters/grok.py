@@ -550,6 +550,7 @@ def _has_any_counter(counters: dict | None) -> bool:
 
 
 _GROK_META_TABLE = "grok_session_meta"
+_IMPORT_VERSION = 2  # Replay older transport-envelope parsing once.
 
 
 def _ensure_grok_meta_table(con: sqlite3.Connection) -> None:
@@ -590,7 +591,7 @@ def _summary_fingerprint(summary: dict) -> str:
         canonical = json.dumps(summary, sort_keys=True, default=str)
     except (TypeError, ValueError):
         canonical = repr(sorted(summary.keys()))
-    return hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()
+    return hashlib.sha256(f"{_IMPORT_VERSION}:{canonical}".encode("utf-8", "replace")).hexdigest()
 
 
 def _stored_meta(con: sqlite3.Connection, session_key: str):
@@ -1426,6 +1427,8 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     already imported, using their resolved source spelling. Metadata still
     comes from session_dir; sharing one file never redirects the other.
     """
+    from .. import intervention_evidence
+    intervention_evidence.ensure_table(con)
     stats = {"lines": 0, "responses_inserted": 0, "responses_duplicate": 0,
              "user_messages_inserted": 0, "events_inserted": 0,
              "events_duplicate": 0, "compactions": 0, "malformed": 0}
@@ -2240,6 +2243,24 @@ def _upsert_submission(con, r: _Reader, src, chat: dict, key: str,
     stale values. Turn bindings only fill unknowns.
     """
     full_text = "".join(entry["texts"])
+    # Strip only the complete native context suffix, never prose after it.
+    # These sibling blocks are Grok's machine-added runtime context;
+    # they are not part of the offered user input.
+    context = re.fullmatch(
+        r"(.*?)\s*<runtime_info>(?:(?!</?runtime_info>).)*</runtime_info>\s*"
+        r"<pull_request_linking>(?:(?!</?pull_request_linking>).)*</pull_request_linking>\s*"
+        r"(?:<t3_code_tool_use>(?:(?!</?t3_code_tool_use>).)*</t3_code_tool_use>\s*)?",
+        full_text, re.DOTALL)
+    offered_text = context[1] if context else full_text
+    # Grok's native first-input envelope contains the actual input in
+    # user_request, after Chromeria instructions. Do not search arbitrary
+    # prose for a notice: only unwrap this complete, anchored native shape.
+    wrapped = re.fullmatch(
+        r"<t3_code_instructions>.*?</t3_code_instructions>\s*"
+        r"<user_request>(.*?)</user_request>\s*"
+        r"(?:<runtime_info>(?:(?!</?runtime_info>).)*</runtime_info>\s*)?",
+        offered_text, re.DOTALL)
+    transport_text = wrapped[1].strip() if wrapped else offered_text
     is_main = r.is_main_session
     kind, is_genuine = _classify_prompt(key, chat, is_main)
     excerpt = privacy.submission_excerpt(
@@ -2261,6 +2282,8 @@ def _upsert_submission(con, r: _Reader, src, chat: dict, key: str,
              digest, excerpt, is_genuine))
         if cur.rowcount:
             r.stats["user_messages_inserted"] += 1
+        from .. import intervention_evidence
+        intervention_evidence.record(con, native_id, transport_text, sdk=True, allowed=is_main)
         return
     if digest != existing["text_hash"] \
             or (existing["text_excerpt"] or "") != excerpt \
@@ -2275,6 +2298,8 @@ def _upsert_submission(con, r: _Reader, src, chat: dict, key: str,
     if turn_id and not existing["turn_id"]:
         con.execute("UPDATE user_messages SET turn_id=? WHERE native_id=?",
                     (turn_id, native_id))
+    from .. import intervention_evidence
+    intervention_evidence.record(con, native_id, transport_text, sdk=True, allowed=is_main)
 
 
 def _reclassify_existing(con, r: _Reader, session_dir: str,

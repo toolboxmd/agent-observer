@@ -164,13 +164,45 @@ def add_session_attributes(con: sqlite3.Connection, records: list) -> dict:
 
 
 def _rows(con, behavior: str, judge=None) -> list:
-    sql = ("SELECT intervention_id, judge, verdict, problem, group_id FROM verdicts"
+    sql = ("SELECT intervention_id, judge, verdict, problem, group_id, recorded_at FROM verdicts"
            " WHERE behavior=?")
     args = [behavior]
     if judge:
         sql += " AND judge=?"
         args.append(judge)
     return con.execute(sql, args).fetchall()
+
+
+def _aliases(scope):
+    return {identity: m['id'] for m in scope.values()
+            for identity in m.get('related_ids', [])}
+
+
+def _canonical_rows(con, behavior, judge, scope):
+    """One current judgment per canonical intervention and judge, with provenance.
+
+    Stored rows are never rewritten. A yes always wins over a no or unclear.
+    Within that priority, latest recorded_at wins, then lexical id, without a
+    canonical-id preference. Every displaced row retains its audit details.
+    """
+    aliases = _aliases(scope)
+    cohorts = {}
+    for r in _rows(con, behavior, judge):
+        canonical = aliases.get(r['intervention_id'], r['intervention_id'])
+        if canonical in scope:
+            cohorts.setdefault((canonical, r['judge']), []).append(r)
+    current, superseded = [], []
+    for (canonical, name), rows in cohorts.items():
+        rows.sort(key=lambda r: (r['verdict'] == 'yes', r['recorded_at'], r['intervention_id']))
+        winner = dict(rows[-1])
+        winner['intervention_id'] = canonical
+        current.append(winner)
+        superseded.extend({'intervention': r['intervention_id'],
+                           'canonical_intervention': canonical, 'judge': name,
+                           'verdict': r['verdict'], 'problem': r['problem'],
+                           'group': r['group_id'], 'recorded_at': r['recorded_at']}
+                          for r in rows[:-1])
+    return current, superseded
 
 
 def _group_entries(rows, scope: dict) -> list:
@@ -210,7 +242,8 @@ def groups(con: sqlite3.Connection, behavior: str, judge=None,
     out = []
     judges = sorted({r["judge"] for r in _rows(con, behavior, judge)})
     for name in judges:
-        for entry in _group_entries(_rows(con, behavior, name), scope):
+        rows, _ = _canonical_rows(con, behavior, name, scope)
+        for entry in _group_entries(rows, scope):
             entry["judge"] = name
             out.append(entry)
     return out
@@ -222,12 +255,21 @@ def listing(con: sqlite3.Connection, behavior: str, judge=None,
     and time, oldest first; the grouping pass reads its problem lines here."""
     found, _ = _interventions._all(con)
     scope = {m["id"]: m for m in found}
+    aliases = _aliases(scope)
+    current, _ = _canonical_rows(con, behavior, judge, scope)
+    canonical_verdicts = {(r['intervention_id'], r['judge']): r for r in current}
     out = []
     for r in _rows(con, behavior, judge):
         if verdict and r["verdict"] != verdict:
             continue
-        intervention = scope.get(r["intervention_id"])
+        canonical = aliases.get(r['intervention_id'], r['intervention_id'])
+        intervention = scope.get(canonical)
+        chosen = canonical_verdicts.get((canonical, r['judge']))
         out.append({"intervention": r["intervention_id"], "judge": r["judge"],
+                    "canonical_intervention": canonical if intervention else None,
+                    "canonical_verdict": chosen['verdict'] if chosen else None,
+                    "canonical_problem": chosen['problem'] if chosen else None,
+                    "canonical_group": chosen['group_id'] if chosen else None,
                     "verdict": r["verdict"], "problem": r["problem"],
                     "group": r["group_id"],
                     "created_by": intervention["created_by"] if intervention else None,
@@ -248,7 +290,7 @@ def recurrence(con: sqlite3.Connection, behavior: str, judge=None,
                                harness=harness, project=project,
                                created_by=created_by, attrs=attrs)
     scope = {m["id"]: m for m in selected["interventions"]}
-    rows = [r for r in _rows(con, behavior, judge) if r["intervention_id"] in scope]
+    rows, superseded = _canonical_rows(con, behavior, judge, scope)
     judges = sorted({r["judge"] for r in rows})
     if judge is None and len(judges) > 1:
         raise VerdictError(
@@ -282,7 +324,8 @@ def recurrence(con: sqlite3.Connection, behavior: str, judge=None,
         every = {m["id"]: m for m in _interventions.select(
             con, since=since, until=until, harness=harness, project=project,
             created_by=None, attrs=attrs)["interventions"]}
-        for r in _rows(con, behavior, chosen):
+        other_rows, _ = _canonical_rows(con, behavior, chosen, every)
+        for r in other_rows:
             intervention = every.get(r["intervention_id"])
             if intervention is None or intervention["created_by"] in created_by \
                     or r["verdict"] != "yes":
@@ -304,6 +347,7 @@ def recurrence(con: sqlite3.Connection, behavior: str, judge=None,
                      "by_created_by": selected["counts"]["by_created_by"],
                      "unjudged_by_created_by": unjudged},
         "verdicts": verdict_counts,
+        "superseded_verdicts": [r for r in superseded if r['judge'] == chosen],
         "occurrences": verdict_counts["yes"],
         "ungrouped": sum(1 for r in rows
                          if r["verdict"] == "yes" and not r["group_id"]),
@@ -340,6 +384,9 @@ def render(report: dict) -> str:
     for origin, entry in sorted(report.get("other_created_by", {}).items()):
         lines.append(f"also {entry['occurrences']} yes on {origin} interventions"
                      f" ({entry['problems']} problems), not counted above")
+    if report.get('superseded_verdicts'):
+        lines.append(f"{len(report['superseded_verdicts'])} stored verdicts superseded by"
+                     " current canonical judgments; verdict list retains them")
     for g in report["groups"]:
         lines.append(f"- {g['group']}: {g['occurrences']}x in {g['sessions']}"
                      f" sessions ({', '.join(g['hosts'])}), {g['first_seen']}"

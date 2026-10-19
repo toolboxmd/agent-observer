@@ -411,6 +411,45 @@ person. They are never interventions and are counted as `policy_denials`.
 Claude writes a rejected tool call twice, as the denial and as an
 interrupt in the same second; that is one intervention.
 
+T3 steer envelopes identify their sender. A steer is one `interrupt`, keyed
+by its follow-up prompt; `related_ids` links the native interrupt marker and
+tool denials it replaces in this view. The raw messages and events remain.
+Delegated-task terminal-state notices count as `agent`, including when the
+harness labels their input as user-authored. Unknown actors carry an
+`actor_reason`; native import stores the reason without the message body.
+`native_sdk_prompt_without_matching_origin` means a Claude SDK prompt has
+no matching Chromeria origin. A root thread alone cannot establish its author,
+and a provider reference to an assistant UUID cannot identify the user prompt.
+The next authorized sync replays older Claude and Codex sources once to
+index this evidence; reporting itself remains read-only.
+
+Grouped ids remain valid: `intervention show` resolves them to their canonical
+steer and its follow-up text. `verdict list` retains every stored verdict under
+its original id and adds `canonical_intervention`. Recurrence and verdict groups
+count one judgment per canonical intervention and judge. A `yes` always wins
+over `no` or `unclear`, regardless of timestamp or which id holds it. Within
+that priority, the latest judgment wins, then the lexically greatest original
+id, with no canonical-id preference. `verdict list` exposes the winning
+`canonical_verdict`, `canonical_problem` and `canonical_group` beside every
+original row. Recurrence reports displaced records, including their problem,
+group and timestamp, in `superseded_verdicts` and names their count in text
+output. Stored verdicts are
+never rewritten or deleted by this grouping, and an alias verdict also marks
+the canonical intervention as judged for `--unjudged`.
+
+Grok imports the same transport metadata, including first-input
+`<user_request>` envelopes and notices immediately followed by `<runtime_info>`.
+Its import-version change replays older session metadata once.
+
+Completion recognition consumes the entire input: only trailing whitespace
+and a complete `<runtime_info>` block may follow the notice. Pasting a notice
+and adding an instruction remains ordinary user input. Grok separates its
+complete native runtime/linking/tool-use context before parsing; prose after those
+blocks is never discarded. Steers require the complete T3 interruption note,
+and explicit native actor evidence takes precedence over steer senders. Complete
+terminal notices remain agent inputs even if Codex retains a preceding human
+turn id.
+
 ```sh
 agent-observer interventions --since 2026-09-14 --unjudged correction --json   # default --created-by user --created-by agent
 agent-observer intervention show sub:claude:<uuid> ev:codex:<id>/lifecycle/turn_aborted:<turn> --json

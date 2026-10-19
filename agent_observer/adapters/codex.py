@@ -752,13 +752,15 @@ def import_codex_file(con: sqlite3.Connection, path: str,
     Malformed lines are recorded in import_errors and skipped. Previously
     valid data is never destroyed.
     """
+    from .. import intervention_evidence
+    intervention_evidence.ensure_table(con)
     stats = {
         "lines": 0, "responses_inserted": 0, "responses_duplicate": 0,
         "user_messages_inserted": 0, "events_inserted": 0,
         "events_duplicate": 0, "compactions": 0, "malformed": 0,
     }
     src = JsonlSource(con, HARNESS, path, full=full)
-    if (src.row["codex_context_version"] != 3
+    if (src.row["codex_context_version"] != 5
             or src.row["codex_context_offset"] != src.row["read_offset"]):
         # Replay older indexes once, including search extensions previously
         # discarded from otherwise unchanged sources (#94).
@@ -958,7 +960,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
                             thread_source=reader.thread_source))
     backfill = 1 if _backfill_complete(
         con, src.source_id, getattr(src, "last_ordinal", None)) else 0
-    con.execute("UPDATE sources SET codex_context_version=3,codex_context_offset=?,"
+    con.execute("UPDATE sources SET codex_context_version=5,codex_context_offset=?,"
                 "codex_model=?,codex_effort=?,occurrence_backfill=? WHERE id=?",
                 (src.end_offset, reader.model, reader.effort, backfill,
                  src.source_id))
@@ -1825,6 +1827,9 @@ def _ingest_response_item(r: _Reader, obj: dict, native_ordinal, position: int) 
                 values + [native_key])
             r.stats["user_messages_updated"] = \
                 r.stats.get("user_messages_updated", 0) + 1
+        if first and (same_source or claims):
+            from .. import intervention_evidence
+            intervention_evidence.record(r.con, native_key, text)
         _note_occurrence(r, "user", native_key, obj)
         return
     if ptype == "message" and p.get("role") == "assistant":
