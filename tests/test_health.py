@@ -1,13 +1,99 @@
 """Session visibility: one compliant and one invisible session per host."""
 
+import contextlib
+import io
 import json
 import os
 import sqlite3
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
-from agent_observer import health
+from agent_observer import cli, health
+
+
+class ScanAvailabilityTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = patch.dict(os.environ, {"PATH": self.tmp.name})
+        self.path.start()
+        self.addCleanup(self.path.stop)
+        self.tool("ps", "printf '201 Mon Oct 19 10:00:00 2026 codex\\n'")
+
+    def tool(self, name, body):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w") as fh:
+            fh.write("#!/bin/sh\n" + body + "\n")
+        os.chmod(path, 0o700)
+
+    def check_unavailable(self, reason):
+        with patch.object(health, "check_claude", return_value=[{"host": "claude"}]) as claude, \
+                patch.object(health, "identity_conflicts", return_value=[]) as identity:
+            result = health.check(registry=[], con=object())
+        self.assertEqual(result["findings"], [{"host": "claude"}])
+        self.assertEqual(result["identity_conflicts"], [])
+        claude.assert_called_once()
+        identity.assert_called_once()
+        self.assertTrue(result["unavailable"])
+        self.assertIn(reason, result["unavailable"][0]["reason"])
+        return result
+
+    def test_path_without_lsof_reports_unavailable_and_continues(self):
+        result = self.check_unavailable("lsof")
+        self.assertEqual(result["unavailable"][0]["pid"], 201)
+
+    def test_failed_lsof_does_not_accept_partial_output(self):
+        self.tool("lsof", "printf 'n/p/app\\n'; echo 'permission denied' >&2; exit 2")
+        self.check_unavailable("permission denied")
+
+    def test_empty_lsof_output_is_unknown(self):
+        self.tool("lsof", "exit 0")
+        self.check_unavailable("no working directory")
+
+    def test_path_without_ps_reports_scan_unavailable(self):
+        os.unlink(os.path.join(self.tmp.name, "ps"))
+        self.check_unavailable("ps")
+
+    def test_failed_ps_reports_scan_unavailable(self):
+        self.tool("ps", "echo 'scan denied' >&2; exit 1")
+        self.check_unavailable("scan denied")
+
+    def test_readable_cwd_still_finds_invisible_process(self):
+        self.tool("lsof", "printf 'p201\\nn/p/unseen\\n'")
+        check_codex = health.check_codex
+        with patch.object(health, "check_codex", side_effect=lambda processes:
+                          check_codex(processes, self.tmp.name)) as codex:
+            result = health.check(registry=[])
+        self.assertEqual(codex.call_args.args[0][0]["cwd"], "/p/unseen")
+        self.assertEqual(result["unavailable"], [])
+        self.assertEqual(result["findings"][0]["pid"], 201)
+
+    def test_one_unreadable_process_does_not_hide_another(self):
+        self.tool("ps", "printf '201 Mon Oct 19 10:00:00 2026 codex\\n"
+                  "202 Mon Oct 19 10:00:00 2026 opencode\\n'")
+        self.tool("lsof", 'if [ "$3" = 201 ]; then exit 1; fi; printf "n/p/unseen\\n"')
+        check_opencode = health.check_opencode
+        with patch.object(health, "check_opencode", side_effect=lambda processes:
+                          check_opencode(processes, os.path.join(self.tmp.name, "missing.db"))):
+            result = health.check(registry=[])
+        self.assertEqual(result["unavailable"][0]["pid"], 201)
+        self.assertEqual(result["findings"][0]["pid"], 202)
+
+    def test_cli_shows_gap_and_does_not_return_success(self):
+        for as_json in (False, True):
+            with self.subTest(as_json=as_json), patch.object(health, "claude_registry", return_value=[]):
+                output = io.StringIO()
+                args = ["--db", os.path.join(self.tmp.name, "missing.db"), "health"]
+                with contextlib.redirect_stdout(output):
+                    code = cli.main(args + (["--json"] if as_json else []))
+                self.assertEqual(code, 4)
+                if as_json:
+                    self.assertIn("lsof", json.loads(output.getvalue())["unavailable"][0]["reason"])
+                else:
+                    self.assertIn("working directory unavailable:", output.getvalue())
+                    self.assertIn("lsof", output.getvalue())
 
 
 class ClaudeVisibilityTest(unittest.TestCase):

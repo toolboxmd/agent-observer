@@ -73,7 +73,7 @@ def check_claude(registry: list[dict], projects_root: str | None = None,
 def process_table() -> list[dict]:
     """Live agent CLI processes with start time and working directory."""
     out = subprocess.run(["ps", "-Ao", "pid=,lstart=,command="],
-                         capture_output=True, text=True, check=False).stdout
+                         capture_output=True, text=True, check=True).stdout
     rows = []
     for line in out.splitlines():
         parts = line.split(None, 6)
@@ -87,18 +87,27 @@ def process_table() -> list[dict]:
             started = time.mktime(time.strptime(" ".join(parts[1:6]), "%a %b %d %H:%M:%S %Y"))
         except ValueError:
             started = None
-        rows.append({"pid": int(pid), "name": name, "command": command,
-                     "started": started, "cwd": _cwd(int(pid))})
+        row = {"pid": int(pid), "name": name, "command": command,
+               "started": started, "cwd": None}
+        try:
+            row["cwd"] = _cwd(int(pid))
+        except (OSError, subprocess.SubprocessError) as exc:
+            row["cwd_error"] = _scan_error(exc)
+        rows.append(row)
     return rows
 
 
-def _cwd(pid: int) -> str | None:
+def _scan_error(exc) -> str:
+    return str(exc) + (f": {exc.stderr.strip()}" if getattr(exc, "stderr", None) else "")
+
+
+def _cwd(pid: int) -> str:
     out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-                         capture_output=True, text=True, check=False).stdout
+                         capture_output=True, text=True, check=True).stdout
     for line in out.splitlines():
-        if line.startswith("n"):
+        if line.startswith("n") and line[1:]:
             return line[1:]
-    return None
+    raise OSError("lsof returned no working directory (process exited or access unavailable)")
 
 
 def check_opencode(processes: list[dict], db_path: str | None = None) -> list[dict]:
@@ -163,10 +172,21 @@ def identity_conflicts(con) -> list[dict]:
 
 
 def check(processes=None, registry=None, con=None) -> dict:
-    processes = process_table() if processes is None else processes
+    unavailable = []
+    if processes is None:
+        try:
+            processes = process_table()
+        except (OSError, subprocess.SubprocessError) as exc:
+            processes = []
+            unavailable.append({"check": "process scan", "reason": _scan_error(exc)})
+    for proc in processes:
+        if proc.get("cwd_error"):
+            unavailable.append({"check": "working directory", "host": proc["name"],
+                                "pid": proc["pid"], "reason": proc["cwd_error"]})
     registry = claude_registry() if registry is None else registry
     findings = check_claude(registry) + check_opencode(processes) + check_codex(processes)
     return {"findings": findings,
+            "unavailable": unavailable,
             "identity_conflicts": identity_conflicts(con) if con is not None else None,
             "checked": {"claude_sessions": len(registry),
                         "processes": len(processes)},
