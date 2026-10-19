@@ -20,7 +20,9 @@ import sqlite3
 from .. import db, privacy
 from ..identity import SessionIdentity, skill_from_path
 from ..ingest import (JsonlSource, MissingNativeId, fingerprint, insert_event,
-                      iso_ts, text_hash)
+                      iso_ts, stored_path, text_hash)
+from . import bare
+
 
 def _native_ordinal(obj) -> int | None:
     if not isinstance(obj, dict):
@@ -225,35 +227,69 @@ def _rollout_paths(root: str) -> list[str]:
     return glob.glob(os.path.join(root, "**", "rollout-*.jsonl"), recursive=True)
 
 
+def _live_and_archived(live_root: str, archive_root: str) -> list[str]:
+    """One home's live rollouts plus archived ones whose basename is not live."""
+    live = _rollout_paths(live_root)
+    live_names = {os.path.basename(path) for path in live}
+    archived = [path for path in _rollout_paths(archive_root)
+                if os.path.basename(path) not in live_names]
+    return live + archived
+
+
+def _bare_home(root: str) -> list[str]:
+    """A bare receipt root (``<home>/sessions``) plus its sibling archive."""
+    return _live_and_archived(
+        root, os.path.join(os.path.dirname(root), "archived_sessions"))
+
+
+def _default_paths() -> tuple[list[str], dict]:
+    """The normal home plus every Chromeria bare root, and the bare report."""
+    paths = _live_and_archived(DEFAULT_ROOT, ARCHIVE_ROOT)
+    found, report = bare.discover(HARNESS, _bare_home)
+    return sorted(paths + found), report
+
+
+def _stored(con: sqlite3.Connection, paths: list[str]) -> list[str]:
+    """Each path as an existing source row already spells it, once each."""
+    return sorted({stored_path(con, HARNESS, path) for path in paths})
+
+
 def discover(root: str | None = None) -> list[str]:
-    """Rollout files under one root, or the live tree plus the archive.
+    """Rollout files under one root, or every default home.
 
     An explicit root is that directory only. With root unset, scan
-    ``~/.codex/sessions`` and ``~/.codex/archived_sessions``. The same
+    ``~/.codex/sessions`` and ``~/.codex/archived_sessions`` and the same
+    pair in each Chromeria bare home its receipts name (#92). Within one home the same
     rollout basename in both trees is the live file; continuation files
     (``rollout-...-<id>_<segment>.jsonl``) have different names and both
     stay. Dedup is by basename, not by thread id.
     """
     if root:
         return sorted(_rollout_paths(root))
-    live = _rollout_paths(DEFAULT_ROOT)
-    live_names = {os.path.basename(path) for path in live}
-    archived = [path for path in _rollout_paths(ARCHIVE_ROOT)
-                if os.path.basename(path) not in live_names]
-    return sorted(live + archived)
+    return _default_paths()[0]
 
 
 def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
          source: str | None = None) -> dict:
     """Import every rollout under root, or one source file.
 
-    With root unset, import the live session tree and the archive.
+    With root unset, import the live session tree, the archive and the
+    bare roots, and report the bare roots under ``bare_roots``.
     """
-    paths = [source] if source else discover(root)
+    report = None
+    if source:
+        paths = [source]
+    elif root:
+        paths = discover(root)
+    else:
+        paths, report = _default_paths()
+    paths = _stored(con, paths)
     totals = {"harness": HARNESS, "sources": 0, "unchanged": 0,
               "responses_inserted": 0, "events_inserted": 0,
               "user_messages_inserted": 0, "malformed": 0,
               "identity_conflicts": 0, "failed": []}
+    if report is not None:
+        totals["bare_roots"] = report
     for path in paths:
         try:
             stats = import_codex_file(con, path, full=full)

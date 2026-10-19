@@ -52,7 +52,19 @@ names another.
 | Claude Code | `~/.claude/projects/*/*.jsonl` and subagent transcripts | per message, counted once across streamed blocks |
 | OpenCode | `~/.local/share/opencode/opencode.db` (read-only) | per completed assistant message |
 | Grok Build | `~/.grok/sessions/*/*/` | per prompt completion |
+| Chromeria bare Codex and Grok | each `bareReceipt.nativeRecord.root` (`<home>/sessions`, plus Codex's sibling `archived_sessions`) in the T3 state database the T3 adapter reads | as for that harness |
 | Model Router | `DURABLE_RUNNER_STATE_DIR`, `~/.local/share/durable-runner`, and legacy `~/.local/state/model-router` (read-only, deduplicated) | explicit task ownership, jobs and invocations |
+
+A default sync reads the record root that each Chromeria bare launch
+receipt names. `sync` and `health` report the receipts under `bare_roots`.
+A root that is missing on this machine, unreadable, empty or not recorded
+is listed as a gap; it never fails the sync or changes its exit code.
+`no bare receipts` means bare mode was not used, and `no T3 state` means
+Observer found no T3 state database.
+An explicit `--root` reads that directory only. A file Observer already
+stored under another path, such as through a symlinked home, keeps its
+stored row, and sessions are keyed by native id, so a root imported both
+ways counts once.
 
 Each Codex thread is its own session, keyed by the `id` of its rollout's
 first `session_meta`; continuation files (`rollout-...-<id>_<segment>.jsonl`)

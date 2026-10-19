@@ -26,7 +26,9 @@ import urllib.parse
 
 from .. import db, privacy
 from ..identity import SessionIdentity, skill_from_path
-from ..ingest import JsonlSource, fingerprint, insert_event, iso_ts, text_hash
+from ..ingest import (JsonlSource, fingerprint, insert_event, iso_ts,
+                      stored_path, text_hash)
+from . import bare
 
 HARNESS = "grok"
 SEMANTICS = "grok:input_includes_cached,output_includes_reasoning"
@@ -233,9 +235,38 @@ def _classify_prompt(prompt_idx: str, chat: dict,
     return "unknown", 0
 
 
+def _default_paths() -> tuple[list[str], dict]:
+    """The normal sessions plus every Chromeria bare root's, and the report."""
+    found, report = bare.discover(HARNESS, _sessions_under)
+    return _sessions_under(DEFAULT_ROOT) + found, report
+
+
+def _stored(con: sqlite3.Connection, paths: list[str]) -> list[str]:
+    """Each session as existing source rows already spell it, once each."""
+    out = []
+    for session_dir in paths:
+        for name in ("updates.jsonl", "events.jsonl"):
+            path = os.path.join(session_dir, name)
+            stored = stored_path(con, HARNESS, path)
+            if stored != path:
+                session_dir = os.path.dirname(stored)
+                break
+        out.append(session_dir)
+    return list(dict.fromkeys(out))
+
+
 def discover(root: str | None = None) -> list[str]:
-    """Session directories under `<url-encoded cwd>/<session id>`."""
-    root = root or DEFAULT_ROOT
+    """Session directories under `<url-encoded cwd>/<session id>`.
+
+    With root unset, the normal sessions root and each sessions root a
+    Chromeria bare receipt names (#92).
+    """
+    if not root:
+        return _default_paths()[0]
+    return _sessions_under(root)
+
+
+def _sessions_under(root: str) -> list[str]:
     if _looks_like_session(root):
         return [root]
     try:
@@ -286,10 +317,19 @@ class _SyncCtx:
 def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
          source: str | None = None) -> dict:
     """Import every session under root, or one session directory."""
-    paths = _resolve_source(source, root) if source else discover(root)
+    report = None
+    if source:
+        paths = _resolve_source(source, root)
+    elif root:
+        paths = discover(root)
+    else:
+        paths, report = _default_paths()
+    paths = _stored(con, paths)
     totals = {"harness": HARNESS, "sources": 0, "unchanged": 0,
               "responses_inserted": 0, "events_inserted": 0,
               "user_messages_inserted": 0, "malformed": 0, "failed": []}
+    if report is not None:
+        totals["bare_roots"] = report
     ctx = _SyncCtx()
     if source is not None:
         # Source-scoped operation: build the containing-tree parent index

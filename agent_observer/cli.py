@@ -83,6 +83,19 @@ def _fmt_session_total(session: dict) -> str:
     return "unknown"
 
 
+def _bare_lines(harness: str, roots: dict) -> list[str]:
+    """One summary line for a harness's bare receipts, then one per gap."""
+    if roots["state"] != "used":
+        detail = {"unused": "no bare receipts"}.get(roots["state"], roots["state"])
+        return [f"  bare roots: {detail} in {roots['state_db']}"]
+    line = (f"  bare roots: {roots['roots']} read from"
+            f" {roots['receipts']} receipts")
+    if roots["gaps"]:
+        line += f", {len(roots['gaps'])} gaps"
+    return [line] + [f"  gap {harness} bare root {g['root'] or '-'}: {g['reason']}"
+                     for g in roots["gaps"]]
+
+
 def _text(payload) -> str:
     if isinstance(payload, dict) and payload.get("_view") == "sync":
         lines = []
@@ -104,6 +117,8 @@ def _text(payload) -> str:
             for item in h.get("failed") or []:
                 lines.append(
                     f"  failed {h['harness']} {item['path']}: {item['error']}")
+            if h.get("bare_roots"):
+                lines += _bare_lines(h["harness"], h["bare_roots"])
         if payload.get("agentsmd_versions") is not None:
             lines.append(f"agentsmd versions mapped: {payload['agentsmd_versions']}")
         return "\n".join(lines)
@@ -712,6 +727,9 @@ def _health_check(ns) -> int:
             for c in conflicts:
                 print(f"- {c['harness']} {c['source_path']} record {c['ordinal_num']}:"
                       " legacy and current rows both kept")
+        for harness, roots in result["bare_roots"].items():
+            for line in _bare_lines(harness, roots):
+                print(f"- {harness} {line.strip()}")
     return 4 if result["findings"] or result["unavailable"] else 0
 
 

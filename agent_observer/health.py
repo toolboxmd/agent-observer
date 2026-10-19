@@ -184,7 +184,18 @@ def identity_conflicts(con) -> list[dict]:
         " WHERE error='identity_conflict' ORDER BY harness, source_path, ordinal_num")]
 
 
-def check(processes=None, registry=None, con=None) -> dict:
+def bare_roots() -> dict:
+    """Chromeria bare receipts per harness and their unreadable roots (#92).
+
+    Reported beside the findings, never as one: a gap is a record root, not
+    a running session.
+    """
+    from .adapters import bare, codex, grok
+    return {codex.HARNESS: bare.discover(codex.HARNESS, codex._bare_home)[1],
+            grok.HARNESS: bare.discover(grok.HARNESS, grok._sessions_under)[1]}
+
+
+def check(processes=None, registry=None, con=None, bare=None) -> dict:
     unavailable = []
     if processes is None:
         try:
@@ -201,6 +212,7 @@ def check(processes=None, registry=None, con=None) -> dict:
     return {"findings": findings,
             "unavailable": unavailable,
             "identity_conflicts": identity_conflicts(con) if con is not None else None,
+            "bare_roots": bare_roots() if bare is None else bare,
             "checked": {"claude_sessions": len(registry),
                         "processes": len(processes)},
             "note": ("Codex app-server and exec sessions and OpenCode servers are not "
