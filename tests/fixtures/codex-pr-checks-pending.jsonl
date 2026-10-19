@@ -1,0 +1,2 @@
+{"timestamp":"2026-10-15T08:20:49Z","type":"session_meta","payload":{"id":"pr-checks-pending","originator":"codex-tui","thread_source":"user"}}
+{"timestamp":"2026-10-15T08:23:09.118Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"pending-checks","command":["/usr/bin/bash","-lc","gh pr checks 353 --repo toolboxmd/chromeria"],"status":"failed","exit_code":8,"duration":{"secs":0,"nanos":866773325}}}}

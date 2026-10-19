@@ -1,0 +1,22 @@
+[
+  {
+    "ledger_id": 860917,
+    "target": "tail -8 /tmp/sanitized-tests.log; gh pr checks 114 --repo toolboxmd/agent-observer"
+  },
+  {
+    "ledger_id": 145983,
+    "target": "gh issue view 284 -R toolboxmd/chromeria --json body,comments\ngh pr checks 243 -R toolboxmd/chromeria\ngh pr checks 52 -R toolboxmd/contextmd"
+  },
+  {
+    "ledger_id": 288772,
+    "target": "tail -12 /tmp/sanitized-proof.log\n gh pr checks 335 --repo toolboxmd/chromeria"
+  },
+  {
+    "ledger_id": 90306,
+    "target": "sed 's@./chromeria/apps/@./chromeria-main/apps/@' /tmp/sanitized/probe.mjs > /tmp/sanitized/probe.base.mjs\nnode /tmp/sanitized/probe.base.mjs /tmp/sanitized/commands.json > /tmp/sanitized/results.json\npython3 - <<'PY'\n# Original Python body omitted; heredoc structure retained.\npass\nPY\ngh pr checks 243 -R toolboxmd/chromeria > /tmp/sanitized/chrom-checks.txt\ngh pr checks 52 -R toolboxmd/contextmd > /tmp/sanitized/context-checks.txt"
+  },
+  {
+    "ledger_id": 894845,
+    "target": "git -C /tmp/sanitized/repo rev-parse HEAD && git -C /tmp/sanitized/repo status --porcelain=v1 && gh pr view 106 -R toolboxmd/from --json headRefOid,baseRefOid,state,url && gh pr checks 106 -R toolboxmd/from"
+  }
+]

@@ -25,6 +25,7 @@ import sqlite3
 import time
 
 from . import privacy
+from .command_status import pending_pr_checks
 from .db import now
 
 TAIL_BYTES = 4096
@@ -333,6 +334,8 @@ def insert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
     safe_status = privacy.filter_event_status(family, status)
     safe_target = privacy.filter_target(target, family)
     filtered = privacy.filter_detail(family, detail)
+    if pending_pr_checks(family, safe_target, filtered):
+        safe_status = "pending"
     # The size bound applies before serialization: shrinking list values
     # (only paths can grow large) keeps detail_json always valid JSON.
     # Slicing serialized JSON could leave an invalid truncated value.

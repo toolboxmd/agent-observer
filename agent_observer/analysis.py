@@ -73,6 +73,8 @@ def _changed_paths(event) -> set:
 
 
 def _failed(row) -> bool:
+    if row["status"] == "pending":
+        return False
     if row["status"] in ("error", "failed", "failure"):
         return True
     detail = _detail(row)

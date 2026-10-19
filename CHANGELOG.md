@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.4.1] - 2026-10-19
+
+### Changed
+
+- Treat gh pr checks exit 8 as pending and correct existing ledgers
+
 ## [1.4.0] - 2026-10-19
 
 ### Added
