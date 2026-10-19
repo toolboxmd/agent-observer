@@ -106,19 +106,26 @@ The headline compares the **first above-threshold judgment per harness session,
 entry and context epoch** in each arm. It does not count repeated injections in
 the serving arm against every repeated score in holdout. The first judgment is
 chosen in source order, before filtering delivery outcomes or target availability;
-a later delivery or entry version cannot replace it. `below_threshold` and
-`not_scored` rows do not consume the first judgment.
+a later entry version cannot replace it. A first `carried` judgment uses its
+eventual delivery in the same epoch, even after intervening `deduped` or
+`carry_expired` rows. That print belongs to the original unit. First `hidden`,
+`cut_budget` or missing-target judgments still consume the slot. `below_threshold`
+and `not_scored` rows do not consume the first judgment.
 
 Only delivered first judgments enter the served denominator. `hidden` first
 judgments have their own excluded group, and other undelivered first judgments
-are excluded as `not_served`. Every later above-threshold judgment is reported
-under repeats, including serving-enabled `deduped` rows, never in headline rates.
+are excluded as `not_served`. Carries that never print have their own excluded
+`carry_unprinted` group. Later above-threshold judgments, except a resolved
+carry's print, are reported under repeats, including serving-enabled `deduped`
+rows, never in headline rates. `carry_prints` counts resolved carries.
 Repeat arm labels describe the session's assignment, not proof of a fresh delivery.
 All source outcome counts remain visible.
 
 The summary gives distinct harness-session counts per arm across all entries,
 both observed assignment coverage (`sessions_by_arm`) and sessions contributing
-to each first-judgment denominator. Excluded first deliveries can make these differ;
+to each first-judgment denominator. The `by_harness` summary reports both arms
+for Claude, Codex and Grok separately so differences in harness mix stay visible.
+Excluded first deliveries can make observed and contributing session counts differ;
 groups split by entry, harness, machine and observed AgentsMD version (`unknown`
 when unidentifiable). Each group and summary separates full/partial target reads,
 reads already present in that epoch and pending observation windows. Reads must
@@ -126,8 +133,10 @@ be settled and successful in ContextMD; pending calls are excluded. Native reads
 link by exact session, call id and path without inserting duplicate events.
 ContextMD-only and native-matched read counts remain visible.
 
-The observation window begins strictly after the judgment and ends before the
-next user message, known context epoch change or 30 minutes, whichever is first.
+The observation window begins strictly after actual delivery, at the print moment
+for a resolved carry. Holdout and excluded diagnostics use the first judgment.
+It ends before the next user message, known context epoch change or 30 minutes,
+whichever is first.
 Every user message ends it, including rows with missing epoch or holdout metadata;
 `boundary_without_cue_metadata` counts windows that needed such a boundary. Missing
 epochs do not create invented epoch changes. The window is clipped to the imported

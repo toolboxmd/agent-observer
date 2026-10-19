@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Resolve Grok carry units at their eventual print, start read windows at delivery, separate unprinted carries and expose headline rates by harness.
 - Compare first above-threshold Cue judgments per session, entry and epoch; separate repeats and hidden deliveries, retain all user-message window boundaries and report session-cluster intervals.
 
 ### Added

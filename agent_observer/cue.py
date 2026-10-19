@@ -317,16 +317,40 @@ def _finish_buckets(container):
             bucket['read_rate'] = bucket['read'] / bucket['opportunities']
 
 
+def _carry_prints(con):
+    """Pair a unit's first carried judgment with its first eventual delivery.
+
+    A queue row is not a delivery. Intermediate deduplication, expiration and
+    further scoring rows do not replace the unit; the print may be much later.
+    Other first outcomes and unavailable first targets still consume the slot.
+    """
+    first, pending, resolved, printed = set(), {}, {}, set()
+    for c in con.execute('''SELECT c.*,m.harness,m.session,m.epoch,m.holdout
+            FROM cue_candidates c JOIN cue_moments m ON m.id=c.moment_id
+            WHERE c.score IS NOT NULL AND c.outcome NOT IN ('below_threshold','not_scored')
+              AND typeof(m.epoch)='integer' AND m.holdout IN (0,1)
+            ORDER BY m.at,m.id,c.id'''):
+        unit = (c['harness'],c['session'],c['entry'],c['epoch'])
+        if unit not in first:
+            first.add(unit)
+            if c['outcome'] == 'carried' and c['target'] and c['holdout'] == 0:
+                pending[unit] = c['id']
+        elif unit in pending and c['holdout'] == 0 and c['outcome'] in SERVED | {'hidden'}:
+            resolved[pending.pop(unit)] = c
+            printed.add(c['id'])
+    return resolved, printed
+
+
 def report(con, machine=None, check_source=True, source=None):
     from .fleet import machine_name
     state = health(con, source) if check_source else _stored_health(con)
     result = {'status': state['status'], 'import': state, 'window_seconds': WINDOW_SECONDS,
               'holdout_unit': 'session', 'comparison': COMPARISON, 'interval_method': INTERVAL_METHOD,
-              'interpretation': 'Compare first above-threshold judgments per harness session, entry and context epoch. Hidden and other undelivered first judgments are excluded; repeats are separate. Holdout withholds all Cue entries for a session. Read evidence proves neither following a procedure nor a per-procedure causal effect. Small holdout session samples limit precision.',
-              'window': 'After the judgment, before every next user message (even with missing Cue metadata) or known context epoch change, capped at 30 minutes and the imported watermark. Earlier reads are separate; incomplete windows are pending.',
+              'interpretation': 'Compare first above-threshold units per harness session, entry and context epoch. A first carried judgment uses its eventual print in that epoch; a carry never printed is excluded separately. Hidden and other undelivered first judgments are excluded; repeats are separate. Holdout withholds all Cue entries for a session. Read evidence proves neither following a procedure nor a per-procedure causal effect. Per-harness headlines expose arm mix differences; small holdout samples limit precision.',
+              'window': 'After actual delivery (the print moment for a resolved carry), or the first judgment for holdout/excluded diagnostics, before every next user message (even with missing Cue metadata) or known context epoch change, capped at 30 minutes and the imported watermark. Earlier reads are separate; incomplete windows are pending.',
               'interval_note': '95% percentile intervals resample whole observed harness sessions 2000 times with a fixed seed. Fewer than two sessions gives no interval; small samples and all-equal outcomes can give unstable or degenerate intervals. These are descriptive, not causal.',
               'summary': {'arms': {}, 'repeats': {}, 'excluded': {}},
-              'sessions_by_arm': {}, 'groups': [], 'gaps': {}}
+              'sessions_by_arm': {}, 'by_harness': {}, 'groups': [], 'gaps': {}}
     if state['status'] != 'ok':
         return result
     moments = {r['id']: dict(r) for r in con.execute('SELECT * FROM cue_moments')}
@@ -354,6 +378,7 @@ def report(con, machine=None, check_source=True, source=None):
         provenance['native_and_contextmd' if r['native_event_id'] else 'contextmd_only'] += 1
     versions = {r[0]: r[1] or 'unknown' for r in con.execute('SELECT session_key,agentsmd_version FROM sessions')}
     groups, seen = {}, set()
+    carry_prints, printed = _carry_prints(con)
     coverage = defaultdict(set)
     gaps = Counter()
     # Source ordering, not import order or the first successful delivery, defines the judgment.
@@ -383,14 +408,26 @@ def report(con, machine=None, check_source=True, source=None):
         if arm == 'served' and c['outcome'] == 'holdout':
             continue
         coverage[arm].add((m['harness'],m['session']))
+        harness_summary = result['by_harness'].setdefault(m['harness'],
+            {'arms': {}, 'repeats': {}, 'excluded': {}, 'sessions_by_arm': {}})
+        # The print belongs to its original first unit, not to a second opportunity.
+        if c['id'] in printed:
+            continue
+        observation = carry_prints.get(c['id'], c)
+        if not observation['target']:
+            continue  # The print's source row records its target gap exactly once.
+        outcome = observation['outcome']
         if not first:
             section = 'repeats'
-        elif arm == 'served' and c['outcome'] not in SERVED:
-            section, arm = 'excluded', 'hidden' if c['outcome'] == 'hidden' else 'not_served'
+        elif arm == 'served' and outcome not in SERVED:
+            section = 'excluded'
+            arm = ('hidden' if outcome == 'hidden' else 'carry_unprinted'
+                   if outcome in ('carried','carry_expired') else 'not_served')
         elif arm == 'holdout' and c['outcome'] != 'holdout':
             section, arm = 'excluded', 'not_served'
         else:
             section = 'arms'
+        m = moments[observation['moment_id']]
         session = (m['harness'],m['session'])
         bs, flags = boundaries[session]
         index = bisect_right(bs, m['at'])
@@ -400,10 +437,11 @@ def report(con, machine=None, check_source=True, source=None):
         watermark = state.get('watermark') or 0
         metrics = {k: 0 for k in ARM_COUNTS if k != 'sessions'}
         metrics['opportunities'] = 1
+        metrics['carry_prints'] = int(c['id'] in carry_prints)
         metrics['pending_window'] = int(end > watermark)
         metrics['boundary_without_cue_metadata'] = int(boundary <= cap and flags.get(boundary, False))
         end = min(end, math.nextafter(watermark, math.inf))
-        rs = reads[(m['harness'],m['session'],m['epoch'],c['target'])]
+        rs = reads[(m['harness'],m['session'],m['epoch'],observation['target'])]
         times = [r['at'] for r in rs]
         earlier = rs[:bisect_right(times,m['at'])]
         if earlier:
@@ -414,13 +452,18 @@ def report(con, machine=None, check_source=True, source=None):
             metrics['read'] = 1
             metrics['full' if any(r['kind'] in FULL for r in after) else 'partial'] = 1
             metrics['native_matched_reads'] = sum(r['native_event_id'] is not None for r in after)
-        for container in (g,result['summary']):
+        for container in (g,result['summary'],harness_summary):
             _add(container[section].setdefault(arm,_bucket()),session,metrics)
     for g in groups.values():
         _finish_buckets(g)
         g['outcomes'] = dict(g['outcomes'])
     _finish_buckets(result['summary'])
     result['sessions_by_arm'] = {arm: len(sessions) for arm,sessions in coverage.items()}
+    for harness,container in result['by_harness'].items():
+        _finish_buckets(container)
+        container['sessions_by_arm'] = {
+            arm: sum(h == harness for h,s in sessions) for arm,sessions in coverage.items()
+            if any(h == harness for h,s in sessions)}
     result.update(groups=sorted(groups.values(),key=lambda g:(g['entry'],g['harness'],g['agentsmd_version'])),
                   gaps=dict(gaps), read_sources=dict(provenance),
                   cue_statuses=dict(Counter(m['cue_status'] or 'unknown' for m in moments.values())))
@@ -445,8 +488,11 @@ def render(result):
                 label = 'first judgments' if section == 'arms' else section
                 lines.append(f"{prefix}{label} {arm}: {a['read']}/{a['opportunities']} ({a['read_rate']:.1%}) read, {a['sessions']} sessions, 95% interval {ci}; "
                              f"full {a['full']}, partial {a['partial']}, earlier {a['already_read']}, pending {a['pending_window']}, "
-                             f"boundaries needing missing metadata {a['boundary_without_cue_metadata']}")
+                             f"carry prints {a['carry_prints']}, boundaries needing missing metadata {a['boundary_without_cue_metadata']}")
     buckets(result['summary'])
+    for harness,container in sorted(result['by_harness'].items()):
+        lines.append(f"Harness {harness}; observed sessions: {json.dumps(container['sessions_by_arm'],sort_keys=True)}")
+        buckets(container, '  ')
     for g in result['groups']:
         lines.append(f"{g['entry']} | {g['harness']} | {g['machine']} | AgentsMD {g['agentsmd_version']}")
         buckets(g, '  ')
@@ -457,9 +503,9 @@ def render(result):
 
 EXPORT_FIELDS = frozenset({'status', 'window_seconds', 'holdout_unit', 'groups',
                            'gaps', 'read_sources', 'cue_statuses', 'summary', 'comparison', 'interval_method',
-                           'sessions_by_arm'})
+                           'sessions_by_arm', 'by_harness'})
 ARM_COUNTS = frozenset({'opportunities', 'sessions', 'read', 'full', 'partial',
-    'already_read', 'already_full', 'already_partial', 'pending_window', 'native_matched_reads', 'boundary_without_cue_metadata'})
+    'already_read', 'already_full', 'already_partial', 'pending_window', 'native_matched_reads', 'boundary_without_cue_metadata', 'carry_prints'})
 
 
 def export(con, machine=None):
@@ -486,7 +532,7 @@ def validate_export(value):
     def validate_buckets(container):
         require(isinstance(container, dict))
         for section, allowed in (('arms', {'served','holdout'}), ('repeats', {'served','holdout'}),
-                                 ('excluded', {'hidden','not_served'})):
+                                 ('excluded', {'hidden','not_served','carry_unprinted'})):
             require(isinstance(container.get(section), dict) and set(container[section]) <= allowed)
             for arm in container[section].values():
                 require(isinstance(arm, dict) and set(arm) == ARM_COUNTS | {'read_rate','interval95'})
@@ -505,6 +551,12 @@ def validate_export(value):
     require(value['comparison'] == COMPARISON and value['interval_method'] == INTERVAL_METHOD)
     require(isinstance(value['summary'], dict) and set(value['summary']) == {'arms','repeats','excluded'})
     counts(value['sessions_by_arm'], {'served','holdout'})
+    require(isinstance(value['by_harness'], dict)
+            and set(value['by_harness']) <= {'codex','claude','grok','opencode'})
+    for container in value['by_harness'].values():
+        require(isinstance(container, dict) and set(container) == {'arms','repeats','excluded','sessions_by_arm'})
+        counts(container['sessions_by_arm'], {'served','holdout'})
+        validate_buckets(container)
     counts(value['gaps'], {'version_unavailable','no_target','ambiguous_target'})
     counts(value['read_sources'], {'native_and_contextmd','contextmd_only'})
     counts(value['cue_statuses'])

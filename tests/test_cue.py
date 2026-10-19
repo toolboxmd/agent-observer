@@ -350,3 +350,63 @@ class CueTests(LedgerCase):
         self.assertEqual(result['sessions_by_arm']['served'],2)
         self.assertEqual(self.arm(result)['sessions'],1)
         self.assertEqual(result['summary']['excluded']['hidden']['sessions'],1)
+
+    def _carry_fixture(self, intermediates=(), printed=True, print_epoch=0):
+        self.native.execute("UPDATE moments SET harness='grok'")
+        self.native.execute("UPDATE reads SET harness='grok'")
+        self.native.execute("UPDATE candidates SET outcome='carried' WHERE id=1")
+        self.native.execute('DELETE FROM reads')
+        for i,outcome in enumerate(intermediates,4):
+            self.moment(i,120+i)
+            self.candidate(i,i,outcome)
+        if printed:
+            self.moment(20,3000,epoch=print_epoch,kind='pre_tool')
+            self.candidate(20,20,'injected')
+            self.moment(21,3010,epoch=print_epoch,kind='tool_result')
+            self.read(21,3010,epoch=print_epoch)
+            self.moment(22,5000,epoch=print_epoch)
+        self.native.execute("UPDATE moments SET harness='grok'")
+        self.native.execute("UPDATE reads SET harness='grok'")
+
+    def test_carry_print_at_second_row_supplies_first_delivery_window(self):
+        self._carry_fixture()
+        result=self.refresh()
+        self.assertIn('served',result['groups'][0]['arms'])
+        arm=self.arm(result)
+        # The print is beyond the first score's 30-minute cap; only its own window sees this read.
+        self.assertEqual((arm['opportunities'],arm['read'],arm['already_read']),(1,1,0))
+        self.assertEqual(arm['carry_prints'],1)
+        self.assertEqual(result['groups'][0]['repeats'],{})
+        self.assertEqual(result['by_harness']['grok']['arms']['served']['read'],1)
+
+    def test_carry_print_after_deduped_and_expired_rows_is_still_first_delivery(self):
+        self._carry_fixture(('deduped','carry_expired','deduped','carried'))
+        result=self.refresh()
+        self.assertIn('served',result['groups'][0]['arms'])
+        self.assertEqual((self.arm(result)['opportunities'],self.arm(result)['read']),(1,1))
+        self.assertEqual(result['groups'][0]['repeats']['served']['opportunities'],4)
+        self.assertEqual(self.arm(result)['carry_prints'],1)
+
+    def test_carry_never_printed_is_its_own_excluded_group(self):
+        self._carry_fixture(('deduped','carry_expired'),printed=False)
+        result=self.refresh()
+        self.assertNotIn('served',result['groups'][0]['arms'])
+        self.assertIn('carry_unprinted',result['summary']['excluded'])
+        self.assertEqual(result['summary']['excluded']['carry_unprinted']['opportunities'],1)
+        self.assertEqual(result['summary']['excluded']['carry_unprinted']['carry_prints'],0)
+        self.assertEqual(result['groups'][0]['repeats']['served']['opportunities'],2)
+
+    def test_carry_print_in_another_epoch_does_not_resolve_the_original(self):
+        self._carry_fixture(print_epoch=1)
+        result=self.refresh()
+        self.assertEqual(self.arm(result)['opportunities'],1)
+        self.assertEqual(self.arm(result)['carry_prints'],0)
+        self.assertEqual(result['summary']['excluded']['carry_unprinted']['opportunities'],1)
+
+    def test_missing_target_on_first_carry_still_takes_the_slot(self):
+        self._carry_fixture()
+        self.native.execute("UPDATE candidates SET version='unavailable' WHERE id=1")
+        result=self.refresh()
+        self.assertEqual(result['groups'][0]['arms'],{})
+        self.assertEqual(result['groups'][0]['repeats']['served']['opportunities'],1)
+        self.assertEqual(result['gaps'],{'version_unavailable':1})
