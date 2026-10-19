@@ -242,12 +242,13 @@ def _default_paths() -> tuple[list[str], dict]:
 
 
 def _stored(con: sqlite3.Connection, paths: list[str]) -> list[str]:
-    """Each session as existing source rows already spell it, once each."""
+    """Reuse stored rows, else keep discovery order (default home first)."""
+    seen: dict[tuple[int, int], str] = {}
     out = []
     for session_dir in paths:
         for name in ("updates.jsonl", "events.jsonl"):
             path = os.path.join(session_dir, name)
-            stored = stored_path(con, HARNESS, path)
+            stored = stored_path(con, HARNESS, path, seen)
             if stored != path:
                 session_dir = os.path.dirname(stored)
                 break

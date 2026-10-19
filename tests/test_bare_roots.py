@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 from agent_observer import cli, db, health
 from agent_observer.adapters import bare, codex, grok
+from agent_observer.ingest import stored_path
 
 from tests.helpers import fixture
 from tests.test_codex_archive import _rollout, _write
@@ -300,6 +301,97 @@ class UpgradeKeepsStoredPathsTest(BareRootCase):
         self.assertEqual(self.scalar(
             "SELECT COUNT(*) FROM sources WHERE path LIKE ?",
             (real + "%",)), 0)
+
+
+class FirstSyncAliasesTest(BareRootCase):
+    def counts(self, con, tables):
+        return {table: con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in tables}
+
+    def assert_sync_once(self, adapter, paths, source_count, tables):
+        # Import each native input once as the accounting reference.
+        expected = db.connect(os.path.join(self.base, "expected.db"))
+        self.addCleanup(expected.close)
+        db.init_db(expected)
+        for path in paths:
+            adapter.sync(expected, source=path)
+        counts = self.counts(expected, tables)
+        self.assertEqual(counts["sources"], source_count)
+
+        stats = adapter.sync(self.con)
+        self.assertEqual(stats["failed"], [])
+        # Before #124 this is four Codex rows for three native files.
+        self.assertEqual(self.counts(self.con, tables), counts)
+        self.assertEqual(stats["sources"], len(paths))
+        self.assertEqual(stats["responses_inserted"], counts["responses"])
+        self.assertEqual(stats["unchanged"], 0)
+        stored = [tuple(row) for row in self.con.execute(
+            "SELECT * FROM sources ORDER BY id")]
+        self.assertEqual({row[0] for row in self.con.execute(
+            "SELECT path FROM sources")},
+            {row[0] for row in expected.execute("SELECT path FROM sources")})
+        before = list(self.con.iterdump())
+
+        again = adapter.sync(self.con)
+        self.assertEqual(again["failed"], [])
+        self.assertEqual(again["sources"], len(paths))
+        self.assertEqual(again["unchanged"], len(paths))
+        for key in ("responses_inserted", "events_inserted",
+                    "user_messages_inserted", "malformed"):
+            self.assertEqual(again[key], 0)
+        self.assertEqual(self.counts(self.con, tables), counts)
+        self.assertEqual([tuple(row) for row in self.con.execute(
+            "SELECT * FROM sources ORDER BY id")], stored)
+        self.assertEqual(list(self.con.iterdump()), before)
+
+    def test_codex_first_sync_keeps_first_sorted_path_for_three_files(self):
+        real = os.path.join(self.base, "z-real-codex")
+        shared = self.rollout(os.path.join(real, "sessions"),
+                              "thr-shared", "resp-shared", 100)
+        os.symlink(real, self.codex_home)
+        bare_root = self.bare_sessions("codex", "a")
+        live = self.rollout(bare_root, "thr-live", "resp-live", 200)
+        archived = self.rollout(os.path.join(os.path.dirname(bare_root),
+                                            "archived_sessions"),
+                                "thr-archived", "resp-archived", 300)
+        self.receipts(("codex", os.path.join(real, "sessions")),
+                      ("codex", bare_root))
+        first = os.path.join(self.codex_home, os.path.relpath(shared, real))
+        self.assertLess(first, shared)
+        self.assert_sync_once(codex, [first, live, archived], 3,
+                              ("sources", "sessions", "responses",
+                               "codex_occurrences", "events"))
+
+    def test_grok_first_sync_keeps_default_home_before_receipts(self):
+        real = os.path.join(self.base, "a-real-grok-sessions")
+        self.grok_session(real, GROK_NORMAL)
+        os.makedirs(os.path.dirname(self.grok_root))
+        os.symlink(real, self.grok_root)
+        self.receipts(("grok", real))
+        first = os.path.join(self.grok_root, GROK_GROUP, GROK_NORMAL)
+        self.assert_sync_once(grok, [first], 2,
+                              ("sources", "sessions", "responses", "events"))
+
+    def test_codex_hardlinks_in_an_explicit_root_import_once(self):
+        root = os.path.join(self.base, "hardlinks")
+        first = self.rollout(root, "thr-hardlink", "resp-hardlink", 100)
+        alias = os.path.join(root, "rollout-z-alias.jsonl")
+        os.link(first, alias)
+        stats = codex.sync(self.con, root=root)
+        self.assertEqual(stats["failed"], [])
+        self.assertEqual(stats["sources"], 1)
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM sources"), 1)
+        self.assertEqual(self.scalar("SELECT path FROM sources"), first)
+
+    def test_same_inode_on_different_devices_keeps_both_paths(self):
+        seen = {}
+        stats = [os.stat_result((0, 42, device, 0, 0, 0, 0, 0, 0, 0))
+                 for device in (1, 2)]
+        with patch("agent_observer.ingest.os.stat", side_effect=stats):
+            self.assertEqual(stored_path(self.con, "codex", "first", seen),
+                             "first")
+            self.assertEqual(stored_path(self.con, "codex", "second", seen),
+                             "second")
 
 
 class ReceiptReadCostTest(BareRootCase):

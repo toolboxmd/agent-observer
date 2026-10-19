@@ -40,28 +40,38 @@ def _tail_sha(fh, offset: int) -> str:
     return hashlib.sha256(fh.read(offset - start)).hexdigest()
 
 
-def stored_path(con: sqlite3.Connection, harness: str, path: str) -> str:
+def stored_path(con: sqlite3.Connection, harness: str, path: str,
+                seen: dict[tuple[int, int], str] | None = None) -> str:
     """The path an existing source row already uses for this file, else path.
 
     A file reached through another spelling (a symlinked home, an aliased
     root) keeps its first row: it is matched by inode and confirmed as the
-    same file, so it is never imported or counted twice (#92).
+    same file, so it is never imported or counted twice (#92). A sync's
+    ``seen`` map also remembers newly discovered files by (device, inode),
+    keeping their first-seen spelling before any source rows exist.
     """
-    if con.execute("SELECT 1 FROM sources WHERE harness=? AND path=?",
-                   (harness, path)).fetchone():
-        return path
     try:
-        ino = os.stat(path).st_ino
+        st = os.stat(path)
     except OSError:
         return path
-    for (stored,) in con.execute(
-            "SELECT path FROM sources WHERE harness=? AND ino=?", (harness, ino)):
-        try:
-            if os.path.samefile(stored, path):
-                return stored
-        except OSError:
-            continue
-    return path
+    identity = (st.st_dev, st.st_ino)
+    if seen is not None and identity in seen:
+        return seen[identity]
+    resolved = path
+    if not con.execute("SELECT 1 FROM sources WHERE harness=? AND path=?",
+                       (harness, path)).fetchone():
+        for (stored,) in con.execute(
+                "SELECT path FROM sources WHERE harness=? AND ino=?",
+                (harness, st.st_ino)):
+            try:
+                if os.path.samefile(stored, path):
+                    resolved = stored
+                    break
+            except OSError:
+                continue
+    if seen is not None:
+        seen[identity] = resolved
+    return resolved
 
 
 class JsonlSource:
