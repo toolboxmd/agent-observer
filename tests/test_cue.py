@@ -183,7 +183,12 @@ class CueTests(LedgerCase):
         for secret in ('PRIVATE',self.target,'codex:s','moment_id','native_event_id'):
             self.assertNotIn(secret, encoded)
         self.assertIn('research',encoded)
-        self.assertEqual(cue.render(doc['cue']).splitlines()[0],'Cue procedure reads: ok')
+        self.assertEqual(cue.render(cue.report(self.con,check_source=False)).splitlines()[0],
+                         'Cue procedure reads: ok')
+        self.assertEqual(fleet._schema_only(fleet.validate(doc))['cue'],doc['cue'])
+        doc['cue']['groups'][0]['prompt'] = 'PRIVATE'
+        with self.assertRaisesRegex(ValueError,'Cue aggregate'):
+            fleet.validate(doc)
 
     def test_targets_use_each_moments_own_library_roots(self):
         other = Path(self.tmp.name) / 'other/library'

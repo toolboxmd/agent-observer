@@ -98,8 +98,8 @@ The source opens read-only. To refresh just this evidence or choose another sour
 
 ```sh
 agent-observer cue import --source /path/to/contextmd.sqlite
-agent-observer cue report
-agent-observer cue report --json
+agent-observer cue report --source /path/to/contextmd.sqlite
+agent-observer cue report --source /path/to/contextmd.sqlite --json
 ```
 
 Reports group Cue entries by harness, machine and observed AgentsMD version

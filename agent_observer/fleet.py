@@ -133,7 +133,9 @@ def export(con: sqlite3.Connection, machine: str | None = None) -> dict:
     synced = con.execute("SELECT MAX(imported_at) FROM sources").fetchone()[0]
     counts, judgments = _judgments(con)
     from . import cue
-    return {"cue": cue.report(con, machine=machine), "schema": SCHEMA, "machine": machine,
+    cue_data = cue.export(con, machine=machine)
+    return {**({"cue": cue_data} if cue_data is not None else {}),
+            "schema": SCHEMA, "machine": machine,
             "observer_version": __version__, "exported_at": _now(),
             "ledger_synced_at": _iso(synced),
             "sessions": sessions, "tasks": tasks, "withheld_tasks": withheld,
@@ -447,6 +449,9 @@ def validate(doc) -> dict:
     if not isinstance(judgments, list) \
             or not all(_valid_judgment(j) for j in judgments):
         raise ValueError("invalid judgments")
+    if "cue" in doc:
+        from . import cue
+        cue.validate_export(doc["cue"])
     return doc
 
 
@@ -459,6 +464,8 @@ TASK_FIELDS = ("task_id", "project", "issue_url", "origin",
 def _schema_only(doc: dict) -> dict:
     """A validated export reduced to its schema fields; extras never stored."""
     out = {k: doc.get(k) for k in HEADER_FIELDS if k in doc}
+    if "cue" in doc:
+        out["cue"] = doc["cue"]
     out["sessions"] = [
         {**{k: s.get(k) for k in SESSION_FIELDS if k in s},
          "usage": [{k: g.get(k) for k in USAGE_FIELDS if k in g}

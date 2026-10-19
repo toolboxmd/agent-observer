@@ -373,3 +373,57 @@ def render(result):
     if result['gaps']:
         lines.append('Target gaps: ' + json.dumps(result['gaps'],sort_keys=True))
     return '\n'.join(lines)
+
+
+EXPORT_FIELDS = frozenset({'status', 'window_seconds', 'holdout_unit', 'groups',
+                           'gaps', 'read_sources', 'cue_statuses'})
+ARM_COUNTS = frozenset({'opportunities', 'sessions', 'read', 'full', 'partial',
+    'already_read', 'already_full', 'already_partial', 'pending_window', 'native_matched_reads'})
+
+
+def export(con, machine=None):
+    """Optional aggregate extension; old ledgers retain their existing export shape."""
+    if _stored_health(con)['status'] == 'not_imported':
+        return None
+    value = report(con, machine=machine)
+    return {k: value.get(k, {}) for k in EXPORT_FIELDS}
+
+
+def validate_export(value):
+    """Fail closed at the fleet boundary: no paths, moments or free-text extras."""
+    def require(ok):
+        if not ok:
+            raise ValueError('invalid Cue aggregate export')
+
+    def counts(mapping, allowed=None):
+        require(isinstance(mapping, dict))
+        for k, v in mapping.items():
+            require(isinstance(k, str) and re.fullmatch(r'[a-z_]{1,64}', k)
+                    and (allowed is None or k in allowed)
+                    and type(v) is int and 0 <= v <= 2**53)
+
+    require(isinstance(value, dict) and set(value) == EXPORT_FIELDS)
+    require(isinstance(value['status'], str) and value['status'] in {'ok','missing_database','schema_drift','no_cue',
+                                'unreadable_database','not_imported'})
+    require(value['window_seconds'] == WINDOW_SECONDS and value['holdout_unit'] == 'session')
+    counts(value['gaps'], {'version_unavailable','no_target','ambiguous_target'})
+    counts(value['read_sources'], {'native_and_contextmd','contextmd_only'})
+    counts(value['cue_statuses'])
+    require(isinstance(value['groups'], list))
+    for g in value['groups']:
+        require(isinstance(g, dict) and set(g) == {'entry','harness','machine',
+                                                    'agentsmd_version','outcomes','arms'})
+        require(isinstance(g['entry'], str) and ENTRY_ID.fullmatch(g['entry']))
+        require(isinstance(g['harness'], str) and g['harness'] in {'codex','claude','grok','opencode'})
+        require(isinstance(g['machine'], str) and re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', g['machine']))
+        require(isinstance(g['agentsmd_version'], str)
+                and re.fullmatch(r'(?:[0-9]+\.[0-9]+\.[0-9]+|unknown)', g['agentsmd_version']))
+        counts(g['outcomes'])
+        require(isinstance(g['arms'], dict) and set(g['arms']) <= {'served','holdout'})
+        for arm in g['arms'].values():
+            require(isinstance(arm, dict) and set(arm) == ARM_COUNTS | {'read_rate'})
+            counts({k: arm[k] for k in ARM_COUNTS}, ARM_COUNTS)
+            require(_number(arm['read_rate']) and 0 <= arm['read_rate'] <= 1)
+            require(arm['read'] == arm['full'] + arm['partial'] <= arm['opportunities'])
+            require(arm['already_read'] == arm['already_full'] + arm['already_partial'] <= arm['opportunities'])
+    return value
