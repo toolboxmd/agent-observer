@@ -2,8 +2,8 @@
 
 Local evidence about how coding agents use resources and produce outcomes.
 
-Agent Observer reads the records Codex, Claude Code, OpenCode and Grok Build
-already keep on this Mac, plus Model Router's job ledger, into one private
+Agent Observer reads the records Codex, Claude Code, OpenCode, Grok Build and
+Muse already keep on this machine, plus Model Router's job ledger, into one private
 SQLite ledger. It reports usage, timelines, repeated work and behavior
 incidents by session, task, model, project and AgentsMD version. It never
 changes the harnesses' records, never calls a model, and posts nothing to
@@ -52,6 +52,7 @@ names another.
 | Claude Code | `~/.claude/projects/*/*.jsonl` and subagent transcripts | per message, counted once across streamed blocks |
 | OpenCode | `~/.local/share/opencode/opencode.db` (read-only) | per completed assistant message |
 | Grok Build | `~/.grok/sessions/*/*/` | per prompt completion |
+| Muse | `~/.local/share/muse/sessions/*/*/*/*/session.jsonl` and `subagent/*/session.jsonl` | not imported: tool, read and skill events only; usage reads unknown |
 | Chromeria bare Codex and Grok | each `bareReceipt.nativeRecord.root` (`<home>/sessions`, plus Codex's sibling `archived_sessions`) in the T3 state database the T3 adapter reads | as for that harness |
 | Model Router | `DURABLE_RUNNER_STATE_DIR`, `~/.local/share/durable-runner`, and legacy `~/.local/state/model-router` (read-only, deduplicated) | explicit task ownership, jobs and invocations |
 

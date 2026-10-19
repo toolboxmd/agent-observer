@@ -61,12 +61,17 @@ def _fmt_section_total(section: dict) -> str:
     Sections over mixed counter semantics carry no top-level raw total;
     the text view names that instead of inventing a sum.
     """
+    unmeasured = section.get("unmeasured_sessions") or []
+    suffix = f"; {len(unmeasured)} unmeasured sessions" if unmeasured else ""
     if "total_tokens" in section:
-        return _fmt_tokens(section.get("total_tokens"),
-                           _bucket_unknown(section))
+        # A session-level lower bound (unmeasured sessions beside measured
+        # responses) renders like a response-level one.
+        lower = _bucket_unknown(section) or (
+            1 if section.get("usage_status") == "lower_bound" else 0)
+        return _fmt_tokens(section.get("total_tokens"), lower) + suffix
     if "by_semantics" in section:
-        return "mixed semantics (see --json)"
-    return "unknown"
+        return "mixed semantics (see --json)" + suffix
+    return "unknown" + suffix
 
 
 def _fmt_session_total(session: dict) -> str:
@@ -184,7 +189,9 @@ def _text(payload) -> str:
         for phase in r.get("phases", []):
             lines.append(f"  phase {phase['phase']}: responses={phase['usage']['responses']} "
                          f"total={_fmt_section_total(phase['usage'])}; "
-                         f"activity={phase['activity']}")
+                         f"activity={phase['activity']}"
+                         + (f" coverage={phase['activity_coverage']}"
+                            if phase.get('activity_coverage') else ""))
             for model in phase['models']:
                 g=model['generation']
                 lines.append(f"    {model['harness']}/{model['model']}: "
@@ -1409,6 +1416,8 @@ def _sessions(con, ns) -> int:
         r.pop("identity_json", None)
         usage = _report.scope_totals(con, {r["session_key"]})
         r["responses"] = usage.get("responses", 0)
+        if usage.get("usage_status"):
+            r["usage_status"] = usage["usage_status"]
         if "total_tokens" in usage:
             r["total_tokens"] = usage.get("total_tokens")
             r["unknown_tokens"] = (usage.get("unknown_counts") or {}).get(

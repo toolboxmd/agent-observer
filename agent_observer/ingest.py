@@ -312,7 +312,8 @@ def insert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
                  ts=None, turn_id=None, name=None, target=None, status=None,
                  duration_ms=None, size_bytes=None, truncated=None,
                  fingerprint=None, detail=None, update: bool = False,
-                 migrate_ordinal: bool = False) -> None:
+                 migrate_ordinal: bool = False,
+                 reconcile: bool = False) -> None:
     """Insert one event under its natural key; a repeat is a no-op.
 
     Every protected field passes through agent_observer/privacy.py rule 6:
@@ -326,6 +327,12 @@ def insert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
     migrate_ordinal. Codex does that for the first sight of an event
     this source already stored. The native id and source are not rewritten
     here.
+
+    When reconcile is true (an adapter that rebuilds each event from a
+    whole changed source, such as Muse), an existing row takes every given
+    evidence value (ordinal, time, turn, name, target, status, duration,
+    size, truncation, fingerprint, detail), so evidence that arrived later
+    fills the same row. It counts as updated only when a value changed.
     """
     native = privacy.filter_native_id(family, native_id)
     if not native:
@@ -360,7 +367,24 @@ def insert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
          safe_name, safe_target, safe_status, duration_ms, size_bytes,
          truncated, fingerprint, payload))
     if cur.rowcount == 0:
-        if update:
+        if reconcile:
+            columns = ("ordinal_num", "ts", "turn_id", "name", "target", "status",
+                       "duration_ms", "size_bytes", "truncated", "fingerprint",
+                       "detail_json")
+            wanted = (ordinal, ts, turn_id, safe_name, safe_target, safe_status,
+                      duration_ms, size_bytes, truncated, fingerprint, payload)
+            row = con.execute(
+                f"SELECT {', '.join(columns)} FROM events WHERE session_key=?"
+                " AND family=? AND native_id=?", (session_key, family, native)).fetchone()
+            if tuple(row) != wanted:
+                con.execute(
+                    f"UPDATE events SET {', '.join(c + '=?' for c in columns)}"
+                    " WHERE session_key=? AND family=? AND native_id=?",
+                    wanted + (session_key, family, native))
+                stats["events_updated"] = stats.get("events_updated", 0) + 1
+            else:
+                stats["events_duplicate"] = stats.get("events_duplicate", 0) + 1
+        elif update:
             fields = "name=?, target=?, status=?, detail_json=?, duration_ms=?"
             values = [safe_name, safe_target, safe_status, payload, duration_ms]
             if migrate_ordinal:

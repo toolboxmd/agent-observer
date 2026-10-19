@@ -96,6 +96,62 @@ def _usage_totals(rows, include_responses: bool = True) -> dict:
     return _bucket_totals(rows, include_responses=include_responses)
 
 
+def _capabilities() -> dict:
+    """harness -> {capability family: declared support}."""
+    from .adapters import capabilities as adapter_capabilities
+    out: dict = {}
+    for row in adapter_capabilities():
+        out.setdefault(row["harness"], {})[row["family"]] = row["supported"]
+    return out
+
+
+def _session_harness(con: sqlite3.Connection, key: str) -> str | None:
+    row = con.execute("SELECT harness FROM sessions WHERE session_key=?",
+                      (key,)).fetchone()
+    return row["harness"] if row is not None else None
+
+
+def unmeasured_sessions(con: sqlite3.Connection, session_keys) -> set:
+    """Sessions whose usage is not imported at all (#127).
+
+    Only a session whose native harness declares model_usage=False and
+    that holds no responses: its consumption is unknown, not zero. A
+    response-less session of a harness that imports usage keeps the
+    existing exact rendering.
+    """
+    caps = _capabilities()
+    out = set()
+    for key in sorted(session_keys or ()):
+        harness = _session_harness(con, key)
+        if harness is None or caps.get(harness, {}).get("model_usage") is not False:
+            continue
+        if con.execute("SELECT 1 FROM responses WHERE session_key=? LIMIT 1",
+                       (key,)).fetchone() is None:
+            out.add(key)
+    return out
+
+
+def _mark_unmeasured(totals: dict, sessions) -> dict:
+    """Mark a usage total that misses unmeasured sessions' consumption.
+
+    With no responses every raw bucket is unknown (None); with responses
+    the numbers are measured subtotals, a lower bound. Mixed semantics keep
+    by_semantics only. Response counts and unknown_counts keep their
+    response-level meaning.
+    """
+    if not sessions:
+        return totals
+    totals["unmeasured_sessions"] = sorted(sessions)
+    if not totals.get("responses") and "by_semantics" not in totals:
+        for bucket in BUCKETS:
+            if bucket in totals:
+                totals[bucket] = None
+        totals["usage_status"] = "unknown"
+    else:
+        totals["usage_status"] = "lower_bound"
+    return totals
+
+
 def model_usage(rows) -> list[dict]:
     """Model buckets over an already selected response scope.
 
@@ -141,6 +197,8 @@ def scope_totals(con: sqlite3.Connection, session_keys=None) -> dict:
     totals = _usage_totals(live) | {
         "overlap_responses": sum(1 for r in rows if r["is_overlap"]),
     }
+    if session_keys is not None:
+        _mark_unmeasured(totals, unmeasured_sessions(con, session_keys))
     return totals
 
 
@@ -305,7 +363,42 @@ def _native_cost(rows: list) -> dict:
                     "estimates and subscription billing."}
 
 
-def _phase_report(con, task_id, rows, whole, attempts, schedule):
+# Activity counter -> the capability family that must support it (#127).
+ACTIVITY_CAPABILITIES = {
+    "tool_calls": "tool_calls", "mcp_results": "tool_results",
+    "reads": "read_evidence", "file_changes": "file_change",
+    "failed_tool_results": "tool_results", "skill_invocations": "skill_invocation",
+}
+
+
+def _activity_coverage(cell: dict, harnesses: list, caps: dict) -> dict:
+    """Per counter: unavailable when no contributing session supports it,
+    partial when only some do. Unavailable counters become None."""
+    coverage = {}
+    for counter, family in ACTIVITY_CAPABILITIES.items():
+        supported = [caps.get(h, {}).get(family) is not False for h in harnesses]
+        if supported and not any(supported):
+            cell[counter] = None
+            coverage[counter] = "unavailable"
+        elif not all(supported):
+            coverage[counter] = "partial"
+    return coverage
+
+
+def _is_mcp_result(event) -> bool:
+    """An MCP result by recorded identity; the mcp. name rule only for
+    records that carry no tool_source (Codex)."""
+    try:
+        detail = json.loads(event["detail_json"] or "{}")
+    except (TypeError, ValueError):
+        detail = {}
+    if isinstance(detail, dict) and "tool_source" in detail:
+        return detail["tool_source"] == "mcp"
+    return (event["name"] or "").startswith("mcp.")
+
+
+def _phase_report(con, task_id, rows, whole, attempts, schedule,
+                  unmeasured=frozenset()):
     from . import pricing, analysis
     by_turn, by_session = {}, {}
 
@@ -337,27 +430,52 @@ def _phase_report(con, task_id, rows, whole, attempts, schedule):
     for row in rows:
         groups.setdefault(selected(row), []).append(row)
     activities = {}
+    contributors: dict[str, dict[str, str | None]] = {}
     turns = {r["turn_id"] for r in rows if r["turn_id"]}
-    for key in sorted({r["session_key"] for r in rows}):
+    # Exclusively owned whole sessions count even without responses (#127).
+    for key in sorted({r["session_key"] for r in rows} | set(whole)):
+        harness = _session_harness(con, key)
         for event in con.execute("SELECT * FROM events WHERE session_key=?", (key,)):
             label = ("session context" if key not in whole and event["turn_id"] not in turns
                      else selected(event))
+            # Capability comes from the event's own native session, never
+            # from the importer that attributed it (Router).
+            contributors.setdefault(label, {})[key] = harness
             cell = activities.setdefault(label, {"tool_calls": 0, "mcp_results": 0,
-                "reads": 0, "file_changes": 0, "failed_tool_results": 0})
+                "reads": 0, "file_changes": 0, "failed_tool_results": 0,
+                "skill_invocations": 0})
             if event["family"] == "tool_call": cell["tool_calls"] += 1
             if event["family"] == "tool_result":
-                if (event["name"] or "").startswith("mcp."): cell["mcp_results"] += 1
+                if _is_mcp_result(event): cell["mcp_results"] += 1
                 if analysis._failed(event): cell["failed_tool_results"] += 1
             if event["family"] == "read": cell["reads"] += 1
             if event["family"] == "file_change": cell["file_changes"] += 1
+            if event["family"] == "skill_invoke": cell["skill_invocations"] += 1
+    caps = _capabilities()
+    coverage = {label: _activity_coverage(cell, list(contributors[label].values()), caps)
+                for label, cell in activities.items()}
     context = activities.pop("session context", {})
-    phases = [{"phase": name, "usage": _usage_totals(groups.get(name, [])),
-             "models": model_usage(groups.get(name, [])),
-             "estimated_cost": pricing.price_scope(groups.get(name, []), schedule),
-             "activity": activities.get(name, {}),
-             "activity_note": "Recorded observations, not separately billed token costs; coverage varies by harness."}
-            for name in sorted(set(groups) | set(activities))]
-    return phases, context
+    context_coverage = coverage.pop("session context", {})
+
+    def phase_entry(name):
+        group = groups.get(name, [])
+        missing = sorted(k for k in contributors.get(name, {}) if k in unmeasured)
+        usage = _mark_unmeasured(_usage_totals(group), missing)
+        estimate = pricing.price_scope(group, schedule)
+        if missing:
+            # Same rule as the task-level gap: no complete total, any priced
+            # subtotal kept.
+            estimate.update(complete=False, estimated_cost_usd_total=None,
+                            status="partial" if estimate.get("priced_responses") else "unknown",
+                            coverage_note="Unmeasured sessions: native usage is not imported")
+        return {"phase": name, "usage": usage, "models": model_usage(group),
+                "estimated_cost": estimate,
+                "activity": activities.get(name, {}),
+                "activity_coverage": coverage.get(name, {}),
+                "activity_note": "Recorded observations, not separately billed token costs; coverage varies by harness."}
+
+    phases = [phase_entry(name) for name in sorted(set(groups) | set(activities))]
+    return phases, context, context_coverage
 
 
 def task_report(con: sqlite3.Connection, task_id: str,
@@ -501,16 +619,41 @@ def task_report(con: sqlite3.Connection, task_id: str,
     empty_sessions = sorted(key for key in scope_keys if key not in missing_sessions
                             and not con.execute("SELECT 1 FROM responses WHERE session_key=?",
                                                 (key,)).fetchone())
+    # Children linked to an owned session but not owned by this task are a
+    # gap; the link never assigns ownership (#127).
+    owned_scope = sorted(owned_sessions & scope_keys)
+    linked_children = {r["session_key"] for r in con.execute(
+        "SELECT session_key FROM sessions WHERE parent_session_key IN"
+        f" ({','.join('?' * len(owned_scope))})", owned_scope)} if owned_scope else set()
     unbound_children = sorted({a["session_key"] for a in task_turn_rows
                               if a.get("harness") == "router" and a.get("session_key")
-                              and a["session_key"] not in whole})
+                              and a["session_key"] not in whole}
+                              | (linked_children - owned_sessions))
+    # Unmeasured sessions join the partition their responses would take.
+    unmeasured = unmeasured_sessions(con, scope_keys)
+    prompt_sessions: dict[str, set] = {}
+    for row in con.execute(
+            "SELECT s.session_key, a.user_message_id FROM assignments a JOIN user_messages s"
+            " ON s.native_id=a.user_message_id WHERE a.task_id=?", (task_id,)):
+        prompt_sessions.setdefault(row["session_key"], set()).add(row["user_message_id"])
+    shared_owned = (set(whole) & whole_shared) | whole_conflicts
+    unmeasured_attributed, unmeasured_shared = set(), set()
+    for key in unmeasured:
+        subs = prompt_sessions.get(key, set())
+        if key in shared_owned:
+            unmeasured_shared.add(key)
+        elif key in whole or any(s not in joint for s in subs):
+            unmeasured_attributed.add(key)
+        elif subs:
+            unmeasured_shared.add(key)
     unavailable_usage = bool(not scope_keys or missing_sessions or empty_sessions
                              or unbound_children or unbound_delegations or whole_conflicts)
     cutoff = _source_cutoff(con, scope_keys)
     task_turns = _task_turn_ids(con, task_id, turn_sub, whole)
     diagnostics = _task_diagnostics(con, scope_keys, whole, task_turns)
-    phases, activity_context = _phase_report(con, task_id, attributed, set(whole)-whole_shared,
-                                             task_turn_rows, schedule)
+    phases, activity_context, activity_context_coverage = _phase_report(
+        con, task_id, attributed, set(whole)-whole_shared, task_turn_rows, schedule,
+        unmeasured_attributed)
 
     def _resp_tuple(r) -> list:
         return [r.get("response_id"), r.get("harness"), r.get("model"),
@@ -532,6 +675,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
         "price_schedule": schedule,
         "phases": phases,
         "activity_session_context": activity_context,
+        "activity_session_context_coverage": activity_context_coverage,
         "coverage_evidence": {"missing_submissions": sorted(missing_submissions),
                               "conflicting_sessions": sorted(whole_conflicts),
                               "joint": joint, "whole_shared": sorted(whole_shared),
@@ -582,11 +726,12 @@ def task_report(con: sqlite3.Connection, task_id: str,
     active_task_turns = [a for a in task_turn_rows if a.get("state") == "active"]
     report = {
         "task": dict(task),
-        "attributed": total(attributed),
+        "attributed": _mark_unmeasured(total(attributed), unmeasured_attributed),
         "models": model_usage(attributed),
         "phases": phases,
         "activity_session_context": activity_context,
-        "shared_joint": total(shared),
+        "activity_session_context_coverage": activity_context_coverage,
+        "shared_joint": _mark_unmeasured(total(shared), unmeasured_shared),
         "shared_models": model_usage(shared),
         "unassigned_in_scope": total(unassigned),
         "unplaced_shared": total(unplaced),

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import importlib
 
-ORDER = ("t3", "codex", "claude", "opencode", "grok", "router")
+ORDER = ("t3", "codex", "claude", "opencode", "grok", "muse", "router")
 
 
 def available() -> dict:

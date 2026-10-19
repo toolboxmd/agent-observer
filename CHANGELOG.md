@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.5.0] - 2026-10-19
+
+### Added
+
+- Import Muse native tool, read and skill evidence; report unmeasured usage and partial activity coverage instead of zeros
+
 ## [1.4.2] - 2026-10-19
 
 ### Changed

@@ -182,6 +182,8 @@ def line_excerpt(line: object) -> str:
 # - skill_invoke.skill_path: installed SKILL.md path when the native
 #   invocation supplies a directory, otherwise omitted
 # - assistant_message.excerpt: analysis._permission_seeking
+# - tool_call/tool_result.tool_source/mcp_server/mcp_tool: report activity
+#   MCP counts (closed tool_source set; server and tool are identifiers)
 # Every other family keeps no detail. Values may be numbers, booleans,
 # fixed-length hex hashes, native identifiers of the expected type, file
 # paths, shell commands, or closed status/kind strings; anything else is
@@ -191,12 +193,15 @@ EVENT_DETAIL_ALLOWLIST: dict[str, dict[str, str]] = {
     "file_change": {"paths": "paths"},
     "tool_result": {"exit_code": "int", "exitCode": "int",
                     "is_timeout": "bool", "auth_retry_attempted": "bool",
-                    "reconnect_attempted": "bool"},
+                    "reconnect_attempted": "bool",
+                    "tool_source": "tool_source", "mcp_server": "identifier",
+                    "mcp_tool": "identifier"},
     "read": {"start_line": "int", "num_lines": "int", "cmd": "command"},
     "skill_read": {"start_line": "int", "num_lines": "int", "cmd": "command",
                    "skill": "identifier", "skill_path": "path"},
     "assistant_message": {"excerpt": "excerpt"},
-    "tool_call": {"timeout_sec": "int"},
+    "tool_call": {"timeout_sec": "int", "tool_source": "tool_source",
+                  "mcp_server": "identifier", "mcp_tool": "identifier"},
     "skill_invoke": {"skill_path": "path"},
     "compaction": {},
     "lifecycle": {},
@@ -204,6 +209,10 @@ EVENT_DETAIL_ALLOWLIST: dict[str, dict[str, str]] = {
 }
 
 _TARGET_CHARS = 500
+
+# tool_call and tool_result detail tool_source: closed set. mcp only from
+# a harness's MCP identity record, never from a name prefix (#127).
+TOOL_SOURCES = frozenset({"mcp", "builtin", "unknown"})
 
 # Rule 8: one target argument (a path or a full shell command, including a
 # Codex code-mode exec program) keeps up to 64 KiB. The longest real values
@@ -620,6 +629,9 @@ def filter_detail(family: str, detail: object) -> dict:
                 out[key] = value
         elif kind == "int":
             if _valid_int(value):
+                out[key] = value
+        elif kind == "tool_source":
+            if isinstance(value, str) and value in TOOL_SOURCES:
                 out[key] = value
         elif kind == "identifier":
             kept = _valid_identifier(value)
