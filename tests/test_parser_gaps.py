@@ -81,7 +81,7 @@ class ParserGapsTest(LedgerCase):
                 'name': 'Read', 'call_id': call, 'arguments': json.dumps({'file_path': path})}})
             if output is not None:
                 records.append({'type': 'response_item', 'payload': {'type': 'function_call_output',
-                    'call_id': call, 'output': output if isinstance(output, str) else json.dumps(output)}})
+                    'call_id': call, 'output': output}})
         path = self.write('rollout-read.jsonl', records)
         codex.sync(self.con, source=path)
         rows = {r['native_id']: (r['family'], r['status']) for r in self.query(
@@ -160,3 +160,17 @@ class ParserGapsTest(LedgerCase):
             self.assertEqual((rows[0]['status'], rows[0]['duration_ms']), ('error', 30000))
             self.assertTrue(json.loads(rows[0]['detail_json'])['is_timeout'])
             self.assertNotIn('private error', str(dict(rows[0])))
+
+    def test_codex_read_json_file_contents_are_not_result_metadata(self):
+        for text in ('{"version":1}', '[]', '123', '{"error":"example"}', 'Error: example from a file'):
+            self.assertEqual(codex._read_output_state(text), 'ok')
+
+    def test_grok_locationless_success_retains_version_evidence(self):
+        path = self.grok_fixture([
+            {'sessionUpdate': 'tool_call_update', 'toolCallId': 'r2', 'kind': 'read',
+             'status': 'in_progress', 'locations': [
+                 {'path': '/plugins/agentsmd/17.3.1/skills/operations/SKILL.md'}]},
+            {'sessionUpdate': 'tool_call_update', 'toolCallId': 'r2', 'status': 'completed'}], [])
+        grok.sync(self.con, source=path)
+        self.assertEqual(self.query("SELECT agentsmd_version FROM sessions")[0][0], '17.3.1')
+        self.assertEqual(self.query("SELECT status FROM events WHERE family='skill_read'")[0][0], 'ok')

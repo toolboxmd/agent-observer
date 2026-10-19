@@ -1870,7 +1870,8 @@ def _ingest_response_item(r: _Reader, obj: dict, native_ordinal, position: int) 
             "SELECT family,target,detail_json FROM events WHERE session_key=? AND native_id=?"
             " AND family IN ('read','skill_read')", (r.session_key, call_id)).fetchone()
         if prior:
-            state = "failed" if p.get("is_error") is True else _read_output_state(out)
+            state = "failed" if p.get("is_error") is True or p.get("status") in (
+                "failed", "error", "cancelled", "denied") else _read_output_state(out)
             if state == "ok":
                 path = (json.loads(prior["detail_json"] or "{}").get("skill_path")
                         if prior["family"] == "skill_read" else prior["target"])
@@ -2166,12 +2167,9 @@ def _command_read_state(item):
 
 def _read_output_state(output):
     if isinstance(output, str):
-        try:
-            output = json.loads(output)
-        except ValueError:
-            # A terminal native Read result is file text unless the tool
-            # explicitly reports an error. Never retain its contents.
-            return "failed" if output.startswith(("Error:", "Error reading file:")) else "ok"
+        # File contents are opaque, including JSON and error-shaped prose.
+        # Only native result metadata can distinguish a failed Read.
+        return "ok"
     if isinstance(output, dict):
         if output.get("is_error") is True or output.get("error") or output.get("status") in ("failed", "error"):
             return "failed"

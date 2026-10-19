@@ -2666,6 +2666,15 @@ def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
                         detail=None)
     status = update.get("status")
     # A terminal update often omits locations. Join the prior read by call ID.
+    if _read_state(status) == "ok":
+        for read in r.con.execute(
+                "SELECT family,target,detail_json FROM events WHERE session_key=?"
+                " AND native_id=? AND family IN ('read','skill_read')",
+                (r.session_key, call_id)):
+            path = (json.loads(read["detail_json"] or "{}").get("skill_path")
+                    if read["family"] == "skill_read" else read["target"])
+            if path:
+                r.identity.observe_path(path)
     if status is not None:
         r.con.execute("UPDATE events SET status=? WHERE session_key=? AND native_id=?"
                       " AND family IN ('read','skill_read')",
