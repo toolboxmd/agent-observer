@@ -63,8 +63,10 @@ class ArchivedRolloutSyncTest(unittest.TestCase):
         return con
 
     def sync_defaults(self, con):
+        # No Chromeria bare homes: this machine's real ones stay out (#92).
         with patch.object(codex, "DEFAULT_ROOT", self.live), \
-                patch.object(codex, "ARCHIVE_ROOT", self.archive):
+                patch.object(codex, "ARCHIVE_ROOT", self.archive), \
+                patch.dict(os.environ, {"T3CODE_HOME": self.tmp.name}):
             return codex.sync(con)
 
     def test_live_and_archived_rollouts_both_import_once(self):

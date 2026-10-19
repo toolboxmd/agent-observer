@@ -40,6 +40,30 @@ def _tail_sha(fh, offset: int) -> str:
     return hashlib.sha256(fh.read(offset - start)).hexdigest()
 
 
+def stored_path(con: sqlite3.Connection, harness: str, path: str) -> str:
+    """The path an existing source row already uses for this file, else path.
+
+    A file reached through another spelling (a symlinked home, an aliased
+    root) keeps its first row: it is matched by inode and confirmed as the
+    same file, so it is never imported or counted twice (#92).
+    """
+    if con.execute("SELECT 1 FROM sources WHERE harness=? AND path=?",
+                   (harness, path)).fetchone():
+        return path
+    try:
+        ino = os.stat(path).st_ino
+    except OSError:
+        return path
+    for (stored,) in con.execute(
+            "SELECT path FROM sources WHERE harness=? AND ino=?", (harness, ino)):
+        try:
+            if os.path.samefile(stored, path):
+                return stored
+        except OSError:
+            continue
+    return path
+
+
 class JsonlSource:
     """One append-only JSONL file being imported."""
 

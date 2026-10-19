@@ -11,6 +11,7 @@ import sys
 
 from . import CAPTURE_CONTRACT_VERSION, EVENT_CONTRACT_VERSION, SCHEMA_VERSION
 from . import adapters as _adapters
+from .adapters import bare as _bare
 from . import analysis as _analysis
 from . import db as _db
 from . import identity as _identity
@@ -83,6 +84,19 @@ def _fmt_session_total(session: dict) -> str:
     return "unknown"
 
 
+def _bare_lines(harness: str, roots: dict) -> list[str]:
+    """One summary line for a harness's bare receipts, then one per gap."""
+    if roots["state"] != "used":
+        detail = {"unused": "no bare receipts"}.get(roots["state"], roots["state"])
+        return [f"  bare roots: {detail} in {roots['state_db']}"]
+    line = (f"  bare roots: {roots['roots']} read from"
+            f" {roots['receipts']} receipts")
+    if roots["gaps"]:
+        line += f", {len(roots['gaps'])} gaps"
+    return [line] + [f"  gap {harness} bare root {g['root'] or '-'}: {g['reason']}"
+                     for g in roots["gaps"]]
+
+
 def _text(payload) -> str:
     if isinstance(payload, dict) and payload.get("_view") == "sync":
         lines = []
@@ -104,6 +118,8 @@ def _text(payload) -> str:
             for item in h.get("failed") or []:
                 lines.append(
                     f"  failed {h['harness']} {item['path']}: {item['error']}")
+            if h.get("bare_roots"):
+                lines += _bare_lines(h["harness"], h["bare_roots"])
         if payload.get("agentsmd_versions") is not None:
             lines.append(f"agentsmd versions mapped: {payload['agentsmd_versions']}")
         return "\n".join(lines)
@@ -712,6 +728,9 @@ def _health_check(ns) -> int:
             for c in conflicts:
                 print(f"- {c['harness']} {c['source_path']} record {c['ordinal_num']}:"
                       " legacy and current rows both kept")
+        for harness, roots in result["bare_roots"].items():
+            for line in _bare_lines(harness, roots):
+                print(f"- {harness} {line.strip()}")
     return 4 if result["findings"] or result["unavailable"] else 0
 
 
@@ -974,13 +993,14 @@ def _sync(con, ns) -> int:
     if repo and os.path.isdir(repo):
         mapped = _identity.store_version_map(con, _identity.build_version_map(repo))
     results = []
-    for name in wanted:
-        module = registry.get(name)
-        if module is None:
-            results.append({"harness": name, "skipped": "adapter not built"})
-            continue
-        results.append(module.sync(con, root=ns.root, full=ns.full,
-                                   source=ns.source))
+    with _bare.one_read():
+        for name in wanted:
+            module = registry.get(name)
+            if module is None:
+                results.append({"harness": name, "skipped": "adapter not built"})
+                continue
+            results.append(module.sync(con, root=ns.root, full=ns.full,
+                                       source=ns.source))
     if "t3" in wanted and len(wanted) > 1 and "t3" in registry:
         # T3 attribution reads first so transcript imports classify
         # prompts as they land, but sessions imported later in this same

@@ -686,6 +686,8 @@ def init_db(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE sources ADD COLUMN mtime_ns INTEGER")
     if "ino" not in columns:
         con.execute("ALTER TABLE sources ADD COLUMN ino INTEGER")
+    # One file reached through another path keeps its row (#92).
+    con.execute("CREATE INDEX IF NOT EXISTS idx_sources_ino ON sources(harness, ino)")
     for name, kind in (("codex_context_version", "INTEGER"),
                        ("codex_context_offset", "INTEGER"),
                        ("claude_usage_version", "INTEGER"),
