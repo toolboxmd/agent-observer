@@ -40,7 +40,7 @@ class PendingChecksTest(LedgerCase):
         self.sync("codex-mini.jsonl")
         usage = dict(self.query("SELECT * FROM responses LIMIT 1")[0])
         usage["session_key"] = "codex:pr-checks-pending"
-        phases, _ = report._phase_report(
+        phases, _, _ = report._phase_report(
             self.con, "unbound-task", [usage], {usage["session_key"]}, [],
             pricing.load_schedule())
         self.assertEqual(phases[0]["activity"]["failed_tool_results"], 0)

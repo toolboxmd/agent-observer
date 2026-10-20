@@ -531,7 +531,10 @@ def _backing_without_events(con, event_rows, *, session_key, session_keys,
     """Sources that back a session but have no event rows.
 
     A response-only session still has a native source. Event counts miss it,
-    and a default of available would hide that the source is gone.
+    and a default of available would hide that the source is gone. A linked
+    child session (parent_session_key set) with no backing source at all
+    yields one row with a NULL source, which reads as no_source: its log was
+    never read, and a parent's readable log is no evidence for it (#127).
     """
     selects = []
     args: list = []
@@ -569,6 +572,10 @@ def _backing_without_events(con, event_rows, *, session_key, session_keys,
         " AND src.session_id = sess.native_id"
         f" WHERE src.id IS NOT NULL{clause}")
     args.extend(key_args)
+    selects.append(
+        "SELECT sess.session_key, NULL FROM sessions sess"
+        f" WHERE sess.parent_session_key IS NOT NULL{clause}")
+    args.extend(key_args)
     harness_sql = ""
     if harness is not None:
         harness_sql = " WHERE harness=?"
@@ -585,8 +592,11 @@ def _backing_without_events(con, event_rows, *, session_key, session_keys,
         " LEFT JOIN sessions sess ON sess.session_key = b.session_key"
         f") backed{harness_sql}", args).fetchall()
     seen = {(row["session_key"], row["source_id"]) for row in event_rows}
+    backed = {row["session_key"] for row in event_rows} | {
+        row["session_key"] for row in found if row["source_id"] is not None}
     return [row for row in found
-            if (row["session_key"], row["source_id"]) not in seen]
+            if (row["session_key"], row["source_id"]) not in seen
+            and (row["source_id"] is not None or row["session_key"] not in backed)]
 
 
 def availability(con: sqlite3.Connection, session_key: str | None = None,

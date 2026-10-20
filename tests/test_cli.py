@@ -125,9 +125,9 @@ class CliTest(unittest.TestCase):
                     f"ccusage import/call in runtime file {name}")
         r = run(self.db, "trace", "--capabilities", "--json")
         self.assertEqual(r.returncode, 0, r.stderr)
-        caps = {c["family"]: c["supported"]
+        caps = {(c["harness"], c["family"]): c["supported"]
                 for c in json.loads(r.stdout)["capabilities"]}
-        self.assertTrue(caps["model_usage"])
+        self.assertTrue(caps[("codex", "model_usage")])
 
 
 class UnknownCountersCliTest(unittest.TestCase):

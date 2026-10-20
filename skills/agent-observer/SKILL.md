@@ -5,8 +5,9 @@ description: Measure what agents actually did on this machine. Use when someone 
 
 # Agent Observer
 
-Agent Observer reads native Codex, Claude Code, OpenCode and Grok Build
-records, Model Router's ledger and Chromeria/T3 Code state into one
+Agent Observer reads native Codex, Claude Code, OpenCode, Grok Build and
+Muse records (Muse: tool, read and skill events only; its token usage reads
+unknown, never zero), Model Router's ledger and Chromeria/T3 Code state into one
 private local ledger. It never changes those records, never calls a model,
 and posts only its cost comment, on a PR being delivered or when asked.
 

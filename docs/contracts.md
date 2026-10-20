@@ -42,7 +42,7 @@ are committed.
 | `import_errors` | none | Quarantined records; prior valid data is kept. |
 
 Every natural key carries its harness prefix (`t3:`, `codex:`, `claude:`,
-`opencode:`, `grok:`, `router:`) except event native ids, which are unique
+`opencode:`, `grok:`, `muse:`, `router:`) except event native ids, which are unique
 within their session and family. Rows are keyed by session, not by source
 file, so re-reading a file, a grown log, or a copied file never adds usage
 twice.
@@ -152,6 +152,7 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
 | Claude Code | `claude:input_excludes_cache,output_includes_thinking` | input + cache_creation + cache_read + output |
 | OpenCode | `opencode:input_excludes_cache,reasoning_separate` | input + output + reasoning + cache read + cache write |
 | Grok Build | `grok:<per native record>` | as reported per prompt completion |
+| Muse | none: usage is not imported (`model_usage` unsupported) | sessions read unmeasured, never zero |
 
 ### Event families
 
@@ -170,6 +171,17 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
 
 A tool call joins its result only on an equal native call id. Nothing is
 guessed into a join.
+
+`tool_call` and `tool_result` may carry detail `tool_source` (closed set
+`mcp`, `builtin`, `unknown`) with `mcp_server` and `mcp_tool` identifiers
+for `mcp`. Only a harness's own MCP identity record sets `mcp`; a name
+prefix never does. Today only Muse writes these keys.
+
+`insert_event(..., reconcile=True)` is for an adapter that rebuilds every
+event from a whole changed source (Muse): an existing row takes every given
+evidence value, so evidence that arrived later fills the same row, and it
+counts as updated only when a value changed. The default and `update` paths
+are unchanged.
 
 ## Instruction identity
 
@@ -439,7 +451,31 @@ An explicit `mixed` label is appropriate when a long turn spans phases.
 Shared and unassigned responses remain outside phase-attributed costs.
 
 Each phase exposes native buckets, per-model estimates and recorded tool calls,
-MCP results, reads, file changes and failed tool results. These activity
+MCP results, reads, skill invocations, file changes and failed tool results.
+Phases include events of exclusively owned sessions that have no responses.
+An MCP result is one whose detail `tool_source` is `mcp`; a result without
+`tool_source` keeps the older `mcp.` name rule (Codex). Each counter depends
+on one capability (`tool_calls`, `tool_results`, `read_evidence`,
+`file_change`, `skill_invocation`) of each contributing session's own native
+harness, never of the importer that attributed it (Router). When no
+contributor supports it the counter is `null` and `activity_coverage` names it
+`unavailable`; when only some do, the measured count stays and is `partial`.
+The session-context cell reports the same under
+`activity_session_context_coverage`.
+
+An unmeasured session exists in the ledger, has no responses, and its native
+harness declares `model_usage` unsupported (today only Muse). It joins the
+partition its responses would take (`attributed`, `shared_joint`, and always
+`scope`) and every phase its events are labeled into. That total gains
+`unmeasured_sessions` and `usage_status`: `unknown` with `null` raw buckets
+when the partition has no responses, `lower_bound` when its numbers are a
+measured subtotal (mixed semantics keep `by_semantics` only). The phase
+estimate then has no complete total. A partition with no unmeasured session
+is unchanged, including exact zeros. Task text prints `>=N (lower bound)` and
+`; N unmeasured sessions`; publication adds an `unmeasured sessions (N)` row
+with unknown buckets. Children whose `parent_session_key` is an owned session
+but which the task does not own are `unbound_child_sessions`; a link never
+assigns ownership. These activity
 observations can overlap and depend on harness coverage. They are not a split
 of the token bill: a later model input can include many earlier tool results.
 Reasoning and other generated output form a separate dimension inside every
@@ -523,6 +559,50 @@ re-read every sync; workload bindings are durable ledger rows.
   agent message with a `senderThreadId` into a thread that is not the
   sender's child records the same fields. `thread-misuse` reads these two
   tables only and follows the recorded parents for chains.
+
+## Muse (`sync --harness muse`)
+
+Default root `~/.local/share/muse/sessions`: each
+`YYYY/MM/DD/<session id>/session.jsonl` and its internal child logs at
+`<session dir>/subagent/<child id>/session.jsonl`, read-only. Frames carry
+`payload_type`, `schema_version`, native `sequence`, frame `id`,
+`recorded_at` (microseconds) and `stream.id` (the session id).
+
+- A changed file is parsed whole (complete lines only), then each event is
+  written with its final values (`reconcile=True`). No join state is kept.
+  Event `ordinal_num` is native `sequence`; import errors use line numbers.
+- One native call is one `tool_call` and at most one `tool_result`, keyed by
+  `call_id`. The terminal `tool_batch` effect gives `ok`/`error`; the
+  committed result gives `size_bytes` as UTF-8 bytes. Either may be missing
+  and stays NULL. Effects never add calls.
+- `read_file` also writes a `read` attempt with its path and the result
+  status; `read_skill` writes one `skill_invoke`. `skill_read_observed`
+  adds nothing.
+- `tool_source` is a session-level rule: in the session's
+  `mcp_tool_identity_catalog` (one server and raw tool) is `mcp`; in the
+  active toolset and in no catalog is `builtin`; otherwise `unknown`.
+- Run frames (`payload.kind=run`) only: `turn_started` and `turn_ended` keyed
+  by their frame ids, turn `muse:<run id>` (the id Chromeria's
+  `nativeTurnRef` carries). Internal `kind=task` frames are skipped.
+- A child link writes `subagent_spawned` and the child session row
+  (`parent_session_key`, role `subagent`). A child log takes its parent only
+  from its own `<parent>/subagent/<child>/` location when the directory
+  matches its `stream.id`; a mismatch is an `identity_conflict`. Record-supplied
+  log paths are never opened or stored. A linked child with no backing source
+  reads `ledger_only` (`no_source`) in `sessions availability`.
+- Consumed variants (catalog, session metadata, opened, branch and end,
+  effect started and terminal, and the listed `kind=run` events) need
+  `schema_version` and `payload_schema_version` 1, else `unsupported_schema`.
+  A run frame whose `event.kind` is not a string, or a terminal without an
+  outcome `kind` string, is a `schema_error`; a call or result batch with any
+  item lacking its `call_id`/`name` or `tool_call_id` is a `missing_id` and is
+  rejected whole, keeping none of its items; that terminal's result keeps
+  an unknown status. Each bad record is quarantined alone at its line number
+  with key names only: it neither sets the session identity nor widens the
+  session span, and the rest of the file still imports. Unconsumed
+  kinds (the envelope, `kind=task`, usage) are skipped silently. Prompts, result
+  text, outcome reasons, hooks, memory and usage are never stored.
+- T3 maps `driver: muse` strong `nativeThreadRef` to `muse:<native id>`.
 
 ## Codex model context across imports
 

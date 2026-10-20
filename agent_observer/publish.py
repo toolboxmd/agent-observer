@@ -120,6 +120,15 @@ def _fmt_tokens(value, unknown: int = 0) -> str:
     return text
 
 
+def _activity_cell(value, coverage: str | None) -> str:
+    """An activity count that never turns missing support into zero."""
+    if value is None or coverage == "unavailable":
+        return "unavailable"
+    if coverage == "partial":
+        return f">={int(value):,} (partial)"
+    return str(value)
+
+
 def summarize(con, session_keys: set, label: str, task_id: str | None = None,
               schedule: dict | None = None) -> dict:
     rep = report.task_report(con, task_id, schedule=schedule) if task_id else None
@@ -190,6 +199,7 @@ def summarize(con, session_keys: set, label: str, task_id: str | None = None,
             "scope": rep["scope"],
             "phases": rep["phases"],
             "activity_session_context": rep["activity_session_context"],
+            "activity_session_context_coverage": rep["activity_session_context_coverage"],
             "outcome": rep["outcome"],
             "acceptance_state": rep["acceptance_state"],
             "task_turns": rep["task_turns"],
@@ -555,13 +565,21 @@ def render(summary: dict, target: str | None = None) -> str:
                 cost = _fmt_cost(c.get('estimated_cost_usd_partial') if c.get('priced_responses') else None)
                 lines.append(f"| {_safe_field(phase['phase'])} | {_model_cell(m)} "
                              f"| {m['responses']} | {buckets} | {cost} |")
+            unmeasured = phase["usage"].get("unmeasured_sessions") or []
+            if unmeasured:
+                # Native usage not imported: unknown, never a zero row.
+                buckets = " | ".join("unknown" for _ in report.BUCKETS)
+                lines.append(f"| {_safe_field(phase['phase'])} | unmeasured sessions "
+                             f"({len(unmeasured)}) | 0 | {buckets} | unknown |")
         lines += ["", "Recorded activity by phase (observations, not separate token bills):", "",
-                  "| Phase | Tool calls | MCP results | Reads | File changes | Failed tool results |",
-                  "| --- | ---: | ---: | ---: | ---: | ---: |"]
+                  "| Phase | Tool calls | MCP results | Reads | Skill invocations | File changes | Failed tool results |",
+                  "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
         for phase in summary['phases']:
             a = phase['activity']
-            counts = " | ".join(str(a.get(k, 0)) for k in
-                                ('tool_calls', 'mcp_results', 'reads', 'file_changes', 'failed_tool_results'))
+            coverage = phase.get('activity_coverage') or {}
+            counts = " | ".join(_activity_cell(a.get(k, 0), coverage.get(k)) for k in
+                                ('tool_calls', 'mcp_results', 'reads', 'skill_invocations',
+                                 'file_changes', 'failed_tool_results'))
             lines.append(f"| {_safe_field(phase['phase'])} | {counts} |")
     lines += _price_evidence_lines(summary)
     lines += ["", "<sub>Local measurement from native records; usage totals are not billing. "

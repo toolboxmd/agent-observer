@@ -89,7 +89,7 @@ V2_MESSAGES = "orchestration_v2_projection_messages"
 V2_RUNS = "orchestration_v2_projection_runs"
 V2_LEGACY_IMPORTS = "orchestration_v2_legacy_imports"
 # V2 drivers whose nativeThreadRef is the ledger's native session id.
-DRIVER_HARNESSES = {"claudeAgent": "claude", "codex": "codex", "grok": "grok",
+DRIVER_HARNESSES = {"claudeAgent": "claude", "codex": "codex", "grok": "grok", "muse": "muse",
                     "opencode": "opencode", "opencode2": "opencode"}
 V2_DRIVERS = tuple(DRIVER_HARNESSES)
 V2_PROVIDER_TURNS = "orchestration_v2_projection_provider_turns"
@@ -1164,7 +1164,7 @@ def _tree_sessions(con: sqlite3.Connection, threads: dict,
                             native_id == native_session
                             or native_id.startswith(native_session + ":")):
                         keys.add(sess_row["session_key"])
-                    elif harness in ("codex", "opencode", "grok") \
+                    elif harness in ("codex", "opencode", "grok", "muse") \
                             and native_id == native_session:
                         keys.add(sess_row["session_key"])
             keys.update(claude_turn_sessions(con, thread_id))
