@@ -105,7 +105,7 @@ def _valid_counter(value) -> bool:
 
 _FINALITY_TABLE = "claude_response_finality"
 _NATIVE_KINDS_TABLE = "claude_native_kinds"
-_IMPORT_VERSION = 4
+_IMPORT_VERSION = 5  # Replay T3 completion-report parsing once (#142).
 
 
 def _ensure_native_kinds(con) -> None:

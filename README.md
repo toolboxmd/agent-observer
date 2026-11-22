@@ -416,7 +416,10 @@ T3 steer envelopes identify their sender. A steer is one `interrupt`, keyed
 by its follow-up prompt; `related_ids` links the native interrupt marker and
 tool denials it replaces in this view. The raw messages and events remain.
 Delegated-task terminal-state notices count as `agent`, including when the
-harness labels their input as user-authored. Unknown actors carry an
+harness labels their input as user-authored. Known limit: a report the
+user pastes into a prompt also counts as `agent`, because its text matches a
+real notice. For a report with an inline result, this holds even when the
+user adds their own words after it (#146). Unknown actors carry an
 `actor_reason`; native import stores the reason without the message body.
 `native_sdk_prompt_without_matching_origin` means a Claude SDK prompt has
 no matching Chromeria origin. A root thread alone cannot establish its author,

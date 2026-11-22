@@ -16,6 +16,17 @@ _RUNTIME_SUFFIX = r"\s*(?:" + _RUNTIME_INFO + r"\s*)?\Z"
 _COMPLETION = re.compile(
     r"\ADelegated task (?P<id>[^\s]+) reached a terminal state\. "
     r"Use task_status with taskId (?P=id) to read the result\." + _RUNTIME_SUFFIX, re.DOTALL)
+# T3's current single-task report: optional title and child thread, the
+# terminal status, then the inline result or the task_status pointer. The
+# result is free text, so only the anchored header is sender evidence.
+# Titles are verbatim and may span lines; a restart cut adds one footer line.
+_COMPLETION_REPORT = re.compile(
+    r"\ADelegated task (?P<id>\S+)(?: \(.*?\))?(?: in child thread \S+)?"
+    r" \[(?:completed|failed|cancelled|interrupted)\]"
+    r"(?::\n|\. Use task_status with taskId (?P=id) to read the result\."
+    r"(?:\nA server restart cut the work for [^\s,]+(?:, [^\s,]+)*\."
+    r" task_status reports the continuation outcome\.)?"
+    + _RUNTIME_SUFFIX + r")", re.DOTALL)
 _COMPLETIONS = re.compile(
     r"\ADelegated tasks [^\n]+ reached terminal states\. "
     r"Use task_status with each taskId to read the results\." + _RUNTIME_SUFFIX, re.DOTALL)
@@ -47,7 +58,8 @@ def record(con, native_id, text, *, sdk=False, allowed=True):
             kind = 'steer'
             actor = 'client' if steer[1] == 'user' else 'server'
             reason = 't3_steer_sender'
-        elif _COMPLETION.match(text) or _COMPLETIONS.match(text):
+        elif (_COMPLETION.match(text) or _COMPLETION_REPORT.match(text)
+              or _COMPLETIONS.match(text)):
             kind, actor, reason = 'completion', 'server', 'delegated_task_notice'
     con.execute(
         "INSERT INTO intervention_prompt_evidence VALUES(?,?,?,?)"
