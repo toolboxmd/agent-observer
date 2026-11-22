@@ -760,7 +760,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         "events_duplicate": 0, "compactions": 0, "malformed": 0,
     }
     src = JsonlSource(con, HARNESS, path, full=full)
-    if (src.row["codex_context_version"] != 5
+    if (src.row["codex_context_version"] != 6
             or src.row["codex_context_offset"] != src.row["read_offset"]):
         # Replay older indexes once, including search extensions previously
         # discarded from otherwise unchanged sources (#94).
@@ -960,7 +960,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
                             thread_source=reader.thread_source))
     backfill = 1 if _backfill_complete(
         con, src.source_id, getattr(src, "last_ordinal", None)) else 0
-    con.execute("UPDATE sources SET codex_context_version=5,codex_context_offset=?,"
+    con.execute("UPDATE sources SET codex_context_version=6,codex_context_offset=?,"
                 "codex_model=?,codex_effort=?,occurrence_backfill=? WHERE id=?",
                 (src.end_offset, reader.model, reader.effort, backfill,
                  src.source_id))

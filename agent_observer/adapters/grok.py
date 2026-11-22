@@ -550,7 +550,7 @@ def _has_any_counter(counters: dict | None) -> bool:
 
 
 _GROK_META_TABLE = "grok_session_meta"
-_IMPORT_VERSION = 2  # Replay older transport-envelope parsing once.
+_IMPORT_VERSION = 3  # Replay older transport-envelope parsing once (#135, #142).
 
 
 def _ensure_grok_meta_table(con: sqlite3.Connection) -> None:

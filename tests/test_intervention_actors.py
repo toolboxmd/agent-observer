@@ -99,6 +99,55 @@ class ActorRegressionTest(unittest.TestCase):
         self.assertEqual(interventions.resolve(self.con, 'sub:codex:notice')
                          ['created_by'], 'agent')
 
+    def test_current_completion_report_is_agent_for_every_terminal_status(self):
+        # Shapes from T3's delegatedCompletionWakeDetail (#142); the queued
+        # Claude form is the one stored as user in the live ledger.
+        task = 'node:delegated-task:command%3Amcp%3Afixture'
+        shapes = {
+            'inline': task + ' (Publish the site) [{status}]:\nI checked the worker.',
+            'child': task + ' (Fix (nested) title) in child thread thread-1'
+                     ' [{status}]:\nSummary.\n\nMore summary.',
+            'untitled': task + ' [{status}]:\nSummary.',
+            'pointer': task + ' (Publish the site) [{status}]. Use task_status with taskId '
+                       + task + ' to read the result.',
+        }
+        for status in ('completed', 'failed', 'cancelled', 'interrupted'):
+            for shape, body in shapes.items():
+                with self.subTest(status=status, shape=shape):
+                    path = os.path.join(self.tmp.name, 'report.jsonl')
+                    text = 'Delegated task ' + body.format(status=status)
+                    _write(path, [
+                        {'type': 'agent-name', 'sessionId': 'report', 'entrypoint': 't3-code'},
+                        {'type': 'queue-operation', 'operation': 'enqueue',
+                         'sessionId': 'report', 'timestamp': '2026-11-18T11:59:00Z',
+                         'content': text}])
+                    claude.import_claude_file(self.con, path, full=True)
+                    [native_id] = [r[0] for r in self.con.execute(
+                        "SELECT native_id FROM user_messages WHERE session_key='claude:report'")]
+                    row = interventions.resolve(self.con, 'sub:' + native_id)
+                    self.assertEqual(row['created_by'], 'agent')
+
+    def test_quoted_or_malformed_completion_report_stays_user(self):
+        task = 'node:fixture'
+        for text in ('See this: Delegated task ' + task + ' (T) [completed]:\nDone.',
+                     'Delegated task ' + task + ' (T) [running]:\nDone.',
+                     'Delegated task ' + task + ' (T) [completed] fix it',
+                     'Delegated task ' + task + ' (T) [completed]. Use task_status with taskId '
+                     + task + ' to read the result.\nNow implement my request.',
+                     'Delegated task ' + task + ' (T) [completed]. Use task_status with taskId '
+                     'node:other to read the result.'):
+            with self.subTest(text=text):
+                path = os.path.join(self.tmp.name, 'quoted.jsonl')
+                _write(path, [
+                    {'type': 'session_meta', 'payload': {'id': 'quoted', 'originator': 'codex-tui'}},
+                    {'type': 'response_item', 'payload': {'type': 'message', 'role': 'user',
+                     'id': 'quoted', 'content': [{'type': 'input_text', 'text': text}],
+                     'internal_chat_message_metadata_passthrough': {
+                         'content_item_kinds': ['user.text']}}}])
+                codex.import_codex_file(self.con, path, full=True)
+                self.assertEqual(interventions.resolve(self.con, 'sub:codex:quoted')
+                                 ['created_by'], 'user')
+
     def test_pasted_notice_with_new_instruction_stays_user(self):
         notice = ('Delegated task node:fixture reached a terminal state. '
                   'Use task_status with taskId node:fixture to read the result.')
