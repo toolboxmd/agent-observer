@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.5.2] - 2026-11-22
+
+### Changed
+
+- Credit T3's current delegated-task completion reports to the agent and replay stored prompts once (#142)
+
 ## [1.5.1] - 2026-11-22
 
 ### Changed
