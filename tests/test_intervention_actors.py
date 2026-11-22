@@ -110,6 +110,10 @@ class ActorRegressionTest(unittest.TestCase):
             'untitled': task + ' [{status}]:\nSummary.',
             'pointer': task + ' (Publish the site) [{status}]. Use task_status with taskId '
                        + task + ' to read the result.',
+            'multiline title': task + ' (Publish\nthe site) [{status}]:\nSummary.',
+            'restart cut': task + ' (Publish the site) [{status}]. Use task_status with taskId '
+                           + task + ' to read the result.\nA server restart cut the work for '
+                           + task + '. task_status reports the continuation outcome.',
         }
         for status in ('completed', 'failed', 'cancelled', 'interrupted'):
             for shape, body in shapes.items():
@@ -135,7 +139,10 @@ class ActorRegressionTest(unittest.TestCase):
                      'Delegated task ' + task + ' (T) [completed]. Use task_status with taskId '
                      + task + ' to read the result.\nNow implement my request.',
                      'Delegated task ' + task + ' (T) [completed]. Use task_status with taskId '
-                     'node:other to read the result.'):
+                     'node:other to read the result.',
+                     'Delegated task ' + task + ' (T) [completed]. Use task_status with taskId '
+                     + task + ' to read the result.\nA server restart cut the work for '
+                     + task + '. task_status reports the continuation outcome.\nMy words.'):
             with self.subTest(text=text):
                 path = os.path.join(self.tmp.name, 'quoted.jsonl')
                 _write(path, [

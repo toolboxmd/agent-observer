@@ -19,10 +19,13 @@ _COMPLETION = re.compile(
 # T3's current single-task report: optional title and child thread, the
 # terminal status, then the inline result or the task_status pointer. The
 # result is free text, so only the anchored header is sender evidence.
+# Titles are verbatim and may span lines; a restart cut adds one footer line.
 _COMPLETION_REPORT = re.compile(
-    r"\ADelegated task (?P<id>\S+)(?: \([^\n]*\))?(?: in child thread \S+)?"
+    r"\ADelegated task (?P<id>\S+)(?: \(.*?\))?(?: in child thread \S+)?"
     r" \[(?:completed|failed|cancelled|interrupted)\]"
     r"(?::\n|\. Use task_status with taskId (?P=id) to read the result\."
+    r"(?:\nA server restart cut the work for [^\s,]+(?:, [^\s,]+)*\."
+    r" task_status reports the continuation outcome\.)?"
     + _RUNTIME_SUFFIX + r")", re.DOTALL)
 _COMPLETIONS = re.compile(
     r"\ADelegated tasks [^\n]+ reached terminal states\. "
