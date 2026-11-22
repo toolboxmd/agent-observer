@@ -95,17 +95,25 @@ class PendingChecksTest(LedgerCase):
                 self.assertTrue(pending_pr_checks(
                     "tool_result", record["target"], {"exit_code": 8}))
 
-    def test_version_one_correction_is_revisited(self):
-        self.commands([("tail /tmp/proof.log; gh pr checks 114", 8)])
-        self.con.execute("UPDATE events SET status='failed' WHERE family='tool_result'")
-        self.con.execute("INSERT OR REPLACE INTO schema_meta(key,value)"
-                         " VALUES ('pr_checks_pending_version','1')")
-        self.con.commit()
-        db.init_db(self.con)
-        event = self.query("SELECT * FROM events WHERE family='tool_result'")[0]
-        self.assertEqual(event["status"], "pending")
-        self.assertEqual(self.query("SELECT value FROM schema_meta WHERE"
-                                    " key='pr_checks_pending_version'")[0][0], "2")
+    def test_earlier_corrections_are_revisited(self):
+        # Version 2: bestia event 3128489 was written failed by a rolled-back
+        # 1.4.0 after 1.4.2 had already recorded the correction (#143).
+        for version, command in (
+                ("1", "tail /tmp/proof.log; gh pr checks 114"),
+                ("2", "gh pr view 559 --json url,headRefOid,baseRefName,isDraft,"
+                      "mergeStateStatus; gh pr checks 559")):
+            with self.subTest(version=version):
+                self.con.execute("DELETE FROM events")
+                self.commands([(command, 8)])
+                self.con.execute("UPDATE events SET status='failed' WHERE family='tool_result'")
+                self.con.execute("INSERT OR REPLACE INTO schema_meta(key,value)"
+                                 " VALUES ('pr_checks_pending_version',?)", (version,))
+                self.con.commit()
+                db.init_db(self.con)
+                event = self.query("SELECT * FROM events WHERE family='tool_result'")[0]
+                self.assertEqual(event["status"], "pending")
+                self.assertEqual(self.query("SELECT value FROM schema_meta WHERE"
+                                            " key='pr_checks_pending_version'")[0][0], "3")
 
     def test_quoting_heredocs_and_ambiguous_status_producers(self):
         cases = [

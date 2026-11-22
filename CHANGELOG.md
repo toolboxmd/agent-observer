@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.5.1] - 2026-11-22
+
+### Changed
+
+- Revisit stored pending gh pr checks results that an older release wrote as failed (#143)
+
 ## [1.5.0] - 2026-10-19
 
 ### Added
