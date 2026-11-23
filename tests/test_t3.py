@@ -468,9 +468,8 @@ class StaleLedgerTest(LedgerCase):
     def setUp(self):
         super().setUp()
         self.t3_path = write_state(os.path.join(self.tmp.name, "state.sqlite"))
-        claude.import_claude_file(
-            self.con, write_transcript(os.path.join(self.tmp.name, "sess.jsonl")))
-        self.con.commit()
+        self.transcript = write_transcript(
+            os.path.join(self.tmp.name, "sess.jsonl"))
         # A synthetic gh answers that #7 is a PR; publish never posts here.
         bin_dir = os.path.join(self.tmp.name, "bin")
         os.mkdir(bin_dir)
@@ -487,9 +486,21 @@ class StaleLedgerTest(LedgerCase):
                               cwd=REPO, capture_output=True, text=True,
                               env=self.env)
 
-    def test_unsynced_task_names_sync_then_resolves_after_sync(self):
-        publish = ("publish", "--task", "example/alpha#7", "--dry-run")
-        show = ("task", "show", "--task", "example/alpha#7")
+    PUBLISH = ("publish", "--task", "example/alpha#7", "--dry-run")
+    SHOW = ("task", "show", "--task", "example/alpha#7")
+
+    def assert_resolves(self):
+        result = self.cli(*self.PUBLISH)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("agent-observer:summary", result.stdout)
+        result = self.cli(*self.SHOW)
+        self.assertNotIn("agent-observer sync", result.stderr)
+        self.assertIn("task example/alpha#7", result.stdout)
+
+    def test_unsynced_link_names_sync_then_resolves_after_sync(self):
+        claude.import_claude_file(self.con, self.transcript)
+        self.con.commit()
+        publish, show = self.PUBLISH, self.SHOW
         for args in (publish, show):
             with self.subTest(args=args[0]):
                 result = self.cli(*args)
@@ -499,12 +510,22 @@ class StaleLedgerTest(LedgerCase):
                 self.assertNotIn("no sessions in scope", result.stderr)
         t3_adapter.sync(self.con, source=self.t3_path)
         self.con.commit()
-        result = self.cli(*publish)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("agent-observer:summary", result.stdout)
-        result = self.cli(*show)
-        self.assertNotIn("agent-observer sync", result.stderr)
-        self.assertIn("task example/alpha#7", result.stdout)
+        self.assert_resolves()
+
+    def test_unsynced_transcript_names_sync_then_resolves_after_sync(self):
+        # The link is known, so the task exists, but its session is not.
+        t3_adapter.sync(self.con, source=self.t3_path)
+        self.con.commit()
+        for args in (self.PUBLISH, self.SHOW):
+            with self.subTest(args=args[0]):
+                result = self.cli(*args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("agent-observer sync", result.stderr)
+                self.assertNotIn("no sessions in scope", result.stderr)
+        claude.import_claude_file(self.con, self.transcript)
+        t3_adapter.sync(self.con, source=self.t3_path)
+        self.con.commit()
+        self.assert_resolves()
 
 
 class T3PricingTest(LedgerCase):

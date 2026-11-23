@@ -627,6 +627,11 @@ def _run_command(con, ns) -> int:
                 return 2
             rep["_view"] = "task"
             _emit(rep, ns.as_json)
+            # A known task with no sessions is usually unsynced work (#147).
+            if not _report.task_sessions(con, ns.task):
+                print(f"task {ns.task}: the ledger has no sessions for this"
+                      f" task; {_report.STALE_LEDGER_HINT}", file=sys.stderr)
+                return 2
             # Missing, conflicting or wholly unbound ownership is visible.
             if rep["missing_assignments"] or rep["conflicting_assignments"] \
                     or rep.get("unbound_usage"):
