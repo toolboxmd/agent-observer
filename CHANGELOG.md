@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.5.3] - 2026-11-23
+
+### Changed
+
+- Name agent-observer sync when publish or task show finds no sessions or an unknown task (#147)
+
 ## [1.5.2] - 2026-11-22
 
 ### Changed

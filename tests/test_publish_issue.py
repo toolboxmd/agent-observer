@@ -41,6 +41,10 @@ else:
 '''
 
 
+EMPTY = ("nothing to publish: the ledger has no sessions for this task;"
+         " if its work is recent, run `agent-observer sync` and retry\n")
+
+
 class PublishIssueTest(LedgerCase):
     def setUp(self):
         super().setUp()
@@ -91,7 +95,7 @@ class PublishIssueTest(LedgerCase):
     def test_empty_pr_retains_existing_message(self):
         result = self.run_publish("pr")
         self.assertEqual(result.returncode, 2)
-        self.assertEqual(result.stderr, "nothing to publish: no sessions in scope\n")
+        self.assertEqual(result.stderr, EMPTY)
         self.assertEqual(len(self.calls.read_text().splitlines()), 1)
 
     def test_issue_or_pr_with_sessions_does_not_query_github(self):
@@ -109,5 +113,5 @@ class PublishIssueTest(LedgerCase):
     def test_local_task_retains_existing_message_without_github(self):
         result = self.run_publish("failure", task="local-task")
         self.assertEqual(result.returncode, 2)
-        self.assertEqual(result.stderr, "nothing to publish: no sessions in scope\n")
+        self.assertEqual(result.stderr, EMPTY)
         self.assertFalse(self.calls.exists())

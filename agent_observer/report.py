@@ -202,6 +202,12 @@ def scope_totals(con: sqlite3.Connection, session_keys=None) -> dict:
     return totals
 
 
+# The ledger only knows what the last sync imported, so an empty or
+# unknown task may just be unsynced work (#147).
+STALE_LEDGER_HINT = ("if its work is recent, run `agent-observer sync`"
+                     " and retry")
+
+
 def task_sessions(con: sqlite3.Connection, task_id: str) -> set:
     """Sessions a task touches: those holding its assigned submissions or
     wholly assigned to it."""
@@ -491,7 +497,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
     task = con.execute("SELECT * FROM tasks WHERE task_id=?",
                        (task_id,)).fetchone()
     if task is None:
-        raise KeyError(f"unknown task: {task_id}")
+        raise KeyError(f"unknown task: {task_id}; {STALE_LEDGER_HINT}")
     turn_sub = _turn_submission(con)
     assigns = con.execute(
         "SELECT * FROM assignments WHERE task_id=?", (task_id,)).fetchall()

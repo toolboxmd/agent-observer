@@ -623,7 +623,7 @@ def _run_command(con, ns) -> int:
                         return 2
                 rep = _report.task_report(con, ns.task, schedule=schedule)
             except KeyError as exc:
-                print(str(exc), file=sys.stderr)
+                print(exc.args[0], file=sys.stderr)
                 return 2
             rep["_view"] = "task"
             _emit(rep, ns.as_json)
@@ -1297,7 +1297,7 @@ def _publish(con, ns) -> int:
         summary = _publish_mod.summarize(con, keys, label, task_id=ns.task,
                                          schedule=schedule)
     except KeyError as exc:
-        print(str(exc), file=sys.stderr)
+        print(exc.args[0], file=sys.stderr)
         return 2
     body = _publish_mod.render(
         summary, "pr" if ns.pr is not None else "commit" if ns.commit else None)
