@@ -462,6 +462,72 @@ class T3SyncTest(LedgerCase):
                          "import:codex:01a0d264-x")
 
 
+class StaleLedgerTest(LedgerCase):
+    """A PR task whose native records exist but are not yet synced (#147)."""
+
+    def setUp(self):
+        super().setUp()
+        self.t3_path = write_state(os.path.join(self.tmp.name, "state.sqlite"))
+        self.transcript = write_transcript(
+            os.path.join(self.tmp.name, "sess.jsonl"))
+        # A synthetic gh answers that #7 is a PR; publish never posts here.
+        bin_dir = os.path.join(self.tmp.name, "bin")
+        os.mkdir(bin_dir)
+        gh = os.path.join(bin_dir, "gh")
+        with open(gh, "w") as fh:
+            fh.write("#!/bin/sh\necho '{\"number\": 7, \"pull_request\": {}}'\n")
+        os.chmod(gh, 0o700)
+        self.env = dict(os.environ, AGENT_OBSERVER_DB=self.db_path,
+                        T3CODE_HOME=os.path.join(self.tmp.name, "no-t3"),
+                        PATH=bin_dir + os.pathsep + os.environ["PATH"])
+
+    def cli(self, *args):
+        return subprocess.run([sys.executable, "-m", "agent_observer", *args],
+                              cwd=REPO, capture_output=True, text=True,
+                              env=self.env)
+
+    PUBLISH = ("publish", "--task", "example/alpha#7", "--dry-run")
+    SHOW = ("task", "show", "--task", "example/alpha#7")
+
+    def assert_resolves(self):
+        result = self.cli(*self.PUBLISH)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("agent-observer:summary", result.stdout)
+        result = self.cli(*self.SHOW)
+        self.assertNotIn("agent-observer sync", result.stderr)
+        self.assertIn("task example/alpha#7", result.stdout)
+
+    def test_unsynced_link_names_sync_then_resolves_after_sync(self):
+        claude.import_claude_file(self.con, self.transcript)
+        self.con.commit()
+        publish, show = self.PUBLISH, self.SHOW
+        for args in (publish, show):
+            with self.subTest(args=args[0]):
+                result = self.cli(*args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("agent-observer sync", result.stderr)
+                self.assertNotIn("no sessions in scope", result.stderr)
+        t3_adapter.sync(self.con, source=self.t3_path)
+        self.con.commit()
+        self.assert_resolves()
+
+    def test_unsynced_transcript_names_sync_then_resolves_after_sync(self):
+        # The link is known, so the task exists, but its session is not.
+        t3_adapter.sync(self.con, source=self.t3_path)
+        self.con.commit()
+        for args in (self.PUBLISH, self.SHOW):
+            with self.subTest(args=args[0]):
+                result = self.cli(*args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("agent-observer sync", result.stderr)
+                self.assertNotIn("no sessions in scope", result.stderr)
+        claude.import_claude_file(self.con, self.transcript)
+        t3_adapter.sync(self.con, source=self.t3_path)
+        self.con.commit()
+        self.assert_resolves()
+
+
 class T3PricingTest(LedgerCase):
     RATES = {
         "fetchedAtMs": 1790516478998,

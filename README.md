@@ -687,6 +687,11 @@ validated before posting; session-only summaries name their limited scope
 and never imply a task outcome. Publication is explicit only and offline
 until posted; repeats update the owned comment in place.
 
+`publish` and `task show` read only what the last `sync` imported; they do
+not sync first, because an incremental sync can take minutes. When the
+ledger has no sessions for the task, or does not know the task, they exit 2
+and tell you to run `agent-observer sync` and retry.
+
 ## Launch requirements
 
 A session is visible only if its harness writes its records:

@@ -616,7 +616,7 @@ def empty_scope_message(task: str | None) -> str:
     Only the first 100 timeline events are inspected: suggestions are cheap,
     best-effort hints, never a claim to enumerate an Issue's whole outcome.
     """
-    empty = "nothing to publish: no sessions in scope"
+    empty = f"nothing to publish: the ledger has no sessions for this task; {report.STALE_LEDGER_HINT}"
     match = re.fullmatch(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([1-9][0-9]*)", task or "")
     if not match:
         return empty
