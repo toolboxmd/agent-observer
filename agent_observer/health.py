@@ -1,4 +1,4 @@
-"""Session visibility: find live agent sessions whose records Observer cannot see.
+"""Check session visibility and whether the ledger is keeping up with native records.
 
 A Claude Code session started from inside another one inherits the parent's
 child-session marker and saves no transcript unless the launcher scrubs the
@@ -15,13 +15,38 @@ import glob
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import time
+from contextlib import closing, nullcontext
+from datetime import datetime
+from pathlib import Path
+
+from .adapters import bare as bare_adapter
+from .adapters.discovery import path_info, sqlite_mtime
 
 CLAUDE_FIX = ("start the session with the parent's CLAUDE_CODE_*, CLAUDECODE, CLAUDE_PID "
               "and CLAUDE_EFFORT variables unset, or with CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1")
 GRACE_SECONDS = 120
 SCAN_TIMEOUT_SECONDS = 5
+DEFAULT_SYNC_INTERVAL_SECONDS = 3600
+
+
+def error_reason(exc: Exception) -> str:
+    """Describe a freshness failure without rendering paths or source text."""
+    if isinstance(exc, PermissionError):
+        return "permission denied"
+    if isinstance(exc, OSError):
+        return os.strerror(exc.errno) if exc.errno is not None else "source unavailable"
+    if isinstance(exc, sqlite3.Error):
+        return getattr(exc, "sqlite_errorname", "SQLite read failed")
+    return "ledger unavailable"
+
+
+def format_timestamp(stamp) -> str:
+    if stamp is None:
+        return "unknown"
+    return datetime.fromtimestamp(stamp).astimezone().isoformat(timespec="seconds")
 
 
 def _alive(pid: int) -> bool:
@@ -142,19 +167,20 @@ def check_opencode(processes: list[dict], db_path: str | None = None) -> list[di
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
     except sqlite3.Error:
         con = None
-    for proc in live:
-        seen = None
-        if con is not None:
-            row = con.execute("SELECT MAX(time_updated) FROM session WHERE directory=?",
-                              (proc["cwd"],)).fetchone()
-            seen = row[0] / 1000.0 if row and row[0] else None
-        if seen is None or (proc.get("started") and seen < proc["started"]):
-            findings.append({
-                "host": "opencode", "pid": proc["pid"], "cwd": proc["cwd"],
-                "problem": "running OpenCode process has no session record since it started",
-                "fix": "keep OpenCode's data directory reachable (no XDG_DATA_HOME override)"})
-    if con is not None:
-        con.close()
+    with closing(con) if con is not None else nullcontext():
+        for proc in live:
+            seen = None
+            if con is not None:
+                row = con.execute(
+                    "SELECT MAX(time_updated) FROM session WHERE directory=?"
+                    " AND typeof(time_updated) IN ('integer', 'real')",
+                    (proc["cwd"],)).fetchone()
+                seen = row[0] / 1000.0 if row and row[0] else None
+            if seen is None or (proc.get("started") and seen < proc["started"]):
+                findings.append({
+                    "host": "opencode", "pid": proc["pid"], "cwd": proc["cwd"],
+                    "problem": "running OpenCode process has no session record since it started",
+                    "fix": "keep OpenCode's data directory reachable (no XDG_DATA_HOME override)"})
     return findings
 
 
@@ -198,13 +224,158 @@ def bare_roots() -> dict:
     Reported beside the findings, never as one: a gap is a record root, not
     a running session.
     """
-    from .adapters import bare, codex, grok
-    with bare.one_read():
-        return {codex.HARNESS: bare.discover(codex.HARNESS, codex._bare_home)[1],
-                grok.HARNESS: bare.discover(grok.HARNESS, grok._sessions_under)[1]}
+    from .adapters import codex, grok
+    with bare_adapter.one_read():
+        return {codex.HARNESS: bare_adapter.discover(codex.HARNESS, codex._bare_home)[1],
+                grok.HARNESS: bare_adapter.discover(grok.HARNESS, grok._sessions_under)[1]}
 
 
-def check(processes=None, registry=None, con=None, bare=None) -> dict:
+def _mtime(path: str) -> float | None:
+    info = path_info(path)
+    if info is not None and stat.S_ISREG(info.st_mode):
+        return info.st_mtime
+    return None
+
+
+def _opencode_record_times(paths):
+    for path in paths:
+        uri = Path(path).absolute().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=SCAN_TIMEOUT_SECONDS)) as native:
+            # A message or part can advance without touching its session row.
+            # Read only timestamps, following the same source boundary as sync.
+            session_cols = {row[1] for row in native.execute("PRAGMA table_info(session)")}
+            if "id" not in session_cols:
+                raise sqlite3.DatabaseError("OpenCode session table unavailable")
+            timestamp_columns = ("time_created", "time_updated")
+            selects = [f"SELECT id AS session_id, {col} AS oldest, {col} AS newest,"
+                       f" typeof({col}) NOT IN ('integer', 'real', 'null') AS invalid FROM session"
+                       for col in timestamp_columns if col in session_cols]
+            for table in ("message", "part"):
+                cols = {row[1] for row in native.execute(f"PRAGMA table_info({table})")}
+                if "session_id" in cols:
+                    selects.extend(f"SELECT session_id, MIN({col}), MAX({col}),"
+                                   f" MAX(typeof({col}) NOT IN ('integer', 'real', 'null'))"
+                                   f" FROM {table} GROUP BY session_id"
+                                   for col in timestamp_columns if col in cols)
+            if not selects:
+                raise sqlite3.DatabaseError("OpenCode session timestamps unavailable")
+            combined = " UNION ALL ".join(selects)
+            for oldest, newest, invalid in native.execute(
+                    f"WITH activity AS ({combined})"
+                    " SELECT MIN(oldest), MAX(newest), MAX(invalid)"
+                    " FROM activity JOIN session ON session.id = activity.session_id"
+                    " GROUP BY session.id"):
+                if invalid:
+                    raise ValueError("invalid timestamp")
+                if newest is not None:
+                    format_timestamp(oldest / 1000)
+                    yield newest / 1000
+
+
+def _native_record_times(harness, paths):
+    from .adapters import grok
+
+    if harness == "opencode":
+        yield from _opencode_record_times(paths)
+        return
+    seen_files = set()
+    for path in dict.fromkeys(paths):
+        if harness == "grok":
+            # One session directory can contain two independently imported logs.
+            times = (_mtime(os.path.join(path, name))
+                     for name in grok.SESSION_RECORD_FILES)
+        elif harness == "codex":
+            info = path_info(path)
+            if info is None or not stat.S_ISREG(info.st_mode):
+                continue
+            identity = (info.st_dev, info.st_ino)
+            if identity not in seen_files:
+                seen_files.add(identity)
+                yield info.st_mtime
+            continue
+        elif harness in ("t3", "router"):
+            times = (sqlite_mtime(path),)
+        else:
+            times = (_mtime(path),)
+        newest = max((stamp for stamp in times if stamp is not None), default=None)
+        if newest is not None:
+            yield newest
+
+
+def _discover_native_paths(harness, adapter):
+    from .adapters import router
+    if harness == "t3":
+        return [adapter.state_path(strict=True)]
+    paths = adapter.discover(strict=True)
+    if harness == "codex":
+        paths.extend(router.discover_rollouts(strict=True))
+    if harness == "grok":
+        return [os.path.realpath(path) for path in paths]
+    return paths
+
+
+def _ledger_freshness(con, sync_interval_seconds, unavailable, ledger_error):
+    from .adapters import available, grok
+
+    imports = {}
+    if con is not None:
+        try:
+            imports = {harness: (stamp,) for harness, stamp in con.execute(
+                "SELECT harness, MAX(imported_at) FROM sources"
+                " WHERE harness != 'grok' GROUP BY harness")}
+            imports["grok"] = grok.complete_import_watermarks(con)
+        except sqlite3.Error as exc:
+            ledger_error = error_reason(exc)
+    if ledger_error is not None:
+        unavailable.append({"check": "ledger freshness", "reason": ledger_error})
+
+    freshness = {}
+    for harness, adapter in available().items():
+        import_times = imports.get(harness, ())
+        try:
+            for stamp in import_times:
+                format_timestamp(stamp)
+        except (OverflowError, OSError, TypeError, ValueError):
+            unavailable.append({"check": f"{harness} ledger import", "reason": "invalid timestamp"})
+            freshness[harness] = {"newest_native_at": None, "newest_import_at": None,
+                                  "newer_sources": None, "lag_seconds": None,
+                                  "status": "unavailable"}
+            continue
+        imported = max((stamp for stamp in import_times if stamp is not None), default=None)
+        try:
+            paths = _discover_native_paths(harness, adapter)
+            records = list(_native_record_times(harness, paths))
+            newest = max(records, default=None)
+            format_timestamp(newest)
+            format_timestamp(min(records, default=None))
+        except (OverflowError, OSError, TypeError, ValueError, sqlite3.Error) as exc:
+            reason = error_reason(exc) if isinstance(exc, (OSError, sqlite3.Error)) else "invalid timestamp"
+            unavailable.append({"check": f"{harness} native record scan", "reason": reason})
+            freshness[harness] = {"newest_native_at": None, "newest_import_at": imported,
+                                  "newer_sources": None, "lag_seconds": None,
+                                  "status": "unavailable"}
+            continue
+        newer = lag = None
+        if ledger_error is not None:
+            status = "unavailable"
+        elif newest is None:
+            newer = 0
+            status = "no_native_records"
+        elif imported is None:
+            newer = len(records)
+            status = "never_synced"
+        else:
+            newer = sum(stamp > imported for stamp in records)
+            lag = max(0, newest - imported)
+            status = "stale" if lag > sync_interval_seconds else (
+                "within_interval" if newer else "current")
+        freshness[harness] = {"newest_native_at": newest, "newest_import_at": imported,
+                              "newer_sources": newer, "lag_seconds": lag, "status": status}
+    return freshness
+
+
+def check(processes=None, registry=None, con=None, bare=None, *,
+          sync_interval_seconds=DEFAULT_SYNC_INTERVAL_SECONDS, ledger_error=None) -> dict:
     unavailable = []
     if processes is None:
         try:
@@ -217,12 +388,27 @@ def check(processes=None, registry=None, con=None, bare=None) -> dict:
             unavailable.append({"check": "working directory", "host": proc["name"],
                                 "pid": proc["pid"], "reason": proc["cwd_error"]})
     registry = claude_registry() if registry is None else registry
-    findings = check_claude(registry) + check_opencode(processes) + check_codex(processes)
+    findings = check_claude(registry)
+    try:
+        findings.extend(check_opencode(processes))
+    except sqlite3.Error as exc:
+        unavailable.append({"check": "OpenCode visibility", "reason": error_reason(exc)})
+    findings.extend(check_codex(processes))
     from . import cue
+    with bare_adapter.one_read():
+        freshness = _ledger_freshness(con, sync_interval_seconds, unavailable, ledger_error)
+        roots = bare_roots() if bare is None else bare
+    conflicts = None
+    if con is not None:
+        try:
+            conflicts = identity_conflicts(con)
+        except sqlite3.Error as exc:
+            unavailable.append({"check": "identity conflicts", "reason": error_reason(exc)})
     return {"cue": cue.health(con), "findings": findings,
             "unavailable": unavailable,
-            "identity_conflicts": identity_conflicts(con) if con is not None else None,
-            "bare_roots": bare_roots() if bare is None else bare,
+            "identity_conflicts": conflicts,
+            "bare_roots": roots,
+            "ledger_freshness": freshness, "sync_interval_seconds": sync_interval_seconds,
             "checked": {"claude_sessions": len(registry),
                         "processes": len(processes)},
             "note": ("Codex app-server and exec sessions and OpenCode servers are not "

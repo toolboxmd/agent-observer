@@ -14,6 +14,7 @@ from . import adapters as _adapters
 from .adapters import bare as _bare
 from . import analysis as _analysis
 from . import db as _db
+from . import health as _health
 from . import identity as _identity
 from . import interventions as _interventions
 from . import placement
@@ -393,7 +394,10 @@ def build_parser() -> argparse.ArgumentParser:
     pb.add_argument("--dry-run", action="store_true", help="print the comment, post nothing")
     pb.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
-    hl = sub.add_parser("health", help="find live sessions Observer cannot see")
+    hl = sub.add_parser("health", help="check session visibility and ledger freshness")
+    hl.add_argument("--sync-interval-seconds", type=_nonnegative,
+                    default=_health.DEFAULT_SYNC_INTERVAL_SECONDS,
+                    help="maximum native-to-ledger lag in seconds (default: %(default)s)")
     hl.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
     cl = sub.add_parser("claims", help="check a Claude Code session's final report against its tool calls")
@@ -742,15 +746,18 @@ def main(argv=None) -> int:
 
 
 def _health_check(ns) -> int:
-    from . import health as _health
     con = None
-    if os.path.exists(ns.db):
-        try:
-            con = _db.connect_read_only(ns.db)
-        except (RuntimeError, sqlite3.Error):
-            con = None
+    ledger_error = None
     try:
-        result = _health.check(con=con)
+        os.stat(ns.db)
+        con = _db.connect_read_only(ns.db)
+    except FileNotFoundError:
+        pass
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        ledger_error = _health.error_reason(exc)
+    try:
+        result = _health.check(con=con, ledger_error=ledger_error,
+                               sync_interval_seconds=ns.sync_interval_seconds)
     finally:
         if con is not None:
             con.close()
@@ -777,7 +784,19 @@ def _health_check(ns) -> int:
         for harness, roots in result["bare_roots"].items():
             for line in _bare_lines(harness, roots):
                 print(f"- {harness} {line.strip()}")
-    return 4 if result["findings"] or result["unavailable"] or result["cue"]["status"] in {"schema_drift", "unreadable_database"} else 0
+        print(f"Ledger freshness (sync interval: {result['sync_interval_seconds']} seconds)")
+        for harness, row in result["ledger_freshness"].items():
+            native = _health.format_timestamp(row["newest_native_at"])
+            imported = _health.format_timestamp(row["newest_import_at"])
+            status = row["status"].replace("_", " ")
+            gap = f", {row['newer_sources']} newer sources" if row["newer_sources"] is not None else ""
+            if row["lag_seconds"] is not None:
+                gap += f", lag {row['lag_seconds']:.0f} seconds"
+            print(f"- {harness}: {status}, newest native {native}, newest import {imported}{gap}")
+    stale = any(row["status"] in {"stale", "never_synced"}
+                for row in result["ledger_freshness"].values())
+    cue_failed = result["cue"]["status"] in {"schema_drift", "unreadable_database"}
+    return 4 if stale or result["findings"] or result["unavailable"] or cue_failed else 0
 
 
 def _capabilities(ns) -> int:

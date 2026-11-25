@@ -23,6 +23,7 @@ import time
 from .. import db, native_response, privacy
 from ..identity import SessionIdentity, skill_from_path
 from ..ingest import fingerprint, insert_event, iso_ts, text_hash
+from .discovery import path_info
 
 HARNESS = "opencode"
 SEMANTICS = "opencode:input_excludes_cache,reasoning_separate"
@@ -74,9 +75,10 @@ def _resolve_db(path: str | None) -> str:
     return candidate
 
 
-def discover(root: str | None = None) -> list[str]:
+def discover(root: str | None = None, *, strict: bool = False) -> list[str]:
     path = _resolve_db(root)
-    return [path] if os.path.exists(path) else []
+    exists = path_info(path) is not None if strict else os.path.exists(path)
+    return [path] if exists else []
 
 
 def _native_columns(native: sqlite3.Connection, table: str) -> set[str]:

@@ -12,7 +12,6 @@ output, so total_tokens = input_tokens + output_tokens.
 
 from __future__ import annotations
 
-import glob
 import json
 import math
 import os
@@ -23,6 +22,7 @@ from ..identity import SessionIdentity, skill_from_path
 from ..ingest import (JsonlSource, MissingNativeId, fingerprint, insert_event,
                       iso_ts, stored_path, text_hash)
 from . import bare
+from .discovery import record_paths
 
 
 def _native_ordinal(obj) -> int | None:
@@ -224,30 +224,31 @@ def _validate_bucket(bucket, *, allow_none: bool = True):
             raise _MalformedUsage("malformed usage counter")
 
 
-def _rollout_paths(root: str) -> list[str]:
+def _rollout_paths(root: str, *, strict: bool = False) -> list[str]:
     """Rollout files under root. A missing directory contributes none."""
-    return glob.glob(os.path.join(root, "**", "rollout-*.jsonl"), recursive=True)
+    return record_paths(root, "**", "rollout-*.jsonl", strict=strict)
 
 
-def _live_and_archived(live_root: str, archive_root: str) -> list[str]:
+def _live_and_archived(live_root: str, archive_root: str, *, strict: bool = False) -> list[str]:
     """One home's live rollouts plus archived ones whose basename is not live."""
-    live = _rollout_paths(live_root)
+    live = _rollout_paths(live_root, strict=strict)
     live_names = {os.path.basename(path) for path in live}
-    archived = [path for path in _rollout_paths(archive_root)
+    archived = [path for path in _rollout_paths(archive_root, strict=strict)
                 if os.path.basename(path) not in live_names]
     return live + archived
 
 
-def _bare_home(root: str) -> list[str]:
+def _bare_home(root: str, *, strict: bool = False) -> list[str]:
     """A bare receipt root (``<home>/sessions``) plus its sibling archive."""
     return _live_and_archived(
-        root, os.path.join(os.path.dirname(root), "archived_sessions"))
+        root, os.path.join(os.path.dirname(root), "archived_sessions"), strict=strict)
 
 
-def _default_paths() -> tuple[list[str], dict]:
+def _default_paths(*, strict: bool = False) -> tuple[list[str], dict]:
     """The normal home plus every Chromeria bare root, and the bare report."""
-    paths = _live_and_archived(DEFAULT_ROOT, ARCHIVE_ROOT)
-    found, report = bare.discover(HARNESS, _bare_home)
+    paths = _live_and_archived(DEFAULT_ROOT, ARCHIVE_ROOT, strict=strict)
+    found, report = bare.discover(HARNESS, lambda root: _bare_home(root, strict=strict),
+                                  strict=strict)
     return sorted(paths + found), report
 
 
@@ -257,7 +258,7 @@ def _stored(con: sqlite3.Connection, paths: list[str]) -> list[str]:
     return sorted({stored_path(con, HARNESS, path, seen) for path in paths})
 
 
-def discover(root: str | None = None) -> list[str]:
+def discover(root: str | None = None, *, strict: bool = False) -> list[str]:
     """Rollout files under one root, or every default home.
 
     An explicit root is that directory only. With root unset, scan
@@ -268,8 +269,8 @@ def discover(root: str | None = None) -> list[str]:
     stay. Dedup is by basename, not by thread id.
     """
     if root:
-        return sorted(_rollout_paths(root))
-    return _default_paths()[0]
+        return sorted(_rollout_paths(root, strict=strict))
+    return _default_paths(strict=strict)[0]
 
 
 def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,

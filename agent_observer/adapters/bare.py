@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from typing import Callable
 
 from . import t3
+from .discovery import path_info
 
 TURN_ITEMS = "orchestration_v2_projection_turn_items"
 # Chromeria ids every receipt ``bare-receipt:<provider thread>:<native id>``
@@ -74,12 +75,13 @@ def _receipts(path: str) -> dict:
     return roots
 
 
-def receipt_roots(harness: str) -> tuple[list, dict]:
+def receipt_roots(harness: str, *, strict: bool = False) -> tuple[list, dict]:
     """Recorded roots (None when a receipt names none) and the base report."""
-    path = t3.state_path()
+    path = t3.state_path(strict=strict)
     report = {"state_db": path, "state": "unused", "receipts": 0, "roots": 0,
               "gaps": []}
-    if not os.path.exists(path):
+    exists = path_info(path) is not None if strict else os.path.exists(path)
+    if not exists:
         report["state"] = "no T3 state"
         return [], report
     try:
@@ -95,13 +97,16 @@ def receipt_roots(harness: str) -> tuple[list, dict]:
 
 
 def discover(harness: str,
-             paths_under: Callable[[str], list[str]]) -> tuple[list[str], dict]:
+             paths_under: Callable[[str], list[str]], *,
+             strict: bool = False) -> tuple[list[str], dict]:
     """Record paths under every receipt root for harness, plus the report.
 
     paths_under(root) lists one root's records. Roots are canonical, so
     aliases of one directory are read once.
     """
-    rows, report = receipt_roots(harness)
+    rows, report = receipt_roots(harness, strict=strict)
+    if strict and report["state"] == "unreadable T3 state":
+        raise OSError(report["error"])
     roots, gaps = [], []
     for root in rows:
         if not isinstance(root, str) or not root:
@@ -116,6 +121,8 @@ def discover(harness: str,
             gaps.append({"root": real, "reason": "missing on this machine"})
             continue
         except OSError:
+            if strict:
+                raise
             gaps.append({"root": real, "reason": "unreadable"})
             continue
         roots.append(real)

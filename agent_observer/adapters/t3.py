@@ -69,6 +69,7 @@ import sqlite3
 
 from .. import db, privacy
 from . import t3_purpose
+from .discovery import path_info
 
 # A PR head branch as T3 snapshots it; anything else is not stored.
 BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
@@ -120,12 +121,14 @@ def t3_home(root: str | None = None) -> str:
     return os.environ.get("T3CODE_HOME") or os.path.expanduser("~/.t3")
 
 
-def state_path(root: str | None = None, source: str | None = None) -> str:
+def state_path(root: str | None = None, source: str | None = None, *,
+               strict: bool = False) -> str:
     """The T3 state database: explicit source, else Chromeria V2, else V1."""
     if source:
         return source
     v2 = os.path.join(t3_home(root), V2_RELATIVE)
-    if os.path.exists(v2):
+    exists = path_info(v2) is not None if strict else os.path.exists(v2)
+    if exists:
         return v2
     return os.path.join(t3_home(root), STATE_RELATIVE)
 
