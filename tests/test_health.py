@@ -630,6 +630,14 @@ class LedgerFreshnessTest(unittest.TestCase):
             with patch("builtins.open", denied_open):
                 self.assertTrue(grok.sync(con)["failed"])
             self.assertEqual(con.execute("SELECT COUNT(*) FROM responses").fetchone()[0], 0)
+            for contents in (None, "{}"):
+                if contents is None:
+                    summary.unlink()
+                else:
+                    summary.write_text(contents)
+                self.assertTrue(grok.sync(con)["failed"])
+                self.assertEqual(con.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 0)
+            summary.write_text('{"info":{"id":"native-id"},"current_model_id":"grok-4"}')
             self.assertEqual(grok.sync(con)["failed"], [])
             rows = con.execute("SELECT session_key FROM sessions").fetchall()
             self.assertEqual([row[0] for row in rows], ["grok:native-id"])

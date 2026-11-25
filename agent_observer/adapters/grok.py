@@ -1523,7 +1523,7 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             recorded_id = _valid_native_id(row["session_id"])
             if recorded_id is not None:
                 break
-    if summary_unavailable and recorded_id is None and updates_path:
+    if (summary_unavailable or not summary) and recorded_id is None and updates_path:
         # The first import has no stored spelling. Prefer the native id in
         # a complete notification, which may differ from the directory.
         try:
@@ -1540,9 +1540,12 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                             break
         except FileNotFoundError:
             pass
-    if summary_unavailable and recorded_id is None:
+    if recorded_id is None and (summary_unavailable or (
+            not summary and (updates_path or events_path))):
         # A directory name is only a fallback after a readable summary
-        # supplied no ID. A failed read can hide a different native ID.
+        # supplies some evidence. An absent summary can precede a different ID.
+        if not metadata_errors:
+            metadata_errors.append("Grok session identity unavailable")
         return stats
     native_sid = recorded_id or valid_info_id or safe_basename
     if native_sid is None:
