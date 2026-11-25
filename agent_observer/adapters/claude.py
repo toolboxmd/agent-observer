@@ -106,7 +106,7 @@ def _valid_counter(value) -> bool:
 
 _FINALITY_TABLE = "claude_response_finality"
 _NATIVE_KINDS_TABLE = "claude_native_kinds"
-_IMPORT_VERSION = 17  # Recheck every priced field and the source of each legacy trace event.
+_IMPORT_VERSION = 18  # Resume historical capture at the last prompt in this source.
 _FINAL_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens",
                  "reasoning_output_tokens", "total_tokens", "cache_write_5m_tokens", "cache_write_1h_tokens", "model")
 
@@ -416,10 +416,8 @@ def import_claude_file(con: sqlite3.Connection, path: str,
     except sqlite3.DatabaseError:
         pass
     if src.incremental and src.row["session_id"]:
-        # Resume the turn the previous import ended in.
-        row = con.execute(
-            "SELECT turn_id FROM user_messages WHERE session_key=? AND kind='genuine'"
-            " ORDER BY ts DESC LIMIT 1", (r.session_key,)).fetchone()
+        row = con.execute("SELECT turn_id FROM claude_source_turns WHERE source_id=?",
+                          (src.source_id,)).fetchone()
         r.turn = row["turn_id"] if row else None
     unreadable = False
     for ordinal, obj, line in src.records():
@@ -509,6 +507,13 @@ def import_claude_file(con: sqlite3.Connection, path: str,
         AND o.response_id=p.response_id AND o.source_id=p.source_id
         AND json_extract(o.payload,'$.'||p.field) IS NOT NULL))""", (src.source_id,))
     _reproject_withdrawn_finals(r)
+    if not src.incremental and not unreadable:
+        for rid, turn in con.execute("""SELECT response_id,MIN(turn_id) FROM claude_final_blocks
+                WHERE source_id=? AND link_status='absent' GROUP BY response_id
+                HAVING COUNT(DISTINCT COALESCE(turn_id,''))=1""", (src.source_id,)):
+            con.execute("UPDATE responses SET turn_id=? WHERE source_id=? AND response_id=? AND turn_id IS NOT ?",
+                        (turn, src.source_id, rid, turn))
+    con.execute("INSERT OR REPLACE INTO claude_source_turns VALUES(?,?)", (src.source_id, r.turn))
     con.executemany("INSERT OR IGNORE INTO claude_ancestry_sources VALUES(?,?)",
                     ((key, src.source_id) for key in r.linked_sessions))
     if r.native_session:
@@ -1364,6 +1369,8 @@ def _prepare_ancestry(r):
         source_id INTEGER NOT NULL REFERENCES sources(id),event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
         turn_id TEXT NOT NULL, PRIMARY KEY(event_id,source_id,turn_id)) WITHOUT ROWID""")
     r.con.execute("CREATE INDEX IF NOT EXISTS claude_event_observation_source ON claude_event_observations(source_id)")
+    r.con.execute("""CREATE TABLE IF NOT EXISTS claude_source_turns (
+        source_id INTEGER PRIMARY KEY REFERENCES sources(id),turn_id TEXT)""")
     if r.src.row["claude_usage_version"] and r.src.row["claude_usage_version"] < _IMPORT_VERSION:
         stale = _unsupported_projections(r.con,
             "(r.source_id=? OR (r.session_key,r.response_id) IN (SELECT session_key,response_id "
@@ -1567,6 +1574,10 @@ def response_witnesses(con, session_key):
             if (rid, source) not in recorded_blocks:
                 unlocated.add(rid)
     conflicts = set()
+    if db._has_table(con, "claude_final_blocks"):
+        conflicts.update(rid for rid, in con.execute("""SELECT response_id FROM claude_final_blocks
+            WHERE session_key=? AND link_status='absent' GROUP BY response_id
+            HAVING COUNT(DISTINCT COALESCE(turn_id,''))>1""", (session_key,)))
     if db._has_table(con, "claude_invalid_ancestry"):
         for uuid, response_id in con.execute(
                 "SELECT uuid,response_id FROM claude_invalid_ancestry WHERE session_key=?", (session_key,)):

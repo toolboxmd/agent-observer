@@ -18,6 +18,7 @@ import os
 import sqlite3
 
 from .. import db, native_response, placement, privacy
+from . import codex_atomic
 from ..identity import SessionIdentity, skill_from_path
 from ..ingest import (JsonlSource, MissingNativeId, fingerprint, insert_event,
                       iso_ts, stored_path, text_hash)
@@ -61,7 +62,7 @@ def _occurrences_ready(row) -> bool:
 
 
 HARNESS = "codex"
-_CONTEXT_VERSION = 7  # Record literal turn witnesses from every atomic occurrence.
+_CONTEXT_VERSION = 8  # Keep the literal turn and measurement together across source snapshots.
 SEMANTICS = "codex:input_includes_cached,output_includes_reasoning"
 # Older rollouts carry usage only in token_count events: last_token_usage per
 # response and a cumulative total that repeats when nothing new happened.
@@ -816,7 +817,11 @@ def import_codex_file(con: sqlite3.Connection, path: str,
             "session_key": session_key,
         })
         return stats
+    if src.incremental and db._has_table(con, "codex_incomplete_sources") and con.execute(
+            "SELECT 1 FROM codex_incomplete_sources WHERE source_id=?", (src.source_id,)).fetchone():
+        src.start_offset = src.end_offset = 0
     reader = _Reader(con, src, stats)
+    codex_atomic.prepare(reader)
     native_response.prepare(con, src.source_id, replace=not src.incremental)
     _ensure_cumulative_table(con)
     own = _first_meta(path)
@@ -888,6 +893,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
     for ordinal, obj, line in src.records():
         stats["lines"] += 1
         if obj is None or not isinstance(obj, dict):
+            reader.unreadable_atomic = True
             stats["malformed"] += 1
             src.error(ordinal,
                       "malformed_json" if obj is None else "unknown_record",
@@ -912,10 +918,18 @@ def import_codex_file(con: sqlite3.Connection, path: str,
             src.error(ordinal, "missing_id", line)
             continue
         except _UnsupportedSchema:
+            if (not isinstance(obj.get("type"), str) or
+                    isinstance(obj.get("payload"), dict) and "response_id" in obj["payload"]):
+                reader.unreadable_atomic = True
             stats["malformed"] += 1
             src.error(ordinal, "unsupported_schema", line)
             continue
         except (KeyError, TypeError, ValueError, AttributeError):
+            if obj.get("type") == "token_usage_record":
+                if isinstance(obj.get("payload"), dict):
+                    codex_atomic.observe(reader, obj, None)
+                else:
+                    reader.unreadable_atomic = True
             stats["malformed"] += 1
             src.error(ordinal, "schema_error", line)
             continue
@@ -923,6 +937,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         if ts is not None:
             reader.first_ts = ts if reader.first_ts is None else min(reader.first_ts, ts)
             reader.last_ts = ts if reader.last_ts is None else max(reader.last_ts, ts)
+    codex_atomic.finish(reader)
     _flush_token_counts(reader)
     _resolve_legacy_user_messages(reader)
     if not src.privacy_stale:
@@ -1599,14 +1614,23 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
     u_raw = p.get("usage")
     tt_raw = p.get("turn_token_usage")
     th_raw = p.get("thread_token_usage")
-    _validate_bucket(u_raw)
-    _validate_bucket(tt_raw)
-    _validate_bucket(th_raw)
+    try:
+        for bucket in (u_raw, tt_raw, th_raw):
+            _validate_bucket(bucket)
+            if bucket and any(v is not None and not 0 <= v < 2**63
+                              for v in (bucket.get(k) for k in _CODEX_BUCKET_KEYS)):
+                raise _MalformedUsage("invalid atomic counter")
+    except _MalformedUsage:
+        codex_atomic.observe(r, obj, None)
+        raise
     u = u_raw if isinstance(u_raw, dict) else {}
     tt = tt_raw if isinstance(tt_raw, dict) else {}
     th = th_raw if isinstance(th_raw, dict) else {}
     rid = f"{HARNESS}:{p['response_id']}"
     turn_id = f"{HARNESS}:{p['turn_id']}" if p.get("turn_id") else None
+    want = {k: u.get(k) for k in _CODEX_BUCKET_KEYS}
+    want.update(turn_total_tokens=tt.get("total_tokens"), thread_total_tokens=th.get("total_tokens"))
+    codex_atomic.observe(r, obj, want)
     cur = r.con.execute(
         "INSERT OR IGNORE INTO responses(response_id, source_id, harness,"
         " session_key, thread_id, turn_id, root_turn_id, session_id,"
@@ -1631,14 +1655,6 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
             " total_tokens, turn_total_tokens, thread_total_tokens"
             " FROM responses WHERE response_id=?", (rid,)).fetchone()
         seen = dict(existing) if existing is not None else {}
-        want = {"input_tokens": u.get("input_tokens"),
-                "cached_input_tokens": u.get("cached_input_tokens"),
-                "cache_write_input_tokens": u.get("cache_write_input_tokens"),
-                "output_tokens": u.get("output_tokens"),
-                "reasoning_output_tokens": u.get("reasoning_output_tokens"),
-                "total_tokens": u.get("total_tokens"),
-                "turn_total_tokens": tt.get("total_tokens"),
-                "thread_total_tokens": th.get("total_tokens")}
         if seen != want:
             raise _UsageConflict("usage conflict")
         _migrate_response_position(r, rid, r.record_position)

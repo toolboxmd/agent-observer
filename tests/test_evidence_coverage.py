@@ -923,3 +923,23 @@ class EvidenceCoverageTest(LedgerCase):
         for turn in (None, "claude:p"):
             self.assertEqual({e["native_id"] for e in report.timeline(self.con, "A", turn_id=turn)["events"]},
                              {"independent-call", "surviving-call"})
+
+    def test_legacy_append_resumes_the_prompt_in_its_own_source(self):
+        files = [Path(self.tmp.name, task + ".jsonl") for task in ("A", "B")]
+        for index, (task, path) in enumerate(zip(("A", "B"), files), 1):
+            prompt = dict(claude_user(task), timestamp=f"2026-11-25T08:00:0{index}Z")
+            response = claude_response("reply-" + task, task, "id-" + task)
+            del response["parentUuid"]
+            write_records(path, [prompt, response])
+            claude.import_claude_file(self.con, str(path))
+            self.assign(task, "claude:" + task)
+        late = claude_response("late", "A", "late")
+        del late["parentUuid"]
+        late["message"]["content"] = [{"type":"tool_use", "id":"late-call", "name":"Read"}]
+        write_records(files[0], [late], mode="a")
+        claude.import_claude_file(self.con, str(files[0]))
+        for task in ("A", "B"):
+            self.assertEqual("claude:late" in report.task_report(self.con, task)["measured"]["attributed_responses"],
+                             task == "A")
+            self.assertEqual("late-call" in [e["native_id"] for e in report.timeline(self.con, task)["events"]],
+                             task == "A")

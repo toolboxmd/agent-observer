@@ -183,6 +183,15 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
         responses, call_witnesses, disputed_completions = grok.response_witnesses(con, key)
     else:
         responses = native_response.inputs(con, key)
+        if harness == "codex":
+            from .adapters import codex, codex_atomic
+            conflicts, incomplete, unavailable = codex_atomic.disputes(con, key, codex.SEMANTICS)
+            disputed_completions.update(conflicts)
+            result.conflicts.update(conflicts)
+            for rid, turns in conflicts.items():
+                responses.setdefault(rid, set()).update(turns)
+            if incomplete:
+                result.unlocated_usage_sessions.add(key)
     # In a contested whole session, only events on resolved turns can be
     # shown. Untagged events cannot be separated between the claimants.
     exclusive = not by_run or (whole == {task_id} and set(by_run.values()) == {task_id})
