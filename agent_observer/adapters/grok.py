@@ -1504,29 +1504,43 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         metadata_errors.append(str(exc))
     stats["metadata_errors"] = metadata_errors
     info = summary.get("info") if isinstance(summary.get("info"), dict) else {}
-    # Fail closed on unsafe identifiers: the native session id comes only
-    # from a validated summary.info.id or a validated directory basename.
-    # Anything else never reaches session keys, response ids, submission
-    # ids or event keys.
+    # Validate every candidate before it can become a ledger identity.
     basename = os.path.basename(session_dir.rstrip(os.sep))
     safe_basename = _valid_native_id(basename)
     raw_info_id = info.get("id")
     valid_info_id = _valid_native_id(raw_info_id) \
         if isinstance(raw_info_id, str) and raw_info_id else None
-    # A temporary summary failure must retain a previously imported
-    # transcript's native identity, which can differ from the directory.
+    # Keep the source's identity during a metadata retry even if it differs
+    # from the directory or the recovered summary.
+    _ensure_grok_meta_table(con)
     recorded_id = None
-    if summary_unavailable:
-        for path in (updates_path, events_path):
-            if path is None:
-                continue
-            row = con.execute("SELECT session_id FROM sources WHERE harness=? AND path=?",
-                              (HARNESS, path)).fetchone()
-            if row is not None:
-                recorded_id = _valid_native_id(row["session_id"])
-                if recorded_id is not None:
-                    break
-    native_sid = valid_info_id or recorded_id or safe_basename
+    for path in (updates_path, events_path):
+        if path is None:
+            continue
+        row = con.execute("SELECT session_id FROM sources WHERE harness=? AND path=?",
+                          (HARNESS, path)).fetchone()
+        if row is not None:
+            recorded_id = _valid_native_id(row["session_id"])
+            if recorded_id is not None:
+                break
+    if summary_unavailable and recorded_id is None and updates_path:
+        # The first import has no stored spelling. Prefer the native id in
+        # a complete notification, which may differ from the directory.
+        try:
+            for _ordinal, raw in _complete_lines(updates_path):
+                try:
+                    record = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(record, dict) and record.get("method") in METHODS:
+                    params = record.get("params")
+                    if isinstance(params, dict):
+                        recorded_id = _valid_native_id(params.get("sessionId"))
+                        if recorded_id is not None:
+                            break
+        except FileNotFoundError:
+            pass
+    native_sid = recorded_id or valid_info_id or safe_basename
     if native_sid is None:
         # No safe native id: quarantine under the fixed missing_id
         # category with no record values. The source_path locates the
@@ -1598,7 +1612,6 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
 
     # Change state before any full parse. JsonlSource does a stat plus a
     # small tail read, never a full parse.
-    _ensure_grok_meta_table(con)
     previous = con.execute(
         f"SELECT imported_at, pending FROM {_GROK_META_TABLE} WHERE session_key=?",
         (r.session_key,)).fetchone()
