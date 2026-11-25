@@ -7,8 +7,18 @@ from .. import db, native_response
 from ..ingest import iso_ts
 
 
-FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens",
-          "reasoning_output_tokens", "total_tokens", "turn_total_tokens", "thread_total_tokens", "model")
+COUNTERS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens",
+            "reasoning_output_tokens", "total_tokens", "turn_total_tokens", "thread_total_tokens")
+
+
+def _signature(observation):
+    # The turn and counters come from the atom. The surrounding model context
+    # belongs to the source position and may differ for an exact repeat.
+    measured = observation["measurement"]
+    if measured:
+        values = json.loads(measured)
+        measured = tuple(values[k] for k in COUNTERS)
+    return observation["session_key"], observation["input_id"], measured
 
 
 def prepare(r):
@@ -83,7 +93,7 @@ def _reconcile(con, rid, refreshing):
     copies = con.execute("""SELECT o.*,i.source_id AS incomplete FROM codex_atomic_observations o
         JOIN sources s ON s.id=o.source_id LEFT JOIN codex_incomplete_sources i ON i.source_id=o.source_id
         WHERE o.response_id=? ORDER BY s.path,o.position""", (rid,)).fetchall()
-    signatures = {(o["session_key"], o["input_id"], o["measurement"]) for o in copies}
+    signatures = {_signature(o) for o in copies}
     if len(signatures) != 1 or not copies[0]["measurement"] or any(o["incomplete"] for o in copies):
         return
     first = copies[0]
@@ -95,19 +105,20 @@ def _reconcile(con, rid, refreshing):
     if source["source_id"] != row["source_id"] and row["source_id"] != refreshing and (row["version"] or 0) < 8:
         return  # The original pre-upgrade source has not been replayed.
     measured = json.loads(source["measurement"])
-    if (source["source_id"] == row["source_id"] and len({o["source_id"] for o in copies}) == 1
-            and any(row[k] is not None and row[k] != measured[k] for k in FIELDS if k != "model")):
+    same_source = source["source_id"] == row["source_id"]
+    if (same_source and len({o["source_id"] for o in copies}) == 1
+            and any(row[k] is not None and row[k] != measured[k] for k in COUNTERS)):
         # One rewritten native atom cannot independently revise immutable
         # counters. The task view withholds it while the raw ledger keeps it.
         return
     turn = "codex:" + source["input_id"] if source["input_id"] else None
-    if (row["source_id"] != source["source_id"] or row["turn_id"] != turn or
-            any(row[k] != measured[k] for k in FIELDS)):
-        con.execute("UPDATE responses SET " + ",".join(f"{k}=?" for k in FIELDS) +
-                    ",source_id=?,turn_id=?,ordinal_num=?,ts=?,effort=?,thread_id=?,root_turn_id=?,session_id=? "
+    if not same_source or row["turn_id"] != turn or any(row[k] != measured[k] for k in COUNTERS):
+        con.execute("UPDATE responses SET " + ",".join(f"{k}=?" for k in COUNTERS) +
+                    ",source_id=?,turn_id=?,ordinal_num=?,ts=?,model=?,effort=?,thread_id=?,root_turn_id=?,session_id=? "
                     "WHERE response_id=?",
-                    (*(measured[k] for k in FIELDS), source["source_id"], turn,
-                     source["position"], source["ts"], source["effort"], source["thread_id"],
+                    (*(measured[k] for k in COUNTERS), source["source_id"], turn,
+                     source["position"], source["ts"], row["model"] if same_source else measured["model"],
+                     row["effort"] if same_source else source["effort"], source["thread_id"],
                      source["root_turn_id"], source["session_id"], rid))
     if source["input_id"]:
         for o in copies:
@@ -128,7 +139,7 @@ def disputes(con, session_key, semantics):
     if not db._has_table(con, "codex_atomic_observations"):
         return historical, legacy, {}
     groups = defaultdict(list)
-    columns = ",".join("r." + k for k in FIELDS)
+    columns = ",".join("r." + k for k in COUNTERS)
     for o in con.execute("SELECT o.*,r.source_id AS measured_source,r.turn_id AS measured_turn," + columns + """
             FROM codex_atomic_observations o
             LEFT JOIN responses r ON r.response_id=o.response_id WHERE o.session_key=? OR o.response_id IN (
@@ -138,7 +149,7 @@ def disputes(con, session_key, semantics):
     conflicts = historical
     partial = {}
     for rid, copies in groups.items():
-        variants = {(o["session_key"], o["input_id"], o["measurement"]) for o in copies}
+        variants = {_signature(o) for o in copies}
         if (len(variants) > 1 or not copies[0]["measurement"] or
                 copies[0]["measured_source"] not in {o["source_id"] for o in copies}):
             conflicts[rid] = {o["input_id"] for o in copies if o["input_id"]}
@@ -147,7 +158,7 @@ def disputes(con, session_key, semantics):
             turn = copies[0]["input_id"]
             inputs = {turn} if turn else set()
             if (copies[0]["measured_turn"] != ("codex:" + turn if turn else None)
-                    or any(values[k] != copies[0][k] for k in FIELDS)):
+                    or any(values[k] != copies[0][k] for k in COUNTERS)):
                 conflicts[rid] = inputs
             elif any(values[k] is None for k in ("input_tokens", "output_tokens", "total_tokens")):
                 partial[rid] = inputs

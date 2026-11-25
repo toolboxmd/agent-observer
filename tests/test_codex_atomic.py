@@ -31,7 +31,7 @@ class CodexAtomicTest(LedgerCase):
 
     def source(self, name, turn, total, *, torn=False):
         path = Path(self.tmp.name, name + ".jsonl")
-        self.context["payload"].update(turn_id=turn, model="gpt-5-mini")
+        self.context["payload"].update(turn_id=turn, model="gpt-5.6-luna")
         self.atom["payload"].update(turn_id=turn, root_turn_id=turn)
         output = total - 1000 if isinstance(total, int) else total
         self.atom["payload"]["usage"].update(total_tokens=total, output_tokens=output)
@@ -87,3 +87,26 @@ class CodexAtomicTest(LedgerCase):
         write_records(first, [self.meta])
         codex.import_codex_file(self.con, str(first))
         self.check_owners(None, 91100)
+
+    def check_repeat_context(self, append):
+        first = self.source("first", "A", 1100)
+        original = report.task_report(self.con, "A")["total_cost"]["estimate"]["estimated_cost_usd_partial"]
+        self.assertGreater(original, 0)
+        if append:
+            copy = first
+            self.context["payload"]["model"] = "gpt-6-astra"
+            write_records(first, [self.context, self.atom], mode="a")
+        else:
+            copy = first.with_name("no-model.jsonl")
+            write_records(copy, [self.meta, self.atom])
+        for full in (False, True):
+            codex.import_codex_file(self.con, str(copy), full=full)
+            self.check_owners(1100, None)
+            estimate = report.task_report(self.con, "A")["total_cost"]["estimate"]
+            self.assertEqual(estimate["estimated_cost_usd_partial"], original)
+
+    def test_repeated_atom_after_model_switch_keeps_its_original_charge(self):
+        self.check_repeat_context(True)
+
+    def test_contextless_duplicate_keeps_its_original_charge(self):
+        self.check_repeat_context(False)
