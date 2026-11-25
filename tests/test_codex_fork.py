@@ -551,8 +551,8 @@ class RetainedHistoryUpgradeTest(unittest.TestCase):
                     "content_item_kinds": ["user.text"]}}
         if user_id:
             user["id"] = user_id
-        alpha = os.path.join(self.tmp.name, "removed-alpha", "x.py")
-        beta = os.path.join(self.tmp.name, "removed-beta", "x.py")
+        alpha = os.path.join(self.tmp.name, "alpha-checkout", "x.py")
+        beta = os.path.join(self.tmp.name, "beta-checkout", "x.py")
         rows = [
             {"type": "session_meta", "payload": child},
             {"type": "session_meta", "payload": {
@@ -596,24 +596,26 @@ class RetainedHistoryUpgradeTest(unittest.TestCase):
         t3._ensure_tables(con)
         for i, repo in enumerate(("alpha", "beta"), 1):
             task = f"o/{repo}#{i}"
-            root = os.path.join(self.tmp.name, f"removed-{repo}")
+            root = os.path.join(self.tmp.name, f"{repo}-checkout")
             con.execute(
                 "INSERT OR IGNORE INTO tasks(task_id, title, created_at)"
                 " VALUES(?,?,0)", (task, task))
             con.execute(
                 "INSERT OR IGNORE INTO session_assignments"
                 "(session_key, task_id, evidence, created_at)"
-                " VALUES('codex:parent', ?, 'review', 0)", (task,))
+                " VALUES('codex:parent', ?, 't3', 0)", (task,))
             con.execute(
                 "INSERT OR IGNORE INTO t3_links(thread_id, kind, host,"
                 " repository, number, url, head_branch)"
                 " VALUES('t','pr','github.com',?,?,?,?)",
                 (f"o/{repo}", i, f"https://github.com/o/{repo}/pull/{i}",
                  "fix/" + repo))
-            con.execute(
-                "INSERT OR IGNORE INTO checkouts(root, repository, branch,"
-                " seen_at) VALUES(?,?,?,0)",
-                (root, f"o/{repo}", "fix/" + repo))
+            if not os.path.isdir(root):
+                for args in (["init", "-q", "-b", "fix/" + repo, root],
+                             ["-C", root, "remote", "add", "origin", f"git@github.com:o/{repo}.git"],
+                             ["-C", root, "-c", "user.email=t@t", "-c", "user.name=t",
+                              "commit", "-q", "--allow-empty", "-m", "start"]):
+                    subprocess.run(["git", *args], check=True, capture_output=True)
 
     def test_upgrade_keeps_parent_input_and_read_attribution(self):
         for user_id in (None, "parent-input"):
@@ -640,7 +642,8 @@ class RetainedHistoryUpgradeTest(unittest.TestCase):
                             con, [sub], turns_before=0, turns_after=0)[0]
                         self.assertEqual(shown["status"], "ok", shown)
                         self.assertIn("retained parent input", shown["text"])
-                        placed = placement.place_session(con, "codex:parent")
+                        placement.record_shared_checkouts(con)
+                        placed = placement.read_placements(con, "codex:parent")
                         self.assertEqual(placed["codex:parent-r1"], "o/alpha#1")
                         self.assertEqual(placed["codex:parent-r2"], "o/beta#2")
                         for i, repo in enumerate(("alpha", "beta"), 1):

@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 from contextlib import redirect_stdout
+from unittest.mock import patch
 
 from agent_observer import cli, db, placement, report
 from agent_observer.adapters import t3 as t3_adapter
@@ -76,6 +77,7 @@ class PlacementTest(LedgerCase):
 
     def test_each_pr_counts_only_its_own_responses_and_totals_reconcile(self):
         self.claude_session()
+        placement.record_shared_checkouts(self.con)
         alpha = report.task_report(self.con, "o/alpha#1", schedule=SCHEDULE)
         beta = report.task_report(self.con, "o/beta#2", schedule=SCHEDULE)
         self.assertEqual(alpha["measured"]["attributed_responses"], ["r0"])
@@ -91,7 +93,8 @@ class PlacementTest(LedgerCase):
     def test_codex_calls_belong_to_the_next_response(self):
         a, b = self.checkouts["alpha"], self.checkouts["beta"]
         self.session("codex", [(2, 1, f"ls {a}"), (4, 3, f"ls {b}")])
-        placed = placement.place_session(self.con, "codex:s")
+        placement.record_shared_checkouts(self.con)
+        placed = placement.read_placements(self.con, "codex:s")
         self.assertEqual(placed, {"r0": "o/alpha#1", "r1": "o/beta#2"})
 
     def test_removed_worktree_still_places_from_recorded_checkouts(self):
@@ -99,45 +102,90 @@ class PlacementTest(LedgerCase):
         self.assertEqual(placement.record_shared_checkouts(self.con), 1)
         for root in self.checkouts.values():
             shutil.rmtree(root)
-        placed = placement.place_session(self.con, "claude:s")
+        placed = placement.read_placements(self.con, "claude:s")
         self.assertEqual((placed["r0"], placed["r1"]), ("o/alpha#1", "o/beta#2"))
 
     def test_without_head_branches_the_session_stays_shared_whole(self):
         self.claude_session()
         self.con.execute("UPDATE t3_links SET head_branch=NULL")
+        placement.record_shared_checkouts(self.con)
         alpha = report.task_report(self.con, "o/alpha#1", schedule=SCHEDULE)
         self.assertEqual(alpha["shared_joint"]["responses"], 5)
         self.assertEqual(alpha["attributed"]["responses"], 0)
 
+    def test_heads_linked_after_checkout_retirement_use_the_original_observation(self):
+        key = self.claude_session()
+        self.con.execute("UPDATE t3_links SET head_branch=NULL")
+        placement.record_shared_checkouts(self.con)
+        shutil.rmtree(self.checkouts["alpha"])
+        self.con.execute("UPDATE t3_links SET head_branch='fix/a' WHERE number=1")
+        self.assertEqual(placement.read_placements(self.con, key)["r0"], "o/alpha#1")
+
     def test_unsupported_harness_stays_shared_whole(self):
         self.session("opencode", [(1, 2, f"ls {self.checkouts['alpha']}")])
-        self.assertIsNone(placement.place_session(self.con, "opencode:s"))
+        self.assertIsNone(placement.read_placements(self.con, "opencode:s"))
 
     def test_detached_checkout_matches_no_pr(self):
-        root = self.checkouts["alpha"]
-        _git("-C", root, "checkout", "-q", "--detach")
-        self.assertEqual(placement.checkout_of(self.con, root), ("o/alpha", None))
-
-    def test_reused_checkout_path_is_read_live_not_from_its_record(self):
-        # Review of 8e20c4b: a recorded root later holding another branch.
-        self.claude_session()
+        _git("-C", self.checkouts["alpha"], "checkout", "-q", "--detach")
+        key = self.claude_session()
         placement.record_shared_checkouts(self.con)
-        _git("-C", self.checkouts["alpha"], "checkout", "-q", "-b", "fix/b")
-        _git("-C", self.checkouts["alpha"], "remote", "set-url", "origin",
-             "git@github.com:o/beta.git")
-        placed = placement.place_session(self.con, "claude:s")
-        self.assertEqual(placed["r0"], "o/beta#2")
-        self.assertEqual(placement.checkout_of(self.con, self.checkouts["alpha"]),
-                         ("o/beta", "fix/b"))
+        self.assertIsNone(placement.read_placements(self.con, key)["r0"])
 
-    def test_checkout_without_origin_forgets_its_old_record(self):
-        # Second review of 382552e: no origin now, removed later.
+    def test_reused_checkout_path_preserves_old_and_new_response_witnesses(self):
+        key = self.claude_session()
+        placement.record_shared_checkouts(self.con)
         root = self.checkouts["alpha"]
-        self.assertEqual(placement.checkout_of(self.con, root), ("o/alpha", "fix/a"))
-        _git("-C", root, "remote", "remove", "origin")
-        self.assertIsNone(placement.checkout_of(self.con, root))
+        _git("-C", root, "checkout", "-q", "-b", "fix/b")
+        _git("-C", root, "remote", "set-url", "origin", "git@github.com:o/beta.git")
+        self.con.execute("INSERT INTO responses(response_id,source_id,session_key,"
+                         " ordinal_num) VALUES('new',?,?,10)", (self.source, key))
+        self.con.execute("INSERT INTO events(session_key,ordinal_num,family,native_id,target)"
+                         " VALUES(?,11,'read','new-call',?)", (key, root))
+        self.assertIsNone(placement.read_placements(self.con, key)["new"])
+        placement.record_shared_checkouts(self.con)
         shutil.rmtree(root)
-        self.assertIsNone(placement.checkout_of(self.con, root))
+        placement.record_shared_checkouts(self.con)
+        placed = placement.read_placements(self.con, key)
+        self.assertEqual((placed["r0"], placed["new"]), ("o/alpha#1", "o/beta#2"))
+
+    def test_removed_checkout_without_response_evidence_does_not_place(self):
+        key = self.claude_session()
+        root = self.checkouts["alpha"]
+        self.con.execute("INSERT INTO checkouts(root,repository,branch,seen_at)"
+                         " VALUES(?,'o/alpha','fix/a',0)", (root,))
+        shutil.rmtree(root)
+        self.assertEqual(placement.read_placements(self.con, key), {})
+        placement.record_shared_checkouts(self.con)
+        self.assertIsNone(placement.read_placements(self.con, key)["r0"])
+
+    def test_checkout_without_origin_cannot_gain_a_retroactive_match(self):
+        key = self.claude_session()
+        root = self.checkouts["alpha"]
+        _git("-C", root, "remote", "remove", "origin")
+        placement.record_shared_checkouts(self.con)
+        _git("-C", root, "remote", "add", "origin", "git@github.com:o/alpha.git")
+        placement.record_shared_checkouts(self.con)
+        self.assertIsNone(placement.read_placements(self.con, key)["r0"])
+
+    def test_identical_heads_are_ambiguous_even_if_linked_after_sync(self):
+        key = self.claude_session()
+        placement.record_shared_checkouts(self.con)
+        self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES('o/alpha#3',0)")
+        self.con.execute("INSERT INTO session_assignments VALUES(?,'o/alpha#3','t3',0)", (key,))
+        self.con.execute("INSERT INTO t3_links(thread_id,kind,host,repository,number,url,"
+                         " head_branch) VALUES('t','pr','github.com','o/alpha',3,'url','fix/a')")
+        placed = placement.read_placements(self.con, key)
+        self.assertIsNone(placed["r0"])
+        self.assertEqual(placed["r1"], "o/beta#2")
+
+    def test_explicit_session_owner_preserves_whole_sharing(self):
+        key = self.claude_session()
+        placement.record_shared_checkouts(self.con)
+        self.con.execute("UPDATE session_assignments SET evidence='router:job'"
+                         " WHERE task_id='o/alpha#1'")
+        self.assertIsNone(placement.read_placements(self.con, key))
+        alpha = report.task_report(self.con, "o/alpha#1", schedule=SCHEDULE)
+        self.assertEqual(alpha["shared_joint"]["responses"], 5)
 
     def test_read_only_ledger_still_splits(self):
         # publish and task open the ledger read-only (cli.py).
@@ -151,33 +199,21 @@ class PlacementTest(LedgerCase):
             ro.close()
         self.assertEqual(alpha["measured"]["attributed_responses"], ["r0"])
 
-    def test_read_only_report_keeps_its_snapshot_across_git(self):
-        # A concurrent sync commits during live git. The reader opened
-        # with BEGIN must not COMMIT, or scope totals see the new row
-        # while attributed rows stay on the old snapshot.
+    def test_report_uses_only_ledger_reads_and_keeps_its_snapshot(self):
         self.claude_session()
-        self.con.commit()
+        placement.record_shared_checkouts(self.con)
         ro = db.connect_read_only(self.db_path)
-        real = placement._git
-        bumped = []
-
-        def wrapped(checkout, *args):
-            if not bumped:
-                bumped.append(checkout)
-                self.con.execute(
-                    "UPDATE responses SET input_tokens=1100, total_tokens=1110"
-                    " WHERE response_id='r0'")
-                self.con.commit()
-            return real(checkout, *args)
-
-        placement._git = wrapped
-        try:
+        self.addCleanup(ro.close)
+        statements = []
+        ro.set_trace_callback(statements.append)
+        self.con.execute("UPDATE responses SET input_tokens=1100, total_tokens=1110"
+                         " WHERE response_id='r0'")
+        self.con.commit()
+        with patch.object(placement, "_git", side_effect=AssertionError("report ran git")):
             alpha = report.task_report(ro, "o/alpha#1", schedule=SCHEDULE)
-            self.assertTrue(ro.in_transaction)
-        finally:
-            placement._git = real
-            ro.close()
-        self.assertTrue(bumped)
+        self.assertTrue(ro.in_transaction)
+        self.assertEqual({s.split()[0].upper() for s in statements} -
+                         {"SELECT", "WITH", "PRAGMA"}, set())
         self.assertTrue(alpha["reconciles"])
         self.assertEqual(alpha["attributed"]["total_tokens"], 110)
         self.assertEqual(alpha["scope"]["total_tokens"], 550)
@@ -227,7 +263,8 @@ class PlacementTest(LedgerCase):
             stored = dict(self.con.execute(
                 "SELECT response_id, ordinal_num FROM responses"))
             self.assertEqual(stored, {"codex:r1": 3, "codex:r2": 6})
-            self.assertEqual(placement.place_session(self.con, key), {
+            placement.record_shared_checkouts(self.con)
+            self.assertEqual(placement.read_placements(self.con, key), {
                 "codex:r1": "o/alpha#1", "codex:r2": "o/beta#2"})
             alpha_report = report.task_report(self.con, "o/alpha#1", schedule=SCHEDULE)
             beta_report = report.task_report(self.con, "o/beta#2", schedule=SCHEDULE)
@@ -244,7 +281,8 @@ class PlacementTest(LedgerCase):
         self.assertEqual(self.con.execute(
             "SELECT ordinal_num FROM responses WHERE response_id='codex:r1'"
         ).fetchone()[0], 3)
-        self.assertEqual(placement.place_session(self.con, key), {
+        placement.record_shared_checkouts(self.con)
+        self.assertEqual(placement.read_placements(self.con, key), {
             "codex:r1": "o/alpha#1", "codex:r2": "o/beta#2"})
 
     def test_repeated_fallback_snapshot_keeps_its_first_position(self):
@@ -320,7 +358,8 @@ class PlacementTest(LedgerCase):
             stored = dict(self.con.execute(
                 "SELECT native_id, ordinal_num FROM events"))
             self.assertEqual(stored, {"call-a": 2, "call-b": 5})
-            self.assertEqual(placement.place_session(self.con, key), {
+            placement.record_shared_checkouts(self.con)
+            self.assertEqual(placement.read_placements(self.con, key), {
                 "codex:r1": "o/alpha#1", "codex:r2": "o/beta#2"})
             alpha_report = report.task_report(self.con, "o/alpha#1", schedule=SCHEDULE)
             beta_report = report.task_report(self.con, "o/beta#2", schedule=SCHEDULE)
@@ -344,7 +383,8 @@ class PlacementTest(LedgerCase):
         self.assertEqual(self.con.execute(
             "SELECT intervention_id FROM verdicts").fetchone()[0],
             f"ev:{key}/tool_call/call-a")
-        self.assertEqual(placement.place_session(self.con, key)["codex:r1"],
+        placement.record_shared_checkouts(self.con)
+        self.assertEqual(placement.read_placements(self.con, key)["codex:r1"],
                          "o/alpha#1")
 
     def test_continuation_keeps_the_original_call_and_response(self):
@@ -412,7 +452,8 @@ class PlacementTest(LedgerCase):
                              (3, "calls.jsonl"))
             self.assertEqual(owned("responses", "response_id", "codex:r2"),
                              (6, "calls.jsonl"))
-            self.assertEqual(placement.place_session(self.con, key), {
+            placement.record_shared_checkouts(self.con)
+            self.assertEqual(placement.read_placements(self.con, key), {
                 "codex:r1": "o/alpha#1", "codex:r2": "o/beta#2"})
             alpha_report = report.task_report(
                 self.con, "o/alpha#1", schedule=SCHEDULE)
@@ -480,7 +521,8 @@ class PlacementTest(LedgerCase):
             "SELECT COUNT(*) FROM events WHERE native_id='call-a'").fetchone()[0], 1)
         self.assertEqual(con.execute(
             "SELECT COUNT(*) FROM responses WHERE is_overlap=0").fetchone()[0], 2)
-        self.assertEqual(placement.place_session(con, key), {
+        placement.record_shared_checkouts(con)
+        self.assertEqual(placement.read_placements(con, key), {
             "codex:r1": "o/alpha#1", "codex:r2": "o/beta#2"})
         alpha_report = report.task_report(con, "o/alpha#1", schedule=SCHEDULE)
         beta_report = report.task_report(con, "o/beta#2", schedule=SCHEDULE)
@@ -575,11 +617,19 @@ class PlacementTest(LedgerCase):
                 (f"o/{repo}", n, f"https://github.com/o/{repo}/pull/{n}", branch))
         self._bind_placement_tasks(other)
         for con, order in ((self.con, (first, second)), (other, (second, first))):
+            import_codex_file(con, order[0])
+            placement.record_shared_checkouts(con)
+            self.assertEqual(list(placement.read_placements(con, key).values()), ["o/alpha#1"])
+            import_codex_file(con, order[1])
+            # A Codex-only import can invalidate a sync's witness before
+            # the placement recorder next runs.
+            ambiguous = {"codex:r1": None, "codex:r2": None}
+            self.assertEqual(placement.read_placements(con, key), ambiguous)
             for full in (False, True, False):
                 for path in order:
                     import_codex_file(con, path, full=full)
-                self.assertEqual(placement.place_session(con, key), {
-                    "codex:r1": None, "codex:r2": None})
+                placement.record_shared_checkouts(con)
+                self.assertEqual(placement.read_placements(con, key), ambiguous)
 
     def test_shared_checkout_is_resolved_once_per_sync(self):
         # Two shared sessions in one record_shared_checkouts share a root.
@@ -622,38 +672,25 @@ class PlacementTest(LedgerCase):
         self.assertEqual(
             [c for c in calls if c == (root, ("rev-parse", "--abbrev-ref", "HEAD"))],
             [(root, ("rev-parse", "--abbrev-ref", "HEAD"))])
-        row = self.con.execute(
-            "SELECT repository, branch FROM checkouts WHERE root=?",
-            (root,)).fetchone()
-        self.assertEqual((row["repository"], row["branch"]), ("o/alpha", "fix/a"))
+        for n in (1, 2):
+            self.assertEqual(placement.read_placements(self.con, f"claude:s{n}"),
+                             {f"once{n}": "o/alpha#1"})
 
     def test_live_git_runs_outside_an_open_write(self):
-        self.con.execute(
-            "INSERT INTO checkouts(root, repository, branch, seen_at)"
-            " VALUES(?,?,?,0)", ("/tmp/seed-open-write", "o/seed", "main"))
+        key = self.claude_session()
         self.assertTrue(self.con.in_transaction)
-        flags = []
         real = placement._git
 
-        def wrapped(checkout, *args):
-            flags.append(self.con.in_transaction)
-            return real(checkout, *args)
+        def check_transaction(root, *args):
+            self.assertFalse(self.con.in_transaction)
+            return real(root, *args)
 
-        placement._git = wrapped
-        try:
-            found = placement.checkout_of(self.con, self.checkouts["alpha"])
-        finally:
-            placement._git = real
-        self.assertEqual(found, ("o/alpha", "fix/a"))
-        self.assertEqual(flags, [False, False])
-        other = db.connect(self.db_path)
-        try:
-            row = other.execute(
-                "SELECT repository, branch FROM checkouts WHERE root=?",
-                (self.checkouts["alpha"],)).fetchone()
-        finally:
-            other.close()
-        self.assertEqual((row["repository"], row["branch"]), ("o/alpha", "fix/a"))
+        with patch.object(placement, "_git", side_effect=check_transaction) as git:
+            placement.record_shared_checkouts(self.con)
+        self.assertTrue(git.called)
+        other = db.connect_read_only(self.db_path)
+        self.addCleanup(other.close)
+        self.assertEqual(placement.read_placements(other, key)["r0"], "o/alpha#1")
 
     def test_sync_records_shared_sessions_once_after_refresh(self):
         calls = []
@@ -681,7 +718,7 @@ class PlacementTest(LedgerCase):
         ns = type("NS", (), {})()
         ns.harness = ["t3", "codex"]
         ns.source = None
-        ns.root = None
+        ns.root = self.tmp.name
         ns.full = False
         ns.agentsmd_repo = os.path.join(self.tmp.name, "no-such-repo")
         ns.as_json = True
