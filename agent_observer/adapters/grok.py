@@ -35,6 +35,7 @@ from .discovery import path_info
 HARNESS = "grok"
 SEMANTICS = "grok:input_includes_cached,output_includes_reasoning"
 DEFAULT_ROOT = os.path.expanduser("~/.grok/sessions")
+SESSION_RECORD_FILES = ("updates.jsonl", "events.jsonl", "summary.json", "chat_history.jsonl")
 
 CAPABILITIES = [
     ("model_usage", True, "one responses row per turn_completed prompt_id; input includes cached reads, output includes reasoning"),
@@ -307,9 +308,7 @@ def _session_path_is(path, is_mode, permissive, strict):
 
 def _looks_like_session(path: str, *, strict: bool = False) -> bool:
     return any(_session_path_is(os.path.join(path, name), stat.S_ISREG, os.path.isfile, strict)
-               for name in
-               ("updates.jsonl", "events.jsonl", "summary.json",
-                "chat_history.jsonl"))
+               for name in SESSION_RECORD_FILES)
 
 
 class _SyncCtx:
@@ -587,17 +586,18 @@ def _ensure_grok_meta_table(con: sqlite3.Connection) -> None:
             " summary_fp TEXT, chat_fp TEXT)")
     except sqlite3.DatabaseError:
         pass
-    for column in ("chat_seen_json", "chat_synthetic_json", "chat_effort",
-                   "chat_reliable"):
-        try:
-            cols = {row["name"] for row in con.execute(
-                f"PRAGMA table_info({_GROK_META_TABLE})")}
-        except sqlite3.DatabaseError:
-            return
+    try:
+        cols = {row["name"] for row in con.execute(
+            f"PRAGMA table_info({_GROK_META_TABLE})")}
+    except sqlite3.DatabaseError:
+        return
+    for column, affinity in (("chat_seen_json", "TEXT"), ("chat_synthetic_json", "TEXT"),
+                             ("chat_effort", "TEXT"), ("chat_reliable", "TEXT"),
+                             ("imported_at", "REAL")):
         if column not in cols:
             try:
                 con.execute(
-                    f"ALTER TABLE {_GROK_META_TABLE} ADD COLUMN {column} TEXT")
+                    f"ALTER TABLE {_GROK_META_TABLE} ADD COLUMN {column} {affinity}")
             except sqlite3.DatabaseError:
                 pass
 
@@ -608,6 +608,14 @@ def _summary_fingerprint(summary: dict) -> str:
     except (TypeError, ValueError):
         canonical = repr(sorted(summary.keys()))
     return hashlib.sha256(f"{_IMPORT_VERSION}:{canonical}".encode("utf-8", "replace")).hexdigest()
+
+
+def newest_metadata_import(con: sqlite3.Connection) -> float | None:
+    """Latest summary/chat import, when this ledger tracks metadata imports."""
+    if "imported_at" not in {row[1] for row in con.execute(
+            f"PRAGMA table_info({_GROK_META_TABLE})")}:
+        return None
+    return con.execute(f"SELECT MAX(imported_at) FROM {_GROK_META_TABLE}").fetchone()[0]
 
 
 def _stored_meta(con: sqlite3.Connection, session_key: str):
@@ -678,10 +686,10 @@ def _store_meta(con: sqlite3.Connection, session_key: str,
         con.execute(
             f"INSERT OR REPLACE INTO {_GROK_META_TABLE}"
             "(session_key, summary_fp, chat_fp, chat_seen_json,"
-            " chat_synthetic_json, chat_effort, chat_reliable)"
-            " VALUES(?,?,?,?,?,?,?)",
+            " chat_synthetic_json, chat_effort, chat_reliable, imported_at)"
+            " VALUES(?,?,?,?,?,?,?,?)",
             (session_key, summary_fp, chat_fp, seen_json, synth_json,
-             chat_effort, chat_reliable))
+             chat_effort, chat_reliable, db.now()))
     except sqlite3.DatabaseError:
         pass
 
@@ -1638,6 +1646,13 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             updates_new = updates_src is not None and not updates_src.unchanged
             events_new = events_src is not None and not events_src.unchanged
             if not updates_new and not events_new:
+                if updates_src is None and events_src is None:
+                    # Older ledgers kept fingerprints for metadata-only
+                    # sessions without a timestamp. They were rechecked above.
+                    con.execute(f"UPDATE {_GROK_META_TABLE} SET imported_at=?"
+                                " WHERE session_key=? AND imported_at IS NULL",
+                                (db.now(), r.session_key))
+                    con.commit()
                 stats["unchanged"] = True
                 stats["session_key"] = r.session_key
                 return stats

@@ -22,6 +22,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .adapters import bare as bare_adapter
+from .adapters.discovery import path_info
 
 CLAUDE_FIX = ("start the session with the parent's CLAUDE_CODE_*, CLAUDECODE, CLAUDE_PID "
               "and CLAUDE_EFFORT variables unset, or with CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1")
@@ -211,12 +212,8 @@ def bare_roots() -> dict:
 
 
 def _mtime(path: str, *, min_size: int = 0) -> float | None:
-    try:
-        info = os.stat(path)
-    except FileNotFoundError:
-        # An active harness can move or delete a file after discovery.
-        return None
-    if stat.S_ISREG(info.st_mode) and info.st_size >= min_size:
+    info = path_info(path)
+    if info is not None and stat.S_ISREG(info.st_mode) and info.st_size >= min_size:
         return info.st_mtime
     return None
 
@@ -249,14 +246,26 @@ def _opencode_record_times(paths):
 
 
 def _native_record_times(harness, paths):
+    from .adapters import grok
+
     if harness == "opencode":
         yield from _opencode_record_times(paths)
         return
+    seen_files = set()
     for path in dict.fromkeys(paths):
         if harness == "grok":
             # One session directory can contain two independently imported logs.
             times = (_mtime(os.path.join(path, name))
-                     for name in ("updates.jsonl", "events.jsonl"))
+                     for name in grok.SESSION_RECORD_FILES)
+        elif harness == "codex":
+            info = path_info(path)
+            if info is None or not stat.S_ISREG(info.st_mode):
+                continue
+            identity = (info.st_dev, info.st_ino)
+            if identity not in seen_files:
+                seen_files.add(identity)
+                yield info.st_mtime
+            continue
         elif harness in ("t3", "router"):
             # A SQLite source can advance before its main file is checkpointed.
             times = (_mtime(path), _mtime(path + "-wal", min_size=33))
@@ -270,22 +279,25 @@ def _native_record_times(harness, paths):
 def _discover_native_paths(harness, adapter):
     from .adapters import router
     if harness == "t3":
-        return [adapter.state_path()]
+        return [adapter.state_path(strict=True)]
     paths = adapter.discover(strict=True)
     if harness == "codex":
         paths.extend(router.discover_rollouts(strict=True))
-        return [os.path.realpath(path) for path in paths]
     return paths
 
 
 def _ledger_freshness(con, sync_interval_seconds, unavailable, ledger_error):
-    from .adapters import available
+    from .adapters import available, grok
 
     imports = {}
     if con is not None:
         try:
             imports = dict(con.execute(
                 "SELECT harness, MAX(imported_at) FROM sources GROUP BY harness"))
+            metadata_import = grok.newest_metadata_import(con)
+            if metadata_import is not None:
+                recorded = imports.get("grok", metadata_import)
+                imports["grok"] = max(recorded, metadata_import)
         except sqlite3.Error as exc:
             ledger_error = str(exc)
     if ledger_error is not None:

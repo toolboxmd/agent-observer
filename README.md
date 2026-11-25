@@ -712,7 +712,8 @@ Health also compares the newest native record with the newest successful ledger
 import for each harness. It counts native sources newer than that harness's
 latest import. Claude, Codex and Muse use transcript file modification times.
 Codex includes rollouts imported by Model Router.
-Grok counts each session directory once using the newest of its two event logs.
+Grok counts each session directory once using its newest event log or session
+metadata file.
 OpenCode counts sessions by their latest session, message or part timestamp.
 Chromeria and Router use database and WAL modification times. These comparisons
 measure lag for each harness. Individual missing imports can predate its newest

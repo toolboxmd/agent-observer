@@ -391,6 +391,59 @@ class LedgerFreshnessTest(unittest.TestCase):
         self.assertIn({"check": "grok native record scan",
                        "reason": "fixture record unreachable"}, result["unavailable"])
 
+    def test_denied_chromeria_v2_state_is_unavailable_for_state_and_receipts(self):
+        path = self.root / "t3/userdata/chromeria-v2.sqlite"
+        path.parent.mkdir(parents=True)
+        stat = os.stat
+
+        def checked_stat(target, *args, **kwargs):
+            if target == str(path):
+                raise PermissionError("fixture V2 state unreachable")
+            return stat(target, *args, **kwargs)
+
+        with patch.object(os, "stat", checked_stat):
+            code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        rows = json.loads(output)["ledger_freshness"]
+        for harness in ("t3", "codex", "grok"):
+            self.assertEqual(rows[harness]["status"], "unavailable")
+
+    def test_grok_metadata_only_lag_clears_after_import(self):
+        session = self.root / "grok/project/session-one"
+        session.mkdir(parents=True)
+        summary = session / "summary.json"
+        summary.write_text("{}")
+        os.utime(summary, (20_000, 20_000))
+        self.imports(grok=11_000)
+
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        self.assertEqual(json.loads(output)["ledger_freshness"]["grok"]["newer_sources"], 1)
+
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            self.assertEqual(grok.sync(con)["failed"], [])
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 1)
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 0)
+        row = json.loads(output)["ledger_freshness"]["grok"]
+        self.assertEqual(row["status"], "current")
+        self.assertGreaterEqual(row["newest_import_at"], 20_000)
+
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            con.execute("UPDATE grok_session_meta SET imported_at=NULL")
+            con.commit()
+            self.assertEqual(grok.sync(con)["failed"], [])
+        self.assertEqual(self.run_health("--json")[0], 0)
+
+    def test_codex_counts_hard_linked_rollouts_once(self):
+        self.source("codex/2026/rollout-first.jsonl", 20_000)
+        os.link(self.root / "codex/2026/rollout-first.jsonl",
+                self.root / "codex/2026/rollout-alias.jsonl")
+        self.imports(codex=11_000)
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        self.assertEqual(json.loads(output)["ledger_freshness"]["codex"]["newer_sources"], 1)
+
 
 class ClaudeVisibilityTest(unittest.TestCase):
     def setUp(self):
