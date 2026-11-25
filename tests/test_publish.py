@@ -108,6 +108,11 @@ class PublishTest(LedgerCase):
         self.assertIn("Delivery PR: https://github.com/org/repo/pull/12", body)
         self.assertIn("Harness-reported cost: none reported.", body)
         self.assertNotIn("$84", body)
+        summary["task_id"] = "internal.example/team/private-repo#11"
+        private = publish.render(summary)
+        self.assertNotIn("internal.example", private)
+        self.assertNotIn("private-repo", private)
+        self.assertIn("Outcome: reference withheld", private)
 
     def test_second_publish_edits_the_same_owned_comment(self):
         gh = PublishGh([])

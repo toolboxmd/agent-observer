@@ -102,6 +102,15 @@ def _safe_ref(value) -> str | None:
     return None
 
 
+def _task_label(task_id):
+    """GitHub outcome IDs use owner/repo#number. Other forges include their host."""
+    if isinstance(task_id, str):
+        repository, _, number = task_id.rpartition("#")
+        if number.isdecimal() and "/" in repository and not _REPO_RE.fullmatch(repository):
+            return "reference withheld"
+    return _safe_field(task_id)
+
+
 def _fmt(n) -> str:
     return "unknown" if n is None else f"{int(n):,}"
 
@@ -434,8 +443,9 @@ def render(summary: dict, target: str | None = None) -> str:
               _counted(sessions, "session", "sessions"), wall]
     lines = [MARKER, f"### {title}", "", " · ".join(parts), ""]
     native = summary.get("native_purpose") or {}
+    task_label = _task_label(summary.get("task_id"))
     if native.get("runs") or native.get("deliveries") or native.get("conflicting_source_runs"):
-        lines.append(f"Outcome: {_safe_field(summary['task_id'])}.")
+        lines.append(f"Outcome: {task_label}.")
         if native.get("coverage_gaps"):
             lines.append("Full outcome cost unknown. Native coverage: " +
                          ", ".join(_safe_field(g.replace("_", " ")) for g in native["coverage_gaps"]) + ".")
@@ -465,7 +475,7 @@ def render(summary: dict, target: str | None = None) -> str:
     versions = ", ".join(_safe_field(v) for v in summary['agentsmd_versions']) or "unknown"
     if task:
         acceptance = summary.get("acceptance_state") or "unknown"
-        lines.append(f"- Task `{_safe_field(summary.get('task_id'))}`: outcome "
+        lines.append(f"- Task `{task_label}`: outcome "
                      f"{_safe_field(acceptance)} (recorded acceptance only; a finished "
                      f"process never implies it).")
         outcome = summary.get("outcome") or {}
