@@ -163,10 +163,11 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
         result.literal_sessions.add(key)
     call_witnesses = set()
     disputed_completions = set()
-    malformed = {}
+    unavailable = {}
     if harness == "claude":
         from .adapters import claude
         responses, disputed_completions = claude.response_witnesses(con, key)
+        unavailable = {rid: responses.get(rid, set()) for rid in claude.provisional_responses(con, key)}
         disputed_completions |= claude.conflicting_final_measurements(con, key)
         result.conflicts.update(disputed_completions)
         if _has_table(con, "claude_unreadable_sources") and con.execute(
@@ -174,7 +175,7 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
             result.unlocated_usage_sessions.add(key)
     elif harness == "opencode":
         from .adapters import opencode
-        responses, disputed_completions, malformed = opencode.response_witnesses(con, key)
+        responses, disputed_completions, unavailable = opencode.response_witnesses(con, key)
         if opencode.has_unlocated_usage_error(con, key):
             result.unlocated_usage_sessions.add(key)
     elif harness == "grok":
@@ -200,9 +201,9 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
             exclusive = False
     measured_turns = dict(con.execute(
         "SELECT response_id,turn_id FROM responses WHERE session_key=? AND is_overlap=0", (key,)))
-    for rid in measured_turns.keys() | malformed.keys():
+    for rid in measured_turns.keys() | unavailable.keys():
         display_turn = measured_turns.get(rid)
-        input_ids = responses.get(rid, malformed.get(rid, set()))
+        input_ids = responses.get(rid, unavailable.get(rid, set()))
         if rid in disputed_completions or len(input_ids) > 1:
             result.conflicts.add(rid)
             blocked_turns.update((display_turn, rid))
@@ -285,7 +286,7 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
                 result.turns.add((key, "codex:" + native_id))
             elif harness == "grok":
                 result.turns.add((key, rid))
-    result.unavailable_usage.update(rid for rid in malformed
+    result.unavailable_usage.update(rid for rid in unavailable
                                     if not result.owners.get(rid) or task_id in result.owners[rid])
     if literal_messages and not by_run:
         result.legacy_event_turns.update((key, turn) for turn, owners in claimed_turns.items()

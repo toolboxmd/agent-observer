@@ -297,7 +297,7 @@ def _prepare_observations(con, session_key, source_id, *, identities_complete):
     # another copy can replace its projection. Only its own edge accompanies it.
     for row in con.execute(
             "SELECT r.* FROM responses r JOIN sources s ON s.id=r.source_id WHERE r.session_key=? "
-            "AND r.source_id<>? AND s.sha256 NOT GLOB 'oc[3-7]:*' AND NOT EXISTS "
+            "AND r.source_id<>? AND s.sha256 NOT GLOB 'oc[3-8]:*' AND NOT EXISTS "
             "(SELECT 1 FROM opencode_response_observations o WHERE o.session_key=r.session_key "
             "AND o.response_id=r.response_id AND o.source_id=r.source_id)", (session_key, source_id)):
         parent = con.execute(
@@ -347,7 +347,9 @@ def response_witnesses(con, session_key):
     conflicts = set()
     payload_sources = {}
     observations = {}
-    malformed = {}
+    unavailable = {rid: set() for rid, in con.execute(
+        "SELECT response_id FROM responses WHERE session_key=? AND is_overlap=0 AND total_tokens IS NULL",
+        (session_key,))}
     measured = dict(con.execute("SELECT response_id,source_id FROM responses WHERE session_key=? AND is_overlap=0",
                                 (session_key,)))
     if db._has_table(con, "opencode_response_observations"):
@@ -356,15 +358,15 @@ def response_witnesses(con, session_key):
                 "WHERE session_key=?", (session_key,)):
             observations.setdefault(rid, set()).add((parent, measurement))
             if measurement in _INVALID_OBSERVATIONS:
-                malformed[rid] = set()
+                unavailable[rid] = set()
             if rid in measured:
                 payload_sources.setdefault(rid, set()).add(source)
         for rid, variants in observations.items():
-            if rid not in measured and rid not in malformed:
+            if rid not in measured and rid not in unavailable:
                 continue
             parents = {parent for parent, _ in variants if parent}
-            if rid in malformed:
-                malformed[rid] = parents
+            if rid in unavailable:
+                unavailable[rid] = parents
             if rid in measured and parents:
                 witnesses[rid] = parents
             if len(variants) > 1 and (any(parent is None for parent, _ in variants)
@@ -380,11 +382,11 @@ def response_witnesses(con, session_key):
     if db._has_table(con, "native_response_events"):
         for rid, source in con.execute(
                 "SELECT DISTINCT e.response_id,e.source_id FROM native_response_events e "
-                "JOIN sources s ON s.id=e.source_id WHERE e.session_key=? AND s.sha256 NOT GLOB 'oc[4-7]:*'",
+                "JOIN sources s ON s.id=e.source_id WHERE e.session_key=? AND s.sha256 NOT GLOB 'oc[4-8]:*'",
                 (session_key,)):
             if rid in measured and source not in payload_sources.get(rid, {measured[rid]}):
                 conflicts.add(rid)
-    return witnesses, conflicts, malformed
+    return witnesses, conflicts, unavailable
 
 
 def has_unlocated_usage_error(con, session_key):
@@ -392,7 +394,7 @@ def has_unlocated_usage_error(con, session_key):
     # Keep the session's cost open without guessing which message failed.
     return con.execute(
         "SELECT 1 FROM sources s WHERE s.harness=? AND s.session_id=? AND "
-        "(s.sha256 GLOB 'oc[4-7]:unlocated' OR (s.sha256 NOT GLOB 'oc[4-7]:*' AND EXISTS (SELECT 1 FROM import_errors e "
+        "(s.sha256 GLOB 'oc[4-8]:unlocated' OR (s.sha256 NOT GLOB 'oc[4-8]:*' AND EXISTS (SELECT 1 FROM import_errors e "
         "WHERE e.harness=s.harness AND e.source_path=s.path AND e.error='malformed_usage' "
         "AND instr(','||e.line_excerpt||',', ',tokens,')>0))) LIMIT 1",
         (HARNESS, session_key.partition(":")[2])).fetchone() is not None
@@ -498,7 +500,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     session_key = f"{HARNESS}:{sess_id}"
     msg_n, msg_m = _count_max(native, "message", sess_id)
     part_n, part_m = _count_max(native, "part", sess_id)
-    fp = "oc7:" + fingerprint(sess.get("time_updated"), msg_m, part_m, msg_n, part_n)
+    fp = "oc8:" + fingerprint(sess.get("time_updated"), msg_m, part_m, msg_n, part_n)
     row = con.execute(
         "SELECT * FROM sources WHERE harness=? AND path=?",
         (HARNESS, src_path)).fetchone()
@@ -710,7 +712,7 @@ def _ingest_response(con, stats, src_path, source_id, session_key, sess,
 
 # The observation holds either the measured fields or a reason they are unavailable.
 _MAX_COUNTER = (1 << 63) - 1  # SQLite INTEGER.
-_UNLOCATED_SNAPSHOT = "oc7:unlocated"  # Never matches a complete snapshot fingerprint.
+_UNLOCATED_SNAPSHOT = "oc8:unlocated"  # Never matches a complete snapshot fingerprint.
 _MALFORMED_USAGE = "malformed_usage"
 _INVALID_OBSERVATIONS = {"null", json.dumps(_MALFORMED_USAGE), json.dumps("unknown_message"),
                          json.dumps("unfinished"), json.dumps("unmeasured")}
@@ -767,7 +769,7 @@ def _measurement(data):
         if type(raw) is not int or not 0 <= raw <= _MAX_COUNTER:
             return _MALFORMED_USAGE
         values[field] = raw
-    if all(v == 0 for v in values.values()):
+    if not any(v is not None and v > 0 for v in values.values()):
         return "unmeasured"
     total = None
     if all(v is not None for v in values.values()):

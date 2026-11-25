@@ -585,8 +585,9 @@ class EvidenceCoverageTest(LedgerCase):
         self.assign("A", "opencode:msg_u1")
         zero = dict(original, tokens={"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}})
         invalid_times = [dict(original, time={"completed": v}) for v in (False, True, -1, "broken", {})]
-        for record in [zero, *invalid_times]:
-            with self.subTest(record=record["time"]["completed"]):
+        no_counters = [dict(original, tokens=tokens) for tokens in ({}, {"cache": {}}, None)]
+        for record in [zero, *invalid_times, *no_counters]:
+            with self.subTest(time=record["time"], tokens=record["tokens"]):
                 with closing(sqlite3.connect(path)) as src, src:
                     src.execute("UPDATE message SET data=? WHERE id='msg_a1'", (json.dumps(record),))
                 opencode.sync(self.con, source=path, full=True)
@@ -595,3 +596,53 @@ class EvidenceCoverageTest(LedgerCase):
                 self.assertIsNone(rep["native_cost"]["total_usd"])
                 self.assertEqual(rep["native_cost"]["known_subtotal_usd"], .10)
                 self.assertIn("Evidence complete: no", self.draft()["body"])
+
+    def test_provisional_claude_copy_cannot_retract_an_observed_final(self):
+        path = self.import_claude()
+        self.assign("B", "claude:b")
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        other = path.with_name("withdrawn.jsonl")
+        msg = rows[-1]["message"]
+        msg["usage"]["output_tokens"] = 90000
+        write_records(other, rows)
+        claude.import_claude_file(self.con, str(other))
+        self.assertFalse(report.task_report(self.con, "B")["attributed"]["responses"])
+        provisional = dict(msg, stop_reason=None)
+        for message in (provisional, dict(msg, usage=None), [], provisional, provisional):
+            rows[-1]["message"] = message
+            write_records(other, rows)
+            claude.import_claude_file(self.con, str(other), full=True)
+            rep = report.task_report(self.con, "B")
+            self.assertFalse(rep["attributed"]["responses"])
+            self.assertFalse(rep["complete"])
+            self.assertFalse(report.timeline(self.con, "B")["events"])
+        other.write_bytes(path.read_bytes())
+        claude.import_claude_file(self.con, str(other), full=True)
+        self.assertTrue(report.task_report(self.con, "B")["complete"])
+
+    def test_partial_measurements_contribute_observations_without_closing_the_total(self):
+        path = self.opencode_store("partial", "msg_u1", 0.20, 50)
+        with closing(sqlite3.connect(path)) as source, source:
+            source.execute("UPDATE message SET data=json_remove(data,'$.tokens.input') WHERE id='msg_a1'")
+        opencode.sync(self.con, source=path)
+        self.assign("A", "opencode:msg_u1")
+        rep = report.task_report(self.con, "A")
+        self.assertEqual(rep["attributed"]["output_tokens"], 50)
+        self.assertFalse(rep["complete"])
+        self.assertIsNone(rep["native_cost"]["total_usd"])
+        self.assertEqual(rep["native_cost"]["known_subtotal_usd"], 0.20)
+
+    def test_claude_provisional_usage_is_an_observation_until_its_first_final(self):
+        path = Path(self.tmp.name, "stream.jsonl")
+        response = claude_response("block", "p", "streamed")
+        response["message"]["stop_reason"] = None
+        write_records(path, [claude_user("p"), response])
+        claude.import_claude_file(self.con, str(path))
+        self.assign("A", "claude:p")
+        rep = report.task_report(self.con, "A")
+        self.assertEqual(rep["attributed"]["output_tokens"], 1)
+        self.assertFalse(rep["complete"])
+        response["message"]["stop_reason"] = "end_turn"
+        write_records(path, [response], mode="a")
+        claude.import_claude_file(self.con, str(path))
+        self.assertTrue(report.task_report(self.con, "A")["complete"])

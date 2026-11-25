@@ -106,7 +106,7 @@ def _valid_counter(value) -> bool:
 
 _FINALITY_TABLE = "claude_response_finality"
 _NATIVE_KINDS_TABLE = "claude_native_kinds"
-_IMPORT_VERSION = 12  # Replay incomplete finals independently of their surviving identity.
+_IMPORT_VERSION = 13  # Replay incomplete finals independently of their surviving identity.
 
 
 def _ensure_native_kinds(con) -> None:
@@ -464,17 +464,15 @@ def import_claude_file(con: sqlite3.Connection, path: str,
                     AND a.session_key=p.session_key AND a.uuid=p.uuid AND a.parent=p.parent
                     AND a.response_id=p.response_id)""")
     if not src.incremental:
-        # Seeing the same message again without any final measurement cannot
-        # retract a previous final. Retain the gap until this source attests it.
-        con.execute("""INSERT OR IGNORE INTO claude_rejected_measurements
-            SELECT a.session_key,a.source_id,a.uuid,a.parent,a.response_id,'missing_final_usage'
-            FROM claude_response_ancestry a JOIN (
-                SELECT session_key,source_id,response_id FROM temp.claude_prior_finals UNION
-                SELECT session_key,source_id,response_id FROM temp.claude_prior_edges
-                WHERE reason IN ('missing_final_usage','malformed_final_usage')
-            ) p USING(session_key,source_id,response_id)
-            WHERE NOT EXISTS (SELECT 1 FROM claude_final_observations f WHERE f.session_key=a.session_key
-                              AND f.source_id=a.source_id AND f.response_id=a.response_id)""")
+        if not unreadable:
+            # A complete snapshot may remove a message altogether. Any
+            # surviving copy of that message, accepted or quarantined, keeps
+            # this source's obligation to supply its previously declared final.
+            con.execute("""DELETE FROM claude_expected_finals WHERE source_id=?
+                AND (session_key,response_id) NOT IN (
+                    SELECT session_key,response_id FROM claude_response_ancestry WHERE source_id=?
+                    UNION SELECT session_key,response_id FROM claude_rejected_measurements WHERE source_id=?
+                )""", (src.source_id, src.source_id, src.source_id))
         con.execute("DROP TABLE temp.claude_prior_edges")
         con.execute("DROP TABLE temp.claude_prior_finals")
     con.executemany("INSERT OR IGNORE INTO claude_ancestry_sources VALUES(?,?)",
@@ -621,12 +619,26 @@ def conflicting_final_measurements(con, session_key):
     conflicts = {rid for rid, in con.execute(
         "SELECT DISTINCT o.response_id FROM claude_final_observations o JOIN responses r USING(session_key,response_id) "
         "WHERE o.session_key=? AND (" + " OR ".join(mismatch) + ")", (session_key,))}
+    if db._has_table(con, "claude_expected_finals"):
+        conflicts.update(rid for rid, in con.execute(
+            "SELECT e.response_id FROM claude_expected_finals e WHERE e.session_key=? AND NOT EXISTS ("
+            "SELECT 1 FROM claude_final_observations f WHERE f.session_key=e.session_key "
+            "AND f.source_id=e.source_id AND f.response_id=e.response_id)", (session_key,)))
     conflicts.update(rid for rid, in con.execute(
         "SELECT DISTINCT q.response_id FROM claude_rejected_measurements q WHERE q.session_key=? "
         "AND q.reason IN ('missing_final_usage','malformed_final_usage') AND NOT EXISTS ("
         "SELECT 1 FROM claude_final_observations f WHERE f.session_key=q.session_key "
         "AND f.source_id=q.source_id AND f.response_id=q.response_id)", (session_key,)))
     return conflicts
+
+
+def provisional_responses(con, session_key):
+    if not db._has_table(con, _FINALITY_TABLE):
+        return set()
+    return {rid for rid, in con.execute(
+        f"SELECT r.response_id FROM responses r JOIN sources s ON s.id=r.source_id "
+        f"WHERE r.session_key=? AND r.is_overlap=0 AND s.claude_usage_version>=13 AND NOT EXISTS ("
+        f"SELECT 1 FROM {_FINALITY_TABLE} f WHERE f.response_id=r.response_id)", (session_key,))}
 
 
 def _ingest_usage_row(r: _Reader, obj: dict, ordinal: int, ts, mid: str,
@@ -719,6 +731,11 @@ def _ingest_usage_row(r: _Reader, obj: dict, ordinal: int, ts, mid: str,
         r.finalized.add(mid)
 
 
+def _final_stop(message):
+    reason = message.get("stop_reason")
+    return isinstance(reason, str) and bool(reason.strip())
+
+
 def _assistant(r: _Reader, obj: dict, ordinal: int, ts) -> None:
     message = obj.get("message")
     if message is None:
@@ -774,7 +791,7 @@ def _assistant(r: _Reader, obj: dict, ordinal: int, ts) -> None:
             # never finalize, so a later valid block still inserts normally.
             values = _usage_values(usage_raw)
             _ingest_usage_row(r, obj, ordinal, ts, mid, model, values,
-                              message.get("stop_reason") is not None)
+                              _final_stop(message))
 
 
 def _submission(r: _Reader, native_id, ordinal, ts, kind: str, text: str,
@@ -1181,6 +1198,14 @@ def _prepare_ancestry(r):
         session_key TEXT NOT NULL, response_id TEXT NOT NULL, source_id INTEGER NOT NULL REFERENCES sources(id),
         payload TEXT NOT NULL, PRIMARY KEY(session_key,response_id,source_id,payload)) WITHOUT ROWID""")
     r.con.execute("CREATE INDEX IF NOT EXISTS claude_final_observation_source ON claude_final_observations(source_id)")
+    if not db._has_table(r.con, "claude_expected_finals"):
+        r.con.execute("""CREATE TABLE claude_expected_finals (
+            source_id INTEGER NOT NULL REFERENCES sources(id), session_key TEXT NOT NULL, response_id TEXT NOT NULL,
+            PRIMARY KEY(session_key,source_id,response_id)) WITHOUT ROWID""")
+        r.con.execute("""INSERT OR IGNORE INTO claude_expected_finals
+            SELECT source_id,session_key,response_id FROM claude_final_observations UNION
+            SELECT source_id,session_key,response_id FROM claude_rejected_measurements
+            WHERE reason IN ('missing_final_usage','malformed_final_usage','unreadable_record')""")
     r.con.execute("""CREATE TABLE IF NOT EXISTS claude_unreadable_sources (
         session_key TEXT NOT NULL, source_id INTEGER NOT NULL REFERENCES sources(id),
         PRIMARY KEY(session_key,source_id)) WITHOUT ROWID""")
@@ -1237,7 +1262,9 @@ def _record_ancestry(r, obj, rejected=None):
         mid = native_response.identifier(message.get("id"))
         if mid and message.get("model") != "<synthetic>":
             response_id = f"{HARNESS}:{mid}"
-            if message.get("stop_reason") is not None:
+            if _final_stop(message):
+                r.con.execute("INSERT OR IGNORE INTO claude_expected_finals VALUES(?,?,?)",
+                              (r.src.source_id, r.session_key, response_id))
                 if rejected == "malformed_usage":
                     rejected = "malformed_final_usage"
                 elif not rejected and not message.get("usage"):
