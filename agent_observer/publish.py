@@ -435,8 +435,7 @@ def render(summary: dict, target: str | None = None) -> str:
     lines = [MARKER, f"### {title}", "", " · ".join(parts), ""]
     native = summary.get("native_purpose") or {}
     if native.get("runs") or native.get("deliveries"):
-        lines.append(f"Outcome: {_safe_field(summary['task_id'])}. "
-                     "Only responses with proved ownership enter the native subtotal.")
+        lines.append(f"Outcome: {_safe_field(summary['task_id'])}.")
         if native.get("coverage_gaps"):
             lines.append("Full outcome cost unknown. Native coverage: " +
                          ", ".join(_safe_field(g.replace("_", " ")) for g in native["coverage_gaps"]) + ".")
