@@ -62,7 +62,7 @@ def _occurrences_ready(row) -> bool:
 
 
 HARNESS = "codex"
-_CONTEXT_VERSION = 9  # Distinguish an unfinished append from an unreadable replacement.
+_CONTEXT_VERSION = 10  # Recover atoms deferred while a formerly incomplete source was growing.
 SEMANTICS = "codex:input_includes_cached,output_includes_reasoning"
 # Older rollouts carry usage only in token_count events: last_token_usage per
 # response and a cumulative total that repeats when nothing new happened.

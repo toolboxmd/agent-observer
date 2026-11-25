@@ -79,7 +79,12 @@ def finish(r):
                     "legacy_dispute=MAX(legacy_dispute,excluded.legacy_dispute),replay=excluded.replay",
                     (src.source_id, r.session_key, legacy, replay))
     else:
-        con.execute("DELETE FROM codex_incomplete_sources WHERE source_id=?", (src.source_id,))
+        cleared = con.execute("DELETE FROM codex_incomplete_sources WHERE source_id=?", (src.source_id,)).rowcount
+        if cleared and src.incremental:
+            # Another source may have withdrawn a conflicting copy while this
+            # tail was unfinished. Revisit its stored atoms without rereading the file.
+            r.atomic_ids.update(rid for rid, in con.execute(
+                "SELECT DISTINCT response_id FROM codex_atomic_observations WHERE source_id=?", (src.source_id,)))
     if not src.incremental:
         r.atomic_ids.update(rid for rid, in con.execute("SELECT DISTINCT response_id FROM prior_codex_atoms"))
         if incomplete:

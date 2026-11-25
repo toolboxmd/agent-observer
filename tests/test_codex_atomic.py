@@ -110,3 +110,21 @@ class CodexAtomicTest(LedgerCase):
 
     def test_contextless_duplicate_keeps_its_original_charge(self):
         self.check_repeat_context(False)
+
+    def test_finishing_unrelated_tail_reconciles_an_earlier_response(self):
+        retired = self.source("first", "A", 1100)
+        surviving = self.source("second", "B", 91100)
+        trailing = json.dumps(self.context) + "\n"
+        with surviving.open("a") as fh:
+            fh.write(trailing[:20])
+        codex.import_codex_file(self.con, str(surviving))
+        write_records(retired, [self.meta])
+        codex.import_codex_file(self.con, str(retired))
+        self.check_owners(None, None)
+
+        with surviving.open("a") as fh:
+            fh.write(trailing[20:])
+        result = codex.import_codex_file(self.con, str(surviving))
+        self.assertTrue(result["incremental"])
+        self.assertEqual(result["lines"], 1)
+        self.check_owners(None, 91100)
