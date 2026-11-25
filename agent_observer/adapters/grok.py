@@ -2068,7 +2068,7 @@ def _read_chat(session_dir: str, r: _Reader) -> dict:
 
 def _notification_session_id(updates_path, events_path) -> str | None:
     """Read identity evidence only from complete native records."""
-    for path, updates in ((updates_path, True), (events_path, False)):
+    for path, updates in ((events_path, False), (updates_path, True)):
         if not path:
             continue
         try:
@@ -2081,9 +2081,15 @@ def _notification_session_id(updates_path, events_path) -> str | None:
                     continue
                 if updates:
                     params = record.get("params")
-                    if (record.get("method") not in METHODS or not isinstance(params, dict)
-                            or not isinstance(params.get("update"), dict)
-                            or not isinstance(params["update"].get("sessionUpdate"), str)):
+                    if record.get("method") not in METHODS or not isinstance(params, dict):
+                        continue
+                    update = params.get("update")
+                    if (not isinstance(update, dict) or update.get("sessionUpdate") != "turn_completed"
+                            or _valid_native_id(update.get("prompt_id") or update.get("promptId")) is None):
+                        continue
+                    try:
+                        _validated_usage_counters(update)
+                    except _AdapterError:
                         continue
                     native_id = params.get("sessionId")
                 else:

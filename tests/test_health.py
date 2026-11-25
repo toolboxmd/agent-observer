@@ -644,7 +644,11 @@ class LedgerFreshnessTest(unittest.TestCase):
         event.write_text('{"type":"turn_started","session_id":"native-id",'
                          '"ts":"2026-11-25T18:00:00Z"}\n')
         event.with_name("updates.jsonl").write_text(
-            '{"method":"session/update","params":{"sessionId":"wrong-id"}}\n')
+            '{"method":"session/update","params":{"sessionId":"wrong-id"}}\n'
+            '{"method":"session/update","params":{"sessionId":"wrong-id",'
+            '"update":{"sessionUpdate":"unrecognized"}}}\n'
+            '{"method":"session/update","params":{"sessionId":"wrong-id",'
+            '"update":{"sessionUpdate":"tool_call"}}}\n')
         self.imports()
         with contextlib.closing(db.connect(str(self.ledger))) as con:
             result = grok.sync(con)
