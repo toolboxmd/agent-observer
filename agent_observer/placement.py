@@ -72,11 +72,18 @@ def _task_heads(con, task_ids):
     for task in task_ids:
         coordinate, separator, number = task.rpartition("#")
         parts = coordinate.lower().split("/")
+        historical_host_key = len(parts) == 3
+        if len(parts) == 4 and parts[-1] == "pr":
+            parts.pop()
         if not separator or len(parts) not in (2, 3):
             continue
-        # T3 task IDs omit the host for GitHub and prefix it for other forges.
+        # Three components also cover historical host-prefixed task IDs.
         host = parts[0] if len(parts) == 3 else "github.com"
         repo = "/".join(parts[-2:])
+        if historical_host_key and con.execute(
+                "SELECT 1 FROM t3_links WHERE kind='issue' AND host=? COLLATE NOCASE"
+                " AND repository=? COLLATE NOCASE AND number=? LIMIT 1", (host, repo, number)).fetchone():
+            continue  # This key could refer to the Issue.
         for row in con.execute(
                 "SELECT DISTINCT head_branch FROM t3_links WHERE kind='pr'"
                 " AND host=? COLLATE NOCASE AND repository=? COLLATE NOCASE"

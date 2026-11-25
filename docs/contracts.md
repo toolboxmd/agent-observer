@@ -537,7 +537,8 @@ re-read every sync; workload bindings are durable ledger rows.
   and interrupt verdicts fail closed; unlisted records (typed prompts,
   Router `sdk-cli` workers) never move; unknown stays unknown.
 - Legacy thread trees: `sub.<parent>.<suffix>` ids (nesting allowed) group under
-  their root. Each linked PR or Issue becomes one `repo#N` task
+  their root. Each linked PR or Issue becomes one task (on github.com,
+  `owner/repo#N`; elsewhere, `host/owner/repo/issue#N` or `host/owner/repo/pr#N`)
   (`origin='t3'`); every ledger session in the tree (cursor sessions plus
   Claude subagent children plus rotated sessions found by turn uuid) binds
   whole to every tree task as historical session context. A thread link alone cannot place a response.

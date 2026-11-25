@@ -25,7 +25,7 @@ onto the existing workload tables:
   through their turn-start uuids in ``submissions``.
 - legacy thread trees: child ids of the form ``sub.<parentThreadId>.<suffix>``
   (nesting allowed) group under their root. Every PR or Issue linked
-  anywhere in a tree becomes one task (``<repo>#<N>``); every native
+  anywhere in a tree becomes one task (host and kind qualify non-GitHub keys); every native
   session in the tree is wholly bound to every tree task through
   ``session_assignments``. A one-link tree attributes exclusively; a
   multi-link tree lands in the shared joint bucket under the existing
@@ -318,10 +318,13 @@ def _valid_id(value) -> str | None:
 
 
 def _valid_link(host, repository, number, url) -> tuple | None:
-    if not isinstance(host, str) or not host or len(host) > 253:
+    if not isinstance(host, str) or not host or "/" in host or len(host) > 253:
         return None
     if not isinstance(repository, str) or not repository \
             or len(repository) > 200 or "/" not in repository:
+        return None
+    # A GitHub link must not impersonate a host-prefixed task ID.
+    if host.lower() == "github.com" and repository.count("/") != 1:
         return None
     if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
         return None
@@ -1235,16 +1238,15 @@ def _bind_trees(con: sqlite3.Connection, threads: dict,
     bound = 0
     wanted: set = set()
     for root, root_links in tree_links.items():
-        seen: dict[tuple, dict] = {}
+        seen: dict[str, dict] = {}
         for link in root_links:
-            seen.setdefault((link["host"], link["repository"], link["number"]), link)
-        for (host, repository, number), link in sorted(seen.items()):
-            task_id = t3_purpose.task_id(con, host, repository, number)
+            seen.setdefault(t3_purpose.task_id(con, link), link)
+        for task_id, link in sorted(seen.items()):
             cur = con.execute(
                 "INSERT OR IGNORE INTO tasks(task_id, project, title,"
                 " issue_url, origin, created_at)"
                 " VALUES(?,?,?,?,?,?)",
-                (task_id, repository, task_id, link["url"], HARNESS,
+                (task_id, link["repository"], task_id, link["url"], HARNESS,
                  db.now()))
             tasks += cur.rowcount
             if task_id in disputed_tasks:
@@ -1334,8 +1336,7 @@ def _write_outcomes(con: sqlite3.Connection, links: list) -> int:
     """
     per_task: dict[str, list] = {}
     for link in links:
-        per_task.setdefault(
-            t3_purpose.task_id(con, link["host"], link["repository"], link["number"]), []).append(link)
+        per_task.setdefault(t3_purpose.task_id(con, link), []).append(link)
     written = 0
     for task_id in sorted(per_task):
         task = con.execute("SELECT origin FROM tasks WHERE task_id=?",

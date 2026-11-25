@@ -208,12 +208,21 @@ class PlacementTest(LedgerCase):
                 "INSERT INTO t3_links(thread_id,kind,host,repository,number,url,head_branch)"
                 " VALUES('t','pr',?,'o/alpha',?,?,'fix/a')",
                 (host, number, f"https://{host}/o/alpha/pull/{number}"))
+        for kind in ("pr", "issue"):
+            task = f"forge.example/o/alpha/{kind}#1"
+            self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES(?,0)", (task,))
+            self._assign(key, task)
         self.assertEqual(placement.checkout_observations(self.con, key), {
             "codex:r1": [{"host": "github.com", "repository": "o/alpha",
                           "branch": "fix/a", "candidate_tasks": ["o/alpha#1", "o/alpha#3"]}],
             "codex:r2": [{"host": "forge.example", "repository": "o/alpha",
-                          "branch": "fix/a", "candidate_tasks": ["forge.example/o/alpha#1"]}],
+                          "branch": "fix/a", "candidate_tasks": ["forge.example/o/alpha#1",
+                                                               "forge.example/o/alpha/pr#1"]}],
         })
+        self.con.execute("INSERT INTO t3_links(thread_id,kind,host,repository,number,url)"
+                         " VALUES('t','issue','forge.example','o/alpha',1,'https://forge.example/o/alpha/issues/1')")
+        self.assertEqual(placement.checkout_observations(self.con, key)["codex:r2"][0]["candidate_tasks"],
+                         ["forge.example/o/alpha/pr#1"])
         for task in ("o/alpha#1", "o/alpha#3", "forge.example/o/alpha#1"):
             result = report.task_report(self.con, task, schedule=SCHEDULE)
             self.assertEqual(result["measured"]["unplaced_responses"], ["codex:r1", "codex:r2"])

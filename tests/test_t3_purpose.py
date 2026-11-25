@@ -4,7 +4,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-from agent_observer import report
+from agent_observer import publish, report
 from agent_observer.adapters import grok, t3
 from tests.helpers import LedgerCase
 from tests.test_t3_v2 import write_v2
@@ -92,10 +92,102 @@ class NativePurposeTest(LedgerCase):
         self.assertEqual(self.values("SELECT session_key FROM t3_purpose_sessions WHERE run_id='b'"),
                          [("codex:historic-codex",)])
         self.assertEqual(self.values("SELECT task_id FROM tasks ORDER BY task_id"), [
-            ("example/project#7",), ("git.example.org/example/project#7",)])
+            ("example/project#7",), ("git.example.org/example/project/issue#7",)])
         self.assertEqual(self.values("SELECT task_id,url FROM t3_purpose_deliveries"), [
             ("example/project#7", "https://github.com/example/project/pull/99")])
         self.assertNotIn("private sentence", "\n".join(self.con.iterdump()))
+
+    def _check_separate_number_spaces(self, kinds):
+        self.sync("codex-mini.jsonl")
+        for table in ("runs", "run_attempts", "provider_turns"):
+            self.native.execute(f"DELETE FROM {PREFIX}{table}")
+        host, repo = "forge.example:8443", "example/project"
+        base = f"https://{host}/{repo}"
+        issue = dict(REF, host=host)
+        delivery = dict(version=1, purpose=issue, pullRequest=dict(issue, kind="pr"), declaredAt=TIME)
+        for kind in kinds:
+            turn = "turn-mini-aaa" if kind == "issue" else "turn-mini-bbb"
+            self.run_turn(kind, "codex", dict(PURPOSE, scope=dict(type="single", reference=dict(issue, kind=kind))),
+                          [dict(version=1, kind="turn", nativeId=turn, validation="codex_turn_started")])
+        self.native.execute(f"UPDATE {PREFIX}run_attempts SET payload_json=json_set("
+                            "payload_json,'$.nativeThreadId','sess-fixture-mini-01')")
+        self.assertEqual(self.refresh()["failed"], [])
+        self.native.execute(f"UPDATE {PREFIX}threads SET payload_json=?",
+                            (json.dumps(dict(id="t", purposeDeliveries=[delivery])),))
+        self.native.execute("CREATE TABLE projection_thread_pull_requests(thread_id,host,repository,"
+                            "number,url,source,linked_at,snapshot_json)")
+        self.native.execute("CREATE TABLE fork_thread_issue_links(thread_id,host,repository,number,"
+                            "url,source,linked_at)")
+        self.native.execute("INSERT INTO projection_thread_pull_requests VALUES('t',?,?,7,?,"
+                            "'agent',?,?)", (host, repo, base + "/pull/7", TIME, '{"state":"merged"}'))
+        self.native.execute("INSERT INTO fork_thread_issue_links VALUES('t',?,?,7,?,'agent',?)",
+                            (host, repo, base + "/issues/7", TIME))
+        # A malformed GitHub navigation key must not mark the private Issue complete.
+        self.native.execute("INSERT INTO projection_thread_pull_requests VALUES('t','github.com',?,7,?,"
+                            "'agent',?,?)", (f"{host}/{repo}/issue", "https://github.com/o/p/pull/7",
+                                             TIME, '{"state":"merged"}'))
+        self.assertEqual(self.refresh()["failed"], [])
+        expected = {"issue": ["codex:resp-mini-001", "codex:resp-mini-002"],
+                    "pr": ["codex:resp-mini-003"]}
+        for kind in kinds:
+            key = f"{host}/{repo}/{kind}#7"
+            rep = report.task_report(self.con, key)
+            self.assertEqual(rep["measured"]["attributed_responses"], expected[kind])
+            native = rep["native_purpose"]
+            self.assertEqual([r["kind"] for r in native["runs"]], [kind])
+            self.assertEqual([r["url"] for r in native["deliveries"]],
+                             [base + "/pull/7"] if kind == "issue" else [])
+            self.assertEqual(rep["acceptance_state"], "unknown" if kind == "issue" else "complete")
+            body = publish.render(publish.summarize(self.con, set(), key, task_id=key))
+            self.assertNotIn(host, body)
+            self.assertNotIn(repo, body)
+            self.assertIn("Outcome: reference withheld", body)
+        self.assertEqual(self.values("SELECT * FROM session_assignments"), [])
+
+    def test_issue_then_pr_on_same_forge_coordinate(self):
+        self._check_separate_number_spaces(("issue", "pr"))
+
+    def test_pr_then_issue_with_old_manual_capture(self):
+        self._check_separate_number_spaces(("pr", "issue"))
+        old = "forge.example:8443/example/project#7"
+        self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES(?,0)", (old,))
+        self.con.execute("INSERT INTO assignments(user_message_id,task_id,created_at)"
+                         " VALUES('codex:msg-mini-sub-01',?,0)", (old,))
+        self.assertEqual(self.refresh()["failed"], [])
+        for key in (old, "forge.example:8443/example/project/issue#7"):
+            rep = report.task_report(self.con, key)
+            self.assertEqual(rep["measured"]["attributed_responses"], [])
+            self.assertEqual(rep["measured"]["unplaced_responses"], ["codex:resp-mini-001", "codex:resp-mini-002"])
+        self.assertEqual(self.values("SELECT task_id FROM assignments"), [(old,)])
+
+    def test_rotated_snapshot_upgrades_only_retained_typed_evidence(self):
+        self._check_separate_number_spaces(("issue", "pr"))
+        # Recreate the shape written before the upgrade. The old delivery row
+        # retained the destination PR and no kind for its originating purpose.
+        old = "forge.example:8443/example/project#7"
+        url = "https://forge.example:8443/example/project/pull/7"
+        self.con.execute("INSERT INTO tasks(task_id,issue_url,created_at) VALUES(?,?,0)", (old, url))
+        self.con.execute("UPDATE t3_source_runs SET task_id=?", (old,))
+        self.con.execute("UPDATE t3_source_deliveries SET task_id=?", (old,))
+        self.con.execute("DELETE FROM outcomes WHERE task_id LIKE 'forge.example:%'")
+        self.con.execute("DELETE FROM tasks WHERE task_id LIKE 'forge.example:%/%/%/%'")
+        for run in ("issue", "pr", None):
+            self.con.execute("INSERT INTO t3_source_segments(source_path,thread_id,owner_id,segment_id,run_id,task_id)"
+                             " VALUES(?,'t','owner',?,?,?)", (self.path, run or "unresolved", run, old))
+        other = write_v2(os.path.join(self.tmp.name, "other.sqlite"))
+        for _ in range(2):
+            self.assertEqual(t3.sync(self.con, source=other)["failed"], [])
+            for kind in ("issue", "pr"):
+                key = f"forge.example:8443/example/project/{kind}#7"
+                native = report.task_report(self.con, key)["native_purpose"]
+                self.assertEqual([r["kind"] for r in native["runs"]], [kind])
+                self.assertEqual(native["deliveries"], [])
+                self.assertEqual(self.con.execute("SELECT task_id FROM t3_purpose_segments WHERE segment_id=?",
+                                                  (kind,)).fetchone()[0], key)
+            historical = report.task_report(self.con, old)
+            self.assertEqual(historical["task"]["issue_url"], url)
+            self.assertEqual([d["url"] for d in historical["native_purpose"]["deliveries"]], [url])
+            self.assertEqual(self.values("SELECT task_id FROM t3_purpose_segments WHERE run_id IS NULL"), [(old,)])
 
     def test_corrupt_joins_and_unvalidated_grok_stay_gaps(self):
         self.native.execute(f"UPDATE {PREFIX}provider_turns SET thread_id='other' WHERE run_attempt_id='attempt-a'")
@@ -122,7 +214,7 @@ class NativePurposeTest(LedgerCase):
             (root / "updates.jsonl").write_text("\n".join(records) + "\n")
             grok.import_grok_session(self.con, str(root), full=True)
         def membership():
-            return report.task_report(self.con, "git.example.org/example/project#7")["native_purpose"]["membership"]
+            return report.task_report(self.con, "git.example.org/example/project/issue#7")["native_purpose"]["membership"]
 
         frame(dict(sessionUpdate="turn_completed", prompt_id="done"))
         frame(dict(sessionUpdate="tool_call", toolCallId="call"), promptId="done")
@@ -139,7 +231,7 @@ class NativePurposeTest(LedgerCase):
         other = sqlite3.connect(other_path)
         self.addCleanup(other.close)
         self.native.backup(other)
-        task = "git.example.org/example/project#7"
+        task = "git.example.org/example/project/issue#7"
         self.con.execute("INSERT INTO session_assignments VALUES(?,?,'capture',1)", ("grok:" + sid, task))
         other.execute(f"""UPDATE {PREFIX}runs SET payload_json=json_set(
             payload_json,'$.purpose.scope.reference.number',8) WHERE run_id='g'""")

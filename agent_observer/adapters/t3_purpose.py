@@ -114,9 +114,10 @@ def _reference(value):
         return dict(host=host.lower(), repository=repo.lower(), kind=kind, number=n)
 
 
-def task_id(con, host, repository, number):
-    prefix = "" if host.lower() == "github.com" else host.lower() + "/"
-    canonical = f"{prefix}{repository.lower()}#{number}"
+def task_id(con, ref):
+    host, repo = ref["host"].lower(), ref["repository"].lower()
+    coordinate = repo if host == "github.com" else f"{host}/{repo}/{ref['kind']}"
+    canonical = f"{coordinate}#{ref['number']}"
     if con.execute("SELECT 1 FROM tasks WHERE task_id=?", (canonical,)).fetchone():
         return canonical
     # Existing GitHub links used the repository's original capitalization.
@@ -132,7 +133,7 @@ def _url(ref):
 
 
 def _task(con, ref):
-    key = task_id(con, ref["host"], ref["repository"], ref["number"])
+    key = task_id(con, ref)
     con.execute("INSERT OR IGNORE INTO tasks(task_id,project,title,issue_url,origin,created_at)"
                 " VALUES(?,?,?,?, 't3',?)", (key, ref["repository"], key, _url(ref), db.now()))
     return key
@@ -689,6 +690,23 @@ def _source_tables(con, path):
         con.execute(f"DELETE FROM {source} WHERE source_path=?", (path,))
 
 
+def _upgrade_retained_run_keys(con):
+    # Other source files may have rotated away. A run retained its full
+    # reference, and only a resolved segment proved it had that run's purpose.
+    # Old delivery rows retained the delivery PR but lost the purpose kind.
+    for row in con.execute("""
+        SELECT DISTINCT host,repository,kind,number,task_id FROM t3_source_runs
+        WHERE host <> 'github.com' AND task_id = host || '/' || repository || '#' || number
+        COLLATE NOCASE""").fetchall():
+        new = _task(con, row)
+        args = (new, row["task_id"], row["kind"])
+        con.execute("""UPDATE t3_source_segments AS s SET task_id=?
+            WHERE task_id=? AND EXISTS (
+                SELECT 1 FROM t3_source_runs r WHERE r.source_path=s.source_path
+                AND r.run_id=s.run_id AND r.task_id=s.task_id AND r.kind=?)""", args)
+        con.execute("UPDATE t3_source_runs SET task_id=? WHERE task_id=? AND kind=?", args)
+
+
 def _materialize(con, table):
     mirror, source = f"t3_purpose_{table}", f"t3_source_{table}"
     info = con.execute(f"PRAGMA table_info({mirror})").fetchall()
@@ -763,6 +781,7 @@ def refresh(con, native, tables):
     con.execute("CREATE INDEX IF NOT EXISTS t3_purpose_inputs_native"
                 " ON t3_purpose_inputs(session_key,native_id)")
     con.execute("CREATE INDEX IF NOT EXISTS t3_purpose_inputs_run ON t3_purpose_inputs(run_id)")
+    _upgrade_retained_run_keys(con)
     aware = _deliveries(snapshot, native, tables)
     runs = _runs(snapshot, native, tables)
     if runs:

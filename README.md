@@ -517,7 +517,11 @@ Intervention text, problem lines and session attributes stay on this machine:
 For a Chromeria run with a declared Issue or PR purpose, use its reference
 as the task ID. For example, `agent-observer task show --task owner/repo#12 --json`
 lists the native responses joined to that purpose, even before a delivery PR
-exists. The `native_purpose` section identifies each run, the input that joins
+exists. On hosts other than github.com, use `forge.example/owner/repo/issue#12`
+or `forge.example/owner/repo/pr#12`. Historical IDs such as
+`forge.example/owner/repo#12` remain available for earlier captures. Observer
+keeps those captures under the original ID because they recorded no kind.
+The `native_purpose` section identifies each run, the input that joins
 a response to it, delivery PRs, provider counter checks, and gaps in coverage.
 A planner serving two Issues can have responses for each in the same session.
 For Grok, a session update can connect the prompt index to the completion ID.
