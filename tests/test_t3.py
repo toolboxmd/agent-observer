@@ -368,15 +368,17 @@ class T3SyncTest(LedgerCase):
                                               "unit": "USD per million tokens",
                                               "models": {}})
         self.assertEqual(shared["attributed"]["responses"], 0)
-        self.assertEqual(shared["unplaced_shared"]["responses"], 4)
+        self.assertEqual(shared["shared_joint"]["responses"], 4)
         self.assertEqual(shared["unassigned_in_scope"]["responses"], 0)
         self.assertTrue(shared["reconciles"])
-        # Never divided: the same whole responses sit under both tasks.
+        # Without PR head evidence both tasks show the same session context.
+        # Neither outcome bills these four responses.
         other = report.task_report(self.con, "example/alpha#3",
                                    schedule=shared["price_schedule"])
         self.assertEqual(
-            sorted(shared["measured"]["unplaced_responses"]),
-            sorted(other["measured"]["unplaced_responses"]))
+            shared["measured"]["shared_responses"], other["measured"]["shared_responses"])
+        self.assertEqual(other["total_cost"]["shared_responses"], 0)
+        self.assertIsNone(shared["total_cost"]["usd"])
         solo = report.task_report(self.con, "example/alpha#9",
                                   schedule=shared["price_schedule"])
         self.assertEqual(solo["attributed"]["responses"], 0)
