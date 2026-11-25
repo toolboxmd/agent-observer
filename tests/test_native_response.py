@@ -78,6 +78,21 @@ class NativeResponseTest(LedgerCase):
                          (legacy["session_key"],))
         self.assertEqual(native_response.inputs(self.con, legacy["session_key"]), {})
 
+    def test_quarantined_codex_conflict_cannot_supply_a_turn(self):
+        rows = [json.loads(line) for line in Path(fixture("codex-mini.jsonl")).read_text().splitlines()]
+        atomic = next(row for row in rows if row["type"] == "token_usage_record")
+        path = Path(self.tmp.name, "rollout.jsonl")
+        rid = "codex:" + atomic["payload"]["response_id"]
+        turn = atomic["payload"].pop("turn_id")
+        write_records(path, rows)
+        key = codex.import_codex_file(self.con, str(path))["session_key"]
+        atomic["payload"].update(turn_id=turn)
+        atomic["payload"]["usage"]["input_tokens"] += 1
+        write_records(path, [atomic], "a")
+        stats = codex.import_codex_file(self.con, str(path))
+        self.assertGreater(stats["malformed"], 0)
+        self.assertNotIn(rid, native_response.inputs(self.con, key))
+
     def test_opencode_requires_same_session_user_parent_and_replaces_snapshot(self):
         path = Path(self.tmp.name, "opencode.db")
         build_native(str(path))

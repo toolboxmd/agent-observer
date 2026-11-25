@@ -222,6 +222,7 @@ def summarize(con, session_keys: set, label: str, task_id: str | None = None,
             "time": rep["time"],
             "native_cost": rep["native_cost"],
             "native_cost_shared": rep["native_cost_shared"],
+            "native_cost_billed_shared": rep["native_cost_billed_shared"],
             "estimated_cost": rep["estimated_cost"],
             "estimated_cost_shared": rep["estimated_cost_shared"],
             "total_cost": rep["total_cost"],
@@ -433,14 +434,18 @@ def render(summary: dict, target: str | None = None) -> str:
               _counted(sessions, "session", "sessions"), wall]
     lines = [MARKER, f"### {title}", "", " · ".join(parts), ""]
     native = summary.get("native_purpose") or {}
-    if native.get("runs"):
+    if native.get("runs") or native.get("deliveries"):
         lines.append(f"Outcome: {_safe_field(summary['task_id'])}. "
                      "Only responses with proved ownership enter the native subtotal.")
         if native.get("coverage_gaps"):
             lines.append("Full outcome cost unknown. Native coverage: " +
                          ", ".join(_safe_field(g.replace("_", " ")) for g in native["coverage_gaps"]) + ".")
         for pr in native["deliveries"]:
-            lines.append(f"Delivery PR: {_safe_field(pr['url'])}")
+            reference = _safe_ref(pr["url"])
+            if reference is not None:
+                lines.append(f"Delivery PR: {reference}")
+            else:
+                lines.append("Delivery PR: [reference withheld]")
         lines.append("")
     if not task:
         lines += [f"_{_safe_field(summary.get('session_note') or 'Session scope only.')} "
@@ -524,7 +529,7 @@ def render(summary: dict, target: str | None = None) -> str:
             lines.append("- Prices: no sourced price schedule, so the estimate is unknown.")
         if est.get("coverage_note"):
             lines.append(f"- {_safe_field(est['coverage_note'])}.")
-        natives = [summary.get("native_cost") or {}, summary.get("native_cost_shared") or {}]
+        natives = [summary.get("native_cost") or {}, summary.get("native_cost_billed_shared") or {}]
         known = sum(n.get("known_responses", 0) or 0 for n in natives)
         if not known:
             lines.append("- Harness-reported cost: none reported.")

@@ -1600,11 +1600,6 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
     th = th_raw if isinstance(th_raw, dict) else {}
     rid = f"{HARNESS}:{p['response_id']}"
     turn_id = f"{HARNESS}:{p['turn_id']}" if p.get("turn_id") else None
-    native_turn = native_response.identifier(p.get("turn_id"))
-    if (native_turn and (r.thread_id or r.session_id)
-            and native_response.identifier(p.get("response_id"))
-            and p.get("thread_id") in (None, r.thread_id)):
-        native_response.record(r.con, r.src.source_id, r.session_key, rid, native_turn)
     cur = r.con.execute(
         "INSERT OR IGNORE INTO responses(response_id, source_id, harness,"
         " session_key, thread_id, turn_id, root_turn_id, session_id,"
@@ -1647,6 +1642,11 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
         r.usage_context_seen.add(rid)
         r.stats["responses_inserted"] += 1
         _note_occurrence(r, "response", rid, obj, model=r.model, effort=r.effort)
+    native_turn = native_response.identifier(p.get("turn_id"))
+    if (native_turn and (r.thread_id or r.session_id)
+            and native_response.identifier(p.get("response_id"))
+            and p.get("thread_id") in (None, r.thread_id)):
+        native_response.record(r.con, r.src.source_id, r.session_key, rid, native_turn)
     if turn_id:
         r.con.execute(
             "INSERT OR IGNORE INTO turns(turn_id, source_id, session_key,"
