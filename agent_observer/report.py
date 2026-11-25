@@ -708,7 +708,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
             unmeasured_shared.add(key)
     has_purpose = native and (canonical or native["deliveries"] or native["conflicting_source_runs"])
     inventory_gaps = outcome.check_inventory(con, native, attributed) if has_purpose else False
-    unresolved_usage = bool(unplaced or unassigned)
+    unresolved_usage = bool(unplaced or unassigned or ownership.unavailable_usage or ownership.unlocated_usage_sessions)
     unavailable_usage = bool(unresolved_usage or conflicts or inventory_gaps or legacy_links
                              or not scope_keys or missing_sessions or empty_sessions
                              or unbound_children or unbound_delegations or whole_conflicts)
@@ -741,7 +741,9 @@ def task_report(con: sqlite3.Connection, task_id: str,
         "phases": phases,
         "activity_session_context": activity_context,
         "activity_session_context_coverage": activity_context_coverage,
-        "coverage_evidence": {"missing_submissions": sorted(missing_submissions),
+        "coverage_evidence": {"unavailable_response_usage": sorted(ownership.unavailable_usage),
+                              "unlocated_usage_sessions": sorted(ownership.unlocated_usage_sessions),
+                              "missing_submissions": sorted(missing_submissions),
                               "conflicting_sessions": sorted(whole_conflicts),
                               "joint": joint, "whole_shared": sorted(whole_shared),
                               "missing_sessions": missing_sessions,
@@ -858,6 +860,8 @@ def task_report(con: sqlite3.Connection, task_id: str,
         "coverage": {
             "no_measured_sessions": not scope_keys,
             "unbound_usage": list(unbound_usage),
+            "unlocated_usage_sessions": sorted(ownership.unlocated_usage_sessions),
+            "unavailable_response_usage": sorted(ownership.unavailable_usage),
             "conflicting_sessions": sorted(whole_conflicts),
             "missing_sessions": missing_sessions,
             "sessions_without_usage": empty_sessions,

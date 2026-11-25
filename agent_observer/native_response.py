@@ -49,7 +49,7 @@ def inputs(con: sqlite3.Connection, session_key: str) -> dict[str, set[str]]:
         return grok.response_inputs(con, session_key)
     if session_key.startswith("opencode:"):
         from .adapters import opencode
-        witnesses, conflicts = opencode.response_witnesses(con, session_key)
+        witnesses, conflicts, _ = opencode.response_witnesses(con, session_key)
         return {rid: ids for rid, ids in witnesses.items() if rid not in conflicts}
     found = defaultdict(set)
     for response_id, input_id, _, _ in stored_inputs(con, session_key):
@@ -109,6 +109,9 @@ def event_responses(con, session_key):
                                            "WHERE session_key=?", (session_key,)):
                 measured_sources[rid].add(source)
     claude = session_key.startswith("claude:")
+    if claude:
+        from .adapters.claude import legacy_capture_sources
+        legacy_sources = legacy_capture_sources(con, session_key)
     legacy_text = defaultdict(set)
     if claude and db._has_table(con, "claude_response_ancestry"):
         # Pre-event-edge ledgers still retain the UUID of each text block.
@@ -119,6 +122,8 @@ def event_responses(con, session_key):
             legacy_text[source, uuid].add(rid)
     for event, source, family, native_id, turn in con.execute(
             "SELECT id,source_id,family,native_id,turn_id FROM events WHERE session_key=?", (session_key,)):
+        if claude and source not in legacy_sources:
+            turn = None  # An event without a literal edge cannot inherit its display turn.
         if claude and family == "assistant_message":
             yield event, turn, edges[family, native_id] | legacy_text[source, native_id.rpartition(":")[0]]
         elif claude and family in {"tool_result", "permission", "skill_invoke", "file_change"}:

@@ -43,6 +43,8 @@ class Ownership:
     response_turns: dict = field(default_factory=dict)
     literal_sessions: set = field(default_factory=set)
     conflicts: set = field(default_factory=set)
+    unavailable_usage: set = field(default_factory=set)
+    unlocated_usage_sessions: set = field(default_factory=set)
     whole: set = field(default_factory=set)
 
     def event_turns(self, con, key):
@@ -107,7 +109,10 @@ def evidence(con, task_id, scope):
 
     if runs or deliveries or session_runs or disputed_runs:
         result.native = {"version": 1, "task_id": task_id, "runs": runs, "deliveries": deliveries,
-                         "membership": members, "sessions": session_runs, "conflicting_responses": sorted(result.conflicts),
+                         "membership": members, "sessions": session_runs,
+                         "unavailable_response_usage": sorted(result.unavailable_usage),
+                         "unlocated_usage_sessions": sorted(result.unlocated_usage_sessions),
+                         "conflicting_responses": sorted(result.conflicts),
                          "conflicting_reference_kinds": reference_conflict, "conflicting_source_runs": disputed_runs}
     return result
 
@@ -158,20 +163,21 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
         result.literal_sessions.add(key)
     call_witnesses = set()
     disputed_completions = set()
+    malformed = {}
     if harness == "claude":
         from .adapters import claude
         responses, disputed_completions = claude.response_witnesses(con, key)
+        result.conflicts.update(disputed_completions)
     elif harness == "opencode":
         from .adapters import opencode
-        responses, disputed_completions = opencode.response_witnesses(con, key)
+        responses, disputed_completions, malformed = opencode.response_witnesses(con, key)
+        if opencode.has_unlocated_usage_error(con, key):
+            result.unlocated_usage_sessions.add(key)
     elif harness == "grok":
         from .adapters import grok
         responses, call_witnesses, disputed_completions = grok.response_witnesses(con, key)
     else:
         responses = native_response.inputs(con, key)
-    # Rejected native records can leave an ownership dispute without a
-    # projected usage row. It still makes coverage incomplete.
-    result.conflicts.update(disputed_completions)
     # In a contested whole session, only events on resolved turns can be
     # shown. Untagged events cannot be separated between the claimants.
     exclusive = not by_run or (whole == {task_id} and set(by_run.values()) == {task_id})
@@ -188,9 +194,11 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
             if harness == "codex":
                 blocked_turns.add(identity)
             exclusive = False
-    for rid, display_turn in con.execute(
-            "SELECT response_id,turn_id FROM responses WHERE session_key=? AND is_overlap=0", (key,)):
-        input_ids = responses.get(rid, set())
+    measured_turns = dict(con.execute(
+        "SELECT response_id,turn_id FROM responses WHERE session_key=? AND is_overlap=0", (key,)))
+    for rid in measured_turns.keys() | malformed.keys():
+        display_turn = measured_turns.get(rid)
+        input_ids = responses.get(rid, malformed.get(rid, set()))
         if rid in disputed_completions or len(input_ids) > 1:
             result.conflicts.add(rid)
             blocked_turns.update((display_turn, rid))
@@ -206,7 +214,10 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
                 display_turn in input_turns[identity] for identity in identities):
             unsafe_display.add(display_turn)
         candidates = {candidate for identity in input_ids for candidate in by_input.get(identity, ())}
-        claims = whole.copy()
+        unresolved_ancestry = harness == "claude" and rid in responses and not input_ids
+        claims = set() if unresolved_ancestry else whole.copy()
+        if unresolved_ancestry:
+            exclusive = False
         for identity in identities:
             claims.update(claimed_inputs[identity])
         # Only an explicit capture may use the historical display turn.
@@ -262,12 +273,16 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
                 result.response_turns[key, rid] = identities
             if rid in call_witnesses:
                 validation = "grok_tool_call"
+            if rid not in measured_turns:
+                continue
             members[rid] = {"run_id": run, "session_key": key, "native_input_id": native_id,
                             "provider_turn_id": turn, "segment_id": segment, "validation": validation}
             if harness == "codex":
                 result.turns.add((key, "codex:" + native_id))
             elif harness == "grok":
                 result.turns.add((key, rid))
+    result.unavailable_usage.update(rid for rid in malformed
+                                    if not result.owners.get(rid) or task_id in result.owners[rid])
     if literal_messages and not by_run:
         result.legacy_event_turns.update((key, turn) for turn, owners in claimed_turns.items()
                                         if task_id in owners and turn not in blocked_turns and turn not in unsafe_display)
@@ -406,6 +421,8 @@ def check_inventory(con, native, rows):
         gaps.add("segment_final_usage_unreconciled")
     if native["conflicting_reference_kinds"]:
         gaps.add("conflicting_reference_kinds")
+    if native["unavailable_response_usage"] or native["unlocated_usage_sessions"]:
+        gaps.add("native_response_usage_unavailable")
     if native["conflicting_responses"]:
         gaps.add("conflicting_response_ownership")
     native["turn_checks"] = checks

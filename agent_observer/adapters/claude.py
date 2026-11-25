@@ -106,7 +106,7 @@ def _valid_counter(value) -> bool:
 
 _FINALITY_TABLE = "claude_response_finality"
 _NATIVE_KINDS_TABLE = "claude_native_kinds"
-_IMPORT_VERSION = 9  # Replay usable identities alongside rejected measurements.
+_IMPORT_VERSION = 10  # Replay usable identities alongside rejected measurements.
 
 
 def _ensure_native_kinds(con) -> None:
@@ -446,6 +446,8 @@ def import_claude_file(con: sqlite3.Connection, path: str,
                 _record_ancestry(r, obj, rejected="schema_error")
             stats["malformed"] += 1
             src.error(ordinal, "schema_error", line)
+    con.executemany("INSERT OR IGNORE INTO claude_ancestry_sources VALUES(?,?)",
+                    ((key, src.source_id) for key in r.linked_sessions))
     if r.native_session:
         fields = {"started_at": r.first_ts, "ended_at": r.last_ts, **r.meta,
                   **r.identity.fields(con)}
@@ -1086,23 +1088,33 @@ def _prepare_ancestry(r):
             session_key TEXT NOT NULL, uuid TEXT NOT NULL, parent TEXT NOT NULL,
             input_id TEXT NOT NULL, response_id TEXT NOT NULL,
             source_id INTEGER NOT NULL REFERENCES sources(id),
+            link_status TEXT NOT NULL DEFAULT 'unknown',
             PRIMARY KEY(session_key, uuid, parent, input_id, response_id, source_id)
         ) WITHOUT ROWID""")
+    if "link_status" not in {col[1] for col in r.con.execute("PRAGMA table_info(claude_response_ancestry)")}:
+        r.con.execute("ALTER TABLE claude_response_ancestry ADD COLUMN link_status TEXT NOT NULL DEFAULT 'unknown'")
     r.con.execute("CREATE INDEX IF NOT EXISTS claude_ancestry_source"
                   " ON claude_response_ancestry(source_id)")
-    r.con.execute("""CREATE TABLE IF NOT EXISTS claude_invalid_ancestry (
-        source_id INTEGER NOT NULL REFERENCES sources(id), session_key TEXT NOT NULL,
-        uuid TEXT NOT NULL, response_id TEXT NOT NULL,
-        PRIMARY KEY(session_key, source_id, uuid, response_id)) WITHOUT ROWID""")
+    r.con.execute("""CREATE TABLE IF NOT EXISTS claude_ancestry_sources (
+        session_key TEXT NOT NULL, source_id INTEGER NOT NULL REFERENCES sources(id),
+        PRIMARY KEY(session_key,source_id)) WITHOUT ROWID""")
     r.con.execute("""CREATE TABLE IF NOT EXISTS claude_rejected_measurements (
         session_key TEXT NOT NULL, source_id INTEGER NOT NULL REFERENCES sources(id),
         uuid TEXT NOT NULL, parent TEXT NOT NULL, response_id TEXT NOT NULL, reason TEXT NOT NULL,
         PRIMARY KEY(session_key, source_id, uuid, parent, response_id, reason)) WITHOUT ROWID""")
+    r.linked_sessions = set()
     if not r.src.incremental:
-        r.con.execute("DELETE FROM claude_response_ancestry WHERE source_id=?",
-                      (r.src.source_id,))
-        r.con.execute("DELETE FROM claude_invalid_ancestry WHERE source_id=?", (r.src.source_id,))
+        if r.src.row["claude_usage_version"] in (6, 7, 8, 9):
+            r.con.execute("INSERT OR IGNORE INTO claude_ancestry_sources "
+                          "SELECT DISTINCT session_key,source_id FROM claude_response_ancestry "
+                          "WHERE source_id=? AND parent<>''", (r.src.source_id,))
+        if db._has_table(r.con, "claude_invalid_ancestry"):
+            r.con.execute("INSERT OR IGNORE INTO claude_ancestry_sources "
+                          "SELECT session_key,source_id FROM claude_invalid_ancestry WHERE source_id=?",
+                          (r.src.source_id,))
+            r.con.execute("DELETE FROM claude_invalid_ancestry WHERE source_id=?", (r.src.source_id,))
         r.con.execute("DELETE FROM claude_rejected_measurements WHERE source_id=?", (r.src.source_id,))
+        r.con.execute("DELETE FROM claude_response_ancestry WHERE source_id=?", (r.src.source_id,))
 
 
 def _record_ancestry(r, obj, rejected=None):
@@ -1144,24 +1156,49 @@ def _record_ancestry(r, obj, rejected=None):
                 return
     elif kind not in ("system", "progress"):
         return
-    # A supplied edge needs both endpoints. Keep its independently valid
-    # identities so a damaged copy cannot turn into historical display capture.
-    if not input_id and "parentUuid" in obj and (not uuid or not parent):
-        if uuid or response_id:
-            r.con.execute("INSERT OR IGNORE INTO claude_invalid_ancestry VALUES(?,?,?,?)",
-                          (r.src.source_id, r.session_key, uuid or "", response_id))
+    if not uuid and not response_id and "parentUuid" not in obj and "uuid" not in obj:
         return
+    invalid = ((not uuid and ("uuid" in obj or obj.get("parentUuid") is not None))
+               or (not parent and obj.get("parentUuid") is not None))
+    if invalid:
+        status = "invalid"
+    elif parent:
+        status = "linked"
+    elif "parentUuid" in obj and not input_id:
+        status = "root"
+    else:
+        status = "absent"
+    # Erasing the last parent on rewrite cannot turn this source into a
+    # pre-ancestry format. Remember the format independently of ownership.
+    if status != "absent":
+        r.linked_sessions.add(r.session_key)
     if rejected and response_id:
         r.con.execute("INSERT OR IGNORE INTO claude_rejected_measurements VALUES(?,?,?,?,?,?)",
                       (r.session_key, r.src.source_id, uuid or "", parent or "", response_id, rejected))
         return
-    if not uuid:
-        return
-    r.con.execute("INSERT OR IGNORE INTO claude_response_ancestry"
-                  "(session_key,uuid,parent,input_id,response_id,source_id)"
-                  " VALUES(?,?,?,?,?,?)",
-                  (r.session_key, uuid, "" if input_id else parent or "",
-                   input_id, response_id, r.src.source_id))
+    r.con.execute("INSERT INTO claude_response_ancestry"
+                  "(session_key,uuid,parent,input_id,response_id,source_id,link_status)"
+                  " VALUES(?,?,?,?,?,?,?) ON CONFLICT DO UPDATE SET link_status="
+                  "CASE WHEN link_status='invalid' OR excluded.link_status='invalid' THEN 'invalid' "
+                  "WHEN link_status='linked' OR excluded.link_status='linked' THEN 'linked' "
+                  "WHEN link_status='root' OR excluded.link_status='root' THEN 'root' ELSE excluded.link_status END",
+                  (r.session_key, uuid or "", "" if input_id else parent or "",
+                   input_id, response_id, r.src.source_id, status))
+
+
+def legacy_capture_sources(con, session_key):
+    """Sources with historical turn capture, or positive evidence of a parentless format."""
+    legacy = {r[0] for r in con.execute(
+        "SELECT DISTINCT e.source_id FROM events e JOIN sources s ON s.id=e.source_id "
+        "WHERE e.session_key=? AND COALESCE(s.claude_usage_version,0)<6", (session_key,))}
+    if "link_status" in {c[1] for c in con.execute("PRAGMA table_info(claude_response_ancestry)")}:
+        legacy.update(r[0] for r in con.execute(
+            "SELECT source_id FROM claude_response_ancestry WHERE session_key=? GROUP BY source_id "
+            "HAVING MIN(link_status='absent' AND parent='') AND MAX(response_id<>'')", (session_key,)))
+    if db._has_table(con, "claude_ancestry_sources"):
+        legacy.difference_update(source for source, in con.execute(
+            "SELECT source_id FROM claude_ancestry_sources WHERE session_key=?", (session_key,)))
+    return legacy
 
 
 def response_witnesses(con, session_key):
@@ -1171,9 +1208,53 @@ def response_witnesses(con, session_key):
     parents must all resolve, and competing inputs survive for the consumer.
     """
     if not db._has_table(con, "claude_response_ancestry"):
-        return {}, set()
+        unresolved = {rid: set() for rid, in con.execute(
+            "SELECT r.response_id FROM responses r JOIN sources s ON s.id=r.source_id "
+            "WHERE r.session_key=? AND r.is_overlap=0 AND s.claude_usage_version>=6", (session_key,))}
+        return unresolved, set()
     parents, children, anchors, blocks = (defaultdict(set) for _ in range(4))
-    seen, disputed = set(), set()
+    seen, disputed = {}, set()
+    legacy_sources = legacy_capture_sources(con, session_key)
+    accepted = set()
+    recorded_blocks = set()
+    unlinked = defaultdict(set)
+    unusable, unlocated, linked_responses = set(), set(), set()
+    columns = {col[1] for col in con.execute("PRAGMA table_info(claude_response_ancestry)")}
+    status_column = "link_status" if "link_status" in columns else "'unknown'"
+    for uuid, parent, input_id, rid, source, status in con.execute(
+            f"SELECT uuid,parent,input_id,response_id,source_id,{status_column} "
+            "FROM claude_response_ancestry WHERE session_key=?", (session_key,)):
+        if rid and uuid:
+            recorded_blocks.add((rid, source))
+            accepted.add((uuid, parent, rid))
+        if rid and status == "absent":
+            unlinked[rid].add(source)
+        if rid and parent:
+            linked_responses.add(rid)
+        if rid and status in {"root", "invalid"}:
+            unusable.add(rid)
+        if not uuid:
+            if rid:
+                unlocated.add(rid)
+            continue  # No graph vertex. The response still has a source observation.
+        edge = (parent, input_id, rid)
+        if seen.setdefault(uuid, edge) != edge:
+            disputed.add(uuid)
+        if input_id:
+            anchors[uuid].add(input_id)
+        elif parent:
+            parents[uuid].add(parent)
+            children[parent].add(uuid)
+        if rid:
+            blocks[rid].add(uuid)
+    if db._has_table(con, "native_response_events"):
+        # Version 7 kept an event edge even when it dropped the response's
+        # malformed graph position. That copy cannot validate another copy.
+        for rid, source in con.execute(
+                "SELECT DISTINCT e.response_id,e.source_id FROM native_response_events e JOIN sources s ON s.id=e.source_id "
+                "WHERE e.session_key=? AND s.claude_usage_version BETWEEN 7 AND 9", (session_key,)):
+            if (rid, source) not in recorded_blocks:
+                unlocated.add(rid)
     conflicts = set()
     if db._has_table(con, "claude_invalid_ancestry"):
         for uuid, response_id in con.execute(
@@ -1182,26 +1263,6 @@ def response_witnesses(con, session_key):
                 disputed.add(uuid)
             if response_id:
                 conflicts.add(response_id)
-    recorded_parents = set()
-    accepted = set()
-    for uuid, parent, input_id, response_id in con.execute(
-        "SELECT DISTINCT uuid,parent,input_id,response_id FROM claude_response_ancestry"
-        " WHERE session_key=?", (session_key,)
-    ):
-        # DISTINCT collapses identical copies. Another row for the same
-        # UUID contradicts its parent, input identity or message identity.
-        if uuid in seen:
-            disputed.add(uuid)
-        seen.add(uuid)
-        if input_id:
-            anchors[uuid].add(input_id)
-        elif parent:
-            recorded_parents.add(uuid)
-            parents[uuid].add(parent)
-            children[parent].add(uuid)
-        if response_id:
-            blocks[response_id].add(uuid)
-            accepted.add((uuid, parent, response_id))
     if db._has_table(con, "claude_rejected_measurements"):
         for uuid, parent, rid, reason, same_source in con.execute(
                 "SELECT q.uuid,q.parent,q.response_id,q.reason,EXISTS (SELECT 1 FROM claude_response_ancestry a "
@@ -1237,18 +1298,19 @@ def response_witnesses(con, session_key):
             if not parents[child]:
                 ready.append(child)
     results = {}
-    for response_id, in con.execute("SELECT response_id FROM responses"
-                                    " WHERE session_key=? AND is_overlap=0", (session_key,)):
-        nodes = blocks.get(response_id)
-        if not nodes:
-            continue
-        if nodes & disputed or (nodes & resolved and nodes - resolved):
+    for response_id, source, version in con.execute(
+            "SELECT r.response_id,r.source_id,s.claude_usage_version FROM responses r "
+            "JOIN sources s ON s.id=r.source_id WHERE r.session_key=? AND r.is_overlap=0", (session_key,)):
+        nodes = blocks[response_id]
+        if nodes & disputed or (nodes & resolved and (nodes - resolved or response_id in unlocated)):
             conflicts.add(response_id)
-        if nodes <= resolved:
+        elif nodes and nodes <= resolved:
             results[response_id] = set.union(*(anchors[node] for node in nodes))
-        elif nodes & recorded_parents:
-            # An empty witness set means a recorded, unresolved parent.
-            # Only an absent key can use historical explicit turn capture.
+        elif (response_id in unusable or response_id in linked_responses or unlinked[response_id] - legacy_sources
+              or ((version or 0) >= 6 and source not in unlinked[response_id])):
+            # Only a positively observed parentless record from a legacy source
+            # can fall back to its captured display turn. Versions 6/7 lost the
+            # distinction between absent and malformed parents until replay.
             results[response_id] = set()
     return results, conflicts
 

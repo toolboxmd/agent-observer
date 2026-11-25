@@ -104,6 +104,8 @@ class EvidenceCoverageTest(LedgerCase):
         path = Path(self.tmp.name, name + ".db")
         build_native(str(path))
         with closing(sqlite3.connect(path)) as source, source:
+            # These task scopes exercise only the two copies of the parent.
+            source.execute("DELETE FROM session WHERE parent_id IS NOT NULL")
             source.execute("UPDATE message SET data=json_set(data,'$.parentID',?,'$.cost',?,"
                            "'$.tokens.output',?) WHERE id='msg_a1'", (parent, cost, output))
             if independent:
@@ -314,3 +316,163 @@ class EvidenceCoverageTest(LedgerCase):
         self.assertEqual(rep["measured"]["attributed_responses"], ["opencode:msg_unique"])
         self.assertEqual(rep["native_cost"]["known_subtotal_usd"], 0.10)
         self.assertFalse(report.timeline(self.con, "A", session_key=key)["events"])
+
+    def check_malformed_claude(self, mutate):
+        path = self.import_claude()
+        self.assign("B", "claude:b")
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        mutate(rows[-1])
+        write_records(path, rows)
+        claude.import_claude_file(self.con, str(path), full=True)
+        path.unlink()
+        for canonical in (False, True):
+            if canonical:
+                self.project_input("claude:s", "a", "claude_prompt_echo")
+                self.con.execute("PRAGMA query_only=ON")
+            for task in ("A", "B"):
+                rep = report.task_report(self.con, task)
+                self.assertEqual(rep["measured"]["unplaced_responses"], ["claude:msg-b"])
+                self.assertNotIn("b-call", [e["native_id"] for e in report.timeline(self.con, task)["events"]])
+            draft = self.draft()
+            self.assertEqual(draft["summary"]["total_cost"]["responses"], 1)
+            self.assertIn("Evidence complete: no", draft["body"])
+
+    def test_claude_response_with_parent_but_no_block_uuid(self):
+        self.check_malformed_claude(lambda row: row.pop("uuid"))
+
+    def test_claude_response_with_malformed_parent(self):
+        self.check_malformed_claude(lambda row: row.update(parentUuid={"invalid": True}))
+
+    def test_claude_response_with_missing_link_in_modern_source(self):
+        self.check_malformed_claude(lambda row: row.pop("parentUuid"))
+
+    def check_malformed_opencode(self, bad_first):
+        good = self.opencode_store("good", "msg_u1", 0.20, 50, independent=True)
+        bad = self.opencode_store("bad", "msg_other", 0.20, 50)
+        with closing(sqlite3.connect(bad)) as source, source:
+            source.execute("INSERT INTO message SELECT 'msg_other',session_id,time_created,time_updated,data "
+                           "FROM message WHERE id='msg_u1'")
+        if not bad_first:
+            for path in (good, bad):
+                opencode.sync(self.con, source=path)
+            self.assign("A", "opencode:msg_u1")
+            self.assertEqual(report.task_report(self.con, "A")["attributed"]["output_tokens"], 3)
+        with closing(sqlite3.connect(bad)) as source, source:
+            source.execute("UPDATE message SET data=json_set(data,'$.tokens.output','invalid') WHERE id='msg_a1'")
+            source.execute("UPDATE session SET time_updated=time_updated+1")
+        self.assertGreater(opencode.sync(self.con, source=bad)["malformed"], 0)
+        opencode.sync(self.con, source=good)
+        if bad_first:
+            self.assign("A", "opencode:msg_u1")
+        for canonical in (False, True):
+            if canonical:
+                self.project_input("opencode:ses_parent", "msg_u1", "opencode_admitted_message")
+                for path in (bad, good):
+                    opencode.sync(self.con, source=path, full=True)
+                self.con.execute("PRAGMA query_only=ON")
+            rep = report.task_report(self.con, "A")
+            self.assertEqual(rep["measured"]["unplaced_responses"], ["opencode:msg_a1"])
+            self.assertEqual(rep["attributed"]["output_tokens"], 3)
+            self.assertIsNone(rep["native_cost"]["total_usd"])
+            self.assertEqual(rep["native_cost"]["known_subtotal_usd"], 0.10)
+            self.assertFalse(report.timeline(self.con, "A")["events"])
+            draft = self.draft()
+            self.assertIn("Evidence complete: no", draft["body"])
+            self.assertEqual(draft["summary"]["native_cost"], rep["native_cost"])
+
+    def test_malformed_opencode_refresh_preserves_dispute(self):
+        self.check_malformed_opencode(False)
+
+    def test_malformed_opencode_first_preserves_dispute(self):
+        self.check_malformed_opencode(True)
+
+    def test_malformed_only_opencode_input_keeps_its_gap_local(self):
+        path = self.opencode_store("single", "msg_u1", .20, 50, independent=True)
+        with closing(sqlite3.connect(path)) as source, source:
+            source.execute("INSERT INTO message SELECT 'other',session_id,time_created,time_updated,data "
+                           "FROM message WHERE id='msg_u1'")
+            source.execute("INSERT INTO part SELECT 'other-text','other',session_id,time_created,time_updated,data "
+                           "FROM part WHERE message_id='msg_u1' LIMIT 1")
+            source.execute("UPDATE message SET data=json_set(data,'$.tokens.output','bad','$.parentID','other') "
+                           "WHERE id='msg_a1'")
+        opencode.sync(self.con, source=path)
+        self.assign("A", "opencode:msg_u1")
+        self.assign("B", "opencode:other")
+        a, b = [report.task_report(self.con, task) for task in ("A", "B")]
+        self.assertEqual(a["native_cost"]["total_usd"], 0.10)
+        self.assertEqual(a["coverage"]["unavailable_response_usage"], [])
+        self.assertTrue(a["complete"])
+        self.assertEqual(b["coverage"]["unavailable_response_usage"], ["opencode:msg_a1"])
+        self.assertIsNone(b["native_cost"]["total_usd"])
+        self.assertFalse(b["complete"])
+
+    def test_claude_invalid_copy_and_correction_in_both_orders(self):
+        self.import_claude()
+        self.assign("B", "claude:b")
+        path = Path(self.tmp.name, "claude.jsonl")
+        other = Path(self.tmp.name, "copy.jsonl")
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        bad = dict(rows[-1], uuid=None)
+        for order in ((other, path), (path, other)):
+            write_records(other, [bad])
+            for source in order:
+                claude.import_claude_file(self.con, str(source), full=True)
+            rep = report.task_report(self.con, "B")
+            self.assertIn("claude:msg-b", rep["measured"]["unplaced_responses"])
+            self.assertFalse(report.timeline(self.con, "B")["events"])
+            write_records(other, [rows[-1]])
+            claude.import_claude_file(self.con, str(other), full=True)
+            self.assertEqual(report.task_report(self.con, "B")["measured"]["attributed_responses"], ["claude:msg-b"])
+
+    def test_unreadable_opencode_identity_cannot_release_previous_dispute(self):
+        good = self.opencode_store("good", "msg_u1", 0.20, 50, independent=True)
+        bad = self.opencode_store("bad", None, 7.25, 500)
+        for source in (good, bad):
+            opencode.sync(self.con, source=source)
+        self.assign("A", "opencode:msg_u1")
+        for sql in ("UPDATE message SET id=NULL WHERE id='msg_a1'",
+                    "UPDATE message SET id='msg_a1',data='broken' WHERE id IS NULL"):
+            with closing(sqlite3.connect(bad)) as source, source:
+                source.execute(sql)
+            for _ in range(2):
+                opencode.sync(self.con, source=bad, full=True)
+                rep = report.task_report(self.con, "A")
+                self.assertEqual(rep["measured"]["attributed_responses"], ["opencode:msg_unique"])
+                self.assertIsNone(rep["native_cost"]["total_usd"])
+                self.assertEqual(rep["native_cost"]["known_subtotal_usd"], 0.10)
+        with closing(sqlite3.connect(good)) as source:
+            valid = source.execute("SELECT data FROM message WHERE id='msg_a1'").fetchone()[0]
+        with closing(sqlite3.connect(bad)) as source, source:
+            source.execute("UPDATE message SET data=? WHERE id='msg_a1'", (valid,))
+        opencode.sync(self.con, source=bad, full=True)
+        rep = report.task_report(self.con, "A")
+        self.assertTrue(rep["complete"])
+        self.assertAlmostEqual(rep["native_cost"]["total_usd"], 0.30)
+        self.assertEqual(rep["attributed"]["output_tokens"], 53)
+
+    def test_unmeasured_claude_event_with_a_parent_cannot_inherit_display_turn(self):
+        path = self.import_claude(legacy=True)
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[1]["parentUuid"] = "a"
+        foreign = claude_response("foreign", "b", "ignored")
+        del foreign["message"]["id"]
+        foreign["message"]["content"] = [{"type": "tool_use", "id": "foreign-call", "name": "Read"}]
+        write_records(path, [claude_user("b"), rows[0], rows[1], foreign])
+        claude.import_claude_file(self.con, str(path), full=True)
+        self.assertNotIn("foreign-call", [e["native_id"] for e in report.timeline(self.con, "A")["events"]])
+
+    def test_erasing_last_claude_parent_does_not_turn_source_into_legacy(self):
+        path = self.import_claude(legacy=True)
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows.insert(0, claude_user("b"))
+        rows[-1]["parentUuid"] = "b"
+        write_records(path, rows)
+        claude.import_claude_file(self.con, str(path), full=True)
+        self.assign("B", "claude:b")
+        self.assertEqual(report.task_report(self.con, "B")["attributed"]["responses"], 1)
+        del rows[-1]["parentUuid"]
+        write_records(path, rows)
+        for _ in range(2):
+            claude.import_claude_file(self.con, str(path), full=True)
+            self.assertEqual(report.task_report(self.con, "A")["measured"]["unplaced_responses"], ["claude:msg-a"])
+            self.assertFalse(report.timeline(self.con, "A")["events"])
