@@ -664,3 +664,69 @@ class EvidenceCoverageTest(LedgerCase):
         rep = report.task_report(self.con, "A")
         self.assertEqual(rep["attributed"]["output_tokens"], 8)
         self.assertFalse(rep["complete"])
+
+    def test_torn_final_line_preserves_dispute_until_a_readable_repair(self):
+        path = self.import_claude()
+        self.assign("B", "claude:b")
+        other = path.with_name("torn.jsonl")
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[-1]["message"]["usage"]["output_tokens"] = 90000
+        write_records(other, rows)
+        claude.import_claude_file(self.con, str(other))
+        write_records(other, rows[:-1])
+        tail = json.dumps(rows[-1])
+        with other.open("a") as out:
+            out.write(tail[:24])
+        for _ in range(2):
+            claude.import_claude_file(self.con, str(other))
+            self.assertFalse(report.task_report(self.con, "B")["attributed"]["responses"])
+            self.assertFalse(report.timeline(self.con, "B")["events"])
+        rows[-1]["message"]["usage"]["output_tokens"] = 5
+        with other.open("a") as out:
+            out.write(json.dumps(rows[-1])[24:] + "\n")
+        claude.import_claude_file(self.con, str(other))
+        self.assertTrue(report.task_report(self.con, "B")["complete"])
+
+    def check_completed_partial_final(self, append):
+        p = Path(self.tmp.name, "partial-final.jsonl")
+        msg = claude_response("reply", "p", "mid")
+        usage = {"output_tokens": 90000, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        msg["message"].update(model="claude-haiku-4-5", usage=usage,
+                              content=[{"type": "tool_use", "id": "call", "name": "Read"}])
+        write_records(p, [claude_user("p"), msg])
+        claude.import_claude_file(self.con, str(p))
+        self.assign("A", "claude:p")
+        before = report.task_report(self.con, "A")
+        self.assertEqual(before["attributed"]["output_tokens"], 90000)
+        self.assertFalse(before["complete"])
+        usage["input_tokens"] = 11
+        write_records(p, [msg] if append else [claude_user("p"), msg], mode="a" if append else "w")
+        claude.import_claude_file(self.con, str(p))
+        after = report.task_report(self.con, "A")
+        self.assertTrue(after["complete"])
+        self.assertEqual(after["attributed"]["total_tokens"], 90011)
+        self.assertEqual([e["native_id"] for e in report.timeline(self.con, "A")["events"]], ["call"])
+
+    def test_appended_final_enriches_missing_counter(self):
+        self.check_completed_partial_final(True)
+
+    def test_rewritten_final_enriches_missing_counter(self):
+        self.check_completed_partial_final(False)
+
+    def test_partial_copy_cannot_retract_its_disputed_counter(self):
+        path = self.import_claude()
+        self.assign("B", "claude:b")
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        copy = path.with_name("partial-copy.jsonl")
+        usage = rows[-1]["message"]["usage"]
+        for output in (90000, None, 5):
+            with self.subTest(output=output):
+                if output is None:
+                    del usage["output_tokens"]
+                else:
+                    usage["output_tokens"] = output
+                write_records(copy, rows)
+                claude.import_claude_file(self.con, str(copy))
+                rep = report.task_report(self.con, "B")
+                self.assertEqual(rep["complete"], output == 5)
+                self.assertEqual(rep["attributed"]["responses"], int(output == 5))

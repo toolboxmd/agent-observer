@@ -121,6 +121,7 @@ class JsonlSource:
             self.row = row
         self.source_id = row["id"]
         self.end_offset = self.start_offset
+        self.incomplete_record = False
 
     def _check_at(self, row, size: int, mtime_ns: int,
                   ino: int) -> tuple[int, bool]:
@@ -245,6 +246,7 @@ class JsonlSource:
             position = self.start_offset
             for raw in fh:
                 if not raw.endswith(b"\n"):
+                    self.incomplete_record = True
                     break
                 position += len(raw)
                 text = raw.decode("utf-8", "replace")
