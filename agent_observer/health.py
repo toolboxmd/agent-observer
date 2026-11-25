@@ -170,10 +170,11 @@ def check_opencode(processes: list[dict], db_path: str | None = None) -> list[di
     for proc in live:
         seen = None
         if con is not None:
-            row = con.execute("SELECT MAX(time_updated) FROM session WHERE directory=?",
-                              (proc["cwd"],)).fetchone()
-            if row and isinstance(row[0], (int, float)) and row[0]:
-                seen = row[0] / 1000.0
+            row = con.execute(
+                "SELECT MAX(time_updated) FROM session WHERE directory=?"
+                " AND typeof(time_updated) IN ('integer', 'real')",
+                (proc["cwd"],)).fetchone()
+            seen = row[0] / 1000.0 if row and row[0] else None
         if seen is None or (proc.get("started") and seen < proc["started"]):
             findings.append({
                 "host": "opencode", "pid": proc["pid"], "cwd": proc["cwd"],
@@ -246,15 +247,17 @@ def _opencode_record_times(paths):
             session_cols = {row[1] for row in native.execute("PRAGMA table_info(session)")}
             if "id" not in session_cols:
                 raise sqlite3.DatabaseError("OpenCode session table unavailable")
+            timestamp_columns = ("time_created", "time_updated")
             selects = [f"SELECT id AS session_id, {col} AS oldest, {col} AS newest,"
                        f" typeof({col}) NOT IN ('integer', 'real', 'null') AS invalid FROM session"
-                       for col in ("time_created", "time_updated") if col in session_cols]
+                       for col in timestamp_columns if col in session_cols]
             for table in ("message", "part"):
                 cols = {row[1] for row in native.execute(f"PRAGMA table_info({table})")}
-                if {"session_id", "time_updated"} <= cols:
-                    selects.append(f"SELECT session_id, MIN(time_updated), MAX(time_updated),"
-                                   " MAX(typeof(time_updated) NOT IN ('integer', 'real', 'null'))"
-                                   f" FROM {table} GROUP BY session_id")
+                if "session_id" in cols:
+                    selects.extend(f"SELECT session_id, MIN({col}), MAX({col}),"
+                                   f" MAX(typeof({col}) NOT IN ('integer', 'real', 'null'))"
+                                   f" FROM {table} GROUP BY session_id"
+                                   for col in timestamp_columns if col in cols)
             if not selects:
                 raise sqlite3.DatabaseError("OpenCode session timestamps unavailable")
             combined = " UNION ALL ".join(selects)
