@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 
 from agent_observer import db, lookup, report
 from agent_observer.adapters import grok, opencode
@@ -145,9 +146,18 @@ class SourceAvailabilityTest(LedgerCase):
         for row in self.con.execute("SELECT DISTINCT session_key FROM user_messages"):
             self._own_session(row[0], task)
 
-    def test_deleted_opencode_session_is_not_available(self):
+    def _completed_opencode_source(self):
         native_path = os.path.join(self.tmp.name, "opencode.db")
         build_native(native_path)
+        with closing(sqlite3.connect(native_path)) as native, native:
+            native.execute("UPDATE message SET data=json_set(data,'$.time.completed',?) WHERE id='msg_a_unf'",
+                           (T0 + 60,))
+            native.execute("UPDATE part SET data=json_set(data,'$.state.status','completed','$.state.time.end',?) "
+                           "WHERE id='p_run1'", (T0 + 59,))
+        return native_path
+
+    def test_deleted_opencode_session_is_not_available(self):
+        native_path = self._completed_opencode_source()
         opencode.sync(self.con, source=native_path)
         self.con.commit()
         self._bind_all("T-OC")
@@ -440,8 +450,7 @@ class SourceAvailabilityTest(LedgerCase):
         self.assertNotEqual(mid["snapshot_id"], after["snapshot_id"])
 
     def test_eventless_gap_makes_a_mixed_task_partial(self):
-        native_path = os.path.join(self.tmp.name, "opencode.db")
-        build_native(native_path)
+        native_path = self._completed_opencode_source()
         opencode.sync(self.con, source=native_path)
         self.con.commit()
         self._bind_all("T-MIX")
