@@ -561,7 +561,7 @@ class HealthBareRootsTest(BareRootCase):
             result = health.check(processes=[], registry=[])
         self.assertEqual(result["ledger_freshness"]["codex"]["status"], "unavailable")
         self.assertIn({"check": "codex native record scan",
-                       "reason": "fixture bare root unreadable"}, result["unavailable"])
+                       "reason": "permission denied"}, result["unavailable"])
         self.assertEqual(result["bare_roots"]["codex"]["gaps"],
                          [{"root": root, "reason": "unreadable"}])
 

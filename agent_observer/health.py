@@ -309,7 +309,13 @@ def _ledger_freshness(con, sync_interval_seconds, unavailable, ledger_error):
             paths = _discover_native_paths(harness, adapter)
             records = list(_native_record_times(harness, paths))
         except (OSError, sqlite3.Error) as exc:
-            unavailable.append({"check": f"{harness} native record scan", "reason": str(exc)})
+            if isinstance(exc, PermissionError):
+                reason = "permission denied"
+            elif isinstance(exc, OSError):
+                reason = os.strerror(exc.errno) if exc.errno is not None else "source unavailable"
+            else:
+                reason = getattr(exc, "sqlite_errorname", "SQLite read failed")
+            unavailable.append({"check": f"{harness} native record scan", "reason": reason})
             freshness[harness] = {"newest_native_at": None, "newest_import_at": imported,
                                   "newer_sources": None, "lag_seconds": None,
                                   "status": "unavailable"}

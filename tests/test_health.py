@@ -328,7 +328,7 @@ class LedgerFreshnessTest(unittest.TestCase):
                 result = json.loads(output)
                 self.assertEqual(result["ledger_freshness"]["grok"]["status"], "unavailable")
                 self.assertIn({"check": "grok native record scan",
-                               "reason": "fixture directory unreadable"}, result["unavailable"])
+                               "reason": "permission denied"}, result["unavailable"])
 
     def test_failed_identity_query_preserves_freshness_json(self):
         self.source("claude/project/new.jsonl", 20_000)
@@ -370,7 +370,7 @@ class LedgerFreshnessTest(unittest.TestCase):
                 result = json.loads(output)
                 self.assertEqual(result["ledger_freshness"][harness]["status"], "unavailable")
                 self.assertIn({"check": f"{harness} native record scan",
-                               "reason": "fixture directory unreadable"}, result["unavailable"])
+                               "reason": "permission denied"}, result["unavailable"])
 
     def test_grok_file_stat_permission_failure_is_unavailable(self):
         path = "grok/project/session/updates.jsonl"
@@ -389,7 +389,20 @@ class LedgerFreshnessTest(unittest.TestCase):
         result = json.loads(output)
         self.assertEqual(result["ledger_freshness"]["grok"]["status"], "unavailable")
         self.assertIn({"check": "grok native record scan",
-                       "reason": "fixture record unreachable"}, result["unavailable"])
+                       "reason": "permission denied"}, result["unavailable"])
+
+    def test_freshness_scan_does_not_render_private_source_path(self):
+        from errno import EACCES
+
+        native = self.root / "claude/private-project-name"
+        error = PermissionError(EACCES, "Permission denied", str(native))
+        with patch.object(claude, "discover", side_effect=error):
+            for args in ((), ("--json",)):
+                with self.subTest(args=args):
+                    code, output = self.run_health(*args)
+                    self.assertEqual(code, 4)
+                    self.assertIn("permission denied", output)
+                    self.assertNotIn("private-project-name", output)
 
     def test_denied_chromeria_v2_state_is_unavailable_for_state_and_receipts(self):
         path = self.root / "t3/userdata/chromeria-v2.sqlite"
