@@ -1074,9 +1074,8 @@ def _sync(con, ns) -> int:
                     row[key] = (row.get(key) or 0) + value
                 elif key not in row:
                     row[key] = value
-    # Placement runs once, after every harness import and the T3 refresh,
-    # so sessions imported later in this run are visible (#80). The refresh
-    # merge must not add shared_sessions a second time.
+    # Count shared sessions after the T3 refresh. Native adapters record
+    # checkout evidence as they import events, regardless of link order.
     if "t3" in wanted:
         for row in results:
             if row.get("harness") == "t3" and "skipped" not in row:

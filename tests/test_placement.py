@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from agent_observer import cli, db, placement, report
 from agent_observer.adapters import t3 as t3_adapter
+from agent_observer.adapters.claude import import_claude_file
 from agent_observer.adapters.codex import import_codex_file
 from tests.helpers import LedgerCase
 
@@ -46,13 +47,14 @@ class PlacementTest(LedgerCase):
                 " head_branch) VALUES('t','pr','github.com',?,?,?,?)",
                 (f"o/{repo}", n, f"https://github.com/o/{repo}/pull/{n}", branch))
 
-    def session(self, harness, calls, *, tasks=("o/alpha#1", "o/beta#2")):
+    def session(self, harness, calls, *, tasks=("o/alpha#1", "o/beta#2"), missing=()):
         """calls: (response ordinal, tool-call ordinal, target) per response."""
         key = f"{harness}:s"
         db.upsert_session(self.con, key, harness, "s", None, project_dir="/nowhere")
         for task in tasks:
             self.con.execute("INSERT INTO session_assignments(session_key, task_id,"
                              " evidence, created_at) VALUES(?,?,'t3',0)", (key, task))
+        new_events = []
         for i, (resp, call, target) in enumerate(calls):
             self.con.execute(
                 "INSERT INTO responses(response_id, source_id, harness, session_key,"
@@ -60,10 +62,14 @@ class PlacementTest(LedgerCase):
                 " VALUES(?,?,?,?,?,'m',100,10,110)",
                 (f"r{i}", self.source, harness, key, resp))
             if target is not None:
-                self.con.execute(
+                event = self.con.execute(
                     "INSERT INTO events(source_id, session_key, ordinal_num, family,"
                     " native_id, name, target) VALUES(?,?,?,'tool_call',?,'Bash',?)",
                     (self.source, key, call, f"e{i}", target))
+                if i not in missing and harness in placement.CALL_FOLLOWS_RESPONSE:
+                    new_events.append((event.lastrowid, target))
+        self.con.commit()
+        placement.observe_new_checkouts(self.con, new_events)
         return key
 
     def claude_session(self):
@@ -105,6 +111,95 @@ class PlacementTest(LedgerCase):
             shutil.rmtree(root)
         placed = placement.read_placements(self.con, "claude:s")
         self.assertEqual((placed["r0"], placed["r1"]), ("o/alpha#1", "o/beta#2"))
+
+    def _append_claude_call(self, path, session, response, root):
+        record = {"type": "assistant", "sessionId": session, "message": {
+            "id": response, "model": "m", "usage": {"input_tokens": 10, "output_tokens": 2},
+            "content": [{"type": "tool_use", "id": f"call-{response}", "name": "Bash",
+                         "input": {"command": f"cat {root}/x.py"}}],
+        }}
+        with open(path, "a") as fh:
+            fh.write(json.dumps(record) + "\n")
+
+    def _assign(self, key, task):
+        self.con.execute(
+            "INSERT INTO session_assignments(session_key,task_id,evidence,created_at)"
+            " VALUES(?,?,'t3',0)", (key, task))
+
+    def test_late_link_keeps_the_first_imports_checkout_after_path_reuse(self):
+        for session, t3_first in (("t3-first", True), ("native-first", False)):
+            with self.subTest(order=session):
+                key = f"claude:{session}"
+                path = os.path.join(self.tmp.name, f"{session}.jsonl")
+                root = self.checkouts["alpha"]
+                _git("-C", root, "checkout", "-q", "fix/a")
+                _git("-C", root, "remote", "set-url", "origin", "git@github.com:o/alpha.git")
+                self.con.execute("DELETE FROM t3_links WHERE number=2")
+                if t3_first:
+                    self._assign(key, "o/alpha#1")
+                self._append_claude_call(path, session, f"{session}-1", root)
+                import_claude_file(self.con, path)
+                if not t3_first:
+                    self._assign(key, "o/alpha#1")
+                placement.record_shared_checkouts(self.con)
+                _git("-C", root, "checkout", "-q", "-B", "fix/b")
+                _git("-C", root, "remote", "set-url", "origin", "git@github.com:o/beta.git")
+                self.con.execute(
+                    "INSERT INTO t3_links(thread_id,kind,host,repository,number,url,head_branch)"
+                    " VALUES('t','pr','github.com','o/beta',2,"
+                    " 'https://github.com/o/beta/pull/2','fix/b')")
+                self._assign(key, "o/beta#2")
+                self._append_claude_call(path, session, f"{session}-2", root)
+                self.assertTrue(import_claude_file(self.con, path)["incremental"])
+                placement.record_shared_checkouts(self.con)
+                self.assertEqual(placement.read_placements(self.con, key), {
+                    f"claude:{session}-1": "o/alpha#1", f"claude:{session}-2": "o/beta#2"})
+
+    def test_replay_of_old_ledger_captures_only_verified_new_records(self):
+        key = "claude:old-ledger"
+        path = os.path.join(self.tmp.name, "old-ledger.jsonl")
+        root = self.checkouts["alpha"]
+        self._append_claude_call(path, "old-ledger", "before", root)
+        # Simulate an older writer that indexed the native rows without observing Git.
+        with patch.object(placement, "observe_new_checkouts"):
+            import_claude_file(self.con, path)
+        # Its parser also missed the tool call. Recovering an event from the
+        # old prefix still cannot make an observation of today's checkout timely.
+        self.con.execute("DELETE FROM events WHERE native_id='call-before'")
+        for task in ("o/alpha#1", "o/beta#2"):
+            self._assign(key, task)
+        _git("-C", root, "checkout", "-q", "-b", "fix/b")
+        _git("-C", root, "remote", "set-url", "origin", "git@github.com:o/beta.git")
+        with patch.object(placement, "_git", side_effect=AssertionError("old checkout scanned")):
+            self.assertEqual(import_claude_file(self.con, path, full=True)["events_inserted"], 1)
+            placement.record_shared_checkouts(self.con)
+        self.assertIsNone(placement.read_placements(self.con, key).get("claude:before"))
+
+        self._append_claude_call(path, "old-ledger", "after", root)
+        # A parser-driven replay must still admit a provably appended record.
+        self.con.execute("UPDATE sources SET claude_usage_version=0")
+        self.assertFalse(import_claude_file(self.con, path)["incremental"])
+        self.assertEqual(placement.read_placements(self.con, key), {
+            "claude:before": None, "claude:after": "o/beta#2"})
+
+    def test_codex_observes_call_before_usage_arrives(self):
+        key = "codex:placement-review"
+        path, _ = self._continuation_files("live")
+        with open(path) as fh:
+            records = fh.readlines()[:4]
+        with open(path, "w") as fh:
+            fh.writelines(records[:3])
+            fh.write(records[3].rstrip("\n"))
+        import_codex_file(self.con, path)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM responses").fetchone()[0], 0)
+        self._bind_placement_tasks(self.con)
+        shutil.rmtree(self.checkouts["alpha"])
+        with open(path, "a") as fh:
+            fh.write("\n")
+        with patch.object(placement, "_git", side_effect=AssertionError("checkout scanned again")):
+            self.assertTrue(import_codex_file(self.con, path)["incremental"])
+            self.assertEqual(placement.read_placements(self.con, key),
+                             {"codex:r1": "o/alpha#1"})
 
     def test_checkout_on_another_forge_does_not_credit_github(self):
         root = self.checkouts["alpha"]
@@ -155,21 +250,23 @@ class PlacementTest(LedgerCase):
         placement.record_shared_checkouts(self.con)
         self.assertIsNone(placement.read_placements(self.con, key)["r0"])
 
-    def test_historical_checkout_without_host_cannot_supply_or_hide_a_match(self):
-        alpha, beta = self.checkouts["alpha"], self.checkouts["beta"]
+    def test_historical_checkout_without_import_provenance_cannot_place(self):
+        alpha = self.checkouts["alpha"]
         key = self.session("claude", [
-            (1, 2, f"diff {alpha}/f {beta}/f"),
+            (1, 2, f"ls {alpha}/f"),
             (3, 4, f"ls {alpha}/f"),
-        ])
+        ], missing=(0,))
         self.con.execute(
             "CREATE TABLE response_checkouts("
             " event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,"
-            " path_digest BLOB NOT NULL, response_id TEXT, repository TEXT, branch TEXT,"
+            " path_digest BLOB NOT NULL, response_id TEXT, host TEXT,"
+            " repository TEXT, branch TEXT,"
             " PRIMARY KEY(event_id, path_digest))")
         event_id = self.con.execute("SELECT id FROM events WHERE native_id='e0'").fetchone()[0]
         digest = hashlib.sha256(f"{alpha}/f".encode()).digest()
-        self.con.execute("INSERT INTO response_checkouts VALUES(?,?,'r0','o/alpha','fix/old')",
-                         (event_id, digest))
+        self.con.execute(
+            "INSERT INTO response_checkouts VALUES(?,?,'r0','github.com','o/alpha','fix/a')",
+            (event_id, digest))
         self.con.commit()
         with closing(db.connect_read_only(self.db_path)) as ro:
             self.assertIsNone(placement.read_placements(ro, key).get("r0"))
@@ -212,29 +309,31 @@ class PlacementTest(LedgerCase):
         _git("-C", root, "remote", "set-url", "origin", "git@github.com:o/beta.git")
         self.con.execute("INSERT INTO responses(response_id,source_id,session_key,"
                          " ordinal_num) VALUES('new',?,?,10)", (self.source, key))
-        self.con.execute("INSERT INTO events(session_key,ordinal_num,family,native_id,target)"
-                         " VALUES(?,11,'read','new-call',?)", (key, root))
+        event = self.con.execute(
+            "INSERT INTO events(session_key,ordinal_num,family,native_id,target)"
+            " VALUES(?,11,'read','new-call',?)", (key, root))
         self.assertIsNone(placement.read_placements(self.con, key)["new"])
-        placement.record_shared_checkouts(self.con)
+        self.con.commit()
+        placement.observe_new_checkouts(self.con, [(event.lastrowid, root)])
         shutil.rmtree(root)
         placement.record_shared_checkouts(self.con)
         placed = placement.read_placements(self.con, key)
         self.assertEqual((placed["r0"], placed["new"]), ("o/alpha#1", "o/beta#2"))
 
     def test_removed_checkout_without_response_evidence_does_not_place(self):
-        key = self.claude_session()
+        key = self.session("claude", [(1, 2, f"ls {self.checkouts['alpha']}")], missing=(0,))
         root = self.checkouts["alpha"]
         self.con.execute("INSERT INTO checkouts(root,repository,branch,seen_at)"
                          " VALUES(?,'o/alpha','fix/a',0)", (root,))
         shutil.rmtree(root)
         self.assertEqual(placement.read_placements(self.con, key), {})
         placement.record_shared_checkouts(self.con)
-        self.assertIsNone(placement.read_placements(self.con, key)["r0"])
+        self.assertEqual(placement.read_placements(self.con, key), {})
 
     def test_checkout_without_origin_cannot_gain_a_retroactive_match(self):
-        key = self.claude_session()
         root = self.checkouts["alpha"]
         _git("-C", root, "remote", "remove", "origin")
+        key = self.claude_session()
         placement.record_shared_checkouts(self.con)
         _git("-C", root, "remote", "add", "origin", "git@github.com:o/alpha.git")
         placement.record_shared_checkouts(self.con)
@@ -704,53 +803,23 @@ class PlacementTest(LedgerCase):
                 placement.record_shared_checkouts(con)
                 self.assertEqual(placement.read_placements(con, key), ambiguous)
 
-    def test_shared_checkout_is_resolved_once_per_sync(self):
-        # Two shared sessions in one record_shared_checkouts share a root.
-        # A per-session roots map would ask git twice for that root.
+    def test_checkout_is_resolved_once_for_new_events_in_one_import(self):
         root = self.checkouts["alpha"]
+        path = os.path.join(self.tmp.name, "same-root.jsonl")
         for n in (1, 2):
-            key = f"claude:s{n}"
-            db.upsert_session(self.con, key, "claude", f"s{n}", None,
-                              project_dir="/nowhere")
-            for task in ("o/alpha#1", "o/beta#2"):
-                self.con.execute(
-                    "INSERT INTO session_assignments(session_key, task_id,"
-                    " evidence, created_at) VALUES(?,?,'t3',0)", (key, task))
-            self.con.execute(
-                "INSERT INTO responses(response_id, source_id, harness,"
-                " session_key, ordinal_num, model, input_tokens,"
-                " output_tokens, total_tokens)"
-                " VALUES(?,?,?,?,?,'m',100,10,110)",
-                (f"once{n}", self.source, "claude", key, 1))
-            self.con.execute(
-                "INSERT INTO events(source_id, session_key, ordinal_num,"
-                " family, native_id, name, target)"
-                " VALUES(?,?,?,'tool_call',?,'Bash',?)",
-                (self.source, key, 2, f"once-e{n}", f"ls {root}"))
-        calls = []
-        real = placement._git
-
-        def wrapped(checkout, *args):
-            calls.append((checkout, args))
-            return real(checkout, *args)
-
-        placement._git = wrapped
-        try:
-            self.assertEqual(placement.record_shared_checkouts(self.con), 2)
-        finally:
-            placement._git = real
-        self.assertEqual(
-            [c for c in calls if c == (root, ("remote", "get-url", "origin"))],
-            [(root, ("remote", "get-url", "origin"))])
-        self.assertEqual(
-            [c for c in calls if c == (root, ("rev-parse", "--abbrev-ref", "HEAD"))],
-            [(root, ("rev-parse", "--abbrev-ref", "HEAD"))])
-        for n in (1, 2):
-            self.assertEqual(placement.read_placements(self.con, f"claude:s{n}"),
-                             {f"once{n}": "o/alpha#1"})
+            self._append_claude_call(path, "same-root", f"r{n}", root)
+        with patch.object(placement, "_git", wraps=placement._git) as git:
+            import_claude_file(self.con, path)
+        self.assertEqual([call.args for call in git.call_args_list], [
+            (root, "remote", "get-url", "origin"),
+            (root, "rev-parse", "--abbrev-ref", "HEAD")])
 
     def test_live_git_runs_outside_an_open_write(self):
-        key = self.claude_session()
+        key = "claude:transaction"
+        path = os.path.join(self.tmp.name, "transaction.jsonl")
+        self._append_claude_call(path, "transaction", "r0", self.checkouts["alpha"])
+        for task in ("o/alpha#1", "o/beta#2"):
+            self._assign(key, task)
         self.assertTrue(self.con.in_transaction)
         real = placement._git
 
@@ -759,11 +828,11 @@ class PlacementTest(LedgerCase):
             return real(root, *args)
 
         with patch.object(placement, "_git", side_effect=check_transaction) as git:
-            placement.record_shared_checkouts(self.con)
+            import_claude_file(self.con, path)
         self.assertTrue(git.called)
         other = db.connect_read_only(self.db_path)
         self.addCleanup(other.close)
-        self.assertEqual(placement.read_placements(other, key)["r0"], "o/alpha#1")
+        self.assertEqual(placement.read_placements(other, key)["claude:r0"], "o/alpha#1")
 
     def test_sync_records_shared_sessions_once_after_refresh(self):
         calls = []

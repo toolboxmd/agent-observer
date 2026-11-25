@@ -617,7 +617,7 @@ class RetainedHistoryUpgradeTest(unittest.TestCase):
                               "commit", "-q", "--allow-empty", "-m", "start"]):
                     subprocess.run(["git", *args], check=True, capture_output=True)
 
-    def test_upgrade_keeps_parent_input_and_read_attribution(self):
+    def test_upgrade_keeps_parent_input_and_read_evidence(self):
         for user_id in (None, "parent-input"):
             with self.subTest(user_id=user_id):
                 if os.path.exists(self.db_path):
@@ -644,14 +644,16 @@ class RetainedHistoryUpgradeTest(unittest.TestCase):
                         self.assertIn("retained parent input", shown["text"])
                         placement.record_shared_checkouts(con)
                         placed = placement.read_placements(con, "codex:parent")
-                        self.assertEqual(placed["codex:parent-r1"], "o/alpha#1")
-                        self.assertEqual(placed["codex:parent-r2"], "o/beta#2")
+                        # The old importer recorded no timely checkout evidence.
+                        # The retained native reads alone cannot prove their forge or head.
+                        self.assertIsNone(placed.get("codex:parent-r1"))
+                        self.assertIsNone(placed.get("codex:parent-r2"))
                         for i, repo in enumerate(("alpha", "beta"), 1):
                             measured = report.task_report(
                                 con, f"o/{repo}#{i}", schedule={"models": {}})[
                                     "measured"]
                             self.assertIn(f"codex:parent-r{i}",
-                                          measured["attributed_responses"])
+                                          measured["unplaced_responses"])
                         reads = con.execute(
                             "SELECT e.family FROM codex_occurrences o"
                             " JOIN events e ON e.id = o.row_key"
