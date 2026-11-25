@@ -173,6 +173,14 @@ def _text(payload) -> str:
             f"session span {r.get('time', {}).get('session_span_s')} "
             f"({r.get('time', {}).get('session_span_label')})",
         ]
+        if r.get("native_purpose", {}).get("runs"):
+            native = r["native_purpose"]
+            lines.append(f"  native purpose: {len(native['runs'])} runs; "
+                         f"{len(native['membership'])} joined responses")
+            if native.get("coverage_gaps"):
+                lines.append("  native coverage: " + ", ".join(native["coverage_gaps"]))
+            for pr in native["deliveries"]:
+                lines.append(f"  delivery PR: {pr['url']}")
         est = r.get("estimated_cost") or {}
         if est.get("schedule_source"):
             lines.append(
@@ -209,6 +217,8 @@ def _text(payload) -> str:
                  f"joined call_ids: {len(payload['join']['joined_call_ids'])}",
                  f"unmatched results: {len(payload['join']['unmatched_results'])}",
                  f"unanswered calls: {len(payload['join']['unanswered_calls'])}"]
+        if "native_response_count" in payload:
+            lines.append(f"native responses joined to this outcome: {payload['native_response_count']}")
         if payload.get("truncated"):
             lines[0] = (f"events: {payload['returned']} of {payload['total']} "
                         f"(truncated). {payload['truncation_hint']}")

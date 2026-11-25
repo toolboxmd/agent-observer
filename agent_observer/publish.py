@@ -227,6 +227,8 @@ def summarize(con, session_keys: set, label: str, task_id: str | None = None,
             "total_cost": rep["total_cost"],
             "subscription_note": rep["subscription_note"],
         })
+        if "native_purpose" in rep:
+            out["native_purpose"] = rep["native_purpose"]
     else:
         out.update({
             "scope_kind": "session",
@@ -430,6 +432,16 @@ def render(summary: dict, target: str | None = None) -> str:
     parts += [_counted(responses, "response", "responses"),
               _counted(sessions, "session", "sessions"), wall]
     lines = [MARKER, f"### {title}", "", " · ".join(parts), ""]
+    native = summary.get("native_purpose") or {}
+    if native.get("runs"):
+        lines.append(f"Outcome: {_safe_field(summary['task_id'])}. "
+                     "Only responses with proved ownership enter the native subtotal.")
+        if native.get("coverage_gaps"):
+            lines.append("Full outcome cost unknown. Native coverage: " +
+                         ", ".join(_safe_field(g.replace("_", " ")) for g in native["coverage_gaps"]) + ".")
+        for pr in native["deliveries"]:
+            lines.append(f"Delivery PR: {_safe_field(pr['url'])}")
+        lines.append("")
     if not task:
         lines += [f"_{_safe_field(summary.get('session_note') or 'Session scope only.')} "
                   f"Finished processes never imply an accepted task outcome._", ""]

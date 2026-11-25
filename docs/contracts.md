@@ -536,17 +536,17 @@ re-read every sync; workload bindings are durable ledger rows.
   (backfilled rows gain their turn but no excerpt). Scaffolding, command
   and interrupt verdicts fail closed; unlisted records (typed prompts,
   Router `sdk-cli` workers) never move; unknown stays unknown.
-- Thread trees: `sub.<parent>.<suffix>` ids (nesting allowed) group under
+- Legacy thread trees: `sub.<parent>.<suffix>` ids (nesting allowed) group under
   their root. Each linked PR or Issue becomes one `repo#N` task
   (`origin='t3'`); every ledger session in the tree (cursor sessions plus
   Claude subagent children plus rotated sessions found by turn uuid) binds
-  whole to every tree task. One-link trees attribute exclusively.
+  whole to every tree task as historical session context. A thread link alone cannot place a response.
   In a multi-link tree, a Claude or Codex response belongs to one PR when
   the paths its tool calls name lie in a checkout of that PR's repository
-  on its head branch (T3 snapshot `headBranch`; checkouts recorded in
-  `checkouts` at sync so removed worktrees still match). A response
+  on its head branch (T3 snapshot `headBranch`). Sync records that observation
+  against the individual event, path digest and response. Reports read the ledger. A response
   matching no PR or several stays unplaced and outside every headline.
-  Other harnesses, and links without a head branch, keep whole sharing.
+  Whole-session sharing from links stays visible outside the outcome cost.
   Ghostty bodies and unknown cursor shapes are skipped.
 - Outcomes come from the PR snapshot (`merged` completes); exit codes are
   never read.

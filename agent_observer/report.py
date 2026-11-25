@@ -6,7 +6,7 @@ import hashlib
 import json
 import sqlite3
 
-from . import codex_order
+from . import codex_order, outcome
 from .db import _has_table
 
 BUCKETS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
@@ -215,9 +215,12 @@ def task_sessions(con: sqlite3.Connection, task_id: str) -> set:
         "SELECT DISTINCT s.session_key FROM assignments a JOIN user_messages s"
         " ON s.native_id=a.user_message_id WHERE a.task_id=?"
         " AND s.session_key IS NOT NULL", (task_id,))}
-    keys |= {r["session_key"] for r in con.execute(
-        "SELECT session_key FROM session_assignments WHERE task_id=?",
-        (task_id,))}
+    canonical = outcome.active(con, task_id)
+    keys.update(outcome.sessions(con, task_id))
+    for r in con.execute(
+            "SELECT session_key, evidence FROM session_assignments WHERE task_id=?", (task_id,)):
+        if not (r["evidence"] or "").startswith("t3:") or not canonical:
+            keys.add(r["session_key"])
     keys |= {r["session_key"] for r in con.execute(
         "SELECT session_key FROM task_turns WHERE task_id=? AND session_key IS NOT NULL",
         (task_id,))}
@@ -404,7 +407,7 @@ def _is_mcp_result(event) -> bool:
 
 
 def _phase_report(con, task_id, rows, whole, attempts, schedule,
-                  unmeasured=frozenset()):
+                  unmeasured=frozenset(), native_sessions=(), native_turns=()):
     from . import pricing, analysis
     by_turn, by_session = {}, {}
 
@@ -429,6 +432,8 @@ def _phase_report(con, task_id, rows, whole, attempts, schedule,
             by_session.setdefault(a["session_key"], set()).add(phase(a.get("stage")))
 
     def selected(row):
+        if row["session_key"] in native_sessions and (row["session_key"], row["turn_id"]) not in native_turns:
+            return "unclassified"
         labels = by_turn.get(row["turn_id"]) or by_session.get(row["session_key"]) or {"unclassified"}
         return next(iter(labels)) if len(labels) == 1 else "mixed"
 
@@ -442,8 +447,11 @@ def _phase_report(con, task_id, rows, whole, attempts, schedule,
     for key in sorted({r["session_key"] for r in rows} | set(whole)):
         harness = _session_harness(con, key)
         for event in con.execute("SELECT * FROM events WHERE session_key=?", (key,)):
-            label = ("session context" if key not in whole and event["turn_id"] not in turns
-                     else selected(event))
+            if key in native_sessions:
+                owned = (key, event["turn_id"]) in native_turns
+            else:
+                owned = key in whole or event["turn_id"] in turns
+            label = selected(event) if owned else "session context"
             # Capability comes from the event's own native session, never
             # from the importer that attributed it (Router).
             contributors.setdefault(label, {})[key] = harness
@@ -519,6 +527,17 @@ def task_report(con: sqlite3.Connection, task_id: str,
     whole = {r["session_key"]: r["evidence"] for r in con.execute(
         "SELECT session_key, evidence FROM session_assignments WHERE task_id=?",
         (task_id,))}
+    native = None
+    purpose_owners = {}
+    native_turns = set()
+    canonical = outcome.active(con, task_id)
+    if canonical or (_has_table(con, "t3_purpose_sessions") and any(
+            con.execute("SELECT 1 FROM t3_purpose_sessions WHERE session_key=? LIMIT 1",
+                        (key,)).fetchone() for key in scope_keys)):
+        native, purpose_owners, native_turns = outcome.evidence(con, task_id, scope_keys)
+        whole = {k: v for k, v in whole.items()
+                 if not (v or "").startswith("t3:") or (not canonical and k not in native["sessions"])}
+    legacy_links = {key for key, ev in whole.items() if ev == "t3" or (ev or "").startswith("t3:")}
     whole_shared = {r["session_key"] for r in con.execute(
         "SELECT session_key FROM session_assignments GROUP BY session_key"
         " HAVING COUNT(DISTINCT task_id) > 1")}
@@ -532,15 +551,29 @@ def task_report(con: sqlite3.Connection, task_id: str,
     # A session shared by several PRs is split per response by the checkout
     # its tool calls worked in (#43); None keeps whole-session sharing.
     placements = {key: _place(con, key) for key in whole_shared & set(whole)
-                  if key not in whole_conflicts}
+                  if key not in whole_conflicts and not canonical
+                  and not (native and key in native["sessions"])}
     unplaced, elsewhere = [], []
     missing_submissions = []
     assigned_anywhere = {r["user_message_id"] for r in
                          con.execute("SELECT user_message_id "
                                      "FROM assignments").fetchall()}
+    conflicts = set(native["conflicting_responses"]) if native else set()
     for r in responses:
         if r["is_overlap"]:
             continue
+        key, rid = r["session_key"], r["response_id"]
+        if native and key in native["sessions"]:
+            owner = purpose_owners.get(rid)
+            if rid in conflicts:
+                unplaced.append(dict(r))
+                continue
+            if owner == task_id:
+                attributed.append(dict(r))
+                continue
+            if rid in purpose_owners or canonical or (key not in whole and not bound_subs):
+                (elsewhere if owner else unplaced).append(dict(r))
+                continue
         if r["session_key"] in whole:
             placed = placements.get(r["session_key"])
             if placed is not None:
@@ -548,7 +581,12 @@ def task_report(con: sqlite3.Connection, task_id: str,
                 (attributed if owner == task_id else
                  unplaced if owner is None else elsewhere).append(dict(r))
                 continue
-            (shared if r["session_key"] in whole_shared else attributed).append(dict(r))
+            if key in whole_shared:
+                shared.append(dict(r))
+            elif key in legacy_links:
+                unplaced.append(dict(r))
+            else:
+                attributed.append(dict(r))
             continue
         sub = turn_sub.get(r["turn_id"])
         if sub is None:
@@ -567,15 +605,8 @@ def task_report(con: sqlite3.Connection, task_id: str,
     # responses while attributed and shared stay empty (for example every
     # prompt read synthetic, so per-prompt assignment refused them). This
     # is a visible coverage gap, never a silent "missing assignments: none".
-    live_scope = [dict(r) for r in responses if not r["is_overlap"]]
-    unbound_usage: list = []
-    if live_scope and not attributed and not shared:
-        responders: dict[str, int] = {}
-        for r in live_scope:
-            if r.get("session_key"):
-                responders[r["session_key"]] = \
-                    responders.get(r["session_key"], 0) + 1
-        unbound_usage = sorted(responders)
+    unbound_usage = sorted({r["session_key"] for r in unassigned + unplaced}
+                           - {r["session_key"] for r in attributed + shared + elsewhere})
 
     def total(rows):
         return _usage_totals(rows)
@@ -605,7 +636,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
         "SELECT * FROM delegations WHERE owning_user_message IN "
         "(SELECT user_message_id FROM assignments WHERE task_id=?)",
         (task_id,))]
-    owned_sessions = set(whole) | {r["session_key"] for r in con.execute(
+    owned_sessions = outcome.sessions(con, task_id) | set(whole) | {r["session_key"] for r in con.execute(
         "SELECT s.session_key FROM user_messages s JOIN assignments a"
         " ON a.user_message_id=s.native_id WHERE a.task_id=?", (task_id,))}
 
@@ -652,14 +683,18 @@ def task_report(con: sqlite3.Connection, task_id: str,
             unmeasured_attributed.add(key)
         elif subs:
             unmeasured_shared.add(key)
-    unavailable_usage = bool(not scope_keys or missing_sessions or empty_sessions
+    inventory_gaps = outcome.check_inventory(con, native, attributed) if canonical else False
+    unavailable_usage = bool(unbound_usage or conflicts or inventory_gaps or legacy_links
+                             or not scope_keys or missing_sessions or empty_sessions
                              or unbound_children or unbound_delegations or whole_conflicts)
     cutoff = _source_cutoff(con, scope_keys)
-    task_turns = _task_turn_ids(con, task_id, turn_sub, whole)
-    diagnostics = _task_diagnostics(con, scope_keys, whole, task_turns)
+    explicit_whole = {k: ev for k, ev in whole.items() if k not in legacy_links}
+    task_turns = _task_turn_ids(con, task_id, turn_sub, explicit_whole)
+    task_turns.update(turn for _, turn in native_turns)
+    diagnostics = _task_diagnostics(con, scope_keys, explicit_whole, task_turns)
     phases, activity_context, activity_context_coverage = _phase_report(
-        con, task_id, attributed, set(whole)-whole_shared, task_turn_rows, schedule,
-        unmeasured_attributed)
+        con, task_id, attributed, set(explicit_whole)-whole_shared, task_turn_rows, schedule,
+        unmeasured_attributed, native["sessions"] if native else (), native_turns)
 
     def _resp_tuple(r) -> list:
         return [r.get("response_id"), r.get("harness"), r.get("model"),
@@ -712,16 +747,20 @@ def task_report(con: sqlite3.Connection, task_id: str,
             [d.get("owning_user_message"), d.get("child_thread")] for d in delegation_rows),
         "source_cutoff": cutoff,
     }
+    if native:
+        snapshot_payload["native_purpose"] = native
     snapshot = _snapshot_id(snapshot_payload)
     estimated = _pricing.price_scope(attributed, schedule)
     shared_estimated = _pricing.price_scope(shared, schedule)
-    total_estimated = _pricing.price_scope(attributed + shared, schedule)
+    billed_shared = [] if canonical else [r for r in shared if r["session_key"] not in legacy_links]
+    total_estimated = _pricing.price_scope(attributed + billed_shared, schedule)
     unplaced_estimated = _pricing.price_scope(unplaced, schedule)
     for estimate in (estimated, shared_estimated, total_estimated, unplaced_estimated):
         estimate["status"] = ("complete" if estimate["complete"] else
                               "partial" if estimate["priced_responses"] else "unknown")
         if unavailable_usage:
-            estimate.update(complete=False, estimated_cost_usd_total=None, status="partial",
+            estimate.update(complete=False, estimated_cost_usd_total=None,
+                            status="partial" if estimate["priced_responses"] else "unknown",
                             coverage_note="Native session usage or worker ownership is unavailable")
     native_cost = _native_cost(attributed)
     if unavailable_usage:
@@ -843,6 +882,10 @@ def task_report(con: sqlite3.Connection, task_id: str,
             parts.get(sem, 0) == wholes.get(sem, 0)
             for sem in parts)
     report["reconciles"] = responses_reconcile and totals_reconcile
+    if legacy_links:
+        report["coverage"]["legacy_thread_links"] = sorted(legacy_links)
+    if native:
+        report["native_purpose"] = native
     report["unbound_usage"] = unbound_usage
     report["source_availability"] = {
         "status": source_availability["status"],
@@ -862,7 +905,10 @@ def task_report(con: sqlite3.Connection, task_id: str,
     report["coverage"]["unavailable_sessions"] = unavailable_sessions
     report["coverage"]["unavailable_sources"] = unavailable_sources
     report["total_cost"] = _total_cost(
-        con, task_id, total_estimated, attributed, shared, joint, whole)
+        con, task_id, total_estimated, attributed, billed_shared, joint, whole)
+    if canonical and inventory_gaps and total_estimated.get("priced_responses"):
+        subtotal = total_estimated["estimated_cost_usd_partial"]
+        report["total_cost"]["text"] = f"unknown (observed priced subtotal ${subtotal:,.2f})"
     report["total_cost"]["unplaced"] = {
         "text": _money(unplaced_estimated) if unplaced else None,
         "responses": len(unplaced),
@@ -873,11 +919,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
 
 def _place(con, session_key: str):
     from . import placement
-    try:
-        return placement.place_session(con, session_key)
-    except sqlite3.OperationalError:
-        # A ledger without T3 head branches or checkouts keeps whole sharing.
-        return None
+    return placement.read_placements(con, session_key)
 
 
 def _money(estimate: dict) -> str:
@@ -925,7 +967,7 @@ def _total_cost(con, task_id, estimate, attributed, shared, joint,
     # partial: an empty subtotal must never read as a numeric zero.
     status = estimate["status"] if estimate.get("priced_responses") else "unknown"
     return {
-        "text": _money(estimate),
+        "text": _money(estimate) if status != "unknown" else "unknown",
         "usd": estimate.get("estimated_cost_usd_total") if status == "complete"
         else estimate.get("estimated_cost_usd_partial") if status == "partial"
         else None,
@@ -956,17 +998,50 @@ def timeline(con: sqlite3.Connection, task_id: str | None = None,
     if turn_id:
         q += " AND turn_id=?"
         args.append(turn_id)
-    elif task_turns is not None:
-        whole = sorted(r["session_key"] for r in con.execute(
-            "SELECT session_key FROM session_assignments WHERE task_id=?",
+    trace_scope = {}
+    if task_turns is not None:
+        canonical = outcome.active(con, task_id)
+        native_turns = set()
+        claude_event_ids = []
+        if canonical:
+            native, _, native_turns = outcome.evidence(con, task_id, outcome.sessions(con, task_id))
+            matches = {rid: member for rid, member in native["membership"].items()
+                       if (not session_key or member["session_key"] == session_key)
+                       and (not turn_id or turn_id == member["session_key"].partition(":")[0] + ":" + member["native_input_id"])}
+            for key in sorted({m["session_key"] for m in matches.values() if m["session_key"].startswith("claude:")}):
+                # Claude gives each text event the transcript UUID and block
+                # index. Its parent chain proves the response independently of
+                # the display turn that may have been retouched.
+                for event_id, rid in con.execute(
+                        "SELECT DISTINCT e.id,a.response_id FROM events e JOIN claude_response_ancestry a "
+                        "ON e.source_id=a.source_id AND e.session_key=a.session_key "
+                        "AND a.uuid=substr(e.native_id,1,instr(e.native_id,':')-1) "
+                        "WHERE e.session_key=? AND e.family='assistant_message'", (key,)):
+                    if rid in matches:
+                        claude_event_ids.append(event_id)
+            trace_scope = {"native_response_count": len(matches),
+                           "native_responses": {rid: matches[rid] for rid in sorted(matches)[:limit]}}
+            # Display turns can be retouched after import. Use only native
+            # session/turn pairs in an exact outcome timeline.
+            task_turns.clear()
+        whole = [] if canonical else sorted(r["session_key"] for r in con.execute(
+            "SELECT session_key FROM session_assignments WHERE task_id=? AND evidence<>'t3' AND evidence NOT LIKE 't3:%'",
             (task_id,)))
-        if not task_turns and not whole:
-            return {"events": [], "returned": 0, "total": 0,
+        if not task_turns and not whole and not native_turns and not claude_event_ids:
+            return {**trace_scope, "events": [], "returned": 0, "total": 0,
                     "truncated": False,
                     "note": "no bound turns; timeline empty",
                     "join": {"calls": 0, "results": 0, "joined_call_ids": [],
                              "unmatched_results": [], "unanswered_calls": []}}
         clauses = []
+        if claude_event_ids:
+            clauses.append("id IN (SELECT value FROM json_each(?))")
+            args.append(json.dumps(claude_event_ids))
+        if native_turns:
+            pairs = sorted(native_turns)
+            clauses.append("(session_key, turn_id) IN (VALUES " + ",".join(["(?,?)"] * len(pairs)) + ")")
+            for pair in pairs:
+                args.extend(pair)
         if task_turns:
             clauses.append(f"turn_id IN ({','.join('?' * len(task_turns))})")
             args.extend(sorted(task_turns))
@@ -985,6 +1060,11 @@ def timeline(con: sqlite3.Connection, task_id: str | None = None,
     out = []
     for r in rows:
         d = dict(r)
+        if trace_scope:
+            d.pop("detail_json", None)
+            d.pop("target", None)
+            out.append(d)
+            continue
         try:
             d["detail"] = json.loads(d["detail_json"]) if d["detail_json"] else None
         except ValueError:
@@ -1023,7 +1103,7 @@ def timeline(con: sqlite3.Connection, task_id: str | None = None,
     calls = {e["native_id"] for e in out if e["family"] == "tool_call"}
     results = {e["native_id"] for e in out if e["family"] == "tool_result"}
     result = {
-        "events": out,
+        **trace_scope, "events": out,
         "returned": len(out),
         "total": total,
         "truncated": len(out) < total,

@@ -131,12 +131,19 @@ class SourceAvailabilityTest(LedgerCase):
         self.assertIn("ledger-only", text.stdout)
         self.assertNotIn(self.live, text.stdout)
 
+    def _own_session(self, session, task):
+        # Isolate source availability from the independent input-ownership gate.
+        self.con.execute("INSERT INTO session_assignments(session_key,task_id,evidence,created_at)"
+                         " VALUES(?,?,'explicit fixture ownership',0)", (session, task))
+
     def _bind_all(self, task):
         _setup_tasks(self, task)
         rows = self.con.execute("SELECT native_id FROM user_messages").fetchall()
         self.assertGreater(len(rows), 0)
         for row in rows:
             _assign(self, row["native_id"], task)
+        for row in self.con.execute("SELECT DISTINCT session_key FROM user_messages"):
+            self._own_session(row[0], task)
 
     def test_deleted_opencode_session_is_not_available(self):
         native_path = os.path.join(self.tmp.name, "opencode.db")
@@ -227,6 +234,7 @@ class SourceAvailabilityTest(LedgerCase):
             (child,))]
         self.assertGreater(len(child_messages), 0)
         _setup_tasks(self, "T-CHILD")
+        self._own_session(child, "T-CHILD")
         for native_id in child_messages:
             _assign(self, native_id, "T-CHILD")
         source = self.con.execute(
@@ -301,6 +309,7 @@ class SourceAvailabilityTest(LedgerCase):
             "SELECT native_id FROM user_messages WHERE session_key=?",
             (session_key,)).fetchone()["native_id"]
         _setup_tasks(self, "T-QUIET")
+        self._own_session(session_key, "T-QUIET")
         _assign(self, native_id, "T-QUIET")
         source = self.con.execute(
             "SELECT * FROM sources WHERE path=?", (live,)).fetchone()
