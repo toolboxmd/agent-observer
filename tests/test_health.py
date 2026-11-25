@@ -630,13 +630,6 @@ class LedgerFreshnessTest(unittest.TestCase):
             with patch("builtins.open", denied_open):
                 self.assertTrue(grok.sync(con)["failed"])
             self.assertEqual(con.execute("SELECT COUNT(*) FROM responses").fetchone()[0], 0)
-            for contents in (None, "{}", '{"head_branch":"main"}'):
-                if contents is None:
-                    summary.unlink()
-                else:
-                    summary.write_text(contents)
-                self.assertTrue(grok.sync(con)["failed"])
-                self.assertEqual(con.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 0)
             summary.write_text('{"info":{"id":"native-id"},"current_model_id":"grok-4"}')
             self.assertEqual(grok.sync(con)["failed"], [])
             rows = con.execute("SELECT session_key FROM sessions").fetchall()
@@ -650,6 +643,8 @@ class LedgerFreshnessTest(unittest.TestCase):
         event = self.root / "grok/project/directory-id/events.jsonl"
         event.write_text('{"type":"turn_started","session_id":"native-id",'
                          '"ts":"2026-11-25T18:00:00Z"}\n')
+        event.with_name("updates.jsonl").write_text(
+            '{"method":"session/update","params":{"sessionId":"wrong-id"}}\n')
         self.imports()
         with contextlib.closing(db.connect(str(self.ledger))) as con:
             result = grok.sync(con)
@@ -657,6 +652,25 @@ class LedgerFreshnessTest(unittest.TestCase):
             self.assertEqual(result["events_inserted"], 1)
             self.assertEqual(con.execute("SELECT session_key FROM events").fetchone()[0],
                              "grok:native-id")
+
+    def test_grok_readable_summary_can_fall_back_to_directory_id(self):
+        folder = self.root / "grok/project/directory-id"
+        folder.mkdir(parents=True)
+        (folder / "summary.json").write_text('{"head_branch":"main"}')
+        (folder / "events.jsonl").write_text(
+            '{"type":"turn_ended","ts":"2026-11-25T18:00:00Z","outcome":"completed"}\n')
+        self.imports()
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            self.assertEqual(grok.sync(con)["failed"], [])
+            self.assertEqual(con.execute("SELECT session_key FROM events").fetchone()[0],
+                             "grok:directory-id")
+            (folder / "summary.json").write_text('{"info":{"id":"native-id"}}')
+            with (folder / "events.jsonl").open("a") as file:
+                file.write('{"type":"turn_started","ts":"2026-11-25T18:01:00Z"}\n')
+            self.assertEqual(grok.sync(con)["failed"], [])
+            self.assertEqual(con.execute(
+                "SELECT session_key FROM events WHERE name='turn_started'").fetchone()[0],
+                "grok:native-id")
 
     def test_bad_grok_metadata_keeps_health_stale(self):
         cases = (

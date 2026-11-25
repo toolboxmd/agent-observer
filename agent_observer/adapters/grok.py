@@ -1510,8 +1510,8 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     raw_info_id = info.get("id")
     valid_info_id = _valid_native_id(raw_info_id) \
         if isinstance(raw_info_id, str) and raw_info_id else None
-    # Keep the source's identity during a metadata retry even if it differs
-    # from the directory or the recovered summary.
+    # A failed summary read can use identity already established for a
+    # transcript, while a readable native ID takes precedence.
     _ensure_grok_meta_table(con)
     recorded_id = None
     for path in (updates_path, events_path):
@@ -1525,11 +1525,9 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                 break
     if recorded_id is None and valid_info_id is None:
         recorded_id = _notification_session_id(updates_path, events_path)
-        if recorded_id is None and (summary_unavailable or safe_basename is not None):
-            if not metadata_errors:
-                metadata_errors.append("Grok session identity unavailable")
+        if recorded_id is None and summary_unavailable:
             return stats
-    native_sid = recorded_id or valid_info_id or safe_basename
+    native_sid = valid_info_id or recorded_id or safe_basename
     if native_sid is None:
         # No safe native id: quarantine under the fixed missing_id
         # category with no record values. The source_path locates the
@@ -2083,7 +2081,9 @@ def _notification_session_id(updates_path, events_path) -> str | None:
                     continue
                 if updates:
                     params = record.get("params")
-                    if record.get("method") not in METHODS or not isinstance(params, dict):
+                    if (record.get("method") not in METHODS or not isinstance(params, dict)
+                            or not isinstance(params.get("update"), dict)
+                            or not isinstance(params["update"].get("sessionUpdate"), str)):
                         continue
                     native_id = params.get("sessionId")
                 else:
