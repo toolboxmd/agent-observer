@@ -268,6 +268,7 @@ def _native_record_times(harness, paths):
             continue
         elif harness in ("t3", "router"):
             # A SQLite source can advance before its main file is checkpointed.
+            path = os.path.realpath(path)
             times = (_mtime(path), _mtime(path + "-wal", min_size=33))
         else:
             times = (_mtime(path),)

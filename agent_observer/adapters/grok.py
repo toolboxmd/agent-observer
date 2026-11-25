@@ -396,13 +396,17 @@ def _resolve_source(source: str, root: str | None) -> list[str]:
     return discover(root)
 
 
-def _read_json(path: str):
+def _read_summary(path: str) -> dict:
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             obj = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    return obj if isinstance(obj, dict) else None
+    except FileNotFoundError:
+        return {}
+    except ValueError as exc:
+        raise OSError("invalid Grok summary JSON") from exc
+    if not isinstance(obj, dict):
+        raise OSError("Grok summary must be a JSON object")
+    return obj
 
 
 def _content_text(content) -> str:
@@ -622,36 +626,36 @@ def _stored_meta(con: sqlite3.Connection, session_key: str):
     """Stored chat/summary state or Nones when absent/unreadable.
 
     Returns (summary_fp, chat_fp, seen_set, synthetic_set, chat_effort,
-    chat_reliable). Mark collections are None when the row or its mark
+    chat_reliable, imported_at). Mark collections are None when the row or its mark
     columns are absent, so the caller falls back to parsing the chat file.
     """
     try:
         row = con.execute(
             f"SELECT summary_fp, chat_fp, chat_seen_json,"
-            f" chat_synthetic_json, chat_effort, chat_reliable"
+            f" chat_synthetic_json, chat_effort, chat_reliable, imported_at"
             f" FROM {_GROK_META_TABLE}"
             " WHERE session_key=?", (session_key,)).fetchone()
     except sqlite3.DatabaseError:
-        return None, None, None, None, None, None
+        return (None,) * 7
     if row is None:
-        return None, None, None, None, None, None
+        return (None,) * 7
     try:
         summary_fp = row["summary_fp"]
         chat_fp = row["chat_fp"]
     except (KeyError, TypeError, IndexError):
-        return None, None, None, None, None, None
+        return (None,) * 7
     try:
         seen_raw = row["chat_seen_json"]
         synth_raw = row["chat_synthetic_json"]
         chat_effort = row["chat_effort"]
         reliable_raw = row["chat_reliable"]
     except (KeyError, TypeError, IndexError):
-        return summary_fp, chat_fp, None, None, None, None
+        return summary_fp, chat_fp, None, None, None, None, None
     try:
         seen = set(json.loads(seen_raw)) if seen_raw else set()
         synthetic = set(json.loads(synth_raw)) if synth_raw else set()
     except (TypeError, ValueError):
-        return summary_fp, chat_fp, None, None, None, None
+        return summary_fp, chat_fp, None, None, None, None, None
     if reliable_raw is None:
         reliable = None
     elif isinstance(reliable_raw, int):
@@ -660,12 +664,12 @@ def _stored_meta(con: sqlite3.Connection, session_key: str):
         reliable = reliable_raw == "1"
     else:
         reliable = None
-    return summary_fp, chat_fp, seen, synthetic, chat_effort, reliable
+    return summary_fp, chat_fp, seen, synthetic, chat_effort, reliable, row["imported_at"]
 
 
 def _store_meta(con: sqlite3.Connection, session_key: str,
                 summary_fp: str | None, chat_fp: str | None,
-                chat: dict | None = None) -> None:
+                chat: dict | None, imported_at: float) -> None:
     """Persist fingerprints plus parsed chat marks for the fast path."""
     _ensure_grok_meta_table(con)
     if chat is None:
@@ -689,7 +693,7 @@ def _store_meta(con: sqlite3.Connection, session_key: str,
             " chat_synthetic_json, chat_effort, chat_reliable, imported_at)"
             " VALUES(?,?,?,?,?,?,?,?)",
             (session_key, summary_fp, chat_fp, seen_json, synth_json,
-             chat_effort, chat_reliable, db.now()))
+             chat_effort, chat_reliable, imported_at))
     except sqlite3.DatabaseError:
         pass
 
@@ -706,7 +710,7 @@ def _chat_fingerprint(session_dir: str) -> str:
     try:
         with open(path, "rb") as bfh:
             raw_bytes = bfh.read()
-    except OSError:
+    except FileNotFoundError:
         return "missing"
     try:
         return hashlib.sha256(raw_bytes).hexdigest()
@@ -1461,7 +1465,14 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         for name in ("updates.jsonl", "events.jsonl")})
     updates_path = source_paths.get("updates.jsonl")
     events_path = source_paths.get("events.jsonl")
-    summary = _read_json(os.path.join(session_dir, "summary.json")) or {}
+    metadata_imported_at = db.now()
+    summary_path = os.path.join(session_dir, "summary.json")
+    metadata_stamps = (path_info(path) for path in
+                       (summary_path, os.path.join(session_dir, "chat_history.jsonl")))
+    metadata_mtime = max((info.st_mtime for info in metadata_stamps if info is not None),
+                         default=None)
+    summary = _read_summary(summary_path)
+    chat_fp_current = _chat_fingerprint(session_dir)
     info = summary.get("info") if isinstance(summary.get("info"), dict) else {}
     # Fail closed on unsafe identifiers: the native session id comes only
     # from a validated summary.info.id or a validated directory basename.
@@ -1582,10 +1593,9 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     except (KeyError, TypeError, IndexError):
         stored_role = None
     summary_fp = _summary_fingerprint(summary)
-    chat_fp_current = _chat_fingerprint(session_dir)
     _ensure_grok_meta_table(con)
     (stored_summary_fp, stored_chat_fp, stored_seen, stored_synthetic,
-     stored_chat_effort, stored_chat_reliable) = _stored_meta(con,
+     stored_chat_effort, stored_chat_reliable, stored_imported_at) = _stored_meta(con,
                                                               r.session_key)
     stored_marks = _chat_from_stored(stored_chat_fp, stored_seen,
                                      stored_synthetic, stored_chat_effort,
@@ -1646,12 +1656,12 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             updates_new = updates_src is not None and not updates_src.unchanged
             events_new = events_src is not None and not events_src.unchanged
             if not updates_new and not events_new:
-                if updates_src is None and events_src is None:
-                    # Older ledgers kept fingerprints for metadata-only
-                    # sessions without a timestamp. They were rechecked above.
+                if metadata_mtime is not None and (
+                        stored_imported_at is None or metadata_mtime > stored_imported_at):
+                    # The reads above revalidated the same metadata bytes.
                     con.execute(f"UPDATE {_GROK_META_TABLE} SET imported_at=?"
-                                " WHERE session_key=? AND imported_at IS NULL",
-                                (db.now(), r.session_key))
+                                " WHERE session_key=?",
+                                (metadata_imported_at, r.session_key))
                     con.commit()
                 stats["unchanged"] = True
                 stats["session_key"] = r.session_key
@@ -1686,7 +1696,7 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                 # Reclassify without records is covered by the force above
                 # (no parse, no duplicates).
                 _store_meta(con, r.session_key, summary_fp, chat_fp_current,
-                            chat)
+                            chat, metadata_imported_at)
                 con.commit()
                 stats["unchanged"] = False
                 stats["session_key"] = r.session_key
@@ -1891,7 +1901,7 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                 "(SELECT version FROM agentsmd_versions WHERE sha256=sessions.instructions_sha256), ?)"
                 " WHERE session_key=?",
                 (json.dumps(evidence, sort_keys=True) if evidence else None, version, r.session_key))
-    _store_meta(con, r.session_key, summary_fp, chat_fp_current, chat)
+    _store_meta(con, r.session_key, summary_fp, chat_fp_current, chat, metadata_imported_at)
     if updates_src is not None:
         stats.update(updates_src.finish(session_id=r.native_sid))
     if events_src is not None:
@@ -1923,7 +1933,7 @@ def _read_chat(session_dir: str, r: _Reader) -> dict:
     try:
         with open(path, "rb") as bfh:
             raw_bytes = bfh.read()
-    except OSError:
+    except FileNotFoundError:
         chat["reliable"] = False
         return chat
     try:
@@ -1934,7 +1944,7 @@ def _read_chat(session_dir: str, r: _Reader) -> dict:
         chat["reliable"] = False
     try:
         fh = open(path, encoding="utf-8", errors="replace")
-    except OSError:
+    except FileNotFoundError:
         chat["reliable"] = False
         return chat
     with fh:

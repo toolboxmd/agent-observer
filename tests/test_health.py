@@ -444,6 +444,51 @@ class LedgerFreshnessTest(unittest.TestCase):
         self.assertEqual(code, 4)
         self.assertEqual(json.loads(output)["ledger_freshness"]["codex"]["newer_sources"], 1)
 
+    def test_grok_revalidates_identical_metadata_and_retries_denied_reads(self):
+        summary = self.root / "grok/project/session-one/summary.json"
+        self.source("grok/project/session-one/summary.json", 10_000)
+        summary.write_text("{}")
+        os.utime(summary, (10_000, 10_000))
+        self.imports()
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            with patch.object(db, "now", return_value=11_000):
+                self.assertEqual(grok.sync(con)["failed"], [])
+            os.utime(summary, (20_000, 20_000))
+            self.assertEqual(self.run_health("--json")[0], 4)
+            with patch.object(db, "now", return_value=21_000):
+                self.assertEqual(grok.sync(con)["failed"], [])
+            self.assertEqual(self.run_health("--json")[0], 0)
+            summary.write_text('{"head_branch": "fresh"}')
+            os.utime(summary, (30_000, 30_000))
+            real_open = open
+
+            def denied_open(path, *args, **kwargs):
+                if path == str(summary):
+                    raise PermissionError("fixture refused summary read")
+                return real_open(path, *args, **kwargs)
+
+            with patch("builtins.open", denied_open), patch.object(db, "now", return_value=31_000):
+                self.assertEqual(len(grok.sync(con)["failed"]), 1)
+            self.assertEqual(grok.newest_metadata_import(con), 21_000)
+            self.assertEqual(self.run_health("--json")[0], 4)
+
+    def test_chromeria_freshness_follows_symlink_to_wal(self):
+        link = self.root / "t3/userdata/chromeria-v2.sqlite"
+        link.parent.mkdir(parents=True)
+        target = self.root / "native.sqlite"
+        link.symlink_to(target)
+        self.imports(t3=11_000)
+        with contextlib.closing(sqlite3.connect(target)) as native:
+            native.execute("PRAGMA journal_mode=WAL")
+            native.executescript("CREATE TABLE evidence(value); INSERT INTO evidence VALUES (1);")
+            os.utime(target, (10_000, 10_000))
+            os.utime(str(target) + "-wal", (20_000, 20_000))
+            code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        row = json.loads(output)["ledger_freshness"]["t3"]
+        self.assertEqual(row["newest_native_at"], 20_000)
+        self.assertEqual(row["status"], "stale")
+
 
 class ClaudeVisibilityTest(unittest.TestCase):
     def setUp(self):
