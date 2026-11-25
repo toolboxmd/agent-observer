@@ -106,7 +106,7 @@ def _valid_counter(value) -> bool:
 
 _FINALITY_TABLE = "claude_response_finality"
 _NATIVE_KINDS_TABLE = "claude_native_kinds"
-_IMPORT_VERSION = 15  # Reconcile source-specific final fields and their cache split.
+_IMPORT_VERSION = 16  # Rebuild measurements from surviving finals after a source withdrawal.
 
 
 def _ensure_native_kinds(con) -> None:
@@ -433,6 +433,7 @@ def import_claude_file(con: sqlite3.Connection, path: str,
                 unreadable = True
         try:
             r.message_events.clear()
+            r.final_location = None
             _ingest(r, obj, ordinal)
             _record_ancestry(r, obj)
             if obj.get("type") == "queue-operation":
@@ -474,11 +475,15 @@ def import_claude_file(con: sqlite3.Connection, path: str,
             # A complete snapshot may remove a message altogether. Any
             # surviving copy of that message, accepted or quarantined, keeps
             # this source's obligation to supply its previously declared final.
-            con.execute("""DELETE FROM claude_expected_finals WHERE source_id=?
+            retired = """ WHERE source_id=?
                 AND (session_key,response_id) NOT IN (
                     SELECT session_key,response_id FROM claude_response_ancestry WHERE source_id=?
                     UNION SELECT session_key,response_id FROM claude_rejected_measurements WHERE source_id=?
-                )""", (src.source_id, src.source_id, src.source_id))
+                )"""
+            ids = (src.source_id,) * 3
+            con.execute("INSERT OR IGNORE INTO claude_withdrawn_finals SELECT session_key,response_id "
+                        "FROM claude_expected_finals" + retired, ids)
+            con.execute("DELETE FROM claude_expected_finals" + retired, ids)
         # A replacement can revise a field by measuring it again. Omitting
         # the field cannot settle a disagreement, even across partial finals.
         con.execute("""INSERT OR IGNORE INTO claude_retained_final_fields
@@ -498,6 +503,7 @@ def import_claude_file(con: sqlite3.Connection, path: str,
         SELECT 1 FROM claude_final_observations o WHERE o.session_key=p.session_key
         AND o.response_id=p.response_id AND o.source_id=p.source_id
         AND json_extract(o.payload,'$.'||p.field) IS NOT NULL))""", (src.source_id,))
+    _reproject_withdrawn_finals(r)
     con.executemany("INSERT OR IGNORE INTO claude_ancestry_sources VALUES(?,?)",
                     ((key, src.source_id) for key in r.linked_sessions))
     if r.native_session:
@@ -624,6 +630,20 @@ def _stored_counters(r: _Reader, rid: str) -> dict:
     return dict(row) if row is not None else {}
 
 
+def _agreeing_fields(rows, fields):
+    agreed = {}
+    witnesses = defaultdict(set)
+    for row in rows:
+        for field, value in json.loads(row["payload"]).items():
+            if value is None or field not in fields:
+                continue
+            if field in agreed and agreed[field] != value:
+                return None, witnesses
+            agreed[field] = value
+            witnesses[field].add(row["source_id"])
+    return agreed, witnesses
+
+
 def _corroborated_final(r, rid, seen):
     """A changed counter needs matching measurements from its original source and a copy."""
     rows = r.con.execute(
@@ -633,25 +653,50 @@ def _corroborated_final(r, rid, seen):
     sources = {row["source_id"] for row in rows}
     if len(sources) < 2 or rows[0]["original"] not in sources:
         return None
-    agreed = {}
-    witnesses = defaultdict(set)
-    for row in rows:
-        for field, value in json.loads(row["payload"]).items():
-            if value is None or (field != "model" and field not in seen):
-                continue
-            if field in agreed and agreed[field] != value:
-                return None
-            agreed[field] = value
-            witnesses[field].add(row["source_id"])
+    agreed, witnesses = _agreeing_fields(rows, {*seen, "model"})
     # A single native final must actually have measured the full total.
     # Its constituent counters, when revised, must also be corroborated.
-    if "total_tokens" not in agreed:
+    if not agreed or "total_tokens" not in agreed:
         return None
     for field, old in dict(seen, model=rows[0]["model"]).items():
         if field != "total_tokens" and old is not None and field in agreed and old != agreed[field]:
             if len(witnesses[field]) < 2 or rows[0]["original"] not in witnesses[field]:
                 return None
     return agreed
+
+
+def _reproject_withdrawn_finals(r):
+    """A readable removal retires every counter and locator supplied only by that source."""
+    con = r.con
+    for key, rid in con.execute("SELECT session_key,response_id FROM claude_withdrawn_finals "
+                                "WHERE session_key=?", (r.session_key,)).fetchall():
+        copies = con.execute("SELECT o.source_id,o.payload,u.source_id AS unreadable FROM claude_final_observations o "
+                             "LEFT JOIN claude_unreadable_sources u USING(session_key,source_id) "
+                             "WHERE o.session_key=? AND o.response_id=?", (key, rid)).fetchall()
+        blocks = con.execute("SELECT b.* FROM claude_final_blocks b JOIN sources s ON s.id=b.source_id "
+                             "WHERE b.session_key=? AND b.response_id=? ORDER BY s.path,b.ordinal_num",
+                             (key, rid)).fetchall()
+        if (not copies or any(c["unreadable"] for c in copies)
+                or {c["source_id"] for c in copies} != {b["source_id"] for b in blocks}):
+            continue
+        fields = (*_stored_counters(r, rid), "model")
+        agreed, witnessed = _agreeing_fields(copies, fields)
+        if not agreed or not _cache_consistent(agreed.get("cache_write_input_tokens"),
+                                               agreed.get("cache_write_5m_tokens"), agreed.get("cache_write_1h_tokens")):
+            continue
+        if all(b["link_status"] == "absent" for b in blocks) and len({b["turn_id"] for b in blocks}) > 1:
+            continue
+        # Prefer a native block from a copy that measured the complete total.
+        block = next((b for b in blocks if b["source_id"] in witnessed["total_tokens"]), blocks[0])
+        con.execute("UPDATE responses SET " + ",".join(f"{field}=?" for field in fields) +
+                    ",source_id=?,turn_id=?,ordinal_num=?,ts=? WHERE session_key=? AND response_id=?",
+                    (*(agreed.get(field) for field in fields), block["source_id"], block["turn_id"],
+                     block["ordinal_num"], block["ts"], key, rid))
+        # Only a block with validated final usage can regain its recorded
+        # ancestry. Other rejected blocks and unusable parents stay disputed.
+        for b in blocks:
+            _save_edge(con, key, b["uuid"], b["parent"], "", rid, b["source_id"], b["link_status"])
+        con.execute("DELETE FROM claude_withdrawn_finals WHERE session_key=? AND response_id=?", (key, rid))
 
 
 def conflicting_final_measurements(con, session_key):
@@ -673,6 +718,9 @@ def conflicting_final_measurements(con, session_key):
             "SELECT DISTINCT p.response_id FROM claude_retained_final_fields p "
             "JOIN responses r USING(session_key,response_id) WHERE p.session_key=? AND p.value IS NOT " + column,
             (session_key,)))
+    if db._has_table(con, "claude_withdrawn_finals"):
+        conflicts.update(rid for rid, in con.execute(
+            "SELECT response_id FROM claude_withdrawn_finals WHERE session_key=?", (session_key,)))
     # Read-only ledgers may already contain an incoherent pre-version-15 row.
     conflicts.update(rid for rid, in con.execute(
         "SELECT response_id FROM responses WHERE session_key=? AND (cache_write_5m_tokens>cache_write_input_tokens "
@@ -697,11 +745,15 @@ def conflicting_final_measurements(con, session_key):
 def responses_without_final_usage(con, session_key):
     if not db._has_table(con, _FINALITY_TABLE):
         return set()
+    missing = ""
+    if db._has_table(con, "claude_final_observations"):
+        missing = (" OR NOT EXISTS (SELECT 1 FROM claude_final_observations o WHERE o.session_key=r.session_key "
+                   "AND o.response_id=r.response_id AND json_extract(o.payload,'$.total_tokens') IS NOT NULL)")
     return {rid for rid, in con.execute(
         f"SELECT r.response_id FROM responses r JOIN sources s ON s.id=r.source_id "
         f"WHERE r.session_key=? AND r.is_overlap=0 AND s.claude_usage_version>=13 "
         f"AND (r.total_tokens IS NULL OR NOT EXISTS (SELECT 1 FROM {_FINALITY_TABLE} f "
-        f"WHERE f.response_id=r.response_id))", (session_key,))}
+        f"WHERE f.response_id=r.response_id)" + missing + ")", (session_key,))}
 
 
 def _ingest_usage_row(r: _Reader, obj: dict, ordinal: int, ts, mid: str,
@@ -717,6 +769,7 @@ def _ingest_usage_row(r: _Reader, obj: dict, ordinal: int, ts, mid: str,
     malformed final block never reaches here, so it never finalizes."""
     rid = f"{HARNESS}:{mid}"
     if final:
+        r.final_location = (ordinal, ts)
         payload = json.dumps(dict(values, model=model), sort_keys=True)
         r.con.execute("INSERT OR IGNORE INTO claude_final_observations VALUES(?,?,?,?)",
                       (r.session_key, rid, r.src.source_id, payload))
@@ -1273,6 +1326,23 @@ def _prepare_ancestry(r):
         field TEXT NOT NULL, value NOT NULL,
         PRIMARY KEY(session_key,response_id,source_id,field,value)) WITHOUT ROWID""")
     r.con.execute("CREATE INDEX IF NOT EXISTS claude_retained_field_source ON claude_retained_final_fields(source_id)")
+    r.con.execute("""CREATE TABLE IF NOT EXISTS claude_final_blocks (
+        session_key TEXT NOT NULL, response_id TEXT NOT NULL, source_id INTEGER NOT NULL REFERENCES sources(id),
+        uuid TEXT NOT NULL, parent TEXT NOT NULL, link_status TEXT NOT NULL, turn_id TEXT, ordinal_num INTEGER NOT NULL,
+        ts REAL, PRIMARY KEY(session_key,response_id,source_id,ordinal_num)) WITHOUT ROWID""")
+    r.con.execute("CREATE INDEX IF NOT EXISTS claude_block_source ON claude_final_blocks(source_id)")
+    if not db._has_table(r.con, "claude_withdrawn_finals"):
+        r.con.execute("""CREATE TABLE claude_withdrawn_finals (
+            session_key TEXT NOT NULL,response_id TEXT NOT NULL, PRIMARY KEY(session_key,response_id)) WITHOUT ROWID""")
+        # A pre-version-16 ledger could already have removed a source while
+        # retaining its total or its location in the materialized response.
+        r.con.execute("""INSERT INTO claude_withdrawn_finals SELECT r.session_key,r.response_id FROM responses r
+            WHERE r.harness='claude' AND EXISTS (SELECT 1 FROM claude_final_observations o
+            WHERE o.session_key=r.session_key AND o.response_id=r.response_id)
+            AND (NOT EXISTS (SELECT 1 FROM claude_final_observations o WHERE o.session_key=r.session_key
+            AND o.response_id=r.response_id AND o.source_id=r.source_id) OR (r.total_tokens IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM claude_final_observations o WHERE o.session_key=r.session_key
+            AND o.response_id=r.response_id AND json_extract(o.payload,'$.total_tokens') IS NOT NULL)))""")
     if not db._has_table(r.con, "claude_expected_finals"):
         r.con.execute("""CREATE TABLE claude_expected_finals (
             source_id INTEGER NOT NULL REFERENCES sources(id), session_key TEXT NOT NULL, response_id TEXT NOT NULL,
@@ -1291,6 +1361,7 @@ def _prepare_ancestry(r):
         PRIMARY KEY(session_key,source_id)) WITHOUT ROWID""")
     r.linked_sessions = set()
     if not r.src.incremental:
+        r.con.execute("DELETE FROM claude_final_blocks WHERE source_id=?", (r.src.source_id,))
         # Keep identities only until the replacement proves it could read
         # every row. A broken line cannot silently retract a competing copy.
         r.con.execute("CREATE TEMP TABLE claude_prior_edges AS "
@@ -1377,18 +1448,26 @@ def _record_ancestry(r, obj, rejected=None):
     # pre-ancestry format. Remember the format independently of ownership.
     if status != "absent":
         r.linked_sessions.add(r.session_key)
+    if response_id and r.final_location is not None:
+        r.con.execute("INSERT OR REPLACE INTO claude_final_blocks VALUES(?,?,?,?,?,?,?,?,?)",
+                      (r.session_key, response_id, r.src.source_id, uuid or "", parent or "", status,
+                       r.turn, *r.final_location))
     if rejected and response_id:
         r.con.execute("INSERT OR IGNORE INTO claude_rejected_measurements VALUES(?,?,?,?,?,?)",
                       (r.session_key, r.src.source_id, uuid or "", parent or "", response_id, rejected))
         return
-    r.con.execute("INSERT INTO claude_response_ancestry"
-                  "(session_key,uuid,parent,input_id,response_id,source_id,link_status)"
-                  " VALUES(?,?,?,?,?,?,?) ON CONFLICT DO UPDATE SET link_status="
-                  "CASE WHEN link_status='invalid' OR excluded.link_status='invalid' THEN 'invalid' "
-                  "WHEN link_status='linked' OR excluded.link_status='linked' THEN 'linked' "
-                  "WHEN link_status='root' OR excluded.link_status='root' THEN 'root' ELSE excluded.link_status END",
-                  (r.session_key, uuid or "", "" if input_id else parent or "",
-                   input_id, response_id, r.src.source_id, status))
+    _save_edge(r.con, r.session_key, uuid or "", "" if input_id else parent or "",
+               input_id, response_id, r.src.source_id, status)
+
+
+def _save_edge(con, session, uuid, parent, input_id, response_id, source, status):
+    con.execute("INSERT INTO claude_response_ancestry"
+                "(session_key,uuid,parent,input_id,response_id,source_id,link_status)"
+                " VALUES(?,?,?,?,?,?,?) ON CONFLICT DO UPDATE SET link_status="
+                "CASE WHEN link_status='invalid' OR excluded.link_status='invalid' THEN 'invalid' "
+                "WHEN link_status='linked' OR excluded.link_status='linked' THEN 'linked' "
+                "WHEN link_status='root' OR excluded.link_status='root' THEN 'root' ELSE excluded.link_status END",
+                (session, uuid, parent, input_id, response_id, source, status))
 
 
 def legacy_capture_sources(con, session_key):

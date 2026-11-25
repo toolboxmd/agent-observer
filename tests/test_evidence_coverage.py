@@ -831,3 +831,47 @@ class EvidenceCoverageTest(LedgerCase):
         rep = report.task_report(self.con, "A")
         self.assertTrue(rep["complete"])
         self.assertEqual(rep["attributed"]["total_tokens"], 15)
+
+    def check_removed_claude_final(self, remove_complete, complete_first):
+        a = Path(self.tmp.name, "partial.jsonl")
+        b = Path(self.tmp.name, "complete.jsonl")
+        msg = claude_response("reply", "p", "id")
+        msg["message"].update(model="claude-haiku-4-5", content=[{"type": "tool_use", "id": "call", "name": "Read"}])
+        common = dict(output_tokens=5, cache_read_input_tokens=0)
+        partial = dict(common, cache_creation_input_tokens=0) if remove_complete else dict(
+            common, input_tokens=10, cache_creation={"ephemeral_5m_input_tokens": 100000, "ephemeral_1h_input_tokens": 0})
+        for path, counters in [(a, partial), (b, dict(common, input_tokens=10, cache_creation_input_tokens=0))]:
+            msg["message"]["usage"] = counters
+            write_records(path, [claude_user("p"), msg])
+        for path in ([b, a] if complete_first else [a, b]):
+            claude.import_claude_file(self.con, str(path))
+        self.assign("A", "claude:p")
+        self.assertEqual(report.task_report(self.con, "A")["complete"], remove_complete)
+        removed, survivor = (b, a) if remove_complete else (a, b)
+        write_records(removed, [claude_user("p")])
+        claude.import_claude_file(self.con, str(removed))
+        for repeat in (False, True):
+            if repeat:
+                self.assertEqual(claude.import_claude_file(self.con, str(survivor), full=True)["malformed"], 0)
+            with self.subTest(reimport=repeat):
+                rep = report.task_report(self.con, "A")
+                self.assertEqual(rep["attributed"]["responses"], 1)
+                self.assertEqual(rep["complete"], not remove_complete)
+                self.assertEqual(rep["total_cost"]["usd"] is None, remove_complete)
+                self.assertEqual([e["native_id"] for e in report.timeline(self.con, "A")["events"]], ["call"])
+                measured = self.con.execute("SELECT total_tokens,input_tokens,output_tokens,cache_write_5m_tokens "
+                                            "FROM responses WHERE response_id='claude:id'").fetchone()
+                self.assertEqual(tuple(measured), (None, None, 5, None) if remove_complete else (15, 10, 5, None))
+                self.assertIn("Evidence complete: " + ("no" if remove_complete else "yes"), self.draft()["body"])
+
+    def test_remove_complete_copy_imported_first(self):
+        self.check_removed_claude_final(True, True)
+
+    def test_remove_complete_copy_imported_second(self):
+        self.check_removed_claude_final(True, False)
+
+    def test_remove_competing_cache_split_imported_first(self):
+        self.check_removed_claude_final(False, False)
+
+    def test_remove_competing_cache_split_imported_second(self):
+        self.check_removed_claude_final(False, True)
