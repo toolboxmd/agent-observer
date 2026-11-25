@@ -492,6 +492,55 @@ class LedgerFreshnessTest(unittest.TestCase):
         self.assertEqual(row["newest_native_at"], 20_000)
         self.assertEqual(row["status"], "stale")
 
+    def test_grok_retry_keeps_recorded_identity_and_counts_alias_once(self):
+        record_path = self.root / "grok/project/directory-id/updates.jsonl"
+        record_path.parent.mkdir(parents=True)
+        summary = record_path.with_name("summary.json")
+        summary.write_text(json.dumps({"info": {"id": "native-id"},
+                                       "current_model_id": "grok-4",
+                                       "reasoning_effort": "high"}))
+        os.utime(summary, (10_000, 10_000))
+        alias = record_path.parent.with_name("alias")
+        alias.symlink_to(record_path.parent, target_is_directory=True)
+
+        def append_completion(prompt, stamp):
+            completion = {"timestamp": stamp, "method": "_x.ai/session/update",
+                          "params": {"sessionId": "native-id", "update": {
+                              "sessionUpdate": "turn_completed", "prompt_id": prompt,
+                              "usage": {"inputTokens": 10, "outputTokens": 2}}}}
+            with record_path.open("a") as file:
+                file.write(json.dumps(completion) + "\n")
+            os.utime(record_path, (stamp, stamp))
+
+        append_completion("first", 10_000)
+        self.imports()
+        real_open = open
+
+        def denied_open(path, *args, **kwargs):
+            if os.path.basename(path) == "summary.json":
+                raise PermissionError("fixture refused summary read")
+            return real_open(path, *args, **kwargs)
+
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            with patch.object(db, "now", return_value=11_000), patch.object(ingest, "now", return_value=11_000):
+                self.assertEqual(grok.sync(con)["failed"], [])
+            append_completion("second", 20_000)
+            for stamp in (21_000, 21_500):
+                with patch("builtins.open", denied_open), patch.object(db, "now", return_value=stamp), \
+                        patch.object(ingest, "now", return_value=stamp):
+                    self.assertTrue(grok.sync(con)["failed"])
+                source = con.execute("SELECT session_id, imported_at FROM sources").fetchone()
+                self.assertEqual(tuple(source), ("native-id", 21_000))
+            code, output = self.run_health("--json")
+            self.assertEqual(code, 4)
+            self.assertEqual(json.loads(output)["ledger_freshness"]["grok"]["newer_sources"], 1)
+            with patch.object(db, "now", return_value=22_000), patch.object(ingest, "now", return_value=22_000):
+                self.assertEqual(grok.sync(con)["failed"], [])
+            rows = con.execute("SELECT DISTINCT session_key, model, effort FROM responses").fetchall()
+            self.assertEqual([tuple(row) for row in rows], [("grok:native-id", "grok-4", "high")])
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM responses").fetchone()[0], 2)
+        self.assertEqual(self.run_health("--json")[0], 0)
+
     def test_bad_grok_summary_keeps_transcript_ingestion(self):
         updates = "grok/project/session-one/updates.jsonl"
         self.source(updates, 20_000)

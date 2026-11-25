@@ -1485,6 +1485,7 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     metadata_errors = []
     metadata_mtime = None
     summary = {}
+    summary_unavailable = False
     chat_fp_current = None
     try:
         summary_stat = path_info(summary_path)
@@ -1492,6 +1493,7 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         if summary_stat is not None:
             metadata_mtime = summary_stat.st_mtime
     except OSError as exc:
+        summary_unavailable = True
         metadata_errors.append(str(exc))
     try:
         chat_stat = path_info(os.path.join(session_dir, "chat_history.jsonl"))
@@ -1511,7 +1513,20 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     raw_info_id = info.get("id")
     valid_info_id = _valid_native_id(raw_info_id) \
         if isinstance(raw_info_id, str) and raw_info_id else None
-    native_sid = valid_info_id or safe_basename
+    # A temporary summary failure must retain a previously imported
+    # transcript's native identity, which can differ from the directory.
+    recorded_id = None
+    if summary_unavailable:
+        for path in (updates_path, events_path):
+            if path is None:
+                continue
+            row = con.execute("SELECT session_id FROM sources WHERE harness=? AND path=?",
+                              (HARNESS, path)).fetchone()
+            if row is not None:
+                recorded_id = _valid_native_id(row["session_id"])
+                if recorded_id is not None:
+                    break
+    native_sid = valid_info_id or recorded_id or safe_basename
     if native_sid is None:
         # No safe native id: quarantine under the fixed missing_id
         # category with no record values. The source_path locates the
@@ -1588,9 +1603,10 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         f"SELECT imported_at, pending FROM {_GROK_META_TABLE} WHERE session_key=?",
         (r.session_key,)).fetchone()
     retry = previous is not None and bool(previous["pending"])
-    updates_src = (JsonlSource(con, HARNESS, updates_path, full=full or retry)
+    replay = full or (retry and not metadata_errors)
+    updates_src = (JsonlSource(con, HARNESS, updates_path, full=replay)
                    if updates_path and os.path.isfile(updates_path) else None)
-    events_src = (JsonlSource(con, HARNESS, events_path, full=full or retry)
+    events_src = (JsonlSource(con, HARNESS, events_path, full=replay)
                   if events_path and os.path.isfile(events_path) else None)
     r.updates_src = updates_src
     r.events_src = events_src
@@ -1961,6 +1977,10 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             (r.session_key, last_complete))
     for source in (updates_src, events_src):
         if source is not None and (not metadata_errors or not source.unchanged):
+            same_snapshot = (source.mtime_ns, source.ino, source.size) == (
+                source.row["mtime_ns"], source.row["ino"], source.row["size_bytes"])
+            if metadata_errors and same_snapshot and not source.privacy_stale and not full:
+                continue
             stats.update(source.finish(session_id=r.native_sid))
     stats["session_key"] = r.session_key
     stats["unchanged"] = bool(

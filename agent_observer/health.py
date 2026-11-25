@@ -282,6 +282,8 @@ def _discover_native_paths(harness, adapter):
     paths = adapter.discover(strict=True)
     if harness == "codex":
         paths.extend(router.discover_rollouts(strict=True))
+    if harness == "grok":
+        return [os.path.realpath(path) for path in paths]
     return paths
 
 
