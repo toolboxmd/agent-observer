@@ -32,7 +32,7 @@ agent-observer sessions list --project myapp --since 2026-09-01
 agent-observer diagnose --since 2026-09-01   # repeated work and behavior incidents
 agent-observer thread-misuse --since 2026-10-01  # deep Chromeria spawns, cross-thread messages
 agent-observer compare --by agentsmd         # behavior per AgentsMD version
-agent-observer health                        # live sessions Observer cannot see
+agent-observer health                        # session visibility and ledger freshness
 agent-observer claims --session claude:<id>  # final-report claims checked against tool calls
 agent-observer delegation-modes --since 2026-10-01  # planner delegation versus a dispatcher thread
 agent-observer event show <id> [<id> ...]    # full tool input, result and assistant text from the native log
@@ -708,11 +708,26 @@ the process, directory and fix. Missing, failed, malformed or timed-out process
 scans are reported as unavailable with a reason; each `ps` or `lsof` invocation
 has a five-second timeout, and other health checks continue.
 
-Health exits 0 when it finds no invisible sessions, unavailable scans or Cue
-schema/read failures; it exits 4 when any is reported, and 2 for invalid
-command-line arguments. Optional missing or unsynced Cue evidence stays visible
-without failing health. An unread ledger
-is reported as unknown and does not by itself change the exit status.
+Health also compares the newest native record with the newest successful ledger
+import for each harness. It counts native sources newer than that harness's
+latest import. Claude, Codex and Muse use transcript file modification times.
+Codex includes rollouts imported by Model Router.
+Grok counts each session directory once using its newest event log or session
+metadata file.
+OpenCode counts sessions by their latest session, message or part timestamp.
+Chromeria and Router use database and WAL modification times. These comparisons
+measure lag for each harness. Individual missing imports can predate its newest
+successful import.
+
+Health exits 4 for an invisible session, an unavailable check, a Cue
+schema/read failure, or a freshness gap. A gap means native records exist and
+the ledger has no import for that harness, or the newest native record is more
+than 3600 seconds newer than its latest import. Set
+`health --sync-interval-seconds N` to match your sync cadence.
+`health --json` includes the interval and the `ledger_freshness` map, with
+Unix timestamps in seconds, newer-source counts, lag and status. Health
+exits 0 when its checks pass and 2 for invalid arguments. Optional missing
+or unsynced Cue evidence stays visible without failing health.
 
 ## Ledger schema 3
 

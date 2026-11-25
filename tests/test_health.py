@@ -4,13 +4,15 @@ import contextlib
 import io
 import json
 import os
+from pathlib import Path
 import sqlite3
 import tempfile
 import time
 import unittest
 from unittest.mock import patch
 
-from agent_observer import cli, health
+from agent_observer import cli, db, health, ingest
+from agent_observer.adapters import claude, codex, grok, muse, opencode, router
 
 
 class ScanAvailabilityTest(unittest.TestCase):
@@ -20,6 +22,7 @@ class ScanAvailabilityTest(unittest.TestCase):
         self.path = patch.dict(os.environ, {"PATH": self.tmp.name})
         self.path.start()
         self.addCleanup(self.path.stop)
+        self.enterContext(patch.object(health, "_ledger_freshness", return_value={}))
         self.tool("ps", "printf '201 Mon Oct 19 10:00:00 2026 codex\\n'")
 
     def tool(self, name, body):
@@ -162,7 +165,8 @@ class CueHealthExitTest(unittest.TestCase):
                 with self.subTest(status=status,json=as_json):
                     result={'checked': {'claude_sessions':0,'processes':0},
                             'findings':[],'unavailable':[],'identity_conflicts':[],
-                            'bare_roots':{},'cue':{'status':status}}
+                            'bare_roots':{},'cue':{'status':status},
+                            'ledger_freshness':{},'sync_interval_seconds':3600}
                     output=io.StringIO()
                     with patch.object(health,'check',return_value=result), \
                             contextlib.redirect_stdout(output):
@@ -173,6 +177,746 @@ class CueHealthExitTest(unittest.TestCase):
                         self.assertEqual(json.loads(output.getvalue())['cue']['status'],status)
                     else:
                         self.assertIn('Cue evidence: '+status,output.getvalue())
+
+
+class LedgerFreshnessTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.ledger = self.root / "observer.db"
+        for adapter in (claude, codex, grok, muse, opencode, router):
+            self.enterContext(patch.object(adapter, "DEFAULT_ROOT",
+                                           str(self.root / adapter.HARNESS)))
+        self.enterContext(patch.object(codex, "ARCHIVE_ROOT", str(self.root / "archive")))
+        self.enterContext(patch.object(router, "LEGACY_ROOT", str(self.root / "legacy")))
+        self.enterContext(patch.dict(os.environ, {"T3CODE_HOME": str(self.root / "t3"),
+                                                  "DURABLE_RUNNER_STATE_DIR": ""}))
+        self.enterContext(patch.object(health, "process_table", return_value=[]))
+        self.enterContext(patch.object(health, "claude_registry", return_value=[]))
+        self.enterContext(patch("agent_observer.cue.health", return_value={"status": "no_cue"}))
+
+    def source(self, path, modified_at):
+        path = self.root / path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("private fixture text that health must never print")
+        os.utime(path, (modified_at, modified_at))
+
+    def imports(self, **harness_times):
+        with contextlib.closing(db.connect(str(self.ledger))) as con, con:
+            db.init_db(con)
+            con.executemany(
+                "INSERT INTO sources(harness, path, sha256, imported_at) VALUES(?,?,?,?)",
+                [(harness, "fixture", "hash", stamp) for harness, stamp in harness_times.items()])
+
+    def run_health(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(["--db", str(self.ledger), "health", *args])
+        self.assertNotIn("private fixture text", out.getvalue())
+        return code, out.getvalue()
+
+    def test_stale_harness_is_not_hidden_by_a_fresher_import_from_another(self):
+        self.source("claude/project/old.jsonl", 10_000)
+        self.source("claude/project/new.jsonl", 22_000)
+        self.source("claude/project/new/subagents/agent-child.jsonl", 20_000)
+        self.source("archive/rollout-old-thread.jsonl", 18_000)
+        self.imports(claude=11_000, codex=23_000)
+
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        result = json.loads(output)
+        self.assertEqual(result["sync_interval_seconds"], 3600)
+        self.assertEqual(result["ledger_freshness"]["claude"], {
+            "newest_native_at": 22_000, "newest_import_at": 11_000,
+            "newer_sources": 2, "lag_seconds": 11_000, "status": "stale",
+        })
+        self.assertEqual(result["ledger_freshness"]["codex"]["newer_sources"], 0)
+        self.assertEqual(result["ledger_freshness"]["codex"]["newest_native_at"], 18_000)
+        code, output = self.run_health()
+        self.assertEqual(code, 4)
+        self.assertIn("claude: stale", output)
+        self.assertIn("11000 seconds", output)
+        self.assertIn("2 newer sources", output)
+
+    def test_current_and_within_interval(self):
+        self.source("claude/project/recent.jsonl", 14_600)
+        self.source("grok/project/session/updates.jsonl", 11_000)
+        self.source("grok/project/session/events.jsonl", 10_000)
+        self.imports(claude=11_000, grok=10_000)
+
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 0)
+        freshness = json.loads(output)["ledger_freshness"]
+        self.assertEqual(freshness["claude"]["newer_sources"], 1)
+        self.assertEqual(freshness["claude"]["status"], "within_interval")
+        self.assertEqual(freshness["grok"]["newer_sources"], 1)
+        self.assertEqual(freshness["codex"]["status"], "no_native_records")
+        self.assertEqual(freshness["muse"]["status"], "no_native_records")
+        self.assertEqual(self.run_health("--sync-interval-seconds", "3599")[0], 4)
+
+    def test_missing_or_empty_ledger_names_never_synced_harness(self):
+        self.source("grok/project/session/updates.jsonl", 10_000)
+        self.source("grok/project/session/events.jsonl", 11_000)
+        for create in (False, True):
+            with self.subTest(create=create):
+                if create:
+                    self.imports()
+                code, output = self.run_health("--json")
+                self.assertEqual(code, 4)
+                self.assertEqual(json.loads(output)["ledger_freshness"]["grok"], {
+                    "newest_native_at": 11_000, "newest_import_at": None,
+                    "newer_sources": 1, "lag_seconds": None, "status": "never_synced",
+                })
+        self.assertIn("grok: never synced", self.run_health()[1])
+
+    def test_opencode_counts_sessions_with_newer_parts_in_wal(self):
+        path = self.root / "opencode"
+        with contextlib.closing(sqlite3.connect(path)) as native:
+            native.execute("PRAGMA journal_mode=WAL")
+            native.executescript("""
+                CREATE TABLE session (id TEXT, time_updated INTEGER);
+                CREATE TABLE part (session_id TEXT, time_updated INTEGER, data TEXT);
+                INSERT INTO session VALUES ('first', 10000000), ('second', 11000000);
+                INSERT INTO part VALUES ('first', 19900000, 'private fixture text'),
+                                        ('first', 20000000, 'private fixture text'),
+                                        ('second', NULL, 'private fixture text');
+            """)
+            self.imports(opencode=11_000)
+            code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        self.assertEqual(json.loads(output)["ledger_freshness"]["opencode"], {
+            "newest_native_at": 20_000, "newest_import_at": 11_000,
+            "newer_sources": 1, "lag_seconds": 9_000, "status": "stale",
+        })
+
+    def test_opencode_counts_child_creation_without_an_update(self):
+        with contextlib.closing(sqlite3.connect(self.root / "opencode")) as native:
+            native.executescript("""
+                CREATE TABLE session (id TEXT, time_updated INTEGER);
+                CREATE TABLE message (session_id TEXT, time_created INTEGER, time_updated INTEGER);
+                CREATE TABLE part (session_id TEXT, time_created INTEGER);
+                INSERT INTO session VALUES ('first', 10000000), ('second', 11000000);
+                INSERT INTO message VALUES ('first', 19000000, NULL);
+                INSERT INTO part VALUES ('second', 20000000);
+            """)
+        self.imports(opencode=11_000)
+        code, output = self.run_health()
+        self.assertEqual(code, 4)
+        self.assertIn("opencode: stale", output)
+        self.assertIn("2 newer sources", output)
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        self.assertEqual(json.loads(output)["ledger_freshness"]["opencode"], {
+            "newest_native_at": 20_000, "newest_import_at": 11_000,
+            "newer_sources": 2, "lag_seconds": 9_000, "status": "stale",
+        })
+
+    def test_opencode_visibility_query_failure_keeps_freshness_available(self):
+        path = self.root / "opencode"
+        self.source("claude/project/fixture.jsonl", 20_000)
+        self.imports(claude=11_000)
+        process = {"pid": 201, "name": "opencode", "command": "opencode", "cwd": "/fixture"}
+        check_opencode = health.check_opencode
+        with patch.object(health, "process_table", return_value=[process]), \
+                patch.object(health, "check_opencode",
+                             side_effect=lambda processes: check_opencode(processes, str(path))):
+            for corrupt in (False, True):
+                with self.subTest(corrupt=corrupt):
+                    if corrupt:
+                        path.write_bytes(b"private fixture text")
+                    else:
+                        with contextlib.closing(sqlite3.connect(path)) as native:
+                            native.executescript("""
+                                CREATE TABLE session (id TEXT, directory TEXT, time_created INTEGER);
+                                INSERT INTO session VALUES ('session', '/fixture', 20000000);
+                            """)
+                    code, output = self.run_health()
+                    self.assertEqual(code, 4)
+                    self.assertIn("OpenCode visibility unavailable:", output)
+                    self.assertIn("claude: stale", output)
+                    code, output = self.run_health("--json")
+                    self.assertEqual(code, 4)
+                    result = json.loads(output)
+                    self.assertIn("OpenCode visibility",
+                                  [check["check"] for check in result["unavailable"]])
+                    self.assertEqual(result["ledger_freshness"]["claude"]["status"], "stale")
+                    self.assertEqual(result["ledger_freshness"]["opencode"]["status"],
+                                     "unavailable" if corrupt else "never_synced")
+
+    def test_unreadable_ledger_is_not_mistaken_for_never_synced(self):
+        self.source("observer.db", 10_000)
+        self.source("claude/project/new.jsonl", 20_000)
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        result = json.loads(output)
+        self.assertEqual(result["ledger_freshness"]["claude"]["status"], "unavailable")
+        self.assertEqual(result["unavailable"][0]["check"], "ledger freshness")
+
+    def test_router_rollouts_contribute_to_codex_freshness(self):
+        self.source("router/jobs.db", 10_000)
+        self.source("router/kits/kit/sessions/2026/rollout-kit.jsonl", 20_000)
+        self.source("router/codex-sessions/2026/rollout-shared.jsonl", 21_000)
+        self.imports(codex=11_000, router=11_000)
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        rows = json.loads(output)["ledger_freshness"]
+        self.assertEqual(rows["codex"]["status"], "stale")
+        self.assertEqual(rows["codex"]["newest_native_at"], 21_000)
+        self.assertEqual(rows["codex"]["newer_sources"], 2)
+        self.assertEqual(rows["router"]["status"], "current")
+
+    def test_unreadable_grok_directory_is_reported_as_unavailable(self):
+        self.source("grok/project/session/updates.jsonl", 20_000)
+        self.imports(grok=11_000)
+        listdir = os.listdir
+        for unreadable in (self.root / "grok", self.root / "grok/project"):
+            def checked_listdir(path):
+                if Path(path) == unreadable:
+                    raise PermissionError("fixture directory unreadable")
+                return listdir(path)
+
+            with self.subTest(unreadable=unreadable), \
+                    patch.object(grok.os, "listdir", side_effect=checked_listdir):
+                code, output = self.run_health("--json")
+                self.assertEqual(code, 4)
+                result = json.loads(output)
+                self.assertEqual(result["ledger_freshness"]["grok"]["status"], "unavailable")
+                self.assertIn({"check": "grok native record scan",
+                               "reason": "permission denied"}, result["unavailable"])
+
+    def test_failed_identity_query_preserves_freshness_json(self):
+        self.source("claude/project/new.jsonl", 20_000)
+        self.imports(claude=11_000)
+        with contextlib.closing(sqlite3.connect(self.ledger)) as con:
+            con.execute("DROP TABLE import_errors")
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        result = json.loads(output)
+        self.assertIsNone(result["identity_conflicts"])
+        self.assertEqual(result["unavailable"][0]["check"], "identity conflicts")
+        self.assertEqual(result["ledger_freshness"]["claude"]["status"], "stale")
+
+    def test_denied_listing_in_glob_layouts_is_unavailable(self):
+        self.source("claude/project/new.jsonl", 20_000)
+        self.source("codex/2026/11/rollout-normal.jsonl", 20_000)
+        self.source("router/codex-sessions/2026/rollout-owned.jsonl", 20_000)
+        self.source("muse/2026/11/25/session/session.jsonl", 20_000)
+        self.imports(claude=11_000, codex=11_000, muse=11_000)
+        listdir = os.listdir
+        scandir = os.scandir
+        for harness, folder in (
+                ("claude", "claude/project"), ("codex", "codex/2026/11"),
+                ("codex", "router/codex-sessions/2026"), ("muse", "muse/2026/11")):
+            def checked_listdir(path):
+                if path == str(self.root / folder):
+                    raise PermissionError("fixture directory unreadable")
+                return listdir(path)
+
+            def checked_scandir(path):
+                if path == str(self.root / folder):
+                    raise PermissionError("fixture directory unreadable")
+                return scandir(path)
+
+            with self.subTest(folder=folder), patch.object(os, "listdir", checked_listdir), \
+                    patch.object(os, "scandir", checked_scandir):
+                code, output = self.run_health("--json")
+                self.assertEqual(code, 4)
+                result = json.loads(output)
+                self.assertEqual(result["ledger_freshness"][harness]["status"], "unavailable")
+                self.assertIn({"check": f"{harness} native record scan",
+                               "reason": "permission denied"}, result["unavailable"])
+
+    def test_grok_file_stat_permission_failure_is_unavailable(self):
+        path = "grok/project/session/updates.jsonl"
+        self.source(path, 20_000)
+        self.imports(grok=11_000)
+        stat = os.stat
+
+        def checked_stat(target, *args, **kwargs):
+            if target == str(self.root / path):
+                raise PermissionError("fixture record unreachable")
+            return stat(target, *args, **kwargs)
+
+        with patch.object(os, "stat", checked_stat):
+            code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        result = json.loads(output)
+        self.assertEqual(result["ledger_freshness"]["grok"]["status"], "unavailable")
+        self.assertIn({"check": "grok native record scan",
+                       "reason": "permission denied"}, result["unavailable"])
+
+    def test_freshness_scan_does_not_render_private_source_path(self):
+        from errno import EACCES
+
+        native = self.root / "claude/private-project-name"
+        error = PermissionError(EACCES, "Permission denied", str(native))
+        with patch.object(claude, "discover", side_effect=error):
+            for args in ((), ("--json",)):
+                with self.subTest(args=args):
+                    code, output = self.run_health(*args)
+                    self.assertEqual(code, 4)
+                    self.assertIn("permission denied", output)
+                    self.assertNotIn("private-project-name", output)
+
+    def test_health_keeps_ledger_permission_diagnostic_path_free(self):
+        from errno import EACCES
+
+        stat = os.stat
+
+        def checked_stat(path, *args, **kwargs):
+            if path == str(self.ledger):
+                raise PermissionError(EACCES, "Permission denied", "/private-ledger/observer.db")
+            return stat(path, *args, **kwargs)
+
+        with patch.object(os, "stat", checked_stat):
+            for args in ((), ("--json",)):
+                code, output = self.run_health(*args)
+                self.assertEqual(code, 4)
+                self.assertIn("permission denied", output)
+                self.assertNotIn("private-ledger", output)
+
+    def test_out_of_range_opencode_time_reports_unavailable_in_both_formats(self):
+        with contextlib.closing(sqlite3.connect(self.root / "opencode")) as native:
+            native.executescript("CREATE TABLE session(id TEXT, time_updated INTEGER);"
+                                 "INSERT INTO session VALUES ('fixture', 1760000000000000);")
+        self.source("claude/project/fixture.jsonl", 10_000)
+        self.imports(claude=11_000)
+        code, output = self.run_health()
+        self.assertEqual(code, 4)
+        self.assertIn("opencode native record scan unavailable: invalid timestamp", output)
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        rows = json.loads(output)["ledger_freshness"]
+        self.assertEqual(rows["opencode"]["status"], "unavailable")
+        self.assertEqual(rows["claude"]["status"], "current")
+
+    def test_malformed_opencode_time_does_not_hide_newer_session(self):
+        with contextlib.closing(sqlite3.connect(self.root / "opencode")) as native:
+            native.executescript("""
+                CREATE TABLE session(id TEXT, time_updated INTEGER);
+                CREATE TABLE message(session_id TEXT, time_updated INTEGER);
+                INSERT INTO session VALUES ('fixture', 20000000);
+                INSERT INTO message VALUES ('fixture', NULL), ('fixture', 'private fixture text');
+            """)
+        self.source("claude/project/fixture.jsonl", 10_000)
+        self.imports(claude=11_000, opencode=11_000)
+        code, output = self.run_health()
+        self.assertEqual(code, 4)
+        self.assertIn("opencode native record scan unavailable: invalid timestamp", output)
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        rows = json.loads(output)["ledger_freshness"]
+        self.assertEqual(rows["opencode"]["status"], "unavailable")
+        self.assertEqual(rows["claude"]["status"], "current")
+
+    def test_malformed_grok_import_time_leaves_other_harnesses_available(self):
+        self.source("claude/project/fixture.jsonl", 10_000)
+        self.source("grok/project/session/events.jsonl", 20_000)
+        self.imports(claude=11_000, grok=11_000)
+        with contextlib.closing(db.connect(str(self.ledger))) as con, con:
+            con.executescript("""
+                CREATE TABLE grok_session_meta(session_key TEXT, imported_at REAL);
+                INSERT INTO grok_session_meta VALUES ('grok:fixture', 'private fixture text');
+            """)
+        code, output = self.run_health()
+        self.assertEqual(code, 4)
+        self.assertIn("grok ledger import unavailable: invalid timestamp", output)
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        rows = json.loads(output)["ledger_freshness"]
+        self.assertEqual(rows["grok"]["status"], "unavailable")
+        self.assertEqual(rows["claude"]["status"], "current")
+
+    def test_denied_chromeria_v2_state_is_unavailable_for_state_and_receipts(self):
+        path = self.root / "t3/userdata/chromeria-v2.sqlite"
+        path.parent.mkdir(parents=True)
+        stat = os.stat
+
+        def checked_stat(target, *args, **kwargs):
+            if target == str(path):
+                raise PermissionError("fixture V2 state unreachable")
+            return stat(target, *args, **kwargs)
+
+        with patch.object(os, "stat", checked_stat):
+            code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        rows = json.loads(output)["ledger_freshness"]
+        for harness in ("t3", "codex", "grok"):
+            self.assertEqual(rows[harness]["status"], "unavailable")
+
+    def test_grok_metadata_only_lag_clears_after_import(self):
+        session = self.root / "grok/project/session-one"
+        session.mkdir(parents=True)
+        summary = session / "summary.json"
+        summary.write_text('{"info":{"id":"session-one"}}')
+        os.utime(summary, (20_000, 20_000))
+        self.imports(grok=11_000)
+
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        self.assertEqual(json.loads(output)["ledger_freshness"]["grok"]["newer_sources"], 1)
+
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            self.assertEqual(grok.sync(con)["failed"], [])
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 1)
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 0)
+        row = json.loads(output)["ledger_freshness"]["grok"]
+        self.assertEqual(row["status"], "current")
+        self.assertGreaterEqual(row["newest_import_at"], 20_000)
+
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            con.execute("UPDATE grok_session_meta SET imported_at=NULL")
+            con.commit()
+            self.assertEqual(grok.sync(con)["failed"], [])
+        self.assertEqual(self.run_health("--json")[0], 0)
+
+    def test_codex_counts_hard_linked_rollouts_once(self):
+        self.source("codex/2026/rollout-first.jsonl", 20_000)
+        os.link(self.root / "codex/2026/rollout-first.jsonl",
+                self.root / "codex/2026/rollout-alias.jsonl")
+        self.imports(codex=11_000)
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        self.assertEqual(json.loads(output)["ledger_freshness"]["codex"]["newer_sources"], 1)
+
+    def test_grok_revalidates_identical_metadata_and_retries_denied_reads(self):
+        summary = self.root / "grok/project/session-one/summary.json"
+        self.source("grok/project/session-one/summary.json", 10_000)
+        summary.write_text('{"info":{"id":"session-one"}}')
+        os.utime(summary, (10_000, 10_000))
+        self.imports()
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            with patch.object(db, "now", return_value=11_000):
+                self.assertEqual(grok.sync(con)["failed"], [])
+            os.utime(summary, (20_000, 20_000))
+            self.assertEqual(self.run_health("--json")[0], 4)
+            with patch.object(db, "now", return_value=21_000):
+                self.assertEqual(grok.sync(con)["failed"], [])
+            self.assertEqual(self.run_health("--json")[0], 0)
+            summary.write_text('{"info":{"id":"session-one"},"head_branch":"fresh"}')
+            os.utime(summary, (30_000, 30_000))
+            real_open = open
+
+            def denied_open(path, *args, **kwargs):
+                if path == str(summary):
+                    raise PermissionError("fixture refused summary read")
+                return real_open(path, *args, **kwargs)
+
+            with patch("builtins.open", denied_open), patch.object(db, "now", return_value=31_000):
+                self.assertEqual(len(grok.sync(con)["failed"]), 1)
+            self.assertEqual(grok.newest_metadata_import(con), 21_000)
+            self.assertEqual(self.run_health("--json")[0], 4)
+            with patch.object(db, "now", return_value=32_000):
+                self.assertEqual(grok.sync(con)["failed"], [])
+            self.assertEqual(self.run_health("--json")[0], 0)
+
+    def test_chromeria_freshness_follows_symlink_to_wal(self):
+        link = self.root / "t3/userdata/chromeria-v2.sqlite"
+        link.parent.mkdir(parents=True)
+        target = self.root / "native.sqlite"
+        link.symlink_to(target)
+        self.imports(t3=11_000)
+        with contextlib.closing(sqlite3.connect(target)) as native:
+            native.execute("PRAGMA journal_mode=WAL")
+            native.executescript("CREATE TABLE evidence(value); INSERT INTO evidence VALUES (1);")
+            os.utime(target, (10_000, 10_000))
+            os.utime(str(target) + "-wal", (20_000, 20_000))
+            code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        row = json.loads(output)["ledger_freshness"]["t3"]
+        self.assertEqual(row["newest_native_at"], 20_000)
+        self.assertEqual(row["status"], "stale")
+
+    def test_grok_retry_keeps_recorded_identity_and_counts_alias_once(self):
+        record_path = self.root / "grok/project/directory-id/updates.jsonl"
+        record_path.parent.mkdir(parents=True)
+        summary = record_path.with_name("summary.json")
+        summary.write_text(json.dumps({"info": {"id": "native-id"},
+                                       "current_model_id": "grok-4",
+                                       "reasoning_effort": "high"}))
+        os.utime(summary, (10_000, 10_000))
+        alias = record_path.parent.with_name("alias")
+        alias.symlink_to(record_path.parent, target_is_directory=True)
+
+        def append_completion(prompt, stamp):
+            completion = {"timestamp": stamp, "method": "_x.ai/session/update",
+                          "params": {"sessionId": "native-id", "update": {
+                              "sessionUpdate": "turn_completed", "prompt_id": prompt,
+                              "usage": {"inputTokens": 10, "outputTokens": 2}}}}
+            with record_path.open("a") as file:
+                file.write(json.dumps(completion) + "\n")
+            os.utime(record_path, (stamp, stamp))
+
+        append_completion("first", 10_000)
+        self.imports()
+        real_open = open
+
+        def denied_open(path, *args, **kwargs):
+            if os.path.basename(path) == "summary.json":
+                raise PermissionError("fixture refused summary read")
+            return real_open(path, *args, **kwargs)
+
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            with patch.object(db, "now", return_value=11_000), patch.object(ingest, "now", return_value=11_000):
+                self.assertEqual(grok.sync(con)["failed"], [])
+            append_completion("second", 20_000)
+            for stamp in (21_000, 21_500):
+                with patch("builtins.open", denied_open), patch.object(db, "now", return_value=stamp), \
+                        patch.object(ingest, "now", return_value=stamp):
+                    self.assertTrue(grok.sync(con)["failed"])
+                source = con.execute("SELECT session_id, imported_at FROM sources").fetchone()
+                self.assertEqual(tuple(source), ("native-id", 21_000))
+            code, output = self.run_health("--json")
+            self.assertEqual(code, 4)
+            self.assertEqual(json.loads(output)["ledger_freshness"]["grok"]["newer_sources"], 1)
+            with patch.object(db, "now", return_value=22_000), patch.object(ingest, "now", return_value=22_000):
+                self.assertEqual(grok.sync(con)["failed"], [])
+            rows = con.execute("SELECT DISTINCT session_key, model, effort FROM responses").fetchall()
+            self.assertEqual([tuple(row) for row in rows], [("grok:native-id", "grok-4", "high")])
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM responses").fetchone()[0], 2)
+        self.assertEqual(self.run_health("--json")[0], 0)
+
+    def test_bad_grok_summary_keeps_transcript_ingestion(self):
+        updates = "grok/project/session-one/updates.jsonl"
+        self.source(updates, 20_000)
+        completion = {"timestamp": 20_000, "method": "_x.ai/session/update",
+                      "params": {"sessionId": "session-one",
+                                 "update": {"sessionUpdate": "turn_completed",
+                                            "prompt_id": "prompt-one",
+                                            "usage": {"inputTokens": 10, "outputTokens": 2}}}}
+        (self.root / updates).write_text(json.dumps(completion) + "\n")
+        (self.root / "grok/project/session-one/summary.json").write_text('{"incomplete":')
+        self.imports()
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            result = grok.sync(con)
+            self.assertEqual(result["responses_inserted"], 1)
+            self.assertEqual(result["failed"][0]["error"], "invalid Grok summary JSON")
+            self.assertIsNone(grok.newest_metadata_import(con))
+            self.assertGreater(con.execute(
+                "SELECT imported_at FROM sources WHERE harness='grok'").fetchone()[0], 0)
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        self.assertEqual(json.loads(output)["ledger_freshness"]["grok"]["status"], "never_synced")
+
+        summary = self.root / "grok/project/session-one/summary.json"
+        summary.write_text('{"info":{"id":"session-one"}}')
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            self.assertEqual(grok.sync(con)["failed"], [])
+            self.assertIsNotNone(grok.newest_metadata_import(con))
+        self.assertEqual(self.run_health("--json")[0], 0)
+
+    def test_grok_first_partial_transcript_uses_native_notification_id(self):
+        folder = self.root / "grok/project/directory-id"
+        folder.mkdir(parents=True)
+        summary = folder / "summary.json"
+        summary.write_text('{"info":{"id":"native-id"},"current_model_id":"grok-4"}')
+        os.utime(summary, (10_000, 10_000))
+        self.imports()
+        real_open = open
+
+        def denied_open(path, *args, **kwargs):
+            if path == str(summary):
+                raise PermissionError("fixture refused summary read")
+            return real_open(path, *args, **kwargs)
+
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            with patch.object(db, "now", return_value=11_000):
+                self.assertEqual(grok.sync(con)["failed"], [])
+            update = folder / "updates.jsonl"
+            completion = {"timestamp": 20_000, "method": "_x.ai/session/update",
+                          "params": {"sessionId": "native-id", "update": {
+                              "sessionUpdate": "turn_completed", "prompt_id": "first",
+                              "usage": {"inputTokens": 10, "outputTokens": 2}}}}
+            update.write_text(json.dumps(completion) + "\n")
+            os.utime(update, (20_000, 20_000))
+            with patch("builtins.open", denied_open), patch.object(db, "now", return_value=21_000), \
+                    patch.object(ingest, "now", return_value=21_000):
+                self.assertTrue(grok.sync(con)["failed"])
+            self.assertEqual(self.run_health("--json")[0], 4)
+            with patch.object(db, "now", return_value=22_000), patch.object(ingest, "now", return_value=22_000):
+                self.assertEqual(grok.sync(con)["failed"], [])
+            rows = con.execute("SELECT session_key, model FROM responses").fetchall()
+            self.assertEqual([tuple(row) for row in rows], [("grok:native-id", "grok-4")])
+        self.assertEqual(self.run_health("--json")[0], 0)
+
+    def test_grok_waits_for_summary_when_first_log_has_no_native_id(self):
+        folder = self.root / "grok/project/directory-id"
+        folder.mkdir(parents=True)
+        summary = folder / "summary.json"
+        summary.write_text('{"info":{"id":"native-id"},"current_model_id":"grok-4"}')
+        self.imports()
+        (folder / "events.jsonl").write_text("{}\n")
+        real_open = open
+
+        def denied_open(path, *args, **kwargs):
+            if path == str(summary):
+                raise PermissionError("fixture refused summary read")
+            return real_open(path, *args, **kwargs)
+
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            with patch("builtins.open", denied_open):
+                self.assertTrue(grok.sync(con)["failed"])
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 0)
+            completion = {"timestamp": 20_000, "method": "_x.ai/session/update",
+                          "params": {"update": {"sessionUpdate": "turn_completed",
+                                                "prompt_id": "first",
+                                                "usage": {"inputTokens": 10, "outputTokens": 2}}}}
+            (folder / "updates.jsonl").write_text(json.dumps(completion) + "\n")
+            with patch("builtins.open", denied_open):
+                self.assertTrue(grok.sync(con)["failed"])
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM responses").fetchone()[0], 0)
+            summary.write_text('{"info":{"id":"native-id"},"current_model_id":"grok-4"}')
+            self.assertEqual(grok.sync(con)["failed"], [])
+            rows = con.execute("SELECT session_key FROM sessions").fetchall()
+            self.assertEqual([row[0] for row in rows], ["grok:native-id"])
+            self.assertEqual(con.execute("SELECT session_key FROM responses").fetchone()[0],
+                             "grok:native-id")
+        self.assertEqual(self.run_health("--json")[0], 0)
+
+    def test_grok_first_event_supplies_native_id_without_summary(self):
+        self.source("grok/project/directory-id/events.jsonl", 20_000)
+        event = self.root / "grok/project/directory-id/events.jsonl"
+        event.write_text('{"type":"turn_started","session_id":"native-id",'
+                         '"ts":"2026-11-25T18:00:00Z"}\n')
+        event.with_name("updates.jsonl").write_text(
+            '{"method":"session/update","params":{"sessionId":"wrong-id"}}\n'
+            '{"method":"session/update","params":{"sessionId":"wrong-id",'
+            '"update":{"sessionUpdate":"unrecognized"}}}\n'
+            '{"method":"session/update","params":{"sessionId":"wrong-id",'
+            '"update":{"sessionUpdate":"tool_call"}}}\n')
+        self.imports()
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            result = grok.sync(con)
+            self.assertEqual(result["failed"], [])
+            self.assertEqual(result["events_inserted"], 1)
+            self.assertEqual(con.execute("SELECT session_key FROM events").fetchone()[0],
+                             "grok:native-id")
+
+    def test_grok_readable_summary_can_fall_back_to_directory_id(self):
+        folder = self.root / "grok/project/directory-id"
+        folder.mkdir(parents=True)
+        (folder / "summary.json").write_text('{"head_branch":"main"}')
+        (folder / "events.jsonl").write_text(
+            '{"type":"turn_ended","ts":"2026-11-25T18:00:00Z","outcome":"completed"}\n')
+        self.imports()
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            self.assertEqual(grok.sync(con)["failed"], [])
+            self.assertEqual(con.execute("SELECT session_key FROM events").fetchone()[0],
+                             "grok:directory-id")
+            (folder / "summary.json").write_text('{"info":{"id":"native-id"}}')
+            with (folder / "events.jsonl").open("a") as file:
+                file.write('{"type":"turn_started","ts":"2026-11-25T18:01:00Z"}\n')
+            self.assertEqual(grok.sync(con)["failed"], [])
+            self.assertEqual(con.execute(
+                "SELECT session_key FROM events WHERE name='turn_started'").fetchone()[0],
+                "grok:native-id")
+
+    def test_grok_valid_tool_call_supplies_id_with_bad_summary(self):
+        folder = self.root / "grok/project/directory-id"
+        folder.mkdir(parents=True)
+        (folder / "summary.json").write_text('{"incomplete":')
+        (folder / "updates.jsonl").write_text(
+            '{"method":"session/update","params":{"sessionId":"wrong-id",'
+            '"update":{"sessionUpdate":"tool_call"}}}\n'
+            '{"method":"session/update","params":{"sessionId":"native-id",'
+            '"update":{"sessionUpdate":"tool_call","toolCallId":"call-one"}}}\n')
+        self.imports()
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            result = grok.sync(con)
+            self.assertEqual(result["failed"][0]["error"], "invalid Grok summary JSON")
+            self.assertEqual(result["events_inserted"], 1)
+            self.assertEqual(con.execute("SELECT session_key FROM events").fetchone()[0],
+                             "grok:native-id")
+
+    def test_grok_message_updates_supply_id_with_bad_summary(self):
+        folder = self.root / "grok/project/directory-id"
+        folder.mkdir(parents=True)
+        (folder / "summary.json").write_text('{"incomplete":')
+        updates = [
+            {"method": "session/update", "params": {
+                "sessionId": "native-id", "update": {
+                    "sessionUpdate": kind, "content": {"type": "text", "text": "fixture"},
+                    "_meta": {"promptIndex": 0}},
+                "_meta": {"promptId": "prompt-one", "promptIndex": 0}}}
+            for kind in ("user_message_chunk", "agent_message_chunk")
+        ]
+        (folder / "updates.jsonl").write_text("".join(json.dumps(row) + "\n" for row in updates))
+        self.imports()
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            result = grok.sync(con)
+            self.assertEqual(result["failed"][0]["error"], "invalid Grok summary JSON")
+            self.assertEqual(con.execute("SELECT session_key FROM user_messages").fetchone()[0],
+                             "grok:native-id")
+            self.assertEqual(con.execute(
+                "SELECT session_key FROM events WHERE family='assistant_message'").fetchone()[0],
+                "grok:native-id")
+
+    def test_grok_compaction_and_extension_updates_supply_native_identity(self):
+        self.imports()
+        for kind in ("auto_compact_started", "retry_state"):
+            folder = self.root / "grok/project" / kind
+            folder.mkdir(parents=True)
+            (folder / "summary.json").write_text('{"incomplete":')
+            update = {"method": "session/update", "params": {
+                "sessionId": f"{kind}-native", "update": {"sessionUpdate": kind}}}
+            (folder / "updates.jsonl").write_text(json.dumps(update) + "\n")
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            stats = grok.sync(con)
+            self.assertEqual([item["error"] for item in stats["failed"]],
+                             ["invalid Grok summary JSON"] * 2)
+            rows = con.execute("SELECT session_key, name FROM events ORDER BY name").fetchall()
+            self.assertEqual([tuple(row) for row in rows], [
+                ("grok:auto_compact_started-native", "auto_compact_started"),
+                ("grok:retry_state-native", "retry_state"),
+            ])
+
+    def test_bad_grok_metadata_keeps_health_stale(self):
+        cases = (
+            ("summary.json", '{"incomplete":', "updates.jsonl", "{}\n", False, None),
+            ("summary.json", '{"incomplete":', "events.jsonl", "", False, None),
+            ("summary.json", '{"incomplete":', "updates.jsonl", "{}\n", True, None),
+            ("summary.json", '{"incomplete":', "updates.jsonl", "{}\n", False, ""),
+            ("summary.json", '{"incomplete":', "updates.jsonl", "{}\n", False, "{"),
+            ("chat_history.jsonl", "invalid json\n", None, "", False, None),
+        )
+        for filename, content, log, log_content, full, append in cases:
+            with self.subTest(filename=filename, log=log, full=full, append=append), \
+                    tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                session = base / "grok/project/session-one"
+                session.mkdir(parents=True)
+                if log is not None:
+                    transcript = session / log
+                    transcript.write_text(log_content)
+                    os.utime(transcript, (10_000, 10_000))
+                summary = session / "summary.json"
+                summary.write_text('{"info":{"id":"session-one"},"head_branch":"fixture"}')
+                os.utime(summary, (10_000, 10_000))
+                ledger = base / "observer.db"
+                with contextlib.closing(db.connect(str(ledger))) as con:
+                    db.init_db(con)
+                    with patch.object(db, "now", return_value=11_000), \
+                            patch.object(ingest, "now", return_value=11_000):
+                        self.assertEqual(grok.sync(con, root=str(base / "grok"))["failed"], [])
+                    metadata = session / filename
+                    metadata.write_text(content)
+                    os.utime(metadata, (20_000, 20_000))
+                    if append is not None:
+                        with transcript.open("a") as file:
+                            file.write(append)
+                        os.utime(transcript, (20_000, 20_000))
+                    with patch.object(db, "now", return_value=21_000), \
+                            patch.object(ingest, "now", return_value=21_000):
+                        result = grok.sync(con, root=str(base / "grok"), full=full)
+                        self.assertTrue(result["failed"])
+                    self.assertEqual(grok.newest_metadata_import(con), 11_000)
+                with patch.object(grok, "DEFAULT_ROOT", str(base / "grok")), \
+                        patch.object(self, "ledger", ledger):
+                    code, output = self.run_health("--json")
+                self.assertEqual(code, 4)
+                self.assertEqual(json.loads(output)["ledger_freshness"]["grok"]["status"], "stale")
 
 
 class ClaudeVisibilityTest(unittest.TestCase):
@@ -225,6 +969,18 @@ class ProcessVisibilityTest(unittest.TestCase):
                 {"pid": 202, "name": name, "command": command, "started": started, "cwd": "/p/unseen"}]
 
     def test_opencode_process_without_session_record(self):
+        findings = health.check_opencode(self.procs("opencode", "opencode"), self.db)
+        self.assertEqual([f["pid"] for f in findings], [202])
+
+    def test_opencode_process_with_malformed_session_timestamp(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as con, con:
+            con.execute("UPDATE session SET time_updated = 'invalid'")
+        findings = health.check_opencode(self.procs("opencode", "opencode"), self.db)
+        self.assertEqual([f["pid"] for f in findings], [201, 202])
+
+    def test_opencode_visibility_keeps_valid_session_beside_malformed_timestamp(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as con, con:
+            con.execute("INSERT INTO session VALUES ('invalid', '/p/seen', 'invalid')")
         findings = health.check_opencode(self.procs("opencode", "opencode"), self.db)
         self.assertEqual([f["pid"] for f in findings], [202])
 

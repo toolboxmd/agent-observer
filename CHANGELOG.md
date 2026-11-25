@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.0] - 2026-11-25
+
+### Added
+
+- Report native session freshness in health and fail when the ledger falls behind
+
 ## [1.5.3] - 2026-11-23
 
 ### Changed

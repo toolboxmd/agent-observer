@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import urllib.parse
 
 from .. import db, privacy
@@ -29,10 +30,12 @@ from ..identity import SessionIdentity, skill_from_path
 from ..ingest import (JsonlSource, fingerprint, insert_event, iso_ts,
                       stored_path, text_hash)
 from . import bare
+from .discovery import path_info
 
 HARNESS = "grok"
 SEMANTICS = "grok:input_includes_cached,output_includes_reasoning"
 DEFAULT_ROOT = os.path.expanduser("~/.grok/sessions")
+SESSION_RECORD_FILES = ("updates.jsonl", "events.jsonl", "summary.json", "chat_history.jsonl")
 
 CAPABILITIES = [
     ("model_usage", True, "one responses row per turn_completed prompt_id; input includes cached reads, output includes reasoning"),
@@ -235,10 +238,11 @@ def _classify_prompt(prompt_idx: str, chat: dict,
     return "unknown", 0
 
 
-def _default_paths() -> tuple[list[str], dict]:
+def _default_paths(*, strict: bool = False) -> tuple[list[str], dict]:
     """The normal sessions plus every Chromeria bare root's, and the report."""
-    found, report = bare.discover(HARNESS, _sessions_under)
-    return _sessions_under(DEFAULT_ROOT) + found, report
+    found, report = bare.discover(HARNESS, lambda root: _sessions_under(root, strict=strict),
+                                  strict=strict)
+    return _sessions_under(DEFAULT_ROOT, strict=strict) + found, report
 
 
 def _stored(con: sqlite3.Connection, paths: list[str]
@@ -256,44 +260,55 @@ def _stored(con: sqlite3.Connection, paths: list[str]
     return out
 
 
-def discover(root: str | None = None) -> list[str]:
+def discover(root: str | None = None, *, strict: bool = False) -> list[str]:
     """Session directories under `<url-encoded cwd>/<session id>`.
 
     With root unset, the normal sessions root and each sessions root a
-    Chromeria bare receipt names (#92).
+    Chromeria bare receipt names (#92). Strict discovery reports listing
+    errors for health while accepting missing optional directories.
     """
     if not root:
-        return _default_paths()[0]
-    return _sessions_under(root)
+        return _default_paths(strict=strict)[0]
+    return _sessions_under(root, strict=strict)
 
 
-def _sessions_under(root: str) -> list[str]:
-    if _looks_like_session(root):
-        return [root]
+def _session_entries(path: str, strict: bool) -> list[str]:
     try:
-        groups = sorted(os.listdir(root))
-    except OSError:
+        return sorted(os.listdir(path))
+    except (FileNotFoundError, NotADirectoryError):
         return []
+    except OSError:
+        if strict:
+            raise
+        return []
+
+
+def _sessions_under(root: str, *, strict: bool = False) -> list[str]:
+    if _looks_like_session(root, strict=strict):
+        return [root]
     out = []
-    for group in groups:
+    for group in _session_entries(root, strict):
         group_dir = os.path.join(root, group)
-        if not os.path.isdir(group_dir):
+        if not _session_path_is(group_dir, stat.S_ISDIR, os.path.isdir, strict):
             continue
-        try:
-            children = sorted(os.listdir(group_dir))
-        except OSError:
-            continue
-        for child in children:
+        for child in _session_entries(group_dir, strict):
             session_dir = os.path.join(group_dir, child)
-            if os.path.isdir(session_dir) and _looks_like_session(session_dir):
+            if (_session_path_is(session_dir, stat.S_ISDIR, os.path.isdir, strict)
+                    and _looks_like_session(session_dir, strict=strict)):
                 out.append(session_dir)
     return out
 
 
-def _looks_like_session(path: str) -> bool:
-    return any(os.path.isfile(os.path.join(path, name)) for name in
-               ("updates.jsonl", "events.jsonl", "summary.json",
-                "chat_history.jsonl"))
+def _session_path_is(path, is_mode, permissive, strict):
+    if not strict:
+        return permissive(path)
+    info = path_info(path)
+    return info is not None and is_mode(info.st_mode)
+
+
+def _looks_like_session(path: str, *, strict: bool = False) -> bool:
+    return any(_session_path_is(os.path.join(path, name), stat.S_ISREG, os.path.isfile, strict)
+               for name in SESSION_RECORD_FILES)
 
 
 class _SyncCtx:
@@ -351,6 +366,8 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
         except (OSError, sqlite3.DatabaseError, UnicodeDecodeError) as exc:
             totals["failed"].append({"path": path, "error": str(exc)})
             continue
+        for error in stats.get("metadata_errors", []):
+            totals["failed"].append({"path": path, "error": error})
         if "session_key" in stats:
             imported.update(new_files.values())
         totals["sources"] += 1
@@ -381,13 +398,17 @@ def _resolve_source(source: str, root: str | None) -> list[str]:
     return discover(root)
 
 
-def _read_json(path: str):
+def _read_summary(path: str) -> dict:
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             obj = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    return obj if isinstance(obj, dict) else None
+    except FileNotFoundError:
+        return {}
+    except ValueError as exc:
+        raise OSError("invalid Grok summary JSON") from exc
+    if not isinstance(obj, dict):
+        raise OSError("Grok summary must be a JSON object")
+    return obj
 
 
 def _content_text(content) -> str:
@@ -571,17 +592,18 @@ def _ensure_grok_meta_table(con: sqlite3.Connection) -> None:
             " summary_fp TEXT, chat_fp TEXT)")
     except sqlite3.DatabaseError:
         pass
-    for column in ("chat_seen_json", "chat_synthetic_json", "chat_effort",
-                   "chat_reliable"):
-        try:
-            cols = {row["name"] for row in con.execute(
-                f"PRAGMA table_info({_GROK_META_TABLE})")}
-        except sqlite3.DatabaseError:
-            return
+    try:
+        cols = {row["name"] for row in con.execute(
+            f"PRAGMA table_info({_GROK_META_TABLE})")}
+    except sqlite3.DatabaseError:
+        return
+    for column, affinity in (("chat_seen_json", "TEXT"), ("chat_synthetic_json", "TEXT"),
+                             ("chat_effort", "TEXT"), ("chat_reliable", "TEXT"),
+                             ("imported_at", "REAL"), ("pending", "INTEGER")):
         if column not in cols:
             try:
                 con.execute(
-                    f"ALTER TABLE {_GROK_META_TABLE} ADD COLUMN {column} TEXT")
+                    f"ALTER TABLE {_GROK_META_TABLE} ADD COLUMN {column} {affinity}")
             except sqlite3.DatabaseError:
                 pass
 
@@ -594,40 +616,60 @@ def _summary_fingerprint(summary: dict) -> str:
     return hashlib.sha256(f"{_IMPORT_VERSION}:{canonical}".encode("utf-8", "replace")).hexdigest()
 
 
+def newest_metadata_import(con: sqlite3.Connection) -> float | None:
+    """Latest summary/chat import, when this ledger tracks metadata imports."""
+    if "imported_at" not in {row[1] for row in con.execute(
+            f"PRAGMA table_info({_GROK_META_TABLE})")}:
+        return None
+    return con.execute(f"SELECT MAX(imported_at) FROM {_GROK_META_TABLE}").fetchone()[0]
+
+
+def complete_import_watermarks(con: sqlite3.Connection) -> tuple[float | None, float | None]:
+    """Return transcript and metadata watermarks for complete sessions."""
+    columns = {row[1] for row in con.execute(f"PRAGMA table_info({_GROK_META_TABLE})")}
+    where = ""
+    if "pending" in columns:
+        where = (f" AND NOT EXISTS (SELECT 1 FROM {_GROK_META_TABLE} m"
+                 " WHERE m.session_key='grok:' || s.session_id AND m.pending=1)")
+    transcript = con.execute(
+        f"SELECT MAX(s.imported_at) FROM sources s WHERE s.harness='grok'{where}").fetchone()[0]
+    return transcript, newest_metadata_import(con)
+
+
 def _stored_meta(con: sqlite3.Connection, session_key: str):
     """Stored chat/summary state or Nones when absent/unreadable.
 
     Returns (summary_fp, chat_fp, seen_set, synthetic_set, chat_effort,
-    chat_reliable). Mark collections are None when the row or its mark
+    chat_reliable, imported_at). Mark collections are None when the row or its mark
     columns are absent, so the caller falls back to parsing the chat file.
     """
     try:
         row = con.execute(
             f"SELECT summary_fp, chat_fp, chat_seen_json,"
-            f" chat_synthetic_json, chat_effort, chat_reliable"
+            f" chat_synthetic_json, chat_effort, chat_reliable, imported_at"
             f" FROM {_GROK_META_TABLE}"
             " WHERE session_key=?", (session_key,)).fetchone()
     except sqlite3.DatabaseError:
-        return None, None, None, None, None, None
+        return (None,) * 7
     if row is None:
-        return None, None, None, None, None, None
+        return (None,) * 7
     try:
         summary_fp = row["summary_fp"]
         chat_fp = row["chat_fp"]
     except (KeyError, TypeError, IndexError):
-        return None, None, None, None, None, None
+        return (None,) * 7
     try:
         seen_raw = row["chat_seen_json"]
         synth_raw = row["chat_synthetic_json"]
         chat_effort = row["chat_effort"]
         reliable_raw = row["chat_reliable"]
     except (KeyError, TypeError, IndexError):
-        return summary_fp, chat_fp, None, None, None, None
+        return summary_fp, chat_fp, None, None, None, None, None
     try:
         seen = set(json.loads(seen_raw)) if seen_raw else set()
         synthetic = set(json.loads(synth_raw)) if synth_raw else set()
     except (TypeError, ValueError):
-        return summary_fp, chat_fp, None, None, None, None
+        return summary_fp, chat_fp, None, None, None, None, None
     if reliable_raw is None:
         reliable = None
     elif isinstance(reliable_raw, int):
@@ -636,12 +678,12 @@ def _stored_meta(con: sqlite3.Connection, session_key: str):
         reliable = reliable_raw == "1"
     else:
         reliable = None
-    return summary_fp, chat_fp, seen, synthetic, chat_effort, reliable
+    return summary_fp, chat_fp, seen, synthetic, chat_effort, reliable, row["imported_at"]
 
 
 def _store_meta(con: sqlite3.Connection, session_key: str,
                 summary_fp: str | None, chat_fp: str | None,
-                chat: dict | None = None) -> None:
+                chat: dict | None, imported_at: float) -> None:
     """Persist fingerprints plus parsed chat marks for the fast path."""
     _ensure_grok_meta_table(con)
     if chat is None:
@@ -662,10 +704,10 @@ def _store_meta(con: sqlite3.Connection, session_key: str,
         con.execute(
             f"INSERT OR REPLACE INTO {_GROK_META_TABLE}"
             "(session_key, summary_fp, chat_fp, chat_seen_json,"
-            " chat_synthetic_json, chat_effort, chat_reliable)"
-            " VALUES(?,?,?,?,?,?,?)",
+            " chat_synthetic_json, chat_effort, chat_reliable, imported_at)"
+            " VALUES(?,?,?,?,?,?,?,?)",
             (session_key, summary_fp, chat_fp, seen_json, synth_json,
-             chat_effort, chat_reliable))
+             chat_effort, chat_reliable, imported_at))
     except sqlite3.DatabaseError:
         pass
 
@@ -682,7 +724,7 @@ def _chat_fingerprint(session_dir: str) -> str:
     try:
         with open(path, "rb") as bfh:
             raw_bytes = bfh.read()
-    except OSError:
+    except FileNotFoundError:
         return "missing"
     try:
         return hashlib.sha256(raw_bytes).hexdigest()
@@ -1437,18 +1479,54 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         for name in ("updates.jsonl", "events.jsonl")})
     updates_path = source_paths.get("updates.jsonl")
     events_path = source_paths.get("events.jsonl")
-    summary = _read_json(os.path.join(session_dir, "summary.json")) or {}
+    metadata_imported_at = db.now()
+    summary_path = os.path.join(session_dir, "summary.json")
+    metadata_errors = []
+    metadata_mtime = None
+    summary = {}
+    summary_unavailable = False
+    chat_fp_current = None
+    try:
+        summary_stat = path_info(summary_path)
+        summary = _read_summary(summary_path)
+        if summary_stat is not None:
+            metadata_mtime = summary_stat.st_mtime
+    except OSError as exc:
+        summary_unavailable = True
+        metadata_errors.append(str(exc))
+    try:
+        chat_stat = path_info(os.path.join(session_dir, "chat_history.jsonl"))
+        chat_fp_current = _chat_fingerprint(session_dir)
+        if chat_stat is not None:
+            metadata_mtime = max(metadata_mtime or 0, chat_stat.st_mtime)
+    except OSError as exc:
+        metadata_errors.append(str(exc))
+    stats["metadata_errors"] = metadata_errors
     info = summary.get("info") if isinstance(summary.get("info"), dict) else {}
-    # Fail closed on unsafe identifiers: the native session id comes only
-    # from a validated summary.info.id or a validated directory basename.
-    # Anything else never reaches session keys, response ids, submission
-    # ids or event keys.
+    # Validate every candidate before it can become a ledger identity.
     basename = os.path.basename(session_dir.rstrip(os.sep))
     safe_basename = _valid_native_id(basename)
     raw_info_id = info.get("id")
     valid_info_id = _valid_native_id(raw_info_id) \
         if isinstance(raw_info_id, str) and raw_info_id else None
-    native_sid = valid_info_id or safe_basename
+    # A failed summary read can use identity already established for a
+    # transcript, while a readable native ID takes precedence.
+    _ensure_grok_meta_table(con)
+    recorded_id = None
+    for path in (updates_path, events_path):
+        if path is None:
+            continue
+        row = con.execute("SELECT session_id FROM sources WHERE harness=? AND path=?",
+                          (HARNESS, path)).fetchone()
+        if row is not None:
+            recorded_id = _valid_native_id(row["session_id"])
+            if recorded_id is not None:
+                break
+    if recorded_id is None and valid_info_id is None:
+        recorded_id = _notification_session_id(updates_path, events_path)
+        if recorded_id is None and summary_unavailable:
+            return stats
+    native_sid = valid_info_id or recorded_id or safe_basename
     if native_sid is None:
         # No safe native id: quarantine under the fixed missing_id
         # category with no record values. The source_path locates the
@@ -1520,9 +1598,14 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
 
     # Change state before any full parse. JsonlSource does a stat plus a
     # small tail read, never a full parse.
-    updates_src = (JsonlSource(con, HARNESS, updates_path, full=full)
+    previous = con.execute(
+        f"SELECT imported_at, pending FROM {_GROK_META_TABLE} WHERE session_key=?",
+        (r.session_key,)).fetchone()
+    retry = previous is not None and bool(previous["pending"])
+    replay = full or (retry and not metadata_errors)
+    updates_src = (JsonlSource(con, HARNESS, updates_path, full=replay)
                    if updates_path and os.path.isfile(updates_path) else None)
-    events_src = (JsonlSource(con, HARNESS, events_path, full=full)
+    events_src = (JsonlSource(con, HARNESS, events_path, full=replay)
                   if events_path and os.path.isfile(events_path) else None)
     r.updates_src = updates_src
     r.events_src = events_src
@@ -1558,10 +1641,8 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     except (KeyError, TypeError, IndexError):
         stored_role = None
     summary_fp = _summary_fingerprint(summary)
-    chat_fp_current = _chat_fingerprint(session_dir)
-    _ensure_grok_meta_table(con)
     (stored_summary_fp, stored_chat_fp, stored_seen, stored_synthetic,
-     stored_chat_effort, stored_chat_reliable) = _stored_meta(con,
+     stored_chat_effort, stored_chat_reliable, stored_imported_at) = _stored_meta(con,
                                                               r.session_key)
     stored_marks = _chat_from_stored(stored_chat_fp, stored_seen,
                                      stored_synthetic, stored_chat_effort,
@@ -1579,6 +1660,10 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         r.meta.get("role") == "subagent" and stored_role != "subagent")
     meta_changed = (stored_summary_fp != summary_fp
                     or stored_chat_fp != chat_fp_current)
+    invalid_chat = "invalid or incomplete Grok chat history"
+    if (stored_chat_fp == chat_fp_current and chat_fp_current not in (None, "missing")
+            and stored_chat_reliable is False):
+        metadata_errors.append(invalid_chat)
 
     chat = None
 
@@ -1598,11 +1683,18 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                                      stored_chat_reliable)
             if chat is not None:
                 return chat
-        chat = _read_chat(session_dir, r)
+        try:
+            chat = _read_chat(session_dir, r)
+        except OSError as exc:
+            metadata_errors.append(str(exc))
+            chat = {"reliable": False}
+        if (chat.get("fp") not in (None, "missing") and not chat["reliable"]
+                and invalid_chat not in metadata_errors):
+            metadata_errors.append(invalid_chat)
         return chat
 
     if known and not updates_new and not events_new and not privacy_stale \
-            and not full:
+            and not (full or retry or metadata_errors):
         if not meta_changed and stored_marks is not None \
                 and not new_parent_via_index and not new_role_via_evidence:
             # Fully unchanged: no parse of updates/events and no JSON parse
@@ -1622,6 +1714,13 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             updates_new = updates_src is not None and not updates_src.unchanged
             events_new = events_src is not None and not events_src.unchanged
             if not updates_new and not events_new:
+                if not metadata_errors and metadata_mtime is not None and (
+                        stored_imported_at is None or metadata_mtime > stored_imported_at):
+                    # The reads above revalidated the same metadata bytes.
+                    con.execute(f"UPDATE {_GROK_META_TABLE} SET imported_at=?"
+                                " WHERE session_key=?",
+                                (metadata_imported_at, r.session_key))
+                    con.commit()
                 stats["unchanged"] = True
                 stats["session_key"] = r.session_key
                 return stats
@@ -1654,8 +1753,9 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                     **late_fields)
                 # Reclassify without records is covered by the force above
                 # (no parse, no duplicates).
-                _store_meta(con, r.session_key, summary_fp, chat_fp_current,
-                            chat)
+                if not metadata_errors:
+                    _store_meta(con, r.session_key, summary_fp, chat_fp_current,
+                                chat, metadata_imported_at)
                 con.commit()
                 stats["unchanged"] = False
                 stats["session_key"] = r.session_key
@@ -1860,11 +1960,27 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                 "(SELECT version FROM agentsmd_versions WHERE sha256=sessions.instructions_sha256), ?)"
                 " WHERE session_key=?",
                 (json.dumps(evidence, sort_keys=True) if evidence else None, version, r.session_key))
-    _store_meta(con, r.session_key, summary_fp, chat_fp_current, chat)
-    if updates_src is not None:
-        stats.update(updates_src.finish(session_id=r.native_sid))
-    if events_src is not None:
-        stats.update(events_src.finish(session_id=r.native_sid))
+    if not metadata_errors:
+        _store_meta(con, r.session_key, summary_fp, chat_fp_current, chat, metadata_imported_at)
+    else:
+        # Keep the last complete watermark while the transcript rows and their
+        # import timestamps remain available to other ledger consumers.
+        last_complete = stored_imported_at
+        if not retry and last_complete is None:
+            last_complete = con.execute(
+                "SELECT MAX(imported_at) FROM sources WHERE harness=? AND session_id=?",
+                (HARNESS, r.native_sid)).fetchone()[0]
+        con.execute(
+            f"INSERT INTO {_GROK_META_TABLE}(session_key, imported_at, pending) VALUES(?,?,1)"
+            " ON CONFLICT(session_key) DO UPDATE SET imported_at=excluded.imported_at, pending=1",
+            (r.session_key, last_complete))
+    for source in (updates_src, events_src):
+        if source is not None and (not metadata_errors or not source.unchanged):
+            same_snapshot = (source.mtime_ns, source.ino, source.size) == (
+                source.row["mtime_ns"], source.row["ino"], source.row["size_bytes"])
+            if metadata_errors and same_snapshot and not source.privacy_stale and not full:
+                continue
+            stats.update(source.finish(session_id=r.native_sid))
     stats["session_key"] = r.session_key
     stats["unchanged"] = bool(
         (updates_src is None or updates_src.unchanged)
@@ -1892,7 +2008,7 @@ def _read_chat(session_dir: str, r: _Reader) -> dict:
     try:
         with open(path, "rb") as bfh:
             raw_bytes = bfh.read()
-    except OSError:
+    except FileNotFoundError:
         chat["reliable"] = False
         return chat
     try:
@@ -1903,7 +2019,7 @@ def _read_chat(session_dir: str, r: _Reader) -> dict:
         chat["reliable"] = False
     try:
         fh = open(path, encoding="utf-8", errors="replace")
-    except OSError:
+    except FileNotFoundError:
         chat["reliable"] = False
         return chat
     with fh:
@@ -1947,6 +2063,60 @@ def _read_chat(session_dir: str, r: _Reader) -> dict:
                 if isinstance(effort, str) and _safe_token(effort) is not None:
                     chat["effort"] = effort
     return chat
+
+
+def _notification_session_id(updates_path, events_path) -> str | None:
+    """Read identity evidence only from complete native records."""
+    for path, updates in ((events_path, False), (updates_path, True)):
+        if not path:
+            continue
+        try:
+            for _ordinal, raw in _complete_lines(path):
+                try:
+                    record = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if updates:
+                    params = record.get("params")
+                    if record.get("method") not in METHODS or not isinstance(params, dict):
+                        continue
+                    update = params.get("update")
+                    if not isinstance(update, dict):
+                        continue
+                    kind = update.get("sessionUpdate")
+                    if kind in ("tool_call", "tool_call_update"):
+                        if _valid_native_id(update.get("toolCallId")) is None:
+                            continue
+                    elif kind in ("user_message_chunk", "agent_message_chunk"):
+                        if not _content_text(update.get("content")):
+                            continue
+                        if kind == "user_message_chunk":
+                            meta = update.get("_meta")
+                            if (not isinstance(meta, dict)
+                                    or _valid_prompt_index(meta.get("promptIndex")) is None):
+                                continue
+                    elif kind == "turn_completed":
+                        if _valid_native_id(update.get("prompt_id") or update.get("promptId")) is None:
+                            continue
+                        try:
+                            _validated_usage_counters(update)
+                        except _AdapterError:
+                            continue
+                    elif not isinstance(kind, str) or (
+                            kind not in COMPACTION_KINDS and kind not in EXTENSION_KINDS):
+                        continue
+                    native_id = params.get("sessionId")
+                else:
+                    if record.get("type") != "turn_started":
+                        continue
+                    native_id = record.get("session_id")
+                if (session_id := _valid_native_id(native_id)) is not None:
+                    return session_id
+        except FileNotFoundError:
+            continue
+    return None
 
 
 def _complete_lines(path: str):
@@ -2674,10 +2844,9 @@ def _tool_name(update: dict):
 
 def _tool_call(r: _Reader, src: JsonlSource, update: dict, params: dict,
                ordinal: int, ts) -> None:
-    raw_call = update.get("toolCallId")
-    if not isinstance(raw_call, str) or _safe_token(raw_call) is None:
+    call_id = _valid_native_id(update.get("toolCallId"))
+    if call_id is None:
         raise _AdapterError("schema_error")
-    call_id = raw_call
     raw = update.get("rawInput")
     name = _tool_name(update)
     target = _safe_target(raw)
@@ -2690,10 +2859,9 @@ def _tool_call(r: _Reader, src: JsonlSource, update: dict, params: dict,
 
 def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
                       params: dict, ordinal: int, ts) -> None:
-    raw_call = update.get("toolCallId")
-    if not isinstance(raw_call, str) or _safe_token(raw_call) is None:
+    call_id = _valid_native_id(update.get("toolCallId"))
+    if call_id is None:
         raise _AdapterError("schema_error")
-    call_id = raw_call
     turn_id = _turn_id(r, params)
     # Keep every validated location until a later terminal update, rather
     # than relying on the single representative path stored on the read row.
