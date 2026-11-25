@@ -2090,6 +2090,14 @@ def _notification_session_id(updates_path, events_path) -> str | None:
                     if kind in ("tool_call", "tool_call_update"):
                         if _valid_native_id(update.get("toolCallId")) is None:
                             continue
+                    elif kind in ("user_message_chunk", "agent_message_chunk"):
+                        if not _content_text(update.get("content")):
+                            continue
+                        if kind == "user_message_chunk":
+                            meta = update.get("_meta")
+                            if (not isinstance(meta, dict)
+                                    or _valid_prompt_index(meta.get("promptIndex")) is None):
+                                continue
                     elif kind == "turn_completed":
                         if _valid_native_id(update.get("prompt_id") or update.get("promptId")) is None:
                             continue

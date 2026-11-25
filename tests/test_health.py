@@ -693,6 +693,29 @@ class LedgerFreshnessTest(unittest.TestCase):
             self.assertEqual(con.execute("SELECT session_key FROM events").fetchone()[0],
                              "grok:native-id")
 
+    def test_grok_message_updates_supply_id_with_bad_summary(self):
+        folder = self.root / "grok/project/directory-id"
+        folder.mkdir(parents=True)
+        (folder / "summary.json").write_text('{"incomplete":')
+        updates = [
+            {"method": "session/update", "params": {
+                "sessionId": "native-id", "update": {
+                    "sessionUpdate": kind, "content": {"type": "text", "text": "fixture"},
+                    "_meta": {"promptIndex": 0}},
+                "_meta": {"promptId": "prompt-one", "promptIndex": 0}}}
+            for kind in ("user_message_chunk", "agent_message_chunk")
+        ]
+        (folder / "updates.jsonl").write_text("".join(json.dumps(row) + "\n" for row in updates))
+        self.imports()
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            result = grok.sync(con)
+            self.assertEqual(result["failed"][0]["error"], "invalid Grok summary JSON")
+            self.assertEqual(con.execute("SELECT session_key FROM user_messages").fetchone()[0],
+                             "grok:native-id")
+            self.assertEqual(con.execute(
+                "SELECT session_key FROM events WHERE family='assistant_message'").fetchone()[0],
+                "grok:native-id")
+
     def test_bad_grok_metadata_keeps_health_stale(self):
         cases = (
             ("summary.json", '{"incomplete":', "updates.jsonl", "{}\n", False, None),
