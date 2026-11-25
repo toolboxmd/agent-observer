@@ -23,13 +23,15 @@ onto the existing workload tables:
   (``resume`` for Claude, ``threadId`` for Codex, ``sessionId`` for
   OpenCode). Claude sessions rotated under one thread are also found
   through their turn-start uuids in ``submissions``.
-- thread trees: child ids of the form ``sub.<parentThreadId>.<suffix>``
+- legacy thread trees: child ids of the form ``sub.<parentThreadId>.<suffix>``
   (nesting allowed) group under their root. Every PR or Issue linked
   anywhere in a tree becomes one task (``<repo>#<N>``); every native
   session in the tree is wholly bound to every tree task through
   ``session_assignments``. A one-link tree attributes exclusively; a
   multi-link tree lands in the shared joint bucket under the existing
-  semantics and is never divided.
+  semantics and is never divided. Purpose-aware trees instead use the run,
+  attempt, provider input and segment mirrors in t3_purpose. Their session
+  evidence records participation independently of response ownership.
 - acceptance: the PR snapshot ``state``; ``merged`` completes the task
   outcome, every other state stays explicit, and nothing is inferred
   from exit codes (which are never read).
@@ -66,6 +68,7 @@ import re
 import sqlite3
 
 from .. import db, privacy
+from . import t3_purpose
 
 # A PR head branch as T3 snapshots it; anything else is not stored.
 BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
@@ -75,7 +78,7 @@ HARNESS = "t3"
 CAPABILITIES = [
     ("turn_origin", True, "T3 turn-start actor_kind maps Claude sdk prompts to genuine (client) or synthetic (server)"),
     ("thread_sessions", True, "provider resume cursors map T3 threads to native Claude, Codex and OpenCode sessions"),
-    ("workload_binding", True, "thread-tree PR/Issue links become repo#N tasks with whole-session ownership; multi-link trees stay shared whole"),
+    ("workload_binding", True, "v1 run purposes and native input identities; legacy-only trees retain linked sessions"),
     ("acceptance", True, "merged PR snapshots complete task outcomes; other states stay explicit"),
     ("tool_calls", False, "no tool evidence is imported from T3 state"),
     ("human_input", False, "no user messages are synthesized; existing user messages are only reclassified"),
@@ -147,24 +150,26 @@ def _ensure_tables(con: sqlite3.Connection) -> None:
         " provider TEXT,"
         " adapter_key TEXT,"
         " native_session TEXT NOT NULL)")
-    con.execute(
+    links_schema = (
         "CREATE TABLE IF NOT EXISTS t3_links("
-        " thread_id TEXT NOT NULL,"
-        " kind TEXT NOT NULL,"
-        " host TEXT NOT NULL,"
-        " repository TEXT NOT NULL,"
-        " number INTEGER NOT NULL,"
-        " url TEXT NOT NULL,"
-        " source TEXT,"
-        " state TEXT,"
-        " linked_at TEXT,"
-        " PRIMARY KEY (thread_id, kind, repository, number))")
+        " thread_id TEXT NOT NULL, kind TEXT NOT NULL, host TEXT NOT NULL,"
+        " repository TEXT NOT NULL, number INTEGER NOT NULL, url TEXT NOT NULL,"
+        " source TEXT, state TEXT, linked_at TEXT, head_branch TEXT,"
+        " PRIMARY KEY (thread_id, kind, host, repository, number))")
+    con.execute(links_schema)
+    link_columns = {r["name"]: r["pk"] for r in con.execute("PRAGMA table_info(t3_links)")}
+    if not link_columns["host"]:
+        # Old navigation mirrors keyed only on repository and number.
+        head = "head_branch" if "head_branch" in link_columns else "NULL"
+        con.execute("ALTER TABLE t3_links RENAME TO t3_links_old_key")
+        con.execute(links_schema)
+        con.execute("INSERT INTO t3_links SELECT thread_id,kind,host,repository,number,"
+                    f"url,source,state,linked_at,{head} FROM t3_links_old_key")
+        con.execute("DROP TABLE t3_links_old_key")
     if "opened_by" not in {r["name"] for r in con.execute("PRAGMA table_info(t3_threads)")}:
         # Who created the thread: client (a person), server (an agent or
         # the system), or NULL without evidence (V1 threads).
         con.execute("ALTER TABLE t3_threads ADD COLUMN opened_by TEXT")
-    if "head_branch" not in {r["name"] for r in con.execute("PRAGMA table_info(t3_links)")}:
-        con.execute("ALTER TABLE t3_links ADD COLUMN head_branch TEXT")
     con.execute(
         "CREATE TABLE IF NOT EXISTS t3_spawns("
         " thread_id TEXT PRIMARY KEY,"
@@ -344,13 +349,22 @@ def sync(con: sqlite3.Connection, root: str | None = None,
     if not os.path.exists(path):
         totals["skipped"] = f"no T3 state at {path}"
         return totals
-    _ensure_tables(con)
     try:
         native = _open_read_only(path)
     except (sqlite3.Error, OSError, ValueError) as exc:
         totals["failed"].append({"path": path, "error": str(exc)})
         return totals
+    # Keep the source at one WAL snapshot and the ledger under its caller's
+    # transaction. A failed refresh must preserve the previous complete mirror.
+    if not con.in_transaction:
+        con.execute("BEGIN")
+    con.execute("SAVEPOINT t3_refresh")
     try:
+        native.execute("BEGIN")
+        _ensure_tables(con)
+        tables = {r[0] for r in native.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        task_count_before = con.execute("SELECT count(*) FROM tasks").fetchone()[0]
+        aware_threads = t3_purpose.refresh(con, native, tables)
         lineage = _v2_lineage(native)
         totals["v2_threads"] = len(lineage)
         _import_turn_origins(con, native, path, totals)
@@ -363,8 +377,8 @@ def sync(con: sqlite3.Connection, root: str | None = None,
         from .. import intervention_evidence
         intervention_evidence.backfill_root_reasons(con)
         totals["responses_retouched"] = _retouch_response_turns(con)
-        bound = _bind_trees(con, threads, links, lineage)
-        totals["tasks"] = bound["tasks"]
+        bound = _bind_trees(con, threads, links, lineage, aware_threads)
+        totals["tasks"] = con.execute("SELECT count(*) FROM tasks").fetchone()[0] - task_count_before
         totals["sessions_bound"] = bound["sessions_bound"]
         totals["outcomes"] = _write_outcomes(con, links)
         con.execute(
@@ -374,8 +388,13 @@ def sync(con: sqlite3.Connection, root: str | None = None,
             (HARNESS, path, _state_marker(path), db.now()))
         totals["sources"] = 1
     except sqlite3.DatabaseError as exc:
+        con.execute("ROLLBACK TO t3_refresh")
         totals["failed"].append({"path": path, "error": str(exc)})
+    except BaseException:
+        con.execute("ROLLBACK TO t3_refresh")
+        raise
     finally:
+        con.execute("RELEASE t3_refresh")
         try:
             native.close()
         except sqlite3.Error:
@@ -879,14 +898,14 @@ def _import_links(con: sqlite3.Connection, native: sqlite3.Connection,
                           if isinstance(row["linked_at"], str) else None})
     unique: dict[tuple, dict] = {}
     for link in links:
-        unique[(link["thread_id"], link["kind"], link["repository"],
+        unique[(link["thread_id"], link["kind"], link["host"], link["repository"],
                 link["number"])] = link
     links = list(unique.values())
     for link in links:
         con.execute(
             "INSERT INTO t3_links(thread_id, kind, host, repository, number,"
             " url, source, state, linked_at, head_branch) VALUES(?,?,?,?,?,?,?,?,?,?)"
-            " ON CONFLICT(thread_id, kind, repository, number) DO UPDATE SET"
+            " ON CONFLICT(thread_id, kind, host, repository, number) DO UPDATE SET"
             " host=excluded.host, url=excluded.url, source=excluded.source,"
             " state=excluded.state, linked_at=excluded.linked_at,"
             " head_branch=COALESCE(excluded.head_branch, t3_links.head_branch)",
@@ -1174,13 +1193,9 @@ def _tree_sessions(con: sqlite3.Connection, threads: dict,
     return out
 
 
-def _task_id(repository: str, number: int) -> str:
-    return f"{repository}#{number}"
-
-
 def _bind_trees(con: sqlite3.Connection, threads: dict,
-                links: list, lineage: dict | None = None) -> dict:
-    """Create repo#N tasks and bind every tree session to every tree link."""
+                links: list, lineage: dict | None = None, aware_threads=()) -> dict:
+    """Retain legacy bindings only where the whole-tree inference still applies."""
     lineage = lineage or {}
     roots: dict[str, list[str]] = {}
     for row in con.execute(
@@ -1198,15 +1213,26 @@ def _bind_trees(con: sqlite3.Connection, threads: dict,
         tree_links.setdefault(_lineage_root(link["thread_id"], lineage),
                               []).append(link)
     sessions = _tree_sessions(con, threads, roots)
+    aware_roots = {_lineage_root(t, lineage) for t in aware_threads}
+    protected = {row[0] for row in con.execute("SELECT session_key FROM t3_purpose_sessions")}
+    # Historical/rotated sessions can outlive their cursor and their tree.
+    # This read proves previous whole-session placement unsafe for these keys.
+    con.execute("DELETE FROM session_assignments WHERE evidence GLOB 't3:*:https://*'"
+                " AND session_key IN (SELECT session_key FROM t3_purpose_sessions)")
+    for root, members in roots.items():
+        if aware_threads and any(t in aware_threads for t in members):
+            aware_roots.add(root)
+    for root in aware_roots:
+        protected.update(sessions.get(root, ()))
     tasks = 0
     bound = 0
     wanted: set = set()
     for root, root_links in tree_links.items():
         seen: dict[tuple, dict] = {}
         for link in root_links:
-            seen.setdefault((link["repository"], link["number"]), link)
-        for (repository, number), link in sorted(seen.items()):
-            task_id = _task_id(repository, number)
+            seen.setdefault((link["host"], link["repository"], link["number"]), link)
+        for (host, repository, number), link in sorted(seen.items()):
+            task_id = t3_purpose.task_id(con, host, repository, number)
             cur = con.execute(
                 "INSERT OR IGNORE INTO tasks(task_id, project, title,"
                 " issue_url, origin, created_at)"
@@ -1214,7 +1240,7 @@ def _bind_trees(con: sqlite3.Connection, threads: dict,
                 (task_id, repository, task_id, link["url"], HARNESS,
                  db.now()))
             tasks += cur.rowcount
-            for session_key in sorted(sessions.get(root, set())):
+            for session_key in sorted(sessions.get(root, set()) - protected):
                 wanted.add((session_key, task_id))
                 cur = con.execute(
                     "INSERT OR IGNORE INTO session_assignments(session_key,"
@@ -1227,11 +1253,11 @@ def _bind_trees(con: sqlite3.Connection, threads: dict,
     # changed PR). Trees absent from this read keep their history, and
     # bindings made outside this adapter are never touched.
     present = {_lineage_root(t, lineage) for t in threads} | set(tree_links)
-    for root in sorted(present):
+    for root in sorted(present | aware_roots):
         for row in con.execute(
                 "SELECT session_key, task_id FROM session_assignments"
                 " WHERE substr(evidence, 1, ?)=?",
-                (len(f"t3:{root}:"), f"t3:{root}:")).fetchall():
+                (len(f"t3:{root}:https://"), f"t3:{root}:https://")).fetchall():
             if (row["session_key"], row["task_id"]) not in wanted:
                 con.execute(
                     "DELETE FROM session_assignments"
@@ -1300,7 +1326,7 @@ def _write_outcomes(con: sqlite3.Connection, links: list) -> int:
     per_task: dict[str, list] = {}
     for link in links:
         per_task.setdefault(
-            _task_id(link["repository"], link["number"]), []).append(link)
+            t3_purpose.task_id(con, link["host"], link["repository"], link["number"]), []).append(link)
     written = 0
     for task_id in sorted(per_task):
         task = con.execute("SELECT origin FROM tasks WHERE task_id=?",
