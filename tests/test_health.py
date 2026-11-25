@@ -312,6 +312,38 @@ class LedgerFreshnessTest(unittest.TestCase):
             "newer_sources": 2, "lag_seconds": 9_000, "status": "stale",
         })
 
+    def test_opencode_visibility_query_failure_keeps_freshness_available(self):
+        path = self.root / "opencode"
+        self.source("claude/project/fixture.jsonl", 20_000)
+        self.imports(claude=11_000)
+        process = {"pid": 201, "name": "opencode", "command": "opencode", "cwd": "/fixture"}
+        check_opencode = health.check_opencode
+        with patch.object(health, "process_table", return_value=[process]), \
+                patch.object(health, "check_opencode",
+                             side_effect=lambda processes: check_opencode(processes, str(path))):
+            for corrupt in (False, True):
+                with self.subTest(corrupt=corrupt):
+                    if corrupt:
+                        path.write_bytes(b"private fixture text")
+                    else:
+                        with contextlib.closing(sqlite3.connect(path)) as native:
+                            native.executescript("""
+                                CREATE TABLE session (id TEXT, directory TEXT, time_created INTEGER);
+                                INSERT INTO session VALUES ('session', '/fixture', 20000000);
+                            """)
+                    code, output = self.run_health()
+                    self.assertEqual(code, 4)
+                    self.assertIn("OpenCode visibility unavailable:", output)
+                    self.assertIn("claude: stale", output)
+                    code, output = self.run_health("--json")
+                    self.assertEqual(code, 4)
+                    result = json.loads(output)
+                    self.assertIn("OpenCode visibility",
+                                  [check["check"] for check in result["unavailable"]])
+                    self.assertEqual(result["ledger_freshness"]["claude"]["status"], "stale")
+                    self.assertEqual(result["ledger_freshness"]["opencode"]["status"],
+                                     "unavailable" if corrupt else "never_synced")
+
     def test_unreadable_ledger_is_not_mistaken_for_never_synced(self):
         self.source("observer.db", 10_000)
         self.source("claude/project/new.jsonl", 20_000)

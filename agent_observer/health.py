@@ -18,7 +18,7 @@ import sqlite3
 import stat
 import subprocess
 import time
-from contextlib import closing
+from contextlib import closing, nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -167,21 +167,20 @@ def check_opencode(processes: list[dict], db_path: str | None = None) -> list[di
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
     except sqlite3.Error:
         con = None
-    for proc in live:
-        seen = None
-        if con is not None:
-            row = con.execute(
-                "SELECT MAX(time_updated) FROM session WHERE directory=?"
-                " AND typeof(time_updated) IN ('integer', 'real')",
-                (proc["cwd"],)).fetchone()
-            seen = row[0] / 1000.0 if row and row[0] else None
-        if seen is None or (proc.get("started") and seen < proc["started"]):
-            findings.append({
-                "host": "opencode", "pid": proc["pid"], "cwd": proc["cwd"],
-                "problem": "running OpenCode process has no session record since it started",
-                "fix": "keep OpenCode's data directory reachable (no XDG_DATA_HOME override)"})
-    if con is not None:
-        con.close()
+    with closing(con) if con is not None else nullcontext():
+        for proc in live:
+            seen = None
+            if con is not None:
+                row = con.execute(
+                    "SELECT MAX(time_updated) FROM session WHERE directory=?"
+                    " AND typeof(time_updated) IN ('integer', 'real')",
+                    (proc["cwd"],)).fetchone()
+                seen = row[0] / 1000.0 if row and row[0] else None
+            if seen is None or (proc.get("started") and seen < proc["started"]):
+                findings.append({
+                    "host": "opencode", "pid": proc["pid"], "cwd": proc["cwd"],
+                    "problem": "running OpenCode process has no session record since it started",
+                    "fix": "keep OpenCode's data directory reachable (no XDG_DATA_HOME override)"})
     return findings
 
 
@@ -389,7 +388,12 @@ def check(processes=None, registry=None, con=None, bare=None, *,
             unavailable.append({"check": "working directory", "host": proc["name"],
                                 "pid": proc["pid"], "reason": proc["cwd_error"]})
     registry = claude_registry() if registry is None else registry
-    findings = check_claude(registry) + check_opencode(processes) + check_codex(processes)
+    findings = check_claude(registry)
+    try:
+        findings.extend(check_opencode(processes))
+    except sqlite3.Error as exc:
+        unavailable.append({"check": "OpenCode visibility", "reason": error_reason(exc)})
+    findings.extend(check_codex(processes))
     from . import cue
     with bare_adapter.one_read():
         freshness = _ledger_freshness(con, sync_interval_seconds, unavailable, ledger_error)
