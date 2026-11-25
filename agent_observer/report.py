@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 import hashlib
 import json
 import sqlite3
@@ -228,17 +229,16 @@ def task_sessions(con: sqlite3.Connection, task_id: str) -> set:
 
 
 def _turn_submission(con: sqlite3.Connection) -> dict:
-    """Map turn_id to the genuine submission that started it.
+    """Map each session and turn to the genuine submission that started it.
 
     One turn follows one genuine user submission; the mapping uses the
     submission turn_id recorded at import. Tool results and assistant rows
     never create submissions.
     """
     mapping = {}
-    for s in con.execute(
-            "SELECT native_id, turn_id FROM user_messages WHERE is_genuine=1"):
-        if s["turn_id"] and s["turn_id"] not in mapping:
-            mapping[s["turn_id"]] = s["native_id"]
+    for key, turn, msg in con.execute(
+            "SELECT session_key,turn_id,native_id FROM user_messages WHERE is_genuine=1 AND turn_id IS NOT NULL"):
+        mapping.setdefault((key, turn), msg)
     return mapping
 
 
@@ -531,26 +531,32 @@ def task_report(con: sqlite3.Connection, task_id: str,
         whole = {k: v for k, v in whole.items()
                  if not outcome.legacy_link(v) or (not canonical and k not in native["sessions"])}
     legacy_links = {key for key, ev in whole.items() if outcome.legacy_link(ev)}
-    whole_shared = {r["session_key"] for r in con.execute(
-        "SELECT session_key FROM session_assignments GROUP BY session_key"
-        " HAVING COUNT(DISTINCT task_id) > 1")}
-    whole_conflicts = {r["session_key"] for r in con.execute(
-        "SELECT DISTINCT w.session_key FROM session_assignments w JOIN user_messages s"
-        " ON s.session_key=w.session_key JOIN assignments a ON a.user_message_id=s.native_id"
-        " WHERE a.task_id<>w.task_id") if r["session_key"] in scope_keys}
-    whole_shared |= whole_conflicts
+    session_owners = defaultdict(set)
+    linked_tasks = defaultdict(set)
+    for key, owner, evidence in con.execute("SELECT session_key,task_id,evidence FROM session_assignments"):
+        if key in scope_keys:
+            claims = linked_tasks if outcome.legacy_link(evidence) else session_owners
+            claims[key].add(owner)
+    prompt_owners = defaultdict(set)
+    assigned_anywhere = set()
+    for key, msg, owner in con.execute(
+            "SELECT s.session_key,s.native_id,a.task_id FROM assignments a "
+            "JOIN user_messages s ON s.native_id=a.user_message_id WHERE s.is_genuine=1"):
+        if key in scope_keys:
+            prompt_owners[key].add(owner)
+            assigned_anywhere.add(msg)
+    whole_conflicts = {key for key, owners in session_owners.items()
+                       if prompt_owners[key] and len(owners | prompt_owners[key]) > 1}
+    whole_shared = whole_conflicts | {key for key, owners in session_owners.items() if len(owners) > 1}
     responses = _responses(con, scope_keys)
     attributed, shared, unassigned = [], [], []
-    # A session shared by several PRs is split per response by the checkout
-    # its tool calls worked in (#43); None keeps whole-session sharing.
-    placements = {key: _place(con, key) for key in whole_shared & set(whole)
-                  if key not in whole_conflicts and not canonical
-                  and not (native and key in native["sessions"])}
+    # A legacy checkout can place the remainder after explicit ownership.
+    placements = {key: _place(con, key) for key in legacy_links
+                  if len(linked_tasks[key]) > 1 and key not in session_owners}
     unplaced, elsewhere = [], []
     missing_submissions = []
-    assigned_anywhere = {r["user_message_id"] for r in
-                         con.execute("SELECT user_message_id "
-                                     "FROM assignments").fetchall()}
+    sharing_tasks = set()
+    legacy_shared = set()
     conflicts = set(native["conflicting_responses"]) if native else set()
     for r in responses:
         if r["is_overlap"]:
@@ -564,34 +570,42 @@ def task_report(con: sqlite3.Connection, task_id: str,
                 elsewhere.append(dict(r))
             elif len(owners) > 1:
                 shared.append(dict(r))
+                sharing_tasks.update(owners)
             else:
                 attributed.append(dict(r))
             continue
-        if r["session_key"] in whole:
-            placed = placements.get(r["session_key"])
+        sub = turn_sub.get((key, r["turn_id"]))
+        if sub in bound_subs:
+            if sub in joint or key in whole_conflicts:
+                shared.append(dict(r))
+                if sub in joint:
+                    sharing_tasks.update(joint[sub]["tasks"])
+                sharing_tasks.update(session_owners.get(key, ()))
+            else:
+                attributed.append(dict(r))
+        elif task_id in session_owners.get(key, ()):
+            # Keep the existing whole-session pool when several records bind
+            # the session and this response has no explicit capture.
+            if key in whole_shared or key in linked_tasks:
+                shared.append(dict(r))
+                sharing_tasks.update(session_owners[key] | prompt_owners[key] | linked_tasks.get(key, set()))
+            else:
+                attributed.append(dict(r))
+        elif key in linked_tasks and (sub in assigned_anywhere or key in session_owners):
+            elsewhere.append(dict(r))
+        elif key in legacy_links:
+            placed = placements.get(key)
             if placed is not None:
-                owner = placed.get(r["response_id"])
-                (attributed if owner == task_id else
-                 unplaced if owner is None else elsewhere).append(dict(r))
-                continue
-            if key in whole_shared:
+                owner = placed.get(rid)
+                (attributed if owner == task_id else unplaced if owner is None else elsewhere).append(dict(r))
+            elif len(linked_tasks[key]) > 1 and not prompt_owners[key]:
                 shared.append(dict(r))
-            elif key in legacy_links:
+                legacy_shared.add(rid)
+            else:
                 unplaced.append(dict(r))
-            else:
-                attributed.append(dict(r))
-            continue
-        sub = turn_sub.get(r["turn_id"])
-        if sub is None:
-            unassigned.append(dict(r))
-        elif sub in bound_subs:
-            if sub in joint or r["session_key"] in whole_conflicts:
-                shared.append(dict(r))
-            else:
-                attributed.append(dict(r))
         else:
             unassigned.append(dict(r))
-            if sub not in assigned_anywhere and sub not in missing_submissions:
+            if sub is not None and sub not in assigned_anywhere and sub not in missing_submissions:
                 missing_submissions.append(sub)
 
     # Sessions are known but nothing is bound: the scope holds measured
@@ -672,7 +686,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
         subs = prompt_sessions.get(key, set())
         if key in shared_owned:
             unmeasured_shared.add(key)
-        elif key in whole or any(s not in joint for s in subs):
+        elif key in ownership.whole or any(s not in joint for s in subs):
             unmeasured_attributed.add(key)
         elif subs:
             unmeasured_shared.add(key)
@@ -744,7 +758,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
     snapshot = _snapshot_id(snapshot_payload)
     estimated = _pricing.price_scope(attributed, schedule)
     shared_estimated = _pricing.price_scope(shared, schedule)
-    billed_shared = [] if canonical else [r for r in shared if r["session_key"] not in legacy_links]
+    billed_shared = [] if canonical else [r for r in shared if r["response_id"] not in legacy_shared]
     total_estimated = _pricing.price_scope(attributed + billed_shared, schedule)
     unplaced_estimated = _pricing.price_scope(unplaced, schedule)
     for estimate in (estimated, shared_estimated, total_estimated, unplaced_estimated):
@@ -898,7 +912,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
     report["coverage"]["unavailable_sessions"] = unavailable_sessions
     report["coverage"]["unavailable_sources"] = unavailable_sources
     report["total_cost"] = _total_cost(
-        con, task_id, total_estimated, attributed, billed_shared, joint, whole)
+        task_id, total_estimated, attributed, billed_shared, sharing_tasks)
     if inventory_gaps and total_estimated.get("priced_responses"):
         subtotal = total_estimated["estimated_cost_usd_partial"]
         amount = "under $0.01" if 0 < subtotal < 0.005 else f"${subtotal:,.2f}"
@@ -931,33 +945,13 @@ def _money(estimate: dict) -> str:
     return prefix + text
 
 
-def _total_cost(con, task_id, estimate, attributed, shared, joint,
-                whole) -> dict:
+def _total_cost(task_id, estimate, attributed, shared, sharing_tasks) -> dict:
     """One total for the task's work: its own usage plus the whole shared pool.
 
     Shared usage is never divided, so every task drawing on a pool counts
     it whole: the total is right for one task, and sums across tasks
     overlap by the shared part. ``shared_with_tasks`` names those tasks.
     """
-    turn_sub = _turn_submission(con)
-    others: set = set()
-    seen_sessions: set = set()
-    for r in shared:
-        key = r["session_key"]
-        if key not in seen_sessions:
-            # Whole-session owners, and prompt owners that conflict with them.
-            seen_sessions.add(key)
-            for row in con.execute(
-                    "SELECT task_id FROM session_assignments WHERE session_key=?"
-                    " UNION SELECT a.task_id FROM assignments a JOIN user_messages s"
-                    " ON a.user_message_id=s.native_id WHERE s.session_key=?"
-                    " AND ? IN (SELECT session_key FROM session_assignments)",
-                    (key, key, key)):
-                others.add(row["task_id"])
-        sub = turn_sub.get(r.get("turn_id"))
-        if key not in whole and sub in joint:
-            others.update(joint[sub]["tasks"])
-    others.discard(task_id)
     # Nothing priced is unknown, even when missing usage marks the estimate
     # partial: an empty subtotal must never read as a numeric zero.
     status = estimate["status"] if estimate.get("priced_responses") else "unknown"
@@ -969,7 +963,7 @@ def _total_cost(con, task_id, estimate, attributed, shared, joint,
         "status": status,
         "responses": len(attributed) + len(shared),
         "shared_responses": len(shared),
-        "shared_with_tasks": sorted(others),
+        "shared_with_tasks": sorted(sharing_tasks - {task_id}) if shared else [],
         "models": model_usage(attributed + shared),
         "estimate": estimate,
     }

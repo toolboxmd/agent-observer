@@ -228,3 +228,71 @@ class NativeOutcomeTest(LedgerCase):
         self.assertEqual({e["native_id"] for e in trace["events"]},
                          {"call-mini-spawn-01", "task_complete:turn-mini-bbb"})
         self.assertNotIn("native_response_count", trace)
+
+    def test_legacy_navigation_preserves_captured_turn_in_every_view(self):
+        self.con.execute("DELETE FROM t3_purpose_runs")
+        other = "example/repo#12"
+        self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES(?,0)", (other,))
+        self.assign(self.task, "01")
+        first = ["codex:resp-mini-001", "codex:resp-mini-002"]
+        self.con.execute("INSERT INTO session_assignments VALUES(?,?,'t3',0)", (self.session, self.task))
+        mine = report.task_report(self.con, self.task)
+        self.assertEqual(mine["measured"]["attributed_responses"], first)
+        self.assertEqual(mine["measured"]["unplaced_responses"], ["codex:resp-mini-003"])
+        self.assertEqual(mine["total_cost"]["responses"], 2)
+        self.assertEqual(report.timeline(self.con, self.task)["returned"], 2)
+
+        self.con.execute("INSERT INTO session_assignments VALUES(?,?,'t3:thread',0)", (self.session, other))
+        linked = report.task_report(self.con, other)
+        self.assertEqual(linked["measured"]["other_task_responses"], first)
+        self.assertEqual(linked["total_cost"]["responses"], 0)
+        self.assertFalse(report.timeline(self.con, other)["events"])
+        self.assign(other, "02")
+        for task, owned, elsewhere, turn in ((self.task, first, ["codex:resp-mini-003"], "aaa"),
+                                              (other, ["codex:resp-mini-003"], first, "bbb")):
+            rep = report.task_report(self.con, task)
+            self.assertEqual(rep["measured"]["attributed_responses"], owned)
+            self.assertEqual(rep["measured"]["other_task_responses"], elsewhere)
+            self.assertFalse(rep["coverage"]["conflicting_sessions"])
+            self.assertTrue(rep["reconciles"])
+            self.assertEqual({e["turn_id"] for e in report.timeline(self.con, task)["events"]},
+                             {"codex:turn-mini-" + turn})
+
+    def test_legacy_links_do_not_join_or_hide_an_explicit_shared_pool(self):
+        self.con.execute("DELETE FROM t3_purpose_runs")
+        partner, observer = "example/repo#12", "example/repo#13"
+        for task in (partner, observer):
+            self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES(?,0)", (task,))
+        for task in (self.task, partner):
+            self.assign(task, "01")
+        self.con.execute("UPDATE assignments SET shared=1")
+        self.con.execute("UPDATE responses SET cost_usd=CASE WHEN turn_id='codex:turn-mini-aaa' THEN 1 ELSE 100 END")
+        for task in (self.task, partner, observer):
+            self.con.execute("INSERT INTO session_assignments VALUES(?,?,'t3:planner',0)", (self.session, task))
+        for task, peer in ((self.task, partner), (partner, self.task)):
+            rep = report.task_report(self.con, task)
+            self.assertEqual(rep["shared_joint"]["responses"], 2)
+            self.assertEqual(rep["total_cost"]["shared_responses"], 2)
+            self.assertEqual(rep["total_cost"]["shared_with_tasks"], [peer])
+            self.assertEqual(rep["native_cost_billed_shared"]["total_usd"], 2)
+            self.assertEqual(report.timeline(self.con, task)["returned"], 2)
+        rep = report.task_report(self.con, observer)
+        self.assertEqual(rep["total_cost"]["responses"], 0)
+        self.assertEqual(rep["measured"]["other_task_responses"], ["codex:resp-mini-001", "codex:resp-mini-002"])
+        self.assertFalse(report.timeline(self.con, observer)["events"])
+        self.assertEqual(rep["native_cost_billed_shared"]["total_usd"], 0)
+
+    def test_linked_session_reusing_a_captured_turn_id_stays_unplaced(self):
+        self.con.execute("DELETE FROM t3_purpose_runs")
+        self.assign(self.task, "01")
+        key = "codex:other-session"
+        self.con.execute("INSERT INTO session_assignments VALUES(?,?,'t3',0)", (key, self.task))
+        self.con.execute("INSERT INTO responses(response_id,source_id,session_key,turn_id)"
+                         " SELECT 'foreign-response',source_id,?,turn_id FROM responses WHERE response_id=?",
+                         (key, "codex:resp-mini-001"))
+        self.con.execute("INSERT INTO events(session_key,turn_id,native_id,family)"
+                         " VALUES(?,'codex:turn-mini-aaa','foreign-event','tool_call')", (key,))
+        rep = report.task_report(self.con, self.task)
+        self.assertEqual(rep["measured"]["unplaced_responses"], ["foreign-response"])
+        self.assertEqual(rep["total_cost"]["responses"], 2)
+        self.assertFalse(report.timeline(self.con, self.task, session_key=key)["events"])
