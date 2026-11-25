@@ -505,16 +505,21 @@ class LedgerFreshnessTest(unittest.TestCase):
             self.assertEqual(result["responses_inserted"], 1)
             self.assertEqual(result["failed"][0]["error"], "invalid Grok summary JSON")
             self.assertIsNone(grok.newest_metadata_import(con))
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        self.assertEqual(json.loads(output)["ledger_freshness"]["grok"]["status"], "never_synced")
 
     def test_bad_grok_metadata_keeps_health_stale(self):
         cases = (
-            ("summary.json", '{"incomplete":', "updates.jsonl", "{}\n", False),
-            ("summary.json", '{"incomplete":', "events.jsonl", "", False),
-            ("summary.json", '{"incomplete":', "updates.jsonl", "{}\n", True),
-            ("chat_history.jsonl", "invalid json\n", None, "", False),
+            ("summary.json", '{"incomplete":', "updates.jsonl", "{}\n", False, None),
+            ("summary.json", '{"incomplete":', "events.jsonl", "", False, None),
+            ("summary.json", '{"incomplete":', "updates.jsonl", "{}\n", True, None),
+            ("summary.json", '{"incomplete":', "updates.jsonl", "{}\n", False, ""),
+            ("summary.json", '{"incomplete":', "updates.jsonl", "{}\n", False, "{"),
+            ("chat_history.jsonl", "invalid json\n", None, "", False, None),
         )
-        for filename, content, log, log_content, full in cases:
-            with self.subTest(filename=filename, log=log, full=full), \
+        for filename, content, log, log_content, full, append in cases:
+            with self.subTest(filename=filename, log=log, full=full, append=append), \
                     tempfile.TemporaryDirectory() as tmp:
                 base = Path(tmp)
                 session = base / "grok/project/session-one"
@@ -535,6 +540,10 @@ class LedgerFreshnessTest(unittest.TestCase):
                     metadata = session / filename
                     metadata.write_text(content)
                     os.utime(metadata, (20_000, 20_000))
+                    if append is not None:
+                        with transcript.open("a") as file:
+                            file.write(append)
+                        os.utime(transcript, (20_000, 20_000))
                     with patch.object(db, "now", return_value=21_000), \
                             patch.object(ingest, "now", return_value=21_000):
                         result = grok.sync(con, root=str(base / "grok"), full=full)

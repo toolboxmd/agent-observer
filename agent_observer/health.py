@@ -292,7 +292,8 @@ def _ledger_freshness(con, sync_interval_seconds, unavailable, ledger_error):
     if con is not None:
         try:
             imports = dict(con.execute(
-                "SELECT harness, MAX(imported_at) FROM sources GROUP BY harness"))
+                "SELECT harness, MAX(imported_at) FROM sources"
+                " WHERE imported_at > 0 GROUP BY harness"))
             metadata_import = grok.newest_metadata_import(con)
             if metadata_import is not None:
                 recorded = imports.get("grok", metadata_import)

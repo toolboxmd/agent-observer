@@ -79,7 +79,7 @@ class JsonlSource:
     """One append-only JSONL file being imported."""
 
     def __init__(self, con: sqlite3.Connection, harness: str, path: str,
-                 full: bool = False):
+                 full: bool = False, *, defer_imported_at: bool = False):
         self.con = con
         self.harness = harness
         self.path = path
@@ -112,7 +112,7 @@ class JsonlSource:
         if row is None:
             con.execute(
                 "INSERT INTO sources(harness, path, sha256, imported_at)"
-                " VALUES(?,?,?,?)", (harness, path, "", now()))
+                " VALUES(?,?,?,?)", (harness, path, "", 0 if defer_imported_at else now()))
             row = con.execute(
                 "SELECT * FROM sources WHERE harness=? AND path=?",
                 (harness, path)).fetchone()

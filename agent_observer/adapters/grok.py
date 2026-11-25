@@ -1570,9 +1570,9 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
 
     # Change state before any full parse. JsonlSource does a stat plus a
     # small tail read, never a full parse.
-    updates_src = (JsonlSource(con, HARNESS, updates_path, full=full)
+    updates_src = (JsonlSource(con, HARNESS, updates_path, full=full, defer_imported_at=True)
                    if updates_path and os.path.isfile(updates_path) else None)
-    events_src = (JsonlSource(con, HARNESS, events_path, full=full)
+    events_src = (JsonlSource(con, HARNESS, events_path, full=full, defer_imported_at=True)
                   if events_path and os.path.isfile(events_path) else None)
     r.updates_src = updates_src
     r.events_src = events_src
@@ -1932,12 +1932,10 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         _store_meta(con, r.session_key, summary_fp, chat_fp_current, chat, metadata_imported_at)
     for source in (updates_src, events_src):
         if source is not None and (not metadata_errors or not source.unchanged):
-            # Empty files and forced replays can require bookkeeping even
-            # when the transcript on disk has not changed.
-            same_snapshot = (source.mtime_ns, source.ino, source.size) == (
-                source.row["mtime_ns"], source.row["ino"], source.row["size_bytes"])
+            # A partial import can commit transcript changes while leaving
+            # the last complete session import time available to health.
             stats.update(source.finish(session_id=r.native_sid,
-                                       advance_imported_at=not metadata_errors or not same_snapshot))
+                                       advance_imported_at=not metadata_errors))
     stats["session_key"] = r.session_key
     stats["unchanged"] = bool(
         (updates_src is None or updates_src.unchanged)
