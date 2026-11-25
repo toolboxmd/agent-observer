@@ -87,15 +87,26 @@ class PlacementTest(LedgerCase):
         _git("-C", root, "checkout", "-q", "-b", "fix/b")
         _git("-C", root, "remote", "set-url", "origin", "git@github.com:o/beta.git")
         self._assign(key, "o/alpha#1")
-        # Late link and replay cannot use the new checkout to place the old call.
-        with patch.object(subprocess, "run", side_effect=AssertionError("import ran Git")):
-            self.assertEqual(import_claude_file(self.con, path)["malformed"], 0)
-            self.assertEqual(self.con.execute(
-                "SELECT COUNT(*) FROM events WHERE family='tool_call'").fetchone()[0], 1)
-            self._assign(key, "o/beta#2")
-            self.assertEqual(placement.record_shared_checkouts(self.con), 1)
+        self.assertEqual(import_claude_file(self.con, path)["malformed"], 0)
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) FROM events WHERE family='tool_call'").fetchone()[0], 1)
+        observed = {"claude:before": [{"host": "github.com", "repository": "o/beta",
+                                      "branch": "fix/b", "candidate_tasks": []}]}
+        self.assertEqual(placement.checkout_observations(self.con, key), observed)
+        self._assign(key, "o/beta#2")
+        self.assertEqual(placement.record_shared_checkouts(self.con), 1)
+        _git("-C", root, "checkout", "-q", "fix/a")
+        _git("-C", root, "remote", "set-url", "origin", "git@github.com:o/alpha.git")
+        # Replaying after reuse never changes what was first observed.
+        with patch.object(subprocess, "run", side_effect=AssertionError("replay ran Git")):
             self.assertEqual(import_claude_file(self.con, path, full=True)["malformed"], 0)
             self._assert_unplaced(self.con, ["claude:before"])
+        observed["claude:before"][0]["candidate_tasks"] = ["o/beta#2"]
+        shutil.rmtree(root)
+        with closing(db.connect_read_only(self.db_path)) as ro, patch.object(
+                subprocess, "run", side_effect=AssertionError("report ran Git")):
+            self.assertEqual(placement.checkout_observations(ro, key), observed)
+            self._assert_unplaced(ro, ["claude:before"])
 
     def test_codex_session_git_and_literal_pr_target_leave_call_unplaced(self):
         key = "codex:target"
@@ -126,7 +137,7 @@ class PlacementTest(LedgerCase):
             self.assertEqual(import_codex_file(self.con, path)["events_inserted"], 1)
             self._assert_unplaced(self.con, ["codex:target-r"])
 
-    def test_old_live_git_tables_cannot_credit_a_response_in_read_only_reports(self):
+    def test_old_and_hostless_observations_stay_out_of_diagnostics_and_totals(self):
         key = "claude:s"
         db.upsert_session(self.con, key, "claude", "s", self.source)
         for task in ("o/alpha#1", "o/beta#2"):
@@ -148,7 +159,7 @@ class PlacementTest(LedgerCase):
         self.con.execute("INSERT INTO response_checkouts VALUES(?,?,'r0','github.com','o/alpha','fix/a')",
                          (event.lastrowid, digest))
         self.con.execute("CREATE TABLE event_checkouts(event_id,path_digest,host,repository,branch)")
-        self.con.execute("INSERT INTO event_checkouts VALUES(?,?,'github.com','o/alpha','fix/a')",
+        self.con.execute("INSERT INTO event_checkouts VALUES(?,?,NULL,'o/alpha','fix/a')",
                          (event.lastrowid, digest))
         self.con.commit()
         shutil.rmtree(root)
@@ -156,6 +167,7 @@ class PlacementTest(LedgerCase):
                 subprocess, "run", side_effect=AssertionError("report ran Git")):
             statements = []
             ro.set_trace_callback(statements.append)
+            self.assertEqual(placement.checkout_observations(ro, key), {})
             self._assert_unplaced(ro, ["r0"])
             self.assertTrue(ro.in_transaction)
             self.assertEqual({sql.split()[0].upper() for sql in statements}
@@ -168,6 +180,44 @@ class PlacementTest(LedgerCase):
             self._assign(key, "o/alpha#1", evidence)
             self._assign(key, "o/beta#2")
             self.assertIsNone(placement.read_placements(self.con, key))
+
+    def test_shared_links_without_pr_heads_stay_context(self):
+        key = "claude:no-head"
+        db.upsert_session(self.con, key, "claude", "no-head", self.source)
+        for task in ("o/alpha#1", "o/beta#2"):
+            self._assign(key, task)
+        self.con.execute("UPDATE t3_links SET head_branch=NULL")
+        self.assertIsNone(placement.read_placements(self.con, key))
+
+    def test_diagnostics_keep_same_head_candidates_separate_by_forge(self):
+        key = "codex:placement-review"
+        hosted_root = self.checkouts["beta"]
+        _git("-C", hosted_root, "checkout", "-q", "-b", "fix/a")
+        _git("-C", hosted_root, "remote", "set-url", "origin",
+             "https://forge.example/o/alpha.git")
+        path, _ = self._continuation_files("forge")
+        import_codex_file(self.con, path)
+        # PR links can arrive after the native import. Same-head PRs on one
+        # forge remain visible as multiple candidates, without task credit.
+        self._assign(key, "o/alpha#1")
+        for host, number, task in (("github.com", 3, "o/alpha#3"),
+                                   ("forge.example", 1, "forge.example/o/alpha#1")):
+            self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES(?,0)", (task,))
+            self._assign(key, task)
+            self.con.execute(
+                "INSERT INTO t3_links(thread_id,kind,host,repository,number,url,head_branch)"
+                " VALUES('t','pr',?,'o/alpha',?,?,'fix/a')",
+                (host, number, f"https://{host}/o/alpha/pull/{number}"))
+        self.assertEqual(placement.checkout_observations(self.con, key), {
+            "codex:r1": [{"host": "github.com", "repository": "o/alpha",
+                          "branch": "fix/a", "candidate_tasks": ["o/alpha#1", "o/alpha#3"]}],
+            "codex:r2": [{"host": "forge.example", "repository": "o/alpha",
+                          "branch": "fix/a", "candidate_tasks": ["forge.example/o/alpha#1"]}],
+        })
+        for task in ("o/alpha#1", "o/alpha#3", "forge.example/o/alpha#1"):
+            result = report.task_report(self.con, task, schedule=SCHEDULE)
+            self.assertEqual(result["measured"]["unplaced_responses"], ["codex:r1", "codex:r2"])
+            self.assertEqual(result["total_cost"]["responses"], 0)
 
     def test_repeated_usage_keeps_the_first_response_position(self):
         alpha = self.checkouts["alpha"]

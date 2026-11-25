@@ -1074,6 +1074,7 @@ def _sync(con, ns) -> int:
                     row[key] = (row.get(key) or 0) + value
                 elif key not in row:
                     row[key] = value
+    # Native imports capture checkout diagnostics independently of T3 links.
     # Count shared sessions after the T3 refresh.
     if "t3" in wanted:
         for row in results:
