@@ -1325,16 +1325,7 @@ def _validate_source_event(con: sqlite3.Connection, db_path: str,
     return False
 
 
-def _sync_rollouts(con: sqlite3.Connection, rollout_root: str, totals: dict,
-                   full: bool = False) -> bool:
-    """Import router-owned Codex rollouts through the Codex adapter.
-
-    Every rollout continues through ``_codex.import_codex_file`` with the
-    full flag, so main-session classification, sanitized excerpts,
-    whitelisted details and targets, fixed categories and in-place privacy
-    corrections come from the core importer. No Codex privacy logic is
-    duplicated here.
-    """
+def _rollouts_under(rollout_root: str) -> list[str]:
     patterns = (
         os.path.join(rollout_root, "codex-sessions", "**", "rollout-*.jsonl"),
         os.path.join(rollout_root, "kits", "*", "sessions", "**",
@@ -1342,16 +1333,20 @@ def _sync_rollouts(con: sqlite3.Connection, rollout_root: str, totals: dict,
     paths = set()
     for pattern in patterns:
         paths.update(glob.glob(pattern, recursive=True))
+    return list(dict.fromkeys(os.path.realpath(path) for path in sorted(paths)))
+
+
+def discover_rollouts() -> list[str]:
+    """Codex rollouts read by default Router sync, including its fallback root."""
+    roots = [os.path.dirname(path) for path in discover()] or [DEFAULT_ROOT]
+    return list(dict.fromkeys(path for root in roots for path in _rollouts_under(root)))
+
+
+def _sync_rollouts(con: sqlite3.Connection, rollout_root: str, totals: dict,
+                   full: bool = False) -> bool:
+    """Import router-owned rollouts through the core Codex importer."""
     changed = False
-    seen: set[str] = set()
-    for path in sorted(paths):
-        try:
-            canonical = os.path.realpath(path)
-        except OSError:
-            canonical = path
-        if canonical in seen:
-            continue
-        seen.add(canonical)
+    for canonical in _rollouts_under(rollout_root):
         try:
             stats = _codex.import_codex_file(con, canonical, full=full)
         except (OSError, sqlite3.DatabaseError, UnicodeDecodeError,

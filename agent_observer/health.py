@@ -267,6 +267,19 @@ def _native_record_times(harness, paths):
             yield newest
 
 
+def _discover_native_paths(harness, adapter):
+    from .adapters import router
+    if harness == "t3":
+        return [adapter.state_path()]
+    if harness == "grok":
+        return adapter.discover(strict=True)
+    paths = adapter.discover()
+    if harness == "codex":
+        paths.extend(router.discover_rollouts())
+        return [os.path.realpath(path) for path in paths]
+    return paths
+
+
 def _ledger_freshness(con, sync_interval_seconds, unavailable, ledger_error):
     from .adapters import available
 
@@ -284,7 +297,7 @@ def _ledger_freshness(con, sync_interval_seconds, unavailable, ledger_error):
     for harness, adapter in available().items():
         imported = imports.get(harness)
         try:
-            paths = [adapter.state_path()] if harness == "t3" else adapter.discover()
+            paths = _discover_native_paths(harness, adapter)
             records = list(_native_record_times(harness, paths))
         except (OSError, sqlite3.Error) as exc:
             unavailable.append({"check": f"{harness} native record scan", "reason": str(exc)})
@@ -332,9 +345,15 @@ def check(processes=None, registry=None, con=None, bare=None, *,
     with bare_adapter.one_read():
         freshness = _ledger_freshness(con, sync_interval_seconds, unavailable, ledger_error)
         roots = bare_roots() if bare is None else bare
+    conflicts = None
+    if con is not None:
+        try:
+            conflicts = identity_conflicts(con)
+        except sqlite3.Error as exc:
+            unavailable.append({"check": "identity conflicts", "reason": str(exc)})
     return {"cue": cue.health(con), "findings": findings,
             "unavailable": unavailable,
-            "identity_conflicts": identity_conflicts(con) if con is not None else None,
+            "identity_conflicts": conflicts,
             "bare_roots": roots,
             "ledger_freshness": freshness, "sync_interval_seconds": sync_interval_seconds,
             "checked": {"claude_sessions": len(registry),

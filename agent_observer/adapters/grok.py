@@ -235,10 +235,12 @@ def _classify_prompt(prompt_idx: str, chat: dict,
     return "unknown", 0
 
 
-def _default_paths() -> tuple[list[str], dict]:
+def _default_paths(*, strict: bool = False) -> tuple[list[str], dict]:
     """The normal sessions plus every Chromeria bare root's, and the report."""
-    found, report = bare.discover(HARNESS, _sessions_under)
-    return _sessions_under(DEFAULT_ROOT) + found, report
+    found, report = bare.discover(HARNESS, lambda root: _sessions_under(root, strict=strict))
+    if strict and any(gap["reason"] == "unreadable" for gap in report["gaps"]):
+        raise PermissionError("Grok bare session root unreadable")
+    return _sessions_under(DEFAULT_ROOT, strict=strict) + found, report
 
 
 def _stored(con: sqlite3.Connection, paths: list[str]
@@ -256,34 +258,38 @@ def _stored(con: sqlite3.Connection, paths: list[str]
     return out
 
 
-def discover(root: str | None = None) -> list[str]:
+def discover(root: str | None = None, *, strict: bool = False) -> list[str]:
     """Session directories under `<url-encoded cwd>/<session id>`.
 
     With root unset, the normal sessions root and each sessions root a
-    Chromeria bare receipt names (#92).
+    Chromeria bare receipt names (#92). Strict discovery reports listing
+    errors for health while accepting missing optional directories.
     """
     if not root:
-        return _default_paths()[0]
-    return _sessions_under(root)
+        return _default_paths(strict=strict)[0]
+    return _sessions_under(root, strict=strict)
 
 
-def _sessions_under(root: str) -> list[str]:
+def _session_entries(path: str, strict: bool) -> list[str]:
+    try:
+        return sorted(os.listdir(path))
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    except OSError:
+        if strict:
+            raise
+        return []
+
+
+def _sessions_under(root: str, *, strict: bool = False) -> list[str]:
     if _looks_like_session(root):
         return [root]
-    try:
-        groups = sorted(os.listdir(root))
-    except OSError:
-        return []
     out = []
-    for group in groups:
+    for group in _session_entries(root, strict):
         group_dir = os.path.join(root, group)
         if not os.path.isdir(group_dir):
             continue
-        try:
-            children = sorted(os.listdir(group_dir))
-        except OSError:
-            continue
-        for child in children:
+        for child in _session_entries(group_dir, strict):
             session_dir = os.path.join(group_dir, child)
             if os.path.isdir(session_dir) and _looks_like_session(session_dir):
                 out.append(session_dir)

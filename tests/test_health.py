@@ -298,6 +298,50 @@ class LedgerFreshnessTest(unittest.TestCase):
         self.assertEqual(result["ledger_freshness"]["claude"]["status"], "unavailable")
         self.assertEqual(result["unavailable"][0]["check"], "ledger freshness")
 
+    def test_router_rollouts_contribute_to_codex_freshness(self):
+        self.source("router/jobs.db", 10_000)
+        self.source("router/kits/kit/sessions/2026/rollout-kit.jsonl", 20_000)
+        self.source("router/codex-sessions/2026/rollout-shared.jsonl", 21_000)
+        self.imports(codex=11_000, router=11_000)
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        rows = json.loads(output)["ledger_freshness"]
+        self.assertEqual(rows["codex"]["status"], "stale")
+        self.assertEqual(rows["codex"]["newest_native_at"], 21_000)
+        self.assertEqual(rows["codex"]["newer_sources"], 2)
+        self.assertEqual(rows["router"]["status"], "current")
+
+    def test_unreadable_grok_directory_is_reported_as_unavailable(self):
+        self.source("grok/project/session/updates.jsonl", 20_000)
+        self.imports(grok=11_000)
+        listdir = os.listdir
+        for unreadable in (self.root / "grok", self.root / "grok/project"):
+            def checked_listdir(path):
+                if Path(path) == unreadable:
+                    raise PermissionError("fixture directory unreadable")
+                return listdir(path)
+
+            with self.subTest(unreadable=unreadable), \
+                    patch.object(grok.os, "listdir", side_effect=checked_listdir):
+                code, output = self.run_health("--json")
+                self.assertEqual(code, 4)
+                result = json.loads(output)
+                self.assertEqual(result["ledger_freshness"]["grok"]["status"], "unavailable")
+                self.assertIn({"check": "grok native record scan",
+                               "reason": "fixture directory unreadable"}, result["unavailable"])
+
+    def test_failed_identity_query_preserves_freshness_json(self):
+        self.source("claude/project/new.jsonl", 20_000)
+        self.imports(claude=11_000)
+        with contextlib.closing(sqlite3.connect(self.ledger)) as con:
+            con.execute("DROP TABLE import_errors")
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        result = json.loads(output)
+        self.assertIsNone(result["identity_conflicts"])
+        self.assertEqual(result["unavailable"][0]["check"], "identity conflicts")
+        self.assertEqual(result["ledger_freshness"]["claude"]["status"], "stale")
+
 
 class ClaudeVisibilityTest(unittest.TestCase):
     def setUp(self):
