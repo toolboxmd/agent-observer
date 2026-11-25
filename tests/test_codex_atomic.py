@@ -2,8 +2,10 @@
 
 from contextlib import closing
 import json
+import os
 from pathlib import Path
 import sqlite3
+from unittest.mock import patch
 
 from agent_observer import report
 from agent_observer.adapters import codex, t3_purpose
@@ -128,3 +130,48 @@ class CodexAtomicTest(LedgerCase):
         self.assertTrue(result["incremental"])
         self.assertEqual(result["lines"], 1)
         self.check_owners(None, 91100)
+
+    def check_archived_tail(self, import_copy_first):
+        live = Path(self.tmp.name, "sessions")
+        archive = live.with_name("archived_sessions")
+        live.mkdir()
+        archive.mkdir()
+        with (patch.object(codex, "DEFAULT_ROOT", str(live)),
+              patch.object(codex, "ARCHIVE_ROOT", str(archive)),
+              patch.dict(os.environ, {"T3CODE_HOME": self.tmp.name})):
+            first = self.source("sessions/rollout-first", "A", 1100)
+            second = self.source("sessions/rollout-second", "B", 91100)
+            tail = json.dumps(self.context) + "\n"
+            with second.open("a") as fh:
+                fh.write(tail[:20])
+            codex.import_codex_file(self.con, str(second))
+            write_records(first, [self.meta])
+            codex.import_codex_file(self.con, str(first))
+            self.check_owners(None, None)
+            target = archive / second.name
+            completed = second.read_bytes() + tail[20:].encode()
+            if import_copy_first:
+                target.write_bytes(completed)
+                codex.sync(self.con, source=str(target))
+                self.check_owners(None, None)
+            second.unlink()
+            codex.sync(self.con, source=str(first))
+            self.check_owners(None, None)
+            if not import_copy_first:
+                # The indexed complete lines agree, but this same-name copy
+                # replaces the torn bytes with a different well-formed record.
+                target.write_bytes(completed[:-len(tail.encode())] + b'{"type":"unrelated","payload":{}}\n')
+                codex.sync(self.con)
+                self.check_owners(None, None)
+                target.write_bytes(completed)
+            for full in (False, True):
+                codex.sync(self.con, full=full)
+                self.check_owners(None, 91100)
+                native = report.task_report(self.con, "B")["native_purpose"]
+                self.assertEqual(native["unlocated_usage_sessions"], [])
+
+    def test_completed_archive_recovers_a_previously_incomplete_source(self):
+        self.check_archived_tail(False)
+
+    def test_already_indexed_archive_recovers_when_the_live_copy_vanishes(self):
+        self.check_archived_tail(True)

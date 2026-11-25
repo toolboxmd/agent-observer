@@ -768,7 +768,8 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         "events_duplicate": 0, "compactions": 0, "malformed": 0,
     }
     src = JsonlSource(con, HARNESS, path, full=full)
-    if (src.row["codex_context_version"] != _CONTEXT_VERSION
+    predecessor = codex_atomic.relocated_source(src)
+    if (predecessor is not None or src.row["codex_context_version"] != _CONTEXT_VERSION
             or src.row["codex_context_offset"] != src.row["read_offset"]):
         # Replay older indexes once to recover literal turn witnesses from copies.
         src.start_offset = 0
@@ -937,7 +938,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         if ts is not None:
             reader.first_ts = ts if reader.first_ts is None else min(reader.first_ts, ts)
             reader.last_ts = ts if reader.last_ts is None else max(reader.last_ts, ts)
-    codex_atomic.finish(reader)
+    codex_atomic.finish(reader, predecessor)
     _flush_token_counts(reader)
     _resolve_legacy_user_messages(reader)
     if not src.privacy_stale:

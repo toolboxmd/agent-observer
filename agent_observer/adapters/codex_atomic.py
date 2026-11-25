@@ -1,9 +1,11 @@
 """Source observations for task attribution of Codex token_usage_record atoms."""
 
+import hashlib
 import json
+import os
 from collections import defaultdict
 
-from .. import db, native_response
+from .. import db, lookup, native_response
 from ..ingest import iso_ts
 
 
@@ -21,6 +23,40 @@ def _signature(observation):
     return observation["session_key"], observation["input_id"], measured
 
 
+def _prefix_digest(path, size):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while size:
+            chunk = stream.read(min(size, 1024 * 1024))
+            if not chunk:
+                return None
+            digest.update(chunk)
+            size -= len(chunk)
+    return digest.hexdigest()
+
+
+def relocated_source(src):
+    """Find an incomplete ledger source whose verified archive is this rollout."""
+    path = os.path.abspath(src.path)
+    if (not any(part in path for part in ("/sessions/", "/archived_sessions/"))
+            or not db._has_table(src.con, "codex_incomplete_sources")):
+        return None
+    matches = []
+    for row in src.con.execute("""SELECT s.*,i.* FROM codex_incomplete_sources i
+            JOIN sources s ON s.id=i.source_id WHERE s.id!=? AND s.read_offset>0""", (src.source_id,)):
+        if os.path.basename(row["path"]) != os.path.basename(path) or not row["tail_sha256"]:
+            continue
+        resolved = lookup.resolve_source(row)
+        if resolved["reason"] != "relocated" or os.path.abspath(resolved["path"]) != path:
+            continue
+        row = dict(row)
+        if row.get("prefix_bytes") is not None:
+            if not row["prefix_digest"] or _prefix_digest(path, row["prefix_bytes"]) != row["prefix_digest"]:
+                continue
+        matches.append(row)
+    return matches[0] if len(matches) == 1 else None
+
+
 def prepare(r):
     con = r.con
     con.execute("""CREATE TABLE IF NOT EXISTS codex_atomic_observations (
@@ -32,9 +68,11 @@ def prepare(r):
     con.execute("CREATE INDEX IF NOT EXISTS codex_atomic_session ON codex_atomic_observations(session_key,response_id)")
     con.execute("""CREATE TABLE IF NOT EXISTS codex_incomplete_sources (
         source_id INTEGER PRIMARY KEY REFERENCES sources(id),session_key TEXT NOT NULL,legacy_dispute INTEGER NOT NULL,
-        replay INTEGER NOT NULL DEFAULT 1)""")
-    if "replay" not in {c[1] for c in con.execute("PRAGMA table_info(codex_incomplete_sources)")}:
-        con.execute("ALTER TABLE codex_incomplete_sources ADD COLUMN replay INTEGER NOT NULL DEFAULT 1")
+        replay INTEGER NOT NULL DEFAULT 1, prefix_bytes INTEGER, prefix_digest TEXT)""")
+    columns = {c[1] for c in con.execute("PRAGMA table_info(codex_incomplete_sources)")}
+    for key, declaration in (("replay", "INTEGER NOT NULL DEFAULT 1"), ("prefix_bytes", "INTEGER"), ("prefix_digest", "TEXT")):
+        if key not in columns:
+            con.execute(f"ALTER TABLE codex_incomplete_sources ADD COLUMN {key} {declaration}")
     r.atomic_ids = set()
     r.unreadable_atomic = False
     if not r.src.incremental:
@@ -66,7 +104,7 @@ def observe(r, obj, counters):
                    *(native_response.identifier(p.get(k)) for k in ("thread_id", "root_turn_id", "session_id"))))
 
 
-def finish(r):
+def finish(r, predecessor):
     con, src = r.con, r.src
     incomplete = r.unreadable_atomic or src.incomplete_record or src.end_offset < src.size
     if incomplete:
@@ -75,10 +113,23 @@ def finish(r):
             (src.path,)).fetchone() is not None)
         replay = r.unreadable_atomic or (not src.incremental and con.execute(
             "SELECT 1 FROM prior_codex_atoms LIMIT 1").fetchone() is not None)
-        con.execute("INSERT INTO codex_incomplete_sources VALUES(?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET "
-                    "legacy_dispute=MAX(legacy_dispute,excluded.legacy_dispute),replay=excluded.replay",
-                    (src.source_id, r.session_key, legacy, replay))
+        con.execute("INSERT INTO codex_incomplete_sources(source_id,session_key,legacy_dispute,replay,"
+                    "prefix_bytes,prefix_digest) VALUES(?,?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET "
+                    "session_key=excluded.session_key,legacy_dispute=MAX(legacy_dispute,excluded.legacy_dispute),"
+                    "replay=excluded.replay,prefix_bytes=excluded.prefix_bytes,prefix_digest=excluded.prefix_digest",
+                    (src.source_id, r.session_key, legacy, replay, src.size, _prefix_digest(src.path, src.size)))
     else:
+        if predecessor is not None and predecessor["session_key"] == r.session_key and (
+                predecessor.get("prefix_digest") or _historical_atoms_survive(con, predecessor["id"], src.source_id)):
+            # The archive was read from the start. Its source now owns the current
+            # observations, including withdrawals. Keep the old raw ledger locators.
+            old = predecessor["id"]
+            r.atomic_ids.update(rid for rid, in con.execute(
+                "SELECT DISTINCT response_id FROM codex_atomic_observations WHERE source_id=?", (old,)))
+            con.execute("DELETE FROM codex_atomic_observations WHERE source_id=?", (old,))
+            con.execute("DELETE FROM native_response_inputs WHERE source_id=?", (old,))
+            con.execute("DELETE FROM codex_incomplete_sources WHERE source_id=?", (old,))
+            con.execute("UPDATE sources SET codex_context_offset=NULL WHERE id=?", (old,))
         cleared = con.execute("DELETE FROM codex_incomplete_sources WHERE source_id=?", (src.source_id,)).rowcount
         if cleared and src.incremental:
             # Another source may have withdrawn a conflicting copy while this
@@ -92,6 +143,16 @@ def finish(r):
         con.execute("DROP TABLE temp.prior_codex_atoms")
     for rid in r.atomic_ids:
         _reconcile(con, rid, src.source_id)
+
+
+def _historical_atoms_survive(con, original, archive):
+    # Older incomplete receipts have only the tail hash at the read offset.
+    # A same-name copy must additionally account for every observed atom.
+    def observations(source_id):
+        return {(o["response_id"], _signature(o)) for o in con.execute(
+            "SELECT * FROM codex_atomic_observations WHERE source_id=?", (source_id,))}
+    previous = observations(original)
+    return bool(previous) and previous <= observations(archive)
 
 
 def _reconcile(con, rid, refreshing):
