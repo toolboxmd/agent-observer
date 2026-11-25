@@ -254,8 +254,9 @@ def _source_cutoff(con: sqlite3.Connection, scope_keys: set) -> float | None:
         return None
     placeholders = ",".join("?" * len(keys))
     tables = ["responses", "events", "user_messages", "sessions"]
-    if _has_table(con, "codex_occurrences"):
-        tables.append("codex_occurrences")
+    for table in ("codex_occurrences", "opencode_response_observations"):
+        if _has_table(con, table):
+            tables.append(table)
     backing = " UNION ".join(
         f"SELECT DISTINCT source_id FROM {table}"
         f" WHERE session_key IN ({placeholders})" for table in tables)
@@ -566,7 +567,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
     for key in sorted(legacy_links):
         checkout_records.update(placement.checkout_observations(con, key))
     unplaced, elsewhere = [], []
-    missing_submissions = []
+    missing_submissions = sorted({msg for ids in ownership.missing_by_response.values() for msg in ids})
     sharing_tasks = set()
     legacy_shared = set()
     conflicts = ownership.conflicts
@@ -576,7 +577,10 @@ def task_report(con: sqlite3.Connection, task_id: str,
         key, rid = r["session_key"], r["response_id"]
         if rid in conflicts or rid in ownership.owners or (native and key in native["sessions"]):
             owners = ownership.owners.get(rid)
-            if rid in conflicts or not owners:
+            if (rid in ownership.missing_by_response and key not in legacy_links
+                    and not (native and key in native["sessions"])):
+                unassigned.append(dict(r))
+            elif rid in conflicts or not owners:
                 unplaced.append(dict(r))
             elif task_id not in owners:
                 elsewhere.append(dict(r))
@@ -603,7 +607,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
                 sharing_tasks.update(session_owners[key] | prompt_owners[key])
             else:
                 attributed.append(dict(r))
-        elif key in linked_tasks and (sub in assigned_anywhere or key in session_owners):
+        elif sub in assigned_anywhere or key in session_owners:
             elsewhere.append(dict(r))
         elif key in legacy_links:
             placed = placements.get(key)
@@ -704,7 +708,8 @@ def task_report(con: sqlite3.Connection, task_id: str,
             unmeasured_shared.add(key)
     has_purpose = native and (canonical or native["deliveries"] or native["conflicting_source_runs"])
     inventory_gaps = outcome.check_inventory(con, native, attributed) if has_purpose else False
-    unavailable_usage = bool(unbound_usage or conflicts or inventory_gaps or legacy_links
+    unresolved_usage = bool(unplaced or unassigned)
+    unavailable_usage = bool(unresolved_usage or conflicts or inventory_gaps or legacy_links
                              or not scope_keys or missing_sessions or empty_sessions
                              or unbound_children or unbound_delegations or whole_conflicts)
     cutoff = _source_cutoff(con, scope_keys)
@@ -928,7 +933,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
     report["coverage"]["unavailable_sources"] = unavailable_sources
     report["total_cost"] = _total_cost(
         task_id, total_estimated, attributed, billed_shared, sharing_tasks)
-    if inventory_gaps and total_estimated.get("priced_responses"):
+    if (inventory_gaps or unresolved_usage) and total_estimated.get("priced_responses"):
         subtotal = total_estimated["estimated_cost_usd_partial"]
         amount = "under $0.01" if 0 < subtotal < 0.005 else f"${subtotal:,.2f}"
         report["total_cost"].update(usd=None, observed_subtotal_usd=subtotal,

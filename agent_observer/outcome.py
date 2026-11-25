@@ -38,6 +38,8 @@ class Ownership:
     # Explicit and native claims resolved against the same literal response.
     owners: dict = field(default_factory=dict)
     turns: set = field(default_factory=set)
+    missing_by_response: dict = field(default_factory=dict)
+    legacy_event_turns: set = field(default_factory=set)
     response_turns: dict = field(default_factory=dict)
     literal_sessions: set = field(default_factory=set)
     conflicts: set = field(default_factory=set)
@@ -47,12 +49,14 @@ class Ownership:
         """Literal event partitions. None excludes, an empty set admits session scope only."""
         if key not in self.literal_sessions:
             return
-        for event, responses in native_response.event_responses(con, key):
+        for event, display_turn, responses in native_response.event_responses(con, key):
             turns = None
-            if len(responses) <= 1:
+            if responses is not None and len(responses) <= 1:
                 rid = next(iter(responses), None)
                 turns = self.response_turns.get((key, rid))
-                if key in self.whole and rid not in self.owners and rid not in self.conflicts:
+                if not responses and (key, display_turn) in self.legacy_event_turns:
+                    turns = {display_turn}
+                if turns is None and key in self.whole and rid not in self.owners and rid not in self.conflicts:
                     # Whole-session capture includes events without a usage row.
                     turns = set()
             yield event, turns
@@ -128,17 +132,21 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
         if not legacy_link(r["evidence"])}
     harness = key.partition(":")[0]
     claimed_turns = defaultdict(set)
+    prompt_ids = defaultdict(set)
     claimed_inputs = defaultdict(set)
     input_turns = defaultdict(set)
     for msg, alias, turn, owner in con.execute(
             "SELECT s.native_id,s.alias_id,s.turn_id,a.task_id FROM user_messages s "
             "LEFT JOIN assignments a ON a.user_message_id=s.native_id WHERE s.session_key=? AND s.is_genuine=1",
             (key,)):
-        if owner and turn:
-            claimed_turns[turn].add(owner)
+        if turn:
+            prompt_ids[turn].add(msg)
+            if owner:
+                claimed_turns[turn].add(owner)
         # Claude and OpenCode identify inputs by message, Codex by turn.
         for identity in ((msg, alias, turn) if harness == "codex" else (msg, alias)):
             if identity:
+                prompt_ids[identity].add(msg)
                 if owner:
                     claimed_inputs[identity].add(owner)
                 if turn:
@@ -153,6 +161,9 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
     if harness == "claude":
         from .adapters import claude
         responses, disputed_completions = claude.response_witnesses(con, key)
+    elif harness == "opencode":
+        from .adapters import opencode
+        responses, disputed_completions = opencode.response_witnesses(con, key)
     elif harness == "grok":
         from .adapters import grok
         responses, call_witnesses, disputed_completions = grok.response_witnesses(con, key)
@@ -163,6 +174,7 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
     exclusive = not by_run or (whole == {task_id} and set(by_run.values()) == {task_id})
     prefix = key if harness == "grok" else harness
     blocked_turns = set()
+    unsafe_display = set()
     for native_id, candidates in by_input.items():
         identity = f"{prefix}:{native_id}"
         input_owners = {by_run.get(entry[0]) for entry in candidates}
@@ -187,19 +199,33 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
             exclusive = False
             continue
         identities = {f"{prefix}:{identity}" for identity in input_ids}
+        if identities and display_turn not in identities and not any(
+                display_turn in input_turns[identity] for identity in identities):
+            unsafe_display.add(display_turn)
         candidates = {candidate for identity in input_ids for candidate in by_input.get(identity, ())}
         claims = whole.copy()
         for identity in identities:
             claims.update(claimed_inputs[identity])
-        if not identities and not literal_messages:
+        # Only an explicit capture may use the historical display turn.
+        # A session with native run evidence must resolve its literal input.
+        legacy_capture = not by_run and rid not in responses
+        if not identities and (not literal_messages or legacy_capture):
             claims.update(claimed_turns[display_turn])
         if not candidates:
             result.owners[rid] = claims
+            if not claims:
+                missing = {msg for identity in identities for msg in prompt_ids[identity]}
+                if legacy_capture:
+                    missing.update(prompt_ids[display_turn])
+                if missing:
+                    result.missing_by_response[rid] = missing
+            if task_id not in claims:
+                unsafe_display.add(display_turn)
             if task_id in claims:
                 turns = {t for identity in identities for t in input_turns[identity]}
                 if literal_messages:
                     turns.update(identities)
-                elif not turns and display_turn:
+                if not turns and display_turn and (not literal_messages or legacy_capture):
                     turns.add(display_turn)
                 result.turns.update((key, t) for t in turns)
                 if literal_messages:
@@ -239,6 +265,9 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
                 result.turns.add((key, "codex:" + native_id))
             elif harness == "grok":
                 result.turns.add((key, rid))
+    if literal_messages and not by_run:
+        result.legacy_event_turns.update((key, turn) for turn, owners in claimed_turns.items()
+                                        if task_id in owners and turn not in blocked_turns and turn not in unsafe_display)
     if not exclusive:
         result.whole.discard(key)
     result.turns.difference_update((key, turn) for turn in blocked_turns)

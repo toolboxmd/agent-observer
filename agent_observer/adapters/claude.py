@@ -1148,6 +1148,7 @@ def response_witnesses(con, session_key):
         return {}, set()
     parents, children, anchors, blocks = (defaultdict(set) for _ in range(4))
     seen, disputed = set(), set()
+    recorded_parents = set()
     for uuid, parent, input_id, response_id in con.execute(
         "SELECT DISTINCT uuid,parent,input_id,response_id FROM claude_response_ancestry"
         " WHERE session_key=?", (session_key,)
@@ -1160,6 +1161,7 @@ def response_witnesses(con, session_key):
         if input_id:
             anchors[uuid].add(input_id)
         elif parent:
+            recorded_parents.add(uuid)
             parents[uuid].add(parent)
             children[parent].add(uuid)
         if response_id:
@@ -1194,9 +1196,13 @@ def response_witnesses(con, session_key):
             conflicts.add(response_id)
         if nodes <= resolved:
             results[response_id] = set.union(*(anchors[node] for node in nodes))
+        elif nodes & recorded_parents:
+            # An empty witness set means a recorded, unresolved parent.
+            # Only an absent key can use historical explicit turn capture.
+            results[response_id] = set()
     return results, conflicts
 
 
 def response_inputs(con, session_key):
     witnesses, conflicts = response_witnesses(con, session_key)
-    return {rid: ids for rid, ids in witnesses.items() if rid not in conflicts}
+    return {rid: ids for rid, ids in witnesses.items() if ids and rid not in conflicts}

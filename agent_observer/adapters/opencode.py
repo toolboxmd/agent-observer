@@ -173,10 +173,13 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
             totals["failed"].append({"path": abs_path, "error": str(exc)})
             return totals
         for row in rows:
+            con.execute("SAVEPOINT opencode_session")
             try:
                 stats = import_session(con, native, abs_path, dict(row),
                                        full=full)
             except (OSError, sqlite3.DatabaseError) as exc:
+                con.execute("ROLLBACK TO opencode_session")
+                con.execute("RELEASE opencode_session")
                 totals["failed"].append(
                     {"path": f"{abs_path}#{row.get('id')}", "error": str(exc)})
                 continue
@@ -277,60 +280,111 @@ def _int_or_none(value):
         else None
 
 
-def _upsert_response(con: sqlite3.Connection, stats: dict, src_path: str,
-                     *, response_id: str, source_id, session_key, session_id,
-                     ordinal, ts, model, provider, effort, values: dict,
-                     total, semantics, cost_usd, line: str = "") -> None:
-    existing = con.execute(
-        "SELECT * FROM responses WHERE response_id=?",
-        (response_id,)).fetchone()
-    if existing is None:
-        con.execute(
-            "INSERT INTO responses(response_id, source_id, harness,"
-            " session_key, session_id, ordinal_num, ts, model, provider, effort,"
-            " input_tokens, cached_input_tokens, cache_write_input_tokens,"
-            " output_tokens, reasoning_output_tokens, total_tokens, semantics,"
-            " cost_usd) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (response_id, source_id, HARNESS, session_key,
-             session_id, ordinal, ts, model,
-             provider, effort,
-             values["input_tokens"], values["cached_input_tokens"],
-             values["cache_write_input_tokens"], values["output_tokens"],
-             values["reasoning_output_tokens"], total, semantics, cost_usd))
-        stats["responses_inserted"] = stats.get("responses_inserted", 0) + 1
+_MEASUREMENT_FIELDS = ("model", "provider", "effort", "input_tokens", "output_tokens",
+                       "cached_input_tokens", "cache_write_input_tokens", "reasoning_output_tokens",
+                       "total_tokens", "cost_usd")
+
+
+def _prepare_observations(con, session_key, source_id):
+    # A snapshot replaces only this store's observations. Keep the projection
+    # fields needed to restore a surviving copy when another store changes.
+    con.execute("""CREATE TABLE IF NOT EXISTS opencode_response_observations (
+        session_key TEXT NOT NULL, response_id TEXT NOT NULL, source_id INTEGER NOT NULL REFERENCES sources(id),
+        parent TEXT, measurement TEXT NOT NULL, ts REAL, ordinal_num INTEGER,
+        PRIMARY KEY(session_key,response_id,source_id)) WITHOUT ROWID""")
+    con.execute("CREATE INDEX IF NOT EXISTS opencode_observation_source ON opencode_response_observations(source_id)")
+    # Preserve the one payload a pre-upgrade ledger actually retained before
+    # another copy can replace its projection. Only its own edge accompanies it.
+    for row in con.execute(
+            "SELECT r.* FROM responses r JOIN sources s ON s.id=r.source_id WHERE r.session_key=? "
+            "AND r.source_id<>? AND s.sha256 NOT LIKE 'oc3:%' AND NOT EXISTS "
+            "(SELECT 1 FROM opencode_response_observations o WHERE o.session_key=r.session_key "
+            "AND o.response_id=r.response_id AND o.source_id=r.source_id)", (session_key, source_id)):
+        parent = con.execute(
+            "SELECT input_id FROM native_response_inputs WHERE session_key=? AND response_id=? AND source_id=?",
+            (session_key, row["response_id"], row["source_id"])).fetchone()
+        measurement = {name: row[name] for name in _MEASUREMENT_FIELDS}
+        _observe_response(con, session_key, row["response_id"], row["source_id"], parent[0] if parent else None,
+                          measurement, row["ts"], row["ordinal_num"])
+    con.execute("DELETE FROM opencode_response_observations WHERE source_id=?", (source_id,))
+
+
+def _project_observations(con, stats, session_key, session_id):
+    # The path selects a stable locator only. Membership and measurements
+    # are usable together only where the copies agree (response_witnesses).
+    groups = {}
+    for row in con.execute(
+            "SELECT o.*,s.path FROM opencode_response_observations o JOIN sources s ON s.id=o.source_id "
+            "WHERE session_key=? ORDER BY response_id,s.path", (session_key,)):
+        groups.setdefault(row["response_id"], []).append(row)
+    for rid, copies in groups.items():
+        copy = copies[0]
+        data = json.loads(copy["measurement"])
+        for other in copies[1:]:
+            for field, value in json.loads(other["measurement"]).items():
+                if data[field] != value:
+                    data[field] = None
+        _project_response(con, stats, rid, session_key, session_id, copy, data)
+    # Previously observed ids without a surviving copy retain their historical
+    # ledger row. Their input witness has been removed in this transaction.
+
+
+def response_witnesses(con, session_key):
+    """Resolve the parent and the measured payload as a single source observation."""
+    witnesses = {}
+    conflicts = set()
+    payload_sources = {}
+    observations = {}
+    if db._has_table(con, "opencode_response_observations"):
+        for rid, source, parent, measurement in con.execute(
+                "SELECT o.response_id,o.source_id,o.parent,o.measurement FROM opencode_response_observations o "
+                "JOIN responses r USING(session_key,response_id) WHERE o.session_key=? AND r.is_overlap=0", (session_key,)):
+            payload_sources.setdefault(rid, set()).add(source)
+            observations.setdefault(rid, set()).add((parent, measurement))
+            if parent:
+                witnesses.setdefault(rid, set()).add(parent)
+        for rid, variants in observations.items():
+            # Competing proved parents are returned together. A missing parent
+            # or incompatible payload additionally invalidates the measurement.
+            if len(variants) > 1 and (any(parent is None for parent, _ in variants)
+                                      or len({payload for _, payload in variants}) > 1):
+                conflicts.add(rid)
+
+    # Old imports recorded edges but kept only the last copy's payload.
+    # An edge from a copy whose measurement was lost cannot vouch for it.
+    measured = dict(con.execute("SELECT response_id,source_id FROM responses WHERE session_key=?", (session_key,)))
+    for rid, input_id, source, measured_source in native_response.stored_inputs(con, session_key):
+        if source not in payload_sources.get(rid, {measured_source}):
+            conflicts.add(rid)
+        witnesses.setdefault(rid, set()).add(input_id)
+    if db._has_table(con, "native_response_events"):
+        for rid, source in con.execute(
+                "SELECT DISTINCT e.response_id,e.source_id FROM native_response_events e "
+                "JOIN sources s ON s.id=e.source_id WHERE e.session_key=? AND s.sha256 NOT LIKE 'oc3:%'",
+                (session_key,)):
+            if rid in measured and source not in payload_sources.get(rid, {measured[rid]}):
+                conflicts.add(rid)
+    return witnesses, conflicts
+
+
+def _project_response(con, stats, rid, session_key, session_id, locator, measurement):
+    fields = ("source_id", "ordinal_num", "ts", "semantics", *_MEASUREMENT_FIELDS)
+    values = (locator["source_id"], locator["ordinal_num"], locator["ts"], SEMANTICS,
+              *(measurement[k] for k in _MEASUREMENT_FIELDS))
+    # Identity was validated before the source observation was accepted.
+    columns = ",".join(fields)
+    row = con.execute(f"SELECT {columns} FROM responses WHERE response_id=?", (rid,)).fetchone()
+    if row and tuple(row) == values:
+        stats["responses_duplicate"] += 1
         return
-    # Immutable identity: the same response id must stay in its session.
-    if (existing["session_key"] != session_key
-            or existing["session_id"] != session_id):
-        _oops(con, stats, src_path, ordinal, "usage_conflict", line)
-        stats["responses_duplicate"] = stats.get("responses_duplicate", 0) + 1
-        return
-    new_fields = {
-        "ordinal_num": ordinal, "ts": ts, "model": model, "provider": provider,
-        "effort": effort, "input_tokens": values["input_tokens"],
-        "cached_input_tokens": values["cached_input_tokens"],
-        "cache_write_input_tokens": values["cache_write_input_tokens"],
-        "output_tokens": values["output_tokens"],
-        "reasoning_output_tokens": values["reasoning_output_tokens"],
-        "total_tokens": total, "semantics": semantics, "cost_usd": cost_usd,
-        "source_id": source_id,
-    }
-    changed = any(existing[col] != val for col, val in new_fields.items())
-    if not changed:
-        stats["responses_duplicate"] = stats.get("responses_duplicate", 0) + 1
-        return
-    con.execute(
-        "UPDATE responses SET source_id=?, ordinal_num=?, ts=?, model=?,"
-        " provider=?, effort=?, input_tokens=?, cached_input_tokens=?,"
-        " cache_write_input_tokens=?, output_tokens=?,"
-        " reasoning_output_tokens=?, total_tokens=?, semantics=?, cost_usd=?"
-        " WHERE response_id=?",
-        (source_id, ordinal, ts, model, provider, effort,
-         values["input_tokens"], values["cached_input_tokens"],
-         values["cache_write_input_tokens"], values["output_tokens"],
-         values["reasoning_output_tokens"], total, semantics, cost_usd,
-         response_id))
-    stats["responses_inserted"] = stats.get("responses_inserted", 0) + 1
+    if row:
+        con.execute(f"UPDATE responses SET ({columns})=({','.join('?' for _ in fields)}) WHERE response_id=?",
+                    (*values, rid))
+    else:
+        con.execute(f"INSERT INTO responses(response_id,harness,session_key,session_id,{columns}) "
+                    f"VALUES({','.join('?' for _ in range(4 + len(fields)))})",
+                    (rid, HARNESS, session_key, session_id, *values))
+    stats["responses_inserted"] += 1
 
 
 def _upsert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
@@ -413,7 +467,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     session_key = f"{HARNESS}:{sess_id}"
     msg_n, msg_m = _count_max(native, "message", sess_id)
     part_n, part_m = _count_max(native, "part", sess_id)
-    fp = fingerprint("native-parent-and-parts-v2", sess.get("time_updated"), msg_m, part_m, msg_n, part_n)
+    fp = "oc3:" + fingerprint(sess.get("time_updated"), msg_m, part_m, msg_n, part_n)
     row = con.execute(
         "SELECT * FROM sources WHERE harness=? AND path=?",
         (HARNESS, src_path)).fetchone()
@@ -506,6 +560,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
         roles[msg_id] = data.get("role")
     native_response.prepare(con, source_id, replace=True)
     native_response.prepare_events(con, source_id, replace=True)
+    _prepare_observations(con, session_key, source_id)
     ordinal = 0
     for index, msg, data in parsed_messages:
         ordinal += 1
@@ -513,6 +568,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
                         session_key, sess, msg, data, index, ordinal,
                         by_message.get(msg.get("id"), []),
                         roles=roles, privacy_stale=privacy_stale)
+    _project_observations(con, stats, session_key, sess_id)
     for part in parts:
         ordinal += 1
         _ingest_part(con, stats, identity, src_path, source_id,
@@ -642,19 +698,29 @@ def _ingest_response(con, stats, src_path, source_id, session_key, sess,
     if all(v is not None for v in values.values()):
         total = sum(values.values())
     cost = data.get("cost")
-    cost_usd = cost if isinstance(cost, (int, float)) \
+    cost_usd = float(cost) if isinstance(cost, (int, float)) \
         and not isinstance(cost, bool) else None
     parent = native_response.identifier(data.get("parentID"))
-    if parent and roles.get(parent) == "user" and native_response.identifier(msg["id"]):
-        native_response.record(con, source_id, session_key, f"{HARNESS}:{msg['id']}", parent)
-    _upsert_response(
-        con, stats, src_path, response_id=f"{HARNESS}:{msg.get('id')}",
-        source_id=source_id, session_key=session_key,
-        session_id=sess.get("id"), ordinal=index, ts=ts,
-        model=data.get("modelID"), provider=data.get("providerID"),
-        effort=data.get("variant"), values=values, total=total,
-        semantics=SEMANTICS, cost_usd=cost_usd,
-        line=_record_line(msg.get("data"), data))
+    if roles.get(parent) != "user" or not native_response.identifier(msg["id"]):
+        parent = None
+    rid = f"{HARNESS}:{msg['id']}"
+    existing = con.execute("SELECT session_key,session_id FROM responses WHERE response_id=?", (rid,)).fetchone()
+    if existing and tuple(existing) != (session_key, sess.get("id")):
+        _oops(con, stats, src_path, ordinal, "usage_conflict", _record_line(msg.get("data"), data))
+        stats["responses_duplicate"] += 1
+        return
+    if any(data.get(k) is not None and not isinstance(data[k], str) for k in ("modelID", "providerID", "variant")):
+        _oops(con, stats, src_path, ordinal, "malformed_usage", _record_line(msg.get("data"), data))
+        return
+    measurement = dict(values, total_tokens=total, model=data.get("modelID"), provider=data.get("providerID"),
+                       effort=data.get("variant"), cost_usd=cost_usd)
+    _observe_response(con, session_key, rid, source_id, parent, measurement, ts, index)
+
+
+def _observe_response(con, session_key, rid, source_id, parent, measurement, ts, index):
+    con.execute("INSERT INTO opencode_response_observations"
+                "(session_key,response_id,source_id,parent,measurement,ts,ordinal_num) VALUES(?,?,?,?,?,?,?)",
+                (session_key, rid, source_id, parent, json.dumps(measurement, sort_keys=True), ts, index))
 
 
 def _ingest_submission(con, stats, identity, src_path, source_id,
