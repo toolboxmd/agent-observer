@@ -106,7 +106,7 @@ def _valid_counter(value) -> bool:
 
 _FINALITY_TABLE = "claude_response_finality"
 _NATIVE_KINDS_TABLE = "claude_native_kinds"
-_IMPORT_VERSION = 6  # Replay UUID ancestry from existing sources.
+_IMPORT_VERSION = 7  # Replay literal event-to-message edges from existing sources.
 
 
 def _ensure_native_kinds(con) -> None:
@@ -312,6 +312,7 @@ class _Reader:
         self.last_ts = None
         self.turn = None
         self.pending: dict = {}
+        self.message_events = []
         # Message ids whose native final block (stop_reason) has been seen,
         # either earlier in this import or in the already-imported file
         # prefix. A row is updated while its message streams; once final,
@@ -335,6 +336,8 @@ class _Reader:
                      checkout_events=self.checkout_events
                      if self.first_new_ordinal is not None
                      and ordinal >= self.first_new_ordinal else None, **kw)
+        if family in {"tool_call", "assistant_message"}:
+            self.message_events.append((family, native_id))
 
 
 def import_claude_file(con: sqlite3.Connection, path: str,
@@ -389,6 +392,7 @@ def import_claude_file(con: sqlite3.Connection, path: str,
     _ensure_native_kinds(con)
     _seed_queue_identity(r)
     _prepare_ancestry(r)
+    native_response.prepare_events(con, src.source_id, replace=not src.incremental)
     # Durable per-response finality is authoritative for accepted final
     # rows. It covers copied sources, full reimports and incremental
     # appends. The file prefix is never authority on its own, so a malformed
@@ -416,6 +420,7 @@ def import_claude_file(con: sqlite3.Connection, path: str,
                       line)
             continue
         try:
+            r.message_events.clear()
             _ingest(r, obj, ordinal)
             _record_ancestry(r, obj)
             if obj.get("type") == "queue-operation":
@@ -1088,7 +1093,7 @@ def _prepare_ancestry(r):
 
 def _record_ancestry(r, obj):
     uuid = native_response.identifier(obj.get("uuid"))
-    if (not uuid or not r.native_session or obj.get("sessionId") != r.native_session
+    if (not r.native_session or obj.get("sessionId") != r.native_session
             or (obj.get("agentId") and obj["agentId"] != r.agent_id)):
         return
     parent = native_response.identifier(obj.get("parentUuid"))
@@ -1113,6 +1118,8 @@ def _record_ancestry(r, obj):
         mid = native_response.identifier(message.get("id"))
         if mid and message.get("model") != "<synthetic>":
             response_id = f"{HARNESS}:{mid}"
+            for family, event_id in r.message_events:
+                native_response.record_event(r.con, r.src.source_id, r.session_key, family, event_id, response_id)
     elif kind == "attachment" and isinstance(obj.get("attachment"), dict):
         if obj["attachment"].get("type") == "queued_command":
             # A consumed queued input has its own identity. A missing identity
@@ -1122,6 +1129,8 @@ def _record_ancestry(r, obj):
                 return
     elif kind not in ("system", "progress"):
         return
+    if not uuid:
+        return
     r.con.execute("INSERT OR IGNORE INTO claude_response_ancestry"
                   "(session_key,uuid,parent,input_id,response_id,source_id)"
                   " VALUES(?,?,?,?,?,?)",
@@ -1129,19 +1138,25 @@ def _record_ancestry(r, obj):
                    input_id, response_id, r.src.source_id))
 
 
-def response_inputs(con, session_key):
+def response_witnesses(con, session_key):
     """Resolve every UUID once, stopping each chain at its nearest native input.
 
     A missing parent or cycle leaves that chain unresolved. Multiple observed
     parents must all resolve, and competing inputs survive for the consumer.
     """
     if not db._has_table(con, "claude_response_ancestry"):
-        return {}
+        return {}, set()
     parents, children, anchors, blocks = (defaultdict(set) for _ in range(4))
+    seen, disputed = set(), set()
     for uuid, parent, input_id, response_id in con.execute(
         "SELECT DISTINCT uuid,parent,input_id,response_id FROM claude_response_ancestry"
         " WHERE session_key=?", (session_key,)
     ):
+        # DISTINCT collapses identical copies. Another row for the same
+        # UUID contradicts its parent, input identity or message identity.
+        if uuid in seen:
+            disputed.add(uuid)
+        seen.add(uuid)
         if input_id:
             anchors[uuid].add(input_id)
         elif parent:
@@ -1149,6 +1164,14 @@ def response_inputs(con, session_key):
             children[parent].add(uuid)
         if response_id:
             blocks[response_id].add(uuid)
+    # Contradictory copies of any ancestor also dispute its descendants,
+    # even when a missing parent keeps the ordinary walk from reaching them.
+    pending = deque(disputed)
+    while pending:
+        for child in children.get(pending.popleft(), ()):
+            if child not in disputed:
+                disputed.add(child)
+                pending.append(child)
     # Process an interior node only after all its parents have resolved.
     ready = deque(uuid for uuid in anchors if uuid not in parents)
     resolved = set()
@@ -1161,9 +1184,19 @@ def response_inputs(con, session_key):
             if not parents[child]:
                 ready.append(child)
     results = {}
+    conflicts = set()
     for response_id, in con.execute("SELECT response_id FROM responses"
                                     " WHERE session_key=? AND is_overlap=0", (session_key,)):
         nodes = blocks.get(response_id)
-        if nodes and nodes <= resolved:
+        if not nodes:
+            continue
+        if nodes & disputed or (nodes & resolved and nodes - resolved):
+            conflicts.add(response_id)
+        if nodes <= resolved:
             results[response_id] = set.union(*(anchors[node] for node in nodes))
-    return results
+    return results, conflicts
+
+
+def response_inputs(con, session_key):
+    witnesses, conflicts = response_witnesses(con, session_key)
+    return {rid: ids for rid, ids in witnesses.items() if rid not in conflicts}

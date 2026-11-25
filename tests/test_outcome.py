@@ -1,11 +1,14 @@
 """Exercise shared-planner reports with native usage and independent purpose rows."""
 
 from contextlib import closing
+from pathlib import Path
 import json
 import sqlite3
 
 from agent_observer import publish, report
-from agent_observer.adapters import t3_purpose
+from agent_observer.adapters import claude, opencode, t3_purpose
+from tests.test_native_response import claude_response, claude_user, write_records
+from tests.test_opencode import build_native
 from tests.helpers import LedgerCase
 
 
@@ -176,10 +179,6 @@ class NativeOutcomeTest(LedgerCase):
         self.assertEqual(task_trace["native_response_count"], 2)
 
     def test_claude_display_turn_cannot_override_native_ancestry_in_capture_trace(self):
-        from pathlib import Path
-        from agent_observer.adapters import claude
-        from tests.test_native_response import claude_response, claude_user, write_records
-
         path = Path(self.tmp.name, "s.jsonl")
         answers = [claude_response("answer-a", "a", "first"), claude_response("answer-b", "b", "second")]
         for answer in answers:
@@ -204,8 +203,8 @@ class NativeOutcomeTest(LedgerCase):
                              ["answer-a:0" if task == self.task else "answer-b:0"])
             selected = report.timeline(self.con, task, session_key="claude:s",
                                        turn_id="claude:a" if task == self.task else "claude:b")
-            self.assertEqual([e["native_id"] for e in selected["events"]],
-                             ["answer-a:0" if task == self.task else "answer-b:0"])
+            self.assertCountEqual([e["native_id"] for e in selected["events"]],
+                                  ["foreign-call", "answer-a:0"] if task == self.task else ["answer-b:0"])
 
     def test_delivery_alone_preserves_legacy_placement_and_capture_trace(self):
         from unittest.mock import patch
@@ -300,3 +299,129 @@ class NativeOutcomeTest(LedgerCase):
         self.assertEqual(rep["measured"]["unplaced_responses"], ["foreign-response"])
         self.assertEqual(rep["total_cost"]["responses"], 2)
         self.assertFalse(report.timeline(self.con, self.task, session_key=key)["events"])
+
+    def project_input(self, session, native_id, validation):
+        self.con.execute("INSERT INTO t3_purpose_sessions VALUES('a',?)", (session,))
+        self.con.execute("INSERT INTO t3_purpose_inputs(run_id,session_key,native_id,kind,validation)"
+                         " VALUES('a',?,?,'message',?)", (session, native_id, validation))
+
+    def test_disputed_claude_parent_never_refunds_usage_to_router(self):
+        path = Path(self.tmp.name, "original.jsonl")
+        response = claude_response("reply", "a", "mid")
+        response["message"]["content"] = [{"type": "text", "text": "answer"},
+                                          {"type": "tool_use", "id": "call", "name": "Read"}]
+        write_records(path, [claude_user("a"), response])
+        claude.import_claude_file(self.con, str(path))
+        self.project_input("claude:s", "a", "claude_prompt_echo")
+        self.assertIn("claude:mid", report.task_report(self.con, self.task)["measured"]["attributed_responses"])
+        self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES('router-job',0)")
+        self.con.execute("INSERT INTO session_assignments VALUES('claude:s','router-job','router:job',0)")
+        copy = Path(self.tmp.name, "copy.jsonl")
+        response["parentUuid"] = "missing"
+        write_records(copy, [response])
+        claude.import_claude_file(self.con, str(copy))
+        for owner in ("router-job", self.task):
+            rep = report.task_report(self.con, owner)
+            self.assertIn("claude:mid", rep["native_purpose"]["conflicting_responses"])
+            self.assertIn("claude:mid", rep["measured"]["unplaced_responses"])
+            self.assertFalse(report.timeline(self.con, owner, session_key="claude:s")["events"])
+        self.con.execute("DELETE FROM session_assignments WHERE task_id='router-job'")
+        response["parentUuid"] = "a"
+        write_records(copy, [response])
+        claude.import_claude_file(self.con, str(copy), full=True)
+        self.assertIn("claude:mid", report.task_report(self.con, self.task)["measured"]["attributed_responses"])
+
+    def test_claude_calls_and_results_follow_later_response_to_earlier_prompt(self):
+        path = Path(self.tmp.name, "s.jsonl")
+        self.con.execute("DELETE FROM t3_purpose_sessions")
+        rows = [claude_user("b"), claude_user("a")]
+        for prompt in ("a", "b"):
+            answer = claude_response("reply-" + prompt, prompt, "msg-" + prompt)
+            call = prompt + "-call"
+            answer["message"]["content"] = [{"type": "tool_use", "name": "Read", "id": call,
+                                             "input": {"file_path": "/fixture.txt"}}]
+            rows.extend([answer, claude_user("result-" + prompt, "reply-" + prompt,
+                         [{"type": "tool_result", "tool_use_id": call, "content": "ok"}])])
+        write_records(path, rows)
+        claude.import_claude_file(self.con, str(path))
+        self.project_input("claude:s", "a", "claude_prompt_echo")
+        self.con.execute("INSERT INTO assignments(user_message_id,task_id,created_at) VALUES('claude:a',?,0)",
+                         (self.task,))
+        for task, prompt in ((self.task, "a"), ("capture-b", "b")):
+            if prompt == "b":
+                self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES(?,0)", (task,))
+                self.con.execute("INSERT INTO assignments(user_message_id,task_id,created_at)"
+                                 " VALUES('claude:b',?,0)", (task,))
+            task_report = report.task_report(self.con, task)
+            self.assertEqual(sum(p["activity"].get("tool_calls", 0) for p in task_report["phases"]), 1)
+            self.assertEqual(task_report["activity_session_context"]["tool_calls"], 1)
+            measured = task_report["measured"]
+            self.assertIn("claude:msg-" + prompt, measured["attributed_responses"])
+            self.assertIn("claude:msg-b" if prompt == "a" else "claude:msg-a",
+                          measured["unplaced_responses" if prompt == "a" else "other_task_responses"])
+            for turn in (None, "claude:" + prompt):
+                trace = report.timeline(self.con, task, turn_id=turn, session_key="claude:s")
+                self.assertEqual({(e["family"], e["native_id"]) for e in trace["events"]},
+                                 {("tool_call", prompt + "-call"), ("tool_result", prompt + "-call"),
+                                  ("read", prompt + "-call:read")})
+            wrong_turn = "claude:b" if prompt == "a" else "claude:a"
+            self.assertFalse(report.timeline(self.con, task, turn_id=wrong_turn, session_key="claude:s")["events"])
+
+    def test_router_session_survives_navigation_and_separate_canonical_run(self):
+        self.con.execute("DELETE FROM t3_purpose_sessions")
+        self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES('navigator',0)")
+        self.con.executemany("INSERT INTO session_assignments VALUES(?,?,?,0)",
+                             [(self.session, self.task, "router:job"), (self.session, "navigator", "t3")])
+        path = Path(self.tmp.name, "s.jsonl")
+        write_records(path, [claude_user("a"), claude_response("reply", "a", "mid")])
+        claude.import_claude_file(self.con, str(path))
+        self.project_input("claude:s", "a", "claude_prompt_echo")
+        rep = report.task_report(self.con, self.task)
+        expected = ["codex:resp-mini-001", "codex:resp-mini-002", "codex:resp-mini-003"]
+        self.assertEqual(rep["measured"]["attributed_responses"], ["claude:mid", *expected])
+        self.assertEqual(rep["total_cost"]["responses"], 4)
+        self.assertEqual(report.task_report(self.con, "navigator")["measured"]["other_task_responses"], expected)
+        self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES('partner',0)")
+        self.con.execute("INSERT INTO session_assignments VALUES(?,'partner','router:job',0)", (self.session,))
+        joint = report.task_report(self.con, self.task)
+        self.assertEqual(joint["total_cost"]["shared_responses"], 3)
+        self.assertEqual(joint["total_cost"]["shared_with_tasks"], ["partner"])
+
+    def test_opencode_parts_follow_message_for_native_and_capture(self):
+        path = Path(self.tmp.name, "oc.db")
+        build_native(str(path))
+        with closing(sqlite3.connect(path)) as source, source:
+            source.execute("UPDATE message SET data=json_set(data,'$.parentID','msg_u1') WHERE id='msg_a1'")
+            source.execute("INSERT INTO part SELECT 'text1',message_id,session_id,time_created,time_updated,"
+                           "? FROM part WHERE id='p_read1'", (json.dumps({"type": "text", "text": "answer"}),))
+        opencode.sync(self.con, source=str(path))
+        key = "opencode:ses_parent"
+        self.project_input(key, "msg_u1", "opencode_admitted_message")
+        for native in (True, False):
+            if not native:
+                self.con.execute("DELETE FROM t3_purpose_sessions WHERE session_key=?", (key,))
+                self.con.execute("INSERT INTO assignments(user_message_id,task_id,created_at)"
+                                 " VALUES('opencode:msg_u1',?,0)", (self.task,))
+            self.assertIn("opencode:msg_a1", report.task_report(self.con, self.task)["measured"]["attributed_responses"])
+            for turn in (None, "opencode:msg_u1"):
+                trace = report.timeline(self.con, self.task, turn_id=turn, session_key=key)
+                self.assertEqual(trace["native_response_count"], int(native))
+                events = {(e["family"], e["native_id"]) for e in trace["events"]}
+                self.assertTrue({("read", "call_read1"), ("tool_call", "call_read1"),
+                                 ("tool_result", "call_read1"), ("assistant_message", "text1"),
+                                 ("file_change", "p_patch1")} <= events, events)
+                self.assertNotIn(("tool_call", "call_run1"), events)
+            self.assertFalse(report.timeline(self.con, self.task, turn_id="opencode:unknown", session_key=key)["events"])
+
+    def test_event_edge_cannot_reuse_an_owned_response_from_another_session(self):
+        for sid in ("s", "other"):
+            answer = claude_response("reply", "a", "same-message-id")
+            answer["message"]["content"] = [{"type": "tool_use", "id": sid + "-call", "name": "Read"}]
+            records = [dict(row, sessionId=sid) for row in (claude_user("a"), answer)]
+            path = Path(self.tmp.name, sid + ".jsonl")
+            write_records(path, records)
+            claude.import_claude_file(self.con, str(path))
+        self.project_input("claude:s", "a", "claude_prompt_echo")
+        self.con.execute("INSERT INTO t3_purpose_sessions VALUES('a','claude:other')")
+        trace = report.timeline(self.con, self.task, turn_id="claude:a", family="tool_call")
+        self.assertEqual([e["native_id"] for e in trace["events"]], ["s-call"])

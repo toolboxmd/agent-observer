@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 import json
 
+from . import native_response
 from .db import _has_table
 
 
@@ -34,11 +35,27 @@ def legacy_link(evidence):
 class Ownership:
     """Task ownership within the inspected sessions, with canonical witnesses kept separately."""
     native: dict | None = None
-    # Response partitions are needed only where native and explicit scope meet.
+    # Explicit and native claims resolved against the same literal response.
     owners: dict = field(default_factory=dict)
     turns: set = field(default_factory=set)
-    claude_capture_turns: dict = field(default_factory=dict)
+    response_turns: dict = field(default_factory=dict)
+    literal_sessions: set = field(default_factory=set)
+    conflicts: set = field(default_factory=set)
     whole: set = field(default_factory=set)
+
+    def event_turns(self, con, key):
+        """Literal event partitions. None excludes, an empty set admits session scope only."""
+        if key not in self.literal_sessions:
+            return
+        for event, responses in native_response.event_responses(con, key):
+            turns = None
+            if len(responses) <= 1:
+                rid = next(iter(responses), None)
+                turns = self.response_turns.get((key, rid))
+                if key in self.whole and rid not in self.owners and rid not in self.conflicts:
+                    # Whole-session capture includes events without a usage row.
+                    turns = set()
+            yield event, turns
 
 
 def evidence(con, task_id, scope):
@@ -53,6 +70,9 @@ def evidence(con, task_id, scope):
         "AND s.session_key IS NOT NULL AND s.turn_id IS NOT NULL",
         (task_id,)))
     if not _has_table(con, "t3_purpose_runs"):
+        for key in scope:
+            if key.startswith(("claude:", "opencode:")):
+                _session_ownership(con, key, task_id, {}, False, result, {})
         return result
     runs = [dict(r) for r in con.execute(
         "SELECT * FROM t3_purpose_runs WHERE task_id=? ORDER BY run_id", (task_id,))]
@@ -66,7 +86,6 @@ def evidence(con, task_id, scope):
     reference_conflict = len({r["kind"] for r in runs}) > 1
     session_runs = {}
     members = {}
-    conflicts = set()
     for key in sorted(scope):
         by_run = dict(con.execute(
             "SELECT r.run_id, r.task_id FROM t3_purpose_sessions s "
@@ -76,34 +95,34 @@ def evidence(con, task_id, scope):
                     "SELECT DISTINCT s.run_id FROM t3_purpose_sessions s JOIN t3_source_runs x USING(run_id) "
                     "LEFT JOIN t3_purpose_runs r USING(run_id) WHERE s.session_key=? AND r.run_id IS NULL", (key,)):
                 by_run[run] = None
-        if not by_run:
+        if by_run:
+            session_runs[key] = sorted(by_run)
+        elif not key.startswith(("claude:", "opencode:")):
             continue
-        session_runs[key] = sorted(by_run)
-        _session_ownership(con, key, task_id, by_run, reference_conflict, result, members, conflicts)
+        _session_ownership(con, key, task_id, by_run, reference_conflict, result, members)
 
     if runs or deliveries or session_runs or disputed_runs:
         result.native = {"version": 1, "task_id": task_id, "runs": runs, "deliveries": deliveries,
-                         "membership": members, "sessions": session_runs, "conflicting_responses": sorted(conflicts),
+                         "membership": members, "sessions": session_runs, "conflicting_responses": sorted(result.conflicts),
                          "conflicting_reference_kinds": reference_conflict, "conflicting_source_runs": disputed_runs}
     return result
 
 
-def _session_ownership(con, key, task_id, by_run, reference_conflict, result, members, conflicts):
-    from . import native_response
-
+def _session_ownership(con, key, task_id, by_run, reference_conflict, result, members):
     by_input = defaultdict(set)
-    for run, native_id, turn, segment, validation in con.execute(
-            "SELECT run_id,native_id,provider_turn_id,segment_id,validation FROM t3_purpose_inputs "
-            "WHERE session_key=?", (key,)):
-        by_input[native_id].add((run, turn, segment, validation))
-    if _has_table(con, "t3_source_inputs"):
-        for native_id, in con.execute(
-                "SELECT DISTINCT s.native_id FROM t3_source_inputs s WHERE s.session_key=? "
-                "AND NOT EXISTS (SELECT 1 FROM t3_purpose_inputs i "
-                "WHERE i.session_key=s.session_key AND i.native_id=s.native_id)", (key,)):
-            # A rejected identity still contradicts explicit or whole-session
-            # credit. Carry it through the same report and event filters.
-            by_input[native_id].add((None, None, None, "conflicting_snapshot"))
+    if by_run:
+        for run, native_id, turn, segment, validation in con.execute(
+                "SELECT run_id,native_id,provider_turn_id,segment_id,validation FROM t3_purpose_inputs "
+                "WHERE session_key=?", (key,)):
+            by_input[native_id].add((run, turn, segment, validation))
+        if _has_table(con, "t3_source_inputs"):
+            for native_id, in con.execute(
+                    "SELECT DISTINCT s.native_id FROM t3_source_inputs s WHERE s.session_key=? "
+                    "AND NOT EXISTS (SELECT 1 FROM t3_purpose_inputs i "
+                    "WHERE i.session_key=s.session_key AND i.native_id=s.native_id)", (key,)):
+                # A rejected identity still contradicts explicit or whole-session
+                # credit. Carry it through the same report and event filters.
+                by_input[native_id].add((None, None, None, "conflicting_snapshot"))
     whole = {r["task_id"] for r in con.execute(
         "SELECT task_id, evidence FROM session_assignments WHERE session_key=?", (key,))
         if not legacy_link(r["evidence"])}
@@ -124,16 +143,24 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
                     claimed_inputs[identity].add(owner)
                 if turn:
                     input_turns[identity].add(turn)
+    literal_messages = harness in {"claude", "opencode"}
+    if not by_run and not whole and not claimed_inputs:
+        return
+    if literal_messages:
+        result.literal_sessions.add(key)
     call_witnesses = set()
     disputed_completions = set()
-    if harness == "grok":
+    if harness == "claude":
+        from .adapters import claude
+        responses, disputed_completions = claude.response_witnesses(con, key)
+    elif harness == "grok":
         from .adapters import grok
         responses, call_witnesses, disputed_completions = grok.response_witnesses(con, key)
     else:
         responses = native_response.inputs(con, key)
     # In a contested whole session, only events on resolved turns can be
     # shown. Untagged events cannot be separated between the claimants.
-    exclusive = whole == {task_id} and set(by_run.values()) == {task_id}
+    exclusive = not by_run or (whole == {task_id} and set(by_run.values()) == {task_id})
     prefix = key if harness == "grok" else harness
     blocked_turns = set()
     for native_id, candidates in by_input.items():
@@ -148,35 +175,35 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
             exclusive = False
     for rid, display_turn in con.execute(
             "SELECT response_id,turn_id FROM responses WHERE session_key=? AND is_overlap=0", (key,)):
-        if rid in disputed_completions:
-            conflicts.add(rid)
-            blocked_turns.add(rid)
+        input_ids = responses.get(rid, set())
+        if rid in disputed_completions or len(input_ids) > 1:
+            result.conflicts.add(rid)
+            blocked_turns.update((display_turn, rid))
+            for identity in input_ids:
+                qualified = f"{prefix}:{identity}"
+                blocked_turns.update(input_turns[qualified])
+                if harness == "codex":
+                    blocked_turns.add(qualified)
             exclusive = False
             continue
-        input_ids = responses.get(rid, set())
         identities = {f"{prefix}:{identity}" for identity in input_ids}
         candidates = {candidate for identity in input_ids for candidate in by_input.get(identity, ())}
         claims = whole.copy()
         for identity in identities:
             claims.update(claimed_inputs[identity])
-        if not identities:
+        if not identities and not literal_messages:
             claims.update(claimed_turns[display_turn])
-        if len(identities) > 1 and not candidates and claims - whole:
-            # Competing input witnesses cannot prove a captured turn.
-            conflicts.add(rid)
-            for identity in identities:
-                blocked_turns.update(input_turns[identity])
-            exclusive = False
-            continue
         if not candidates:
             result.owners[rid] = claims
             if task_id in claims:
                 turns = {t for identity in identities for t in input_turns[identity]}
-                if not turns and display_turn:
+                if literal_messages:
+                    turns.update(identities)
+                elif not turns and display_turn:
                     turns.add(display_turn)
                 result.turns.update((key, t) for t in turns)
-                if harness == "claude":
-                    result.claude_capture_turns[rid] = turns
+                if literal_messages:
+                    result.response_turns[key, rid] = turns
             continue
 
         run, turn, segment, validation = next(iter(candidates))
@@ -196,12 +223,14 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
                 # display turn. Keep only literal events on that mixed turn.
                 blocked_turns.add(display_turn)
         if disputed:
-            conflicts.add(rid)
+            result.conflicts.add(rid)
             exclusive = False
             continue
         result.owners[rid] = {owner} if owner else set()
         if owner == task_id:
             native_id, = input_ids
+            if literal_messages:
+                result.response_turns[key, rid] = identities
             if rid in call_witnesses:
                 validation = "grok_tool_call"
             members[rid] = {"run_id": run, "session_key": key, "native_input_id": native_id,

@@ -60,3 +60,50 @@ def inputs(con: sqlite3.Connection, session_key: str) -> dict[str, set[str]]:
         for response_id, turn_id in codex.legacy_response_inputs(con, session_key):
             found[response_id].add(turn_id)
     return dict(found)
+
+
+def prepare_events(con, source_id, *, replace):
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS native_response_events (
+            session_key TEXT NOT NULL, family TEXT NOT NULL, native_id TEXT NOT NULL,
+            response_id TEXT NOT NULL, source_id INTEGER NOT NULL REFERENCES sources(id),
+            PRIMARY KEY(session_key, family, native_id, response_id, source_id)
+        ) WITHOUT ROWID""")
+    con.execute("CREATE INDEX IF NOT EXISTS native_response_event_source ON native_response_events(source_id)")
+    if replace:
+        con.execute("DELETE FROM native_response_events WHERE source_id=?", (source_id,))
+
+
+def record_event(con, source_id, session_key, family, native_id, response_id):
+    con.execute("INSERT OR IGNORE INTO native_response_events"
+                "(session_key,family,native_id,response_id,source_id) VALUES(?,?,?,?,?)",
+                (session_key, family, native_id, response_id, source_id))
+
+
+def event_responses(con, session_key):
+    """Return literal event associations, including competing copies and unmatched calls."""
+    edges = defaultdict(set)
+    if db._has_table(con, "native_response_events"):
+        for family, native_id, rid in con.execute(
+                "SELECT DISTINCT family,native_id,response_id FROM native_response_events WHERE session_key=?",
+                (session_key,)):
+            edges[family, native_id].add(rid)
+    claude = session_key.startswith("claude:")
+    legacy_text = defaultdict(set)
+    if claude and db._has_table(con, "claude_response_ancestry"):
+        # Pre-event-edge ledgers still retain the UUID of each text block.
+        for source, uuid, rid in con.execute(
+                "SELECT a.source_id,a.uuid,a.response_id FROM claude_response_ancestry a "
+                "JOIN sources s ON s.id=a.source_id WHERE a.session_key=? AND a.response_id<>'' "
+                "AND s.claude_usage_version<7", (session_key,)):
+            legacy_text[source, uuid].add(rid)
+    for event, source, family, native_id in con.execute(
+            "SELECT id,source_id,family,native_id FROM events WHERE session_key=?", (session_key,)):
+        if claude and family == "assistant_message":
+            yield event, edges[family, native_id] | legacy_text[source, native_id.rpartition(":")[0]]
+        elif claude and family in {"tool_result", "permission", "skill_invoke", "file_change"}:
+            yield event, edges["tool_call", native_id]
+        elif claude and family in {"read", "skill_read"} and native_id.endswith(":read"):
+            yield event, edges["tool_call", native_id[:-5]]
+        else:
+            yield event, edges[family, native_id]

@@ -14,6 +14,7 @@ response row, error or not.
 
 from __future__ import annotations
 
+from functools import partial
 import json
 import os
 import sqlite3
@@ -336,7 +337,7 @@ def _upsert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
                   session_key: str, family: str, native_id, ordinal=None,
                   ts=None, turn_id=None, name=None, target=None, status=None,
                   duration_ms=None, size_bytes=None, truncated=None,
-                  fingerprint=None, detail=None) -> None:
+                  fingerprint=None, detail=None, response_id=None) -> None:
     """Insert one event under its natural key; mutable rows update in place.
 
     Rule 6 via agent_observer/privacy.py for every protected field:
@@ -353,6 +354,8 @@ def _upsert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
     native = privacy.filter_native_id(family, native_id)
     if not native:
         raise ValueError(f"{family} event missing native identity")
+    if response_id:
+        native_response.record_event(con, source_id, session_key, family, native, response_id)
     safe_name = privacy.filter_event_name(family, name)
     safe_status = privacy.filter_event_status(family, status)
     safe_target = privacy.filter_target(target, family) or None
@@ -410,7 +413,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     session_key = f"{HARNESS}:{sess_id}"
     msg_n, msg_m = _count_max(native, "message", sess_id)
     part_n, part_m = _count_max(native, "part", sess_id)
-    fp = fingerprint("native-parent-v1", sess.get("time_updated"), msg_m, part_m, msg_n, part_n)
+    fp = fingerprint("native-parent-and-parts-v2", sess.get("time_updated"), msg_m, part_m, msg_n, part_n)
     row = con.execute(
         "SELECT * FROM sources WHERE harness=? AND path=?",
         (HARNESS, src_path)).fetchone()
@@ -502,6 +505,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
         parsed_messages.append((index, msg, data))
         roles[msg_id] = data.get("role")
     native_response.prepare(con, source_id, replace=True)
+    native_response.prepare_events(con, source_id, replace=True)
     ordinal = 0
     for index, msg, data in parsed_messages:
         ordinal += 1
@@ -512,8 +516,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     for part in parts:
         ordinal += 1
         _ingest_part(con, stats, identity, src_path, source_id,
-                      session_key, sess, roles, part, ordinal,
-                      privacy_stale=privacy_stale)
+                      session_key, roles, part, ordinal)
     if sess.get("time_compacting") is not None:
         insert_event(con, stats, source_id=source_id,
                      session_key=session_key, family="compaction",
@@ -569,6 +572,7 @@ def _ingest_message(con, native, stats, identity, src_path, source_id,
         _upsert_event(con, stats, source_id=source_id,
                      session_key=session_key, family="lifecycle",
                      native_id=msg_id, ordinal=ordinal, ts=ts,
+                     response_id=_assistant_id(roles, msg_id),
                      name="turn_aborted" if error.get("name") == "MessageAbortedError" else "error",
                      status="interrupted" if error.get("name") == "MessageAbortedError" else
                      (str(code) if isinstance(code, int) and not isinstance(code, bool) else None),
@@ -772,9 +776,14 @@ def _ingest_submission(con, stats, identity, src_path, source_id,
         stats["user_messages_inserted"] += 1
 
 
+def _assistant_id(roles, message_id):
+    if roles.get(message_id) == "assistant" and native_response.identifier(message_id):
+        return f"{HARNESS}:{message_id}"
+    return None
+
+
 def _ingest_part(con, stats, identity, src_path, source_id, session_key,
-                  sess, roles, part, ordinal,
-                  privacy_stale: bool = False) -> None:
+                  roles, part, ordinal) -> None:
     raw = part.get("data") if isinstance(part, dict) else None
     part_id = part.get("id") if isinstance(part, dict) else None
     if raw is None:
@@ -798,6 +807,8 @@ def _ingest_part(con, stats, identity, src_path, source_id, session_key,
         _oops(con, stats, src_path, ordinal, "missing_id",
               _record_line(raw, data))
         return
+    event = partial(_upsert_event, con, stats, source_id=source_id, session_key=session_key,
+                    response_id=_assistant_id(roles, part.get("message_id")), ordinal=ordinal, ts=ts)
     if ptype == "text":
         if roles.get(part.get("message_id")) != "assistant":
             return  # User text is indexed once under its message id.
@@ -814,25 +825,17 @@ def _ingest_part(con, stats, identity, src_path, source_id, session_key,
             (session_key, "assistant_message", native)).fetchone()
         if text or exists:
             excerpt = privacy.assistant_excerpt(text)
-            _upsert_event(con, stats, source_id=source_id, session_key=session_key,
-                          family="assistant_message", native_id=part_id,
-                          ordinal=ordinal, ts=ts, name="assistant_message",
-                          size_bytes=len(text), fingerprint=text_hash(text),
-                          detail={"excerpt": excerpt} if excerpt else None)
+            event(family="assistant_message", native_id=part_id,
+                  name="assistant_message",
+                  size_bytes=len(text), fingerprint=text_hash(text),
+                  detail={"excerpt": excerpt} if excerpt else None)
     elif ptype == "tool":
-        _ingest_tool(con, stats, identity, src_path, source_id,
-                      session_key, sess, roles, part, data, ordinal, ts,
-                      line=_record_line(raw, data))
+        _ingest_tool(con, stats, identity, src_path, event, data, ordinal,
+                     line=_record_line(raw, data))
     elif ptype == "patch":
-        _ingest_patch(con, stats, source_id, session_key, part, data,
-                      ordinal, ts)
+        _ingest_patch(event, part, data)
     elif ptype == "compaction":
-        # Rule 6 via the core writer: closed name set. update=True lets a
-        # privacy-stale re-import repopulate a cleared row in place.
-        insert_event(con, stats, source_id=source_id,
-                     session_key=session_key, family="compaction",
-                     native_id=part_id, ordinal=ordinal, ts=ts,
-                     name="compaction", update=privacy_stale)
+        event(family="compaction", native_id=part_id, name="compaction")
     elif isinstance(ptype, str) and ptype in _KNOWN_QUIET_PART_TYPES:
         # text, reasoning, step checkpoints and file data URLs carry no
         # ledger event: user text is handled per message, and file data,
@@ -849,8 +852,7 @@ def _ingest_part(con, stats, identity, src_path, source_id, session_key,
               _record_line(raw, data))
 
 
-def _ingest_tool(con, stats, identity, src_path, source_id, session_key,
-                  sess, roles, part, data, ordinal, ts,
+def _ingest_tool(con, stats, identity, src_path, event, data, ordinal,
                   line: str = "") -> None:
     # Native tool/call/skill names must be strings: dicts, lists,
     # booleans, numbers and other objects fall back to "unknown" and are
@@ -872,27 +874,19 @@ def _ingest_tool(con, stats, identity, src_path, source_id, session_key,
                                               default=str)[:4000])
     except (TypeError, ValueError):
         arg_fp = fingerprint(tool)
-    # Rule 6: the tool_call family keeps no detail; the message linkage
-    # some older imports stored is dropped rather than persisted. The name
-    # passes through privacy.filter_event_name inside _upsert_event, so
-    # free-text tool names never persist.
-    _upsert_event(con, stats, source_id=source_id, session_key=session_key,
-                  family="tool_call", native_id=call_id, ordinal=ordinal,
-                  ts=ts, name=tool[:200], target=target,
-                  fingerprint=arg_fp, detail=None)
+    # The message identity belongs to the source witness. Tool detail stays empty.
+    event(family="tool_call", native_id=call_id, name=tool[:200], target=target,
+          fingerprint=arg_fp, detail=None)
     if status is None or (
             isinstance(status, str) and status in _INCOMPLETE_TOOL_STATUSES):
         # No terminal result yet; a later snapshot must add it.
         pass
     elif status in ("completed", "error"):
         result_status = "ok" if status == "completed" else "error"
-        _upsert_event(con, stats, source_id=source_id,
-                      session_key=session_key, family="tool_result",
-                      native_id=call_id, ordinal=ordinal, ts=ts,
-                      name=tool[:200], target=target,
-                      status=result_status, duration_ms=_duration_ms(state),
-                      size_bytes=_output_size(output),
-                      detail=None)
+        event(family="tool_result", native_id=call_id, name=tool[:200], target=target,
+              status=result_status, duration_ms=_duration_ms(state),
+              size_bytes=_output_size(output),
+              detail=None)
     elif isinstance(status, str):
         _oops(con, stats, src_path, ordinal, "unknown_record", line)
     else:
@@ -911,21 +905,15 @@ def _ingest_tool(con, stats, identity, src_path, source_id, session_key,
             # Rule 6: skill_read target holds only the validated skill
             # identifier, never the installed path. The file path lives
             # only in detail skill_path.
-            _upsert_event(con, stats, source_id=source_id,
-                          session_key=session_key, family=family,
-                          native_id=call_id, ordinal=ordinal, ts=ts,
-                          name=os.path.basename(target)[:200], target=safe_skill,
-                          status="ok", size_bytes=_output_size(output),
-                          fingerprint=fingerprint(target),
-                          detail={"skill": raw_skill, "skill_path": target})
+            event(family=family, native_id=call_id, name=os.path.basename(target)[:200], target=safe_skill,
+                  status="ok", size_bytes=_output_size(output),
+                  fingerprint=fingerprint(target),
+                  detail={"skill": raw_skill, "skill_path": target})
         else:
-            _upsert_event(con, stats, source_id=source_id,
-                          session_key=session_key, family=family,
-                          native_id=call_id, ordinal=ordinal, ts=ts,
-                          name=os.path.basename(target)[:200], target=target,
-                          status="ok", size_bytes=_output_size(output),
-                          fingerprint=fingerprint(target),
-                          detail=None)
+            event(family=family, native_id=call_id, name=os.path.basename(target)[:200], target=target,
+                  status="ok", size_bytes=_output_size(output),
+                  fingerprint=fingerprint(target),
+                  detail=None)
     if tool == "skill":
         raw_name = tool_input.get("name")
         if isinstance(raw_name, str) and raw_name:
@@ -949,22 +937,15 @@ def _ingest_tool(con, stats, identity, src_path, source_id, session_key,
         # Rule 6: skill_invoke target holds only the validated skill
         # identifier; the installed SKILL.md path lives only in detail
         # skill_path when the native invocation supplies a directory.
-        _upsert_event(con, stats, source_id=source_id,
-                      session_key=session_key, family="skill_invoke",
-                      native_id=call_id, ordinal=ordinal, ts=ts,
-                      name=safe_skill, target=safe_skill,
-                      detail={"skill_path": skill_path} if skill_path else None)
+        event(family="skill_invoke", native_id=call_id, name=safe_skill, target=safe_skill,
+              detail={"skill_path": skill_path} if skill_path else None)
     if tool in ("edit", "write", "patch") and target:
-        _upsert_event(con, stats, source_id=source_id,
-                      session_key=session_key, family="file_change",
-                      native_id=call_id, ordinal=ordinal, ts=ts,
-                      name=tool[:200], target=target,
-                      fingerprint=fingerprint(tool, target),
-                      detail=None)
+        event(family="file_change", native_id=call_id, name=tool[:200], target=target,
+              fingerprint=fingerprint(tool, target),
+              detail=None)
 
 
-def _ingest_patch(con, stats, source_id, session_key, part, data, ordinal,
-                  ts) -> None:
+def _ingest_patch(event, part, data) -> None:
     digest = data.get("hash")
     files = data.get("files")
     file_list = files if isinstance(files, list) else []
@@ -986,8 +967,7 @@ def _ingest_patch(con, stats, source_id, session_key, part, data, ordinal,
     # Rule 6: the file_change family keeps only path lists, so an
     # arbitrary native hash is omitted, never coerced. The fingerprint
     # column keeps only our own fixed-format generated digest.
-    _upsert_event(con, stats, source_id=source_id, session_key=session_key,
-                  family="file_change", native_id=part_id,
-                  ordinal=ordinal, ts=ts, name="patch", target=target,
-                  fingerprint=fingerprint("patch", digest, file_list),
-                  detail={"paths": valid_paths} if valid_paths else None)
+    event(family="file_change", native_id=part_id,
+          name="patch", target=target,
+          fingerprint=fingerprint("patch", digest, file_list),
+          detail={"paths": valid_paths} if valid_paths else None)

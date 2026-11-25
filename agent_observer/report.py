@@ -403,8 +403,9 @@ def _is_mcp_result(event) -> bool:
 
 
 def _phase_report(con, task_id, rows, whole, attempts, schedule,
-                  unmeasured=frozenset(), native_sessions=(), native_turns=()):
+                  unmeasured=frozenset(), native_sessions=(), ownership=None):
     from . import pricing, analysis
+    ownership = ownership or outcome.Ownership()
     by_turn, by_session = {}, {}
 
     def phase(value):
@@ -416,7 +417,7 @@ def _phase_report(con, task_id, rows, whole, attempts, schedule,
             return "review"
         return "unclassified"
 
-    for a in con.execute("SELECT s.turn_id,a.phase FROM assignments a JOIN user_messages s"
+    for a in con.execute("SELECT COALESCE(s.turn_id,s.native_id) AS turn_id,a.phase FROM assignments a JOIN user_messages s"
                          " ON s.native_id=a.user_message_id WHERE a.task_id=?", (task_id,)):
         if a["turn_id"] and a["phase"]:
             by_turn.setdefault(a["turn_id"], set()).add(phase(a["phase"]))
@@ -427,28 +428,36 @@ def _phase_report(con, task_id, rows, whole, attempts, schedule,
         if a.get("session_key") in whole and a.get("harness") == "router":
             by_session.setdefault(a["session_key"], set()).add(phase(a.get("stage")))
 
-    def selected(row):
-        if (row["session_key"] in native_sessions and row["session_key"] not in whole
-                and (row["session_key"], row["turn_id"]) not in native_turns):
-            return "unclassified"
-        labels = by_turn.get(row["turn_id"]) or by_session.get(row["session_key"]) or {"unclassified"}
+    def selected(row, literal_turns=None):
+        if literal_turns is None:
+            if (row["session_key"] in native_sessions and row["session_key"] not in whole
+                    and (row["session_key"], row["turn_id"]) not in ownership.turns):
+                return "unclassified"
+            literal_turns = (row["turn_id"],)
+        labels = {label for turn in literal_turns for label in by_turn.get(turn, ())}
+        labels = labels or by_session.get(row["session_key"]) or {"unclassified"}
         return next(iter(labels)) if len(labels) == 1 else "mixed"
 
     groups = {}
     for row in rows:
-        groups.setdefault(selected(row), []).append(row)
+        literal_turns = ownership.response_turns.get((row["session_key"], row["response_id"]))
+        groups.setdefault(selected(row, literal_turns), []).append(row)
     activities = {}
     contributors: dict[str, dict[str, str | None]] = {}
     turns = {r["turn_id"] for r in rows if r["turn_id"]}
     # Exclusively owned whole sessions count even without responses (#127).
     for key in sorted({r["session_key"] for r in rows} | set(whole)):
         harness = _session_harness(con, key)
+        event_turns = dict(ownership.event_turns(con, key))
         for event in con.execute("SELECT * FROM events WHERE session_key=?", (key,)):
-            if key in native_sessions:
-                owned = key in whole or (key, event["turn_id"]) in native_turns
+            literal_turns = event_turns.get(event["id"])
+            if event["id"] in event_turns:
+                owned = literal_turns is not None
+            elif key in native_sessions:
+                owned = key in whole or (key, event["turn_id"]) in ownership.turns
             else:
                 owned = key in whole or event["turn_id"] in turns
-            label = selected(event) if owned else "session context"
+            label = selected(event, literal_turns) if owned else "session context"
             # Capability comes from the event's own native session, never
             # from the importer that attributed it (Router).
             contributors.setdefault(label, {})[key] = harness
@@ -560,12 +569,12 @@ def task_report(con: sqlite3.Connection, task_id: str,
     missing_submissions = []
     sharing_tasks = set()
     legacy_shared = set()
-    conflicts = set(native["conflicting_responses"]) if native else set()
+    conflicts = ownership.conflicts
     for r in responses:
         if r["is_overlap"]:
             continue
         key, rid = r["session_key"], r["response_id"]
-        if native and key in native["sessions"]:
+        if rid in conflicts or rid in ownership.owners or (native and key in native["sessions"]):
             owners = ownership.owners.get(rid)
             if rid in conflicts or not owners:
                 unplaced.append(dict(r))
@@ -589,9 +598,9 @@ def task_report(con: sqlite3.Connection, task_id: str,
         elif task_id in session_owners.get(key, ()):
             # Keep the existing whole-session pool when several records bind
             # the session and this response has no explicit capture.
-            if key in whole_shared or key in linked_tasks:
+            if key in whole_shared:
                 shared.append(dict(r))
-                sharing_tasks.update(session_owners[key] | prompt_owners[key] | linked_tasks.get(key, set()))
+                sharing_tasks.update(session_owners[key] | prompt_owners[key])
             else:
                 attributed.append(dict(r))
         elif key in linked_tasks and (sub in assigned_anywhere or key in session_owners):
@@ -703,7 +712,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
     diagnostics = _task_diagnostics(con, scope_keys, ownership.whole, task_turns)
     phases, activity_context, activity_context_coverage = _phase_report(
         con, task_id, attributed, ownership.whole - whole_shared, task_turn_rows, schedule,
-        unmeasured_attributed, native["sessions"] if native else (), ownership.turns)
+        unmeasured_attributed, native["sessions"] if native else (), ownership)
 
     def _resp_tuple(r) -> list:
         return [r.get("response_id"), r.get("harness"), r.get("model"),
@@ -762,7 +771,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
     snapshot = _snapshot_id(snapshot_payload)
     estimated = _pricing.price_scope(attributed, schedule)
     shared_estimated = _pricing.price_scope(shared, schedule)
-    billed_shared = [] if canonical else [r for r in shared if r["response_id"] not in legacy_shared]
+    billed_shared = [r for r in shared if r["response_id"] not in legacy_shared]
     total_estimated = _pricing.price_scope(attributed + billed_shared, schedule)
     unplaced_estimated = _pricing.price_scope(unplaced, schedule)
     for estimate in (estimated, shared_estimated, total_estimated, unplaced_estimated):
@@ -994,28 +1003,17 @@ def timeline(con: sqlite3.Connection, task_id: str | None = None,
                        if (not session_key or member["session_key"] == session_key)
                        and (not turn_id or turn_id == (rid if member["session_key"].startswith("grok:")
                             else member["session_key"].partition(":")[0] + ":" + member["native_input_id"]))}
-            conflicts = set(native["conflicting_responses"])
-            for key in native["sessions"]:
-                if (not key.startswith("claude:") or (session_key and key != session_key)
-                        or not _has_table(con, "claude_response_ancestry")):
-                    continue
-                # Claude gives each text event the transcript UUID and block
-                # index. Its parent chain proves the response independently of
-                # the display turn that may have been retouched.
-                for event_id, rid in con.execute(
-                        "SELECT DISTINCT e.id,a.response_id FROM events e JOIN claude_response_ancestry a "
-                        "ON e.source_id=a.source_id AND e.session_key=a.session_key "
-                        "AND a.uuid=substr(e.native_id,1,instr(e.native_id,':')-1) "
-                        "WHERE e.session_key=? AND e.family='assistant_message'", (key,)):
-                    capture_turns = ownership.claude_capture_turns.get(rid)
-                    if rid in matches or (capture_turns is not None and (not turn_id or turn_id in capture_turns)):
-                        literal_events.add(event_id)
-                    elif (capture_turns is not None or rid in native["membership"] or rid in conflicts
-                          or (rid in ownership.owners and task_id not in ownership.owners[rid])):
-                        excluded_events.add(event_id)
             if native["runs"]:
                 trace_scope = {"native_response_count": len(matches),
                                "native_responses": {rid: matches[rid] for rid in sorted(matches)[:limit]}}
+        for key in ownership.literal_sessions:
+            if session_key and key != session_key:
+                continue
+            for event, turns in ownership.event_turns(con, key):
+                if turns is not None and (not turn_id or turn_id in turns):
+                    literal_events.add(event)
+                else:
+                    excluded_events.add(event)
         if not ownership.turns and not ownership.whole and not literal_events:
             return {**trace_scope, "events": [], "returned": 0, "total": 0,
                     "truncated": False,
