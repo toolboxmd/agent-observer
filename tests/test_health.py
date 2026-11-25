@@ -604,6 +604,39 @@ class LedgerFreshnessTest(unittest.TestCase):
             self.assertEqual([tuple(row) for row in rows], [("grok:native-id", "grok-4")])
         self.assertEqual(self.run_health("--json")[0], 0)
 
+    def test_grok_waits_for_summary_when_first_log_has_no_native_id(self):
+        folder = self.root / "grok/project/directory-id"
+        folder.mkdir(parents=True)
+        summary = folder / "summary.json"
+        summary.write_text('{"info":{"id":"native-id"},"current_model_id":"grok-4"}')
+        self.imports()
+        (folder / "events.jsonl").write_text("{}\n")
+        real_open = open
+
+        def denied_open(path, *args, **kwargs):
+            if path == str(summary):
+                raise PermissionError("fixture refused summary read")
+            return real_open(path, *args, **kwargs)
+
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            with patch("builtins.open", denied_open):
+                self.assertTrue(grok.sync(con)["failed"])
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 0)
+            completion = {"timestamp": 20_000, "method": "_x.ai/session/update",
+                          "params": {"update": {"sessionUpdate": "turn_completed",
+                                                "prompt_id": "first",
+                                                "usage": {"inputTokens": 10, "outputTokens": 2}}}}
+            (folder / "updates.jsonl").write_text(json.dumps(completion) + "\n")
+            with patch("builtins.open", denied_open):
+                self.assertTrue(grok.sync(con)["failed"])
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM responses").fetchone()[0], 0)
+            self.assertEqual(grok.sync(con)["failed"], [])
+            rows = con.execute("SELECT session_key FROM sessions").fetchall()
+            self.assertEqual([row[0] for row in rows], ["grok:native-id"])
+            self.assertEqual(con.execute("SELECT session_key FROM responses").fetchone()[0],
+                             "grok:native-id")
+        self.assertEqual(self.run_health("--json")[0], 0)
+
     def test_bad_grok_metadata_keeps_health_stale(self):
         cases = (
             ("summary.json", '{"incomplete":', "updates.jsonl", "{}\n", False, None),

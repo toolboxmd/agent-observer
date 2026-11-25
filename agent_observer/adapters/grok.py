@@ -1540,6 +1540,10 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                             break
         except FileNotFoundError:
             pass
+    if summary_unavailable and recorded_id is None:
+        # A directory name is only a fallback after a readable summary
+        # supplied no ID. A failed read can hide a different native ID.
+        return stats
     native_sid = recorded_id or valid_info_id or safe_basename
     if native_sid is None:
         # No safe native id: quarantine under the fixed missing_id
