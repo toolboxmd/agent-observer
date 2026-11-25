@@ -1628,6 +1628,10 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         r.meta.get("role") == "subagent" and stored_role != "subagent")
     meta_changed = (stored_summary_fp != summary_fp
                     or stored_chat_fp != chat_fp_current)
+    invalid_chat = "invalid or incomplete Grok chat history"
+    if (stored_chat_fp == chat_fp_current and chat_fp_current not in (None, "missing")
+            and stored_chat_reliable is False):
+        metadata_errors.append(invalid_chat)
 
     chat = None
 
@@ -1652,6 +1656,9 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         except OSError as exc:
             metadata_errors.append(str(exc))
             chat = {"reliable": False}
+        if (chat.get("fp") not in (None, "missing") and not chat["reliable"]
+                and invalid_chat not in metadata_errors):
+            metadata_errors.append(invalid_chat)
         return chat
 
     if known and not updates_new and not events_new and not privacy_stale \
@@ -1923,10 +1930,9 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                 (json.dumps(evidence, sort_keys=True) if evidence else None, version, r.session_key))
     if not metadata_errors:
         _store_meta(con, r.session_key, summary_fp, chat_fp_current, chat, metadata_imported_at)
-    if updates_src is not None:
-        stats.update(updates_src.finish(session_id=r.native_sid))
-    if events_src is not None:
-        stats.update(events_src.finish(session_id=r.native_sid))
+    for source in (updates_src, events_src):
+        if source is not None and (not metadata_errors or not source.unchanged):
+            stats.update(source.finish(session_id=r.native_sid))
     stats["session_key"] = r.session_key
     stats["unchanged"] = bool(
         (updates_src is None or updates_src.unchanged)

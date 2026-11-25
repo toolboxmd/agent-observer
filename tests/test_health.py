@@ -11,7 +11,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from agent_observer import cli, db, health
+from agent_observer import cli, db, health, ingest
 from agent_observer.adapters import claude, codex, grok, muse, opencode, router
 
 
@@ -505,6 +505,39 @@ class LedgerFreshnessTest(unittest.TestCase):
             self.assertEqual(result["responses_inserted"], 1)
             self.assertEqual(result["failed"][0]["error"], "invalid Grok summary JSON")
             self.assertIsNone(grok.newest_metadata_import(con))
+
+    def test_bad_grok_metadata_keeps_health_stale(self):
+        for filename, content in (("summary.json", '{"incomplete":'),
+                                  ("chat_history.jsonl", 'invalid json\n')):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                session = base / "grok/project/session-one"
+                session.mkdir(parents=True)
+                if filename == "summary.json":
+                    transcript = session / "updates.jsonl"
+                    transcript.write_text("{}\n")
+                    os.utime(transcript, (10_000, 10_000))
+                summary = session / "summary.json"
+                summary.write_text("{}")
+                os.utime(summary, (10_000, 10_000))
+                ledger = base / "observer.db"
+                with contextlib.closing(db.connect(str(ledger))) as con:
+                    db.init_db(con)
+                    with patch.object(db, "now", return_value=11_000), \
+                            patch.object(ingest, "now", return_value=11_000):
+                        self.assertEqual(grok.sync(con, root=str(base / "grok"))["failed"], [])
+                    metadata = session / filename
+                    metadata.write_text(content)
+                    os.utime(metadata, (20_000, 20_000))
+                    with patch.object(db, "now", return_value=21_000), \
+                            patch.object(ingest, "now", return_value=21_000):
+                        self.assertTrue(grok.sync(con, root=str(base / "grok"))["failed"])
+                    self.assertEqual(grok.newest_metadata_import(con), 11_000)
+                with patch.object(grok, "DEFAULT_ROOT", str(base / "grok")), \
+                        patch.object(self, "ledger", ledger):
+                    code, output = self.run_health("--json")
+                self.assertEqual(code, 4)
+                self.assertEqual(json.loads(output)["ledger_freshness"]["grok"]["status"], "stale")
 
 
 class ClaudeVisibilityTest(unittest.TestCase):
