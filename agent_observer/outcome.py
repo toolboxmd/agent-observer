@@ -167,7 +167,7 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
     if harness == "claude":
         from .adapters import claude
         responses, disputed_completions = claude.response_witnesses(con, key)
-        unavailable = {rid: responses.get(rid, set()) for rid in claude.provisional_responses(con, key)}
+        unavailable = {rid: responses.get(rid, set()) for rid in claude.responses_without_final_usage(con, key)}
         disputed_completions |= claude.conflicting_final_measurements(con, key)
         result.conflicts.update(disputed_completions)
         if _has_table(con, "claude_unreadable_sources") and con.execute(

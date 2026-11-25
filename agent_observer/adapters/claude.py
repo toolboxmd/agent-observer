@@ -98,10 +98,10 @@ _CLAUDE_COUNTER_KEYS = ("input_tokens", "cache_creation_input_tokens",
 
 
 def _valid_counter(value) -> bool:
-    """Only NULL or a real integer counter; booleans are malformed."""
+    """A known counter is a nonnegative SQLite INTEGER."""
     if value is None:
         return True
-    return isinstance(value, int) and not isinstance(value, bool)
+    return type(value) is int and 0 <= value <= (1 << 63) - 1
 
 
 _FINALITY_TABLE = "claude_response_finality"
@@ -556,8 +556,7 @@ def _usage_values(usage) -> dict:
         raise _MalformedUsage("malformed usage counter")
     # service_tier and any other unrecognized metadata are ignored: they
     # never validate or invalidate a usage block.
-    if not any(k in usage for k in _CLAUDE_COUNTER_KEYS) and \
-            "thinking_tokens" not in details:
+    if all(usage.get(k) is None for k in _CLAUDE_COUNTER_KEYS) and thinking is None:
         raise _MalformedUsage("malformed usage")
     ttl = usage.get("cache_creation")
     if ttl is not None and not isinstance(ttl, dict):
@@ -572,6 +571,9 @@ def _usage_values(usage) -> dict:
             and five + hour != total_write:
         raise _MalformedUsage("inconsistent cache creation counters")
     values = [usage.get(k) for k in _CLAUDE_COUNTER_KEYS]
+    total = sum(values) if all(type(v) is int for v in values) else None
+    if not _valid_counter(total):
+        raise _MalformedUsage("invalid total token count")
     return {
         "input_tokens": usage.get("input_tokens"),
         "cached_input_tokens": usage.get("cache_read_input_tokens"),
@@ -580,8 +582,7 @@ def _usage_values(usage) -> dict:
         "cache_write_1h_tokens": hour,
         "output_tokens": usage.get("output_tokens"),
         "reasoning_output_tokens": details.get("thinking_tokens"),
-        "total_tokens": sum(values)
-        if all(type(v) is int for v in values) else None,
+        "total_tokens": total,
     }
 
 
@@ -632,13 +633,14 @@ def conflicting_final_measurements(con, session_key):
     return conflicts
 
 
-def provisional_responses(con, session_key):
+def responses_without_final_usage(con, session_key):
     if not db._has_table(con, _FINALITY_TABLE):
         return set()
     return {rid for rid, in con.execute(
         f"SELECT r.response_id FROM responses r JOIN sources s ON s.id=r.source_id "
-        f"WHERE r.session_key=? AND r.is_overlap=0 AND s.claude_usage_version>=13 AND NOT EXISTS ("
-        f"SELECT 1 FROM {_FINALITY_TABLE} f WHERE f.response_id=r.response_id)", (session_key,))}
+        f"WHERE r.session_key=? AND r.is_overlap=0 AND s.claude_usage_version>=13 "
+        f"AND (r.total_tokens IS NULL OR NOT EXISTS (SELECT 1 FROM {_FINALITY_TABLE} f "
+        f"WHERE f.response_id=r.response_id))", (session_key,))}
 
 
 def _ingest_usage_row(r: _Reader, obj: dict, ordinal: int, ts, mid: str,

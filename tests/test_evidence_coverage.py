@@ -635,6 +635,7 @@ class EvidenceCoverageTest(LedgerCase):
     def test_claude_provisional_usage_is_an_observation_until_its_first_final(self):
         path = Path(self.tmp.name, "stream.jsonl")
         response = claude_response("block", "p", "streamed")
+        response["message"]["usage"].update(input_tokens=0, cache_read_input_tokens=0, cache_creation_input_tokens=0)
         response["message"]["stop_reason"] = None
         write_records(path, [claude_user("p"), response])
         claude.import_claude_file(self.con, str(path))
@@ -646,3 +647,20 @@ class EvidenceCoverageTest(LedgerCase):
         write_records(path, [response], mode="a")
         claude.import_claude_file(self.con, str(path))
         self.assertTrue(report.task_report(self.con, "A")["complete"])
+
+    def test_claude_final_with_unavailable_counters_cannot_close_the_bill(self):
+        path = Path(self.tmp.name, "only-final.jsonl")
+        message = claude_response("block", "p", "partial")
+        message["message"]["usage"] = {"output_tokens": None}
+        write_records(path, [claude_user("p"), message])
+        claude.import_claude_file(self.con, str(path))
+        self.assign("A", "claude:p")
+        rep = report.task_report(self.con, "A")
+        self.assertEqual(rep["attributed"]["responses"], 0)
+        self.assertFalse(rep["complete"])
+        message["message"]["usage"]["output_tokens"] = 8
+        write_records(path, [claude_user("p"), message])
+        claude.import_claude_file(self.con, str(path), full=True)
+        rep = report.task_report(self.con, "A")
+        self.assertEqual(rep["attributed"]["output_tokens"], 8)
+        self.assertFalse(rep["complete"])
