@@ -1,4 +1,4 @@
-"""Session visibility: find live agent sessions whose records Observer cannot see.
+"""Check session visibility and whether the ledger is keeping up with native records.
 
 A Claude Code session started from inside another one inherits the parent's
 child-session marker and saves no transcript unless the launcher scrubs the
@@ -15,13 +15,19 @@ import glob
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import time
+from contextlib import closing
+from pathlib import Path
+
+from .adapters import bare as bare_adapter
 
 CLAUDE_FIX = ("start the session with the parent's CLAUDE_CODE_*, CLAUDECODE, CLAUDE_PID "
               "and CLAUDE_EFFORT variables unset, or with CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1")
 GRACE_SECONDS = 120
 SCAN_TIMEOUT_SECONDS = 5
+DEFAULT_SYNC_INTERVAL_SECONDS = 3600
 
 
 def _alive(pid: int) -> bool:
@@ -198,13 +204,117 @@ def bare_roots() -> dict:
     Reported beside the findings, never as one: a gap is a record root, not
     a running session.
     """
-    from .adapters import bare, codex, grok
-    with bare.one_read():
-        return {codex.HARNESS: bare.discover(codex.HARNESS, codex._bare_home)[1],
-                grok.HARNESS: bare.discover(grok.HARNESS, grok._sessions_under)[1]}
+    from .adapters import codex, grok
+    with bare_adapter.one_read():
+        return {codex.HARNESS: bare_adapter.discover(codex.HARNESS, codex._bare_home)[1],
+                grok.HARNESS: bare_adapter.discover(grok.HARNESS, grok._sessions_under)[1]}
 
 
-def check(processes=None, registry=None, con=None, bare=None) -> dict:
+def _mtime(path: str, *, min_size: int = 0) -> float | None:
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        # An active harness can move or delete a file after discovery.
+        return None
+    if stat.S_ISREG(info.st_mode) and info.st_size >= min_size:
+        return info.st_mtime
+    return None
+
+
+def _opencode_record_times(paths):
+    for path in paths:
+        uri = Path(path).absolute().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=SCAN_TIMEOUT_SECONDS)) as native:
+            # A message or part can advance without touching its session row.
+            # Read only timestamps, following the same source boundary as sync.
+            session_cols = {row[1] for row in native.execute("PRAGMA table_info(session)")}
+            if "id" not in session_cols:
+                raise sqlite3.DatabaseError("OpenCode session table unavailable")
+            selects = [f"SELECT id AS session_id, {col} AS stamp FROM session"
+                       for col in ("time_created", "time_updated") if col in session_cols]
+            for table in ("message", "part"):
+                cols = {row[1] for row in native.execute(f"PRAGMA table_info({table})")}
+                if {"session_id", "time_updated"} <= cols:
+                    selects.append(f"SELECT session_id, MAX(time_updated) AS stamp"
+                                   f" FROM {table} GROUP BY session_id")
+            if not selects:
+                raise sqlite3.DatabaseError("OpenCode session timestamps unavailable")
+            combined = " UNION ALL ".join(selects)
+            for (stamp,) in native.execute(
+                    f"WITH activity AS ({combined})"
+                    " SELECT MAX(stamp) FROM activity JOIN session ON session.id = activity.session_id"
+                    " GROUP BY session.id"):
+                if isinstance(stamp, (int, float)):
+                    yield stamp / 1000
+
+
+def _native_record_times(harness, paths):
+    if harness == "opencode":
+        yield from _opencode_record_times(paths)
+        return
+    for path in dict.fromkeys(paths):
+        if harness == "grok":
+            # One session directory can contain two independently imported logs.
+            times = (_mtime(os.path.join(path, name))
+                     for name in ("updates.jsonl", "events.jsonl"))
+        elif harness in ("t3", "router"):
+            # A SQLite source can advance before its main file is checkpointed.
+            times = (_mtime(path), _mtime(path + "-wal", min_size=33))
+        else:
+            times = (_mtime(path),)
+        newest = max((stamp for stamp in times if stamp is not None), default=None)
+        if newest is not None:
+            yield newest
+
+
+def _ledger_freshness(con, sync_interval_seconds, unavailable, ledger_error):
+    from .adapters import available
+
+    imports = {}
+    if con is not None:
+        try:
+            imports = dict(con.execute(
+                "SELECT harness, MAX(imported_at) FROM sources GROUP BY harness"))
+        except sqlite3.Error as exc:
+            ledger_error = str(exc)
+    if ledger_error is not None:
+        unavailable.append({"check": "ledger freshness", "reason": ledger_error})
+
+    freshness = {}
+    for harness, adapter in available().items():
+        imported = imports.get(harness)
+        try:
+            paths = [adapter.state_path()] if harness == "t3" else adapter.discover()
+            records = list(_native_record_times(harness, paths))
+        except (OSError, sqlite3.Error) as exc:
+            unavailable.append({"check": f"{harness} native record scan", "reason": str(exc)})
+            freshness[harness] = {"newest_native_at": None, "newest_import_at": imported,
+                                  "newer_sources": None, "lag_seconds": None,
+                                  "status": "unavailable"}
+            continue
+
+        newest = max(records, default=None)
+        newer = lag = None
+        if ledger_error is not None:
+            status = "unavailable"
+        elif newest is None:
+            newer = 0
+            status = "no_native_records"
+        elif imported is None:
+            newer = len(records)
+            status = "never_synced"
+        else:
+            newer = sum(stamp > imported for stamp in records)
+            lag = max(0, newest - imported)
+            status = "stale" if lag > sync_interval_seconds else (
+                "within_interval" if newer else "current")
+        freshness[harness] = {"newest_native_at": newest, "newest_import_at": imported,
+                              "newer_sources": newer, "lag_seconds": lag, "status": status}
+    return freshness
+
+
+def check(processes=None, registry=None, con=None, bare=None, *,
+          sync_interval_seconds=DEFAULT_SYNC_INTERVAL_SECONDS, ledger_error=None) -> dict:
     unavailable = []
     if processes is None:
         try:
@@ -219,10 +329,14 @@ def check(processes=None, registry=None, con=None, bare=None) -> dict:
     registry = claude_registry() if registry is None else registry
     findings = check_claude(registry) + check_opencode(processes) + check_codex(processes)
     from . import cue
+    with bare_adapter.one_read():
+        freshness = _ledger_freshness(con, sync_interval_seconds, unavailable, ledger_error)
+        roots = bare_roots() if bare is None else bare
     return {"cue": cue.health(con), "findings": findings,
             "unavailable": unavailable,
             "identity_conflicts": identity_conflicts(con) if con is not None else None,
-            "bare_roots": bare_roots() if bare is None else bare,
+            "bare_roots": roots,
+            "ledger_freshness": freshness, "sync_interval_seconds": sync_interval_seconds,
             "checked": {"claude_sessions": len(registry),
                         "processes": len(processes)},
             "note": ("Codex app-server and exec sessions and OpenCode servers are not "

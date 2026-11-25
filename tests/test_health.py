@@ -4,13 +4,15 @@ import contextlib
 import io
 import json
 import os
+from pathlib import Path
 import sqlite3
 import tempfile
 import time
 import unittest
 from unittest.mock import patch
 
-from agent_observer import cli, health
+from agent_observer import cli, db, health
+from agent_observer.adapters import claude, codex, grok, muse, opencode, router
 
 
 class ScanAvailabilityTest(unittest.TestCase):
@@ -20,6 +22,7 @@ class ScanAvailabilityTest(unittest.TestCase):
         self.path = patch.dict(os.environ, {"PATH": self.tmp.name})
         self.path.start()
         self.addCleanup(self.path.stop)
+        self.enterContext(patch.object(health, "_ledger_freshness", return_value={}))
         self.tool("ps", "printf '201 Mon Oct 19 10:00:00 2026 codex\\n'")
 
     def tool(self, name, body):
@@ -162,7 +165,8 @@ class CueHealthExitTest(unittest.TestCase):
                 with self.subTest(status=status,json=as_json):
                     result={'checked': {'claude_sessions':0,'processes':0},
                             'findings':[],'unavailable':[],'identity_conflicts':[],
-                            'bare_roots':{},'cue':{'status':status}}
+                            'bare_roots':{},'cue':{'status':status},
+                            'ledger_freshness':{},'sync_interval_seconds':3600}
                     output=io.StringIO()
                     with patch.object(health,'check',return_value=result), \
                             contextlib.redirect_stdout(output):
@@ -173,6 +177,126 @@ class CueHealthExitTest(unittest.TestCase):
                         self.assertEqual(json.loads(output.getvalue())['cue']['status'],status)
                     else:
                         self.assertIn('Cue evidence: '+status,output.getvalue())
+
+
+class LedgerFreshnessTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.ledger = self.root / "observer.db"
+        for adapter in (claude, codex, grok, muse, opencode, router):
+            self.enterContext(patch.object(adapter, "DEFAULT_ROOT",
+                                           str(self.root / adapter.HARNESS)))
+        self.enterContext(patch.object(codex, "ARCHIVE_ROOT", str(self.root / "archive")))
+        self.enterContext(patch.object(router, "LEGACY_ROOT", str(self.root / "legacy")))
+        self.enterContext(patch.dict(os.environ, {"T3CODE_HOME": str(self.root / "t3"),
+                                                  "DURABLE_RUNNER_STATE_DIR": ""}))
+        self.enterContext(patch.object(health, "process_table", return_value=[]))
+        self.enterContext(patch.object(health, "claude_registry", return_value=[]))
+        self.enterContext(patch("agent_observer.cue.health", return_value={"status": "no_cue"}))
+
+    def source(self, path, modified_at):
+        path = self.root / path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("private fixture text that health must never print")
+        os.utime(path, (modified_at, modified_at))
+
+    def imports(self, **harness_times):
+        with contextlib.closing(db.connect(str(self.ledger))) as con, con:
+            db.init_db(con)
+            con.executemany(
+                "INSERT INTO sources(harness, path, sha256, imported_at) VALUES(?,?,?,?)",
+                [(harness, "fixture", "hash", stamp) for harness, stamp in harness_times.items()])
+
+    def run_health(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(["--db", str(self.ledger), "health", *args])
+        self.assertNotIn("private fixture text", out.getvalue())
+        return code, out.getvalue()
+
+    def test_stale_harness_is_not_hidden_by_a_fresher_import_from_another(self):
+        self.source("claude/project/old.jsonl", 10_000)
+        self.source("claude/project/new.jsonl", 22_000)
+        self.source("claude/project/new/subagents/agent-child.jsonl", 20_000)
+        self.source("archive/rollout-old-thread.jsonl", 18_000)
+        self.imports(claude=11_000, codex=23_000)
+
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        result = json.loads(output)
+        self.assertEqual(result["sync_interval_seconds"], 3600)
+        self.assertEqual(result["ledger_freshness"]["claude"], {
+            "newest_native_at": 22_000, "newest_import_at": 11_000,
+            "newer_sources": 2, "lag_seconds": 11_000, "status": "stale",
+        })
+        self.assertEqual(result["ledger_freshness"]["codex"]["newer_sources"], 0)
+        self.assertEqual(result["ledger_freshness"]["codex"]["newest_native_at"], 18_000)
+        code, output = self.run_health()
+        self.assertEqual(code, 4)
+        self.assertIn("claude: stale", output)
+        self.assertIn("11000 seconds", output)
+        self.assertIn("2 newer sources", output)
+
+    def test_current_and_within_interval(self):
+        self.source("claude/project/recent.jsonl", 14_600)
+        self.source("grok/project/session/updates.jsonl", 11_000)
+        self.source("grok/project/session/events.jsonl", 10_000)
+        self.imports(claude=11_000, grok=10_000)
+
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 0)
+        freshness = json.loads(output)["ledger_freshness"]
+        self.assertEqual(freshness["claude"]["newer_sources"], 1)
+        self.assertEqual(freshness["claude"]["status"], "within_interval")
+        self.assertEqual(freshness["grok"]["newer_sources"], 1)
+        self.assertEqual(freshness["codex"]["status"], "no_native_records")
+        self.assertEqual(freshness["muse"]["status"], "no_native_records")
+        self.assertEqual(self.run_health("--sync-interval-seconds", "3599")[0], 4)
+
+    def test_missing_or_empty_ledger_names_never_synced_harness(self):
+        self.source("grok/project/session/updates.jsonl", 10_000)
+        self.source("grok/project/session/events.jsonl", 11_000)
+        for create in (False, True):
+            with self.subTest(create=create):
+                if create:
+                    self.imports()
+                code, output = self.run_health("--json")
+                self.assertEqual(code, 4)
+                self.assertEqual(json.loads(output)["ledger_freshness"]["grok"], {
+                    "newest_native_at": 11_000, "newest_import_at": None,
+                    "newer_sources": 1, "lag_seconds": None, "status": "never_synced",
+                })
+        self.assertIn("grok: never synced", self.run_health()[1])
+
+    def test_opencode_counts_sessions_with_newer_parts_in_wal(self):
+        path = self.root / "opencode"
+        with contextlib.closing(sqlite3.connect(path)) as native:
+            native.execute("PRAGMA journal_mode=WAL")
+            native.executescript("""
+                CREATE TABLE session (id TEXT, time_updated INTEGER);
+                CREATE TABLE part (session_id TEXT, time_updated INTEGER, data TEXT);
+                INSERT INTO session VALUES ('first', 10000000), ('second', 11000000);
+                INSERT INTO part VALUES ('first', 19900000, 'private fixture text'),
+                                        ('first', 20000000, 'private fixture text');
+            """)
+            self.imports(opencode=11_000)
+            code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        self.assertEqual(json.loads(output)["ledger_freshness"]["opencode"], {
+            "newest_native_at": 20_000, "newest_import_at": 11_000,
+            "newer_sources": 1, "lag_seconds": 9_000, "status": "stale",
+        })
+
+    def test_unreadable_ledger_is_not_mistaken_for_never_synced(self):
+        self.source("observer.db", 10_000)
+        self.source("claude/project/new.jsonl", 20_000)
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        result = json.loads(output)
+        self.assertEqual(result["ledger_freshness"]["claude"]["status"], "unavailable")
+        self.assertEqual(result["unavailable"][0]["check"], "ledger freshness")
 
 
 class ClaudeVisibilityTest(unittest.TestCase):
