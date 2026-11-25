@@ -214,13 +214,17 @@ class NativeOutcomeTest(LedgerCase):
         self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES(?,0)", (other,))
         self.con.executemany("INSERT INTO session_assignments VALUES(?,?,'t3',0)",
                              [(self.session, self.task), (self.session, other)])
-        placed = {"codex:resp-mini-001": self.task, "codex:resp-mini-002": other}
-        with patch("agent_observer.placement.read_placements", return_value=placed):
+        observed = {"codex:resp-mini-001": [{"host": "github.com", "repository": "example/repo",
+                                            "branch": "topic", "candidate_tasks": [self.task]}]}
+        with patch("agent_observer.placement.checkout_observations", return_value=observed):
             before = report.task_report(self.con, self.task)
             self.con.execute("INSERT INTO t3_purpose_deliveries VALUES(?, 'planner', 'github.com',"
                              "'example/repo',42,'https://github.com/example/repo/pull/42','now')", (self.task,))
             after = report.task_report(self.con, self.task)
-        self.assertEqual(before["measured"]["attributed_responses"], ["codex:resp-mini-001"])
+        self.assertEqual(before["measured"]["attributed_responses"], [])
+        self.assertEqual(after["legacy_checkout_observations"],
+                         {"basis": "first_native_import", "responses": observed})
+        self.assertIsNone(after["total_cost"]["usd"])
         self.assertEqual(after["measured"], before["measured"])
         self.assertIn("purpose_run_unavailable", after["native_purpose"]["coverage_gaps"])
         self.assign(self.task, "02")

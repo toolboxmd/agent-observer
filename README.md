@@ -529,9 +529,10 @@ A provider turn can reconcile while the full outcome cost remains unknown.
 Chromeria v1 records observed background causes for some drivers and has no
 background inventory for others. A missing child boundary or unavailable
 price leaves any priced work as a subtotal. The same scope appears in
-`publish --task`. For legacy shared PR sessions, sync captures checkout
-evidence per response while the checkout exists. Retiring the checkout
-preserves those observations.
+`publish --task`. For legacy PR links, `legacy_checkout_observations`
+shows which checkout Observer saw when it imported a tool call. The observation
+survives checkout retirement. A path can change hands before import, so a
+matching PR head alone leaves the response outside the bill.
 
 Put `observer_task_id` in related Router jobs' prepared task JSON to connect
 them to one Observer task. `sync` binds their dedicated worker and dispatcher

@@ -541,11 +541,12 @@ re-read every sync; workload bindings are durable ledger rows.
   (`origin='t3'`); every ledger session in the tree (cursor sessions plus
   Claude subagent children plus rotated sessions found by turn uuid) binds
   whole to every tree task as historical session context. A thread link alone cannot place a response.
-  In a multi-link tree, a Claude or Codex response belongs to one PR when
-  the paths its tool calls name lie in a checkout of that PR's repository
-  on its head branch (T3 snapshot `headBranch`). Sync records that observation
-  against the individual event, path digest and response. Reports read the ledger. A response
-  matching no PR or several stays unplaced and outside every headline.
+  For new Claude or Codex events, the importer can observe the forge,
+  repository and branch of a checkout named by a tool path. Reports join
+  those observations to individual responses and list matching PR heads in
+  `legacy_checkout_observations`. A path can change owners before its first
+  import. These observations establish which checkout Observer saw at sync.
+  Billing requires independent evidence of the response's owner.
   Whole-session sharing from links stays visible outside the outcome cost.
   Ghostty bodies and unknown cursor shapes are skipped.
 - Outcomes come from the PR snapshot (`merged` completes); exit codes are

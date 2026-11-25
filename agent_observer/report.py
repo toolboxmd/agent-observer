@@ -7,7 +7,7 @@ import hashlib
 import json
 import sqlite3
 
-from . import codex_order, outcome
+from . import codex_order, outcome, placement
 from .db import _has_table
 
 BUCKETS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
@@ -550,9 +550,12 @@ def task_report(con: sqlite3.Connection, task_id: str,
     whole_shared = whole_conflicts | {key for key, owners in session_owners.items() if len(owners) > 1}
     responses = _responses(con, scope_keys)
     attributed, shared, unassigned = [], [], []
-    # A legacy checkout can place the remainder after explicit ownership.
+    # A link can supply session context while the individual owners remain unknown.
     placements = {key: _place(con, key) for key in legacy_links
                   if len(linked_tasks[key]) > 1 and key not in session_owners}
+    checkout_records = {}
+    for key in sorted(legacy_links):
+        checkout_records.update(placement.checkout_observations(con, key))
     unplaced, elsewhere = [], []
     missing_submissions = []
     sharing_tasks = set()
@@ -719,6 +722,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
     unavailable_sources = list(
         source_availability.get("unavailable_sources") or [])
     snapshot_payload = {
+        **({"legacy_checkout_observations": checkout_records} if checkout_records else {}),
         "price_schedule": schedule,
         "phases": phases,
         "activity_session_context": activity_context,
@@ -891,6 +895,8 @@ def task_report(con: sqlite3.Connection, task_id: str,
     report["reconciles"] = responses_reconcile and totals_reconcile
     if legacy_links:
         report["coverage"]["legacy_thread_links"] = sorted(legacy_links)
+    if checkout_records:
+        report["legacy_checkout_observations"] = {"basis": "first_native_import", "responses": checkout_records}
     if native:
         report["native_purpose"] = native
     report["unbound_usage"] = unbound_usage
