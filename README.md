@@ -520,6 +520,10 @@ lists the native responses joined to that purpose, even before a delivery PR
 exists. The `native_purpose` section identifies each run, the input that joins
 a response to it, delivery PRs, provider counter checks, and gaps in coverage.
 A planner serving two Issues can have responses for each in the same session.
+For Grok, a session update can connect the prompt index to the completion ID.
+A tool call can also supply that connection when Chromeria and Grok record
+the same call ID for the turn. A tool-free response without either witness
+stays unplaced.
 
 A provider turn can reconcile while the full outcome cost remains unknown.
 Chromeria v1 records observed background causes for some drivers and has no
