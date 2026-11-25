@@ -2105,7 +2105,8 @@ def _notification_session_id(updates_path, events_path) -> str | None:
                             _validated_usage_counters(update)
                         except _AdapterError:
                             continue
-                    else:
+                    elif not isinstance(kind, str) or (
+                            kind not in COMPACTION_KINDS and kind not in EXTENSION_KINDS):
                         continue
                     native_id = params.get("sessionId")
                 else:

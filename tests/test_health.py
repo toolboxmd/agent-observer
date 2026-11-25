@@ -716,6 +716,25 @@ class LedgerFreshnessTest(unittest.TestCase):
                 "SELECT session_key FROM events WHERE family='assistant_message'").fetchone()[0],
                 "grok:native-id")
 
+    def test_grok_compaction_and_extension_updates_supply_native_identity(self):
+        self.imports()
+        for kind in ("auto_compact_started", "retry_state"):
+            folder = self.root / "grok/project" / kind
+            folder.mkdir(parents=True)
+            (folder / "summary.json").write_text('{"incomplete":')
+            update = {"method": "session/update", "params": {
+                "sessionId": f"{kind}-native", "update": {"sessionUpdate": kind}}}
+            (folder / "updates.jsonl").write_text(json.dumps(update) + "\n")
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            stats = grok.sync(con)
+            self.assertEqual([item["error"] for item in stats["failed"]],
+                             ["invalid Grok summary JSON"] * 2)
+            rows = con.execute("SELECT session_key, name FROM events ORDER BY name").fetchall()
+            self.assertEqual([tuple(row) for row in rows], [
+                ("grok:auto_compact_started-native", "auto_compact_started"),
+                ("grok:retry_state-native", "retry_state"),
+            ])
+
     def test_bad_grok_metadata_keeps_health_stale(self):
         cases = (
             ("summary.json", '{"incomplete":', "updates.jsonl", "{}\n", False, None),
