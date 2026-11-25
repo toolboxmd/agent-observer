@@ -79,7 +79,7 @@ class JsonlSource:
     """One append-only JSONL file being imported."""
 
     def __init__(self, con: sqlite3.Connection, harness: str, path: str,
-                 full: bool = False, *, defer_imported_at: bool = False):
+                 full: bool = False):
         self.con = con
         self.harness = harness
         self.path = path
@@ -112,7 +112,7 @@ class JsonlSource:
         if row is None:
             con.execute(
                 "INSERT INTO sources(harness, path, sha256, imported_at)"
-                " VALUES(?,?,?,?)", (harness, path, "", 0 if defer_imported_at else now()))
+                " VALUES(?,?,?,?)", (harness, path, "", now()))
             row = con.execute(
                 "SELECT * FROM sources WHERE harness=? AND path=?",
                 (harness, path)).fetchone()
@@ -271,8 +271,7 @@ class JsonlSource:
     def finish(self, session_id: str | None = None,
                thread_id: str | None = None,
                cli_version: str | None = None,
-               thread_source: str | None = None, *,
-               advance_imported_at: bool = True) -> dict:
+               thread_source: str | None = None) -> dict:
         # Fresh stat at finish: the file may have grown while records were
         # parsed, so the persisted size/mtime/ino describe the current file,
         # not the import-start snapshot. Only offsets and hashes persist;
@@ -298,7 +297,7 @@ class JsonlSource:
             " thread_source=COALESCE(?, thread_source),"
             " privacy_version=?, mtime_ns=?, ino=? WHERE id=?",
             (fingerprint, self.size, self.end_offset, tail, self.end_offset,
-             ordinal_max, now() if advance_imported_at else self.row["imported_at"],
+             ordinal_max, now(),
              int((time.monotonic() - self.started) * 1000),
              session_id, thread_id, cli_version, thread_source,
              privacy.PRIVACY_VERSION, self.mtime_ns, self.ino,

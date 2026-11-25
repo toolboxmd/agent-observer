@@ -293,11 +293,8 @@ def _ledger_freshness(con, sync_interval_seconds, unavailable, ledger_error):
         try:
             imports = dict(con.execute(
                 "SELECT harness, MAX(imported_at) FROM sources"
-                " WHERE imported_at > 0 GROUP BY harness"))
-            metadata_import = grok.newest_metadata_import(con)
-            if metadata_import is not None:
-                recorded = imports.get("grok", metadata_import)
-                imports["grok"] = max(recorded, metadata_import)
+                " WHERE harness != 'grok' GROUP BY harness"))
+            imports["grok"] = grok.newest_complete_import(con)
         except sqlite3.Error as exc:
             ledger_error = str(exc)
     if ledger_error is not None:

@@ -599,7 +599,7 @@ def _ensure_grok_meta_table(con: sqlite3.Connection) -> None:
         return
     for column, affinity in (("chat_seen_json", "TEXT"), ("chat_synthetic_json", "TEXT"),
                              ("chat_effort", "TEXT"), ("chat_reliable", "TEXT"),
-                             ("imported_at", "REAL")):
+                             ("imported_at", "REAL"), ("pending", "INTEGER")):
         if column not in cols:
             try:
                 con.execute(
@@ -622,6 +622,19 @@ def newest_metadata_import(con: sqlite3.Connection) -> float | None:
             f"PRAGMA table_info({_GROK_META_TABLE})")}:
         return None
     return con.execute(f"SELECT MAX(imported_at) FROM {_GROK_META_TABLE}").fetchone()[0]
+
+
+def newest_complete_import(con: sqlite3.Connection) -> float | None:
+    """Watermark for complete sessions, including logs imported by older versions."""
+    columns = {row[1] for row in con.execute(f"PRAGMA table_info({_GROK_META_TABLE})")}
+    where = ""
+    if "pending" in columns:
+        where = (f" AND NOT EXISTS (SELECT 1 FROM {_GROK_META_TABLE} m"
+                 " WHERE m.session_key='grok:' || s.session_id AND m.pending=1)")
+    transcript = con.execute(
+        f"SELECT MAX(s.imported_at) FROM sources s WHERE s.harness='grok'{where}").fetchone()[0]
+    metadata = newest_metadata_import(con)
+    return max((stamp for stamp in (transcript, metadata) if stamp is not None), default=None)
 
 
 def _stored_meta(con: sqlite3.Connection, session_key: str):
@@ -1570,9 +1583,14 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
 
     # Change state before any full parse. JsonlSource does a stat plus a
     # small tail read, never a full parse.
-    updates_src = (JsonlSource(con, HARNESS, updates_path, full=full, defer_imported_at=True)
+    _ensure_grok_meta_table(con)
+    previous = con.execute(
+        f"SELECT imported_at, pending FROM {_GROK_META_TABLE} WHERE session_key=?",
+        (r.session_key,)).fetchone()
+    retry = previous is not None and bool(previous["pending"])
+    updates_src = (JsonlSource(con, HARNESS, updates_path, full=full or retry)
                    if updates_path and os.path.isfile(updates_path) else None)
-    events_src = (JsonlSource(con, HARNESS, events_path, full=full, defer_imported_at=True)
+    events_src = (JsonlSource(con, HARNESS, events_path, full=full or retry)
                   if events_path and os.path.isfile(events_path) else None)
     r.updates_src = updates_src
     r.events_src = events_src
@@ -1608,7 +1626,6 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     except (KeyError, TypeError, IndexError):
         stored_role = None
     summary_fp = _summary_fingerprint(summary)
-    _ensure_grok_meta_table(con)
     (stored_summary_fp, stored_chat_fp, stored_seen, stored_synthetic,
      stored_chat_effort, stored_chat_reliable, stored_imported_at) = _stored_meta(con,
                                                               r.session_key)
@@ -1662,7 +1679,7 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         return chat
 
     if known and not updates_new and not events_new and not privacy_stale \
-            and not full:
+            and not (full or retry or metadata_errors):
         if not meta_changed and stored_marks is not None \
                 and not new_parent_via_index and not new_role_via_evidence:
             # Fully unchanged: no parse of updates/events and no JSON parse
@@ -1930,12 +1947,21 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                 (json.dumps(evidence, sort_keys=True) if evidence else None, version, r.session_key))
     if not metadata_errors:
         _store_meta(con, r.session_key, summary_fp, chat_fp_current, chat, metadata_imported_at)
+    else:
+        # Keep the last complete watermark while the transcript rows and their
+        # import timestamps remain available to other ledger consumers.
+        last_complete = stored_imported_at
+        if not retry and last_complete is None:
+            last_complete = con.execute(
+                "SELECT MAX(imported_at) FROM sources WHERE harness=? AND session_id=?",
+                (HARNESS, r.native_sid)).fetchone()[0]
+        con.execute(
+            f"INSERT INTO {_GROK_META_TABLE}(session_key, imported_at, pending) VALUES(?,?,1)"
+            " ON CONFLICT(session_key) DO UPDATE SET imported_at=excluded.imported_at, pending=1",
+            (r.session_key, last_complete))
     for source in (updates_src, events_src):
         if source is not None and (not metadata_errors or not source.unchanged):
-            # A partial import can commit transcript changes while leaving
-            # the last complete session import time available to health.
-            stats.update(source.finish(session_id=r.native_sid,
-                                       advance_imported_at=not metadata_errors))
+            stats.update(source.finish(session_id=r.native_sid))
     stats["session_key"] = r.session_key
     stats["unchanged"] = bool(
         (updates_src is None or updates_src.unchanged)

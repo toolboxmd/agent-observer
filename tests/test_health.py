@@ -471,6 +471,9 @@ class LedgerFreshnessTest(unittest.TestCase):
                 self.assertEqual(len(grok.sync(con)["failed"]), 1)
             self.assertEqual(grok.newest_metadata_import(con), 21_000)
             self.assertEqual(self.run_health("--json")[0], 4)
+            with patch.object(db, "now", return_value=32_000):
+                self.assertEqual(grok.sync(con)["failed"], [])
+            self.assertEqual(self.run_health("--json")[0], 0)
 
     def test_chromeria_freshness_follows_symlink_to_wal(self):
         link = self.root / "t3/userdata/chromeria-v2.sqlite"
@@ -505,9 +508,18 @@ class LedgerFreshnessTest(unittest.TestCase):
             self.assertEqual(result["responses_inserted"], 1)
             self.assertEqual(result["failed"][0]["error"], "invalid Grok summary JSON")
             self.assertIsNone(grok.newest_metadata_import(con))
+            self.assertGreater(con.execute(
+                "SELECT imported_at FROM sources WHERE harness='grok'").fetchone()[0], 0)
         code, output = self.run_health("--json")
         self.assertEqual(code, 4)
         self.assertEqual(json.loads(output)["ledger_freshness"]["grok"]["status"], "never_synced")
+
+        summary = self.root / "grok/project/session-one/summary.json"
+        summary.write_text('{"model":"grok-4"}')
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            self.assertEqual(grok.sync(con)["failed"], [])
+            self.assertIsNotNone(grok.newest_metadata_import(con))
+        self.assertEqual(self.run_health("--json")[0], 0)
 
     def test_bad_grok_metadata_keeps_health_stale(self):
         cases = (
