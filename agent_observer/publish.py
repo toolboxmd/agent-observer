@@ -501,12 +501,11 @@ def render(summary: dict, target: str | None = None) -> str:
                          f"so sums across PRs overlap.")
         unplaced = total.get("unplaced") or {}
         if unplaced.get("responses"):
-            lines.append(f"- Not counted: {unplaced['responses']:,} responses "
-                         f"({_safe_field(unplaced.get('text') or 'unknown')}) in sessions "
-                         f"shared with other PRs that worked in no single PR's checkout.")
+            lines.append(f"- Ownership is unresolved for {unplaced['responses']:,} responses "
+                         f"({_safe_field(unplaced.get('text') or 'unknown')}). They are excluded from this total.")
         if unplaced.get("other_task_responses"):
-            lines.append(f"- {unplaced['other_task_responses']:,} responses in these "
-                         f"sessions worked on other PRs and are counted there.")
+            lines.append(f"- {unplaced['other_task_responses']:,} responses belong to other tasks "
+                         "and are excluded from this total.")
         unassigned = (summary.get("unassigned_in_scope") or {}).get("responses", 0)
         if unassigned:
             lines.append(f"- {unassigned:,} responses in these sessions belong to no "

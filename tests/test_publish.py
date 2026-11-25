@@ -113,6 +113,11 @@ class PublishTest(LedgerCase):
         self.assertNotIn("internal.example", private)
         self.assertNotIn("private-repo", private)
         self.assertIn("Outcome: reference withheld", private)
+        summary["total_cost"] = {"unplaced": {"responses": 2, "other_task_responses": 3}}
+        scoped = publish.render(summary)
+        self.assertIn("Ownership is unresolved for 2 responses", scoped)
+        self.assertIn("3 responses belong to other tasks", scoped)
+        self.assertNotIn("checkout", scoped)
 
     def test_second_publish_edits_the_same_owned_comment(self):
         gh = PublishGh([])

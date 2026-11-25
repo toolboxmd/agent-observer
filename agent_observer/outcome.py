@@ -125,9 +125,10 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
                 if turn:
                     input_turns[identity].add(turn)
     call_witnesses = set()
+    disputed_completions = set()
     if harness == "grok":
         from .adapters import grok
-        responses, call_witnesses = grok.response_witnesses(con, key)
+        responses, call_witnesses, disputed_completions = grok.response_witnesses(con, key)
     else:
         responses = native_response.inputs(con, key)
     # In a contested whole session, only events on resolved turns can be
@@ -147,6 +148,11 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
             exclusive = False
     for rid, display_turn in con.execute(
             "SELECT response_id,turn_id FROM responses WHERE session_key=? AND is_overlap=0", (key,)):
+        if rid in disputed_completions:
+            conflicts.add(rid)
+            blocked_turns.add(rid)
+            exclusive = False
+            continue
         input_ids = responses.get(rid, set())
         identities = {f"{prefix}:{identity}" for identity in input_ids}
         candidates = {candidate for identity in input_ids for candidate in by_input.get(identity, ())}

@@ -2982,7 +2982,7 @@ def _record_prompt_bridges(r, src, records):
 
 def response_witnesses(con, session_key):
     if not db._has_table(con, "grok_prompt_bridges"):
-        return {}, set()
+        return {}, set(), set()
     completed = set()
     indexes = {}
     calls = {}
@@ -3013,6 +3013,19 @@ def response_witnesses(con, session_key):
             if index is not None:
                 indexes.setdefault(index, set()).update(pids)
                 tool_witnesses.update(f"{session_key}:{pid}" for pid in pids)
+        if db._has_table(con, "t3_source_grok_calls"):
+            # A rejected projection cannot grant ownership, but its literal
+            # call still identifies which completion a competing capture must exclude.
+            for call, in con.execute(
+                    "SELECT DISTINCT s.call_id FROM t3_source_grok_calls s "
+                    "LEFT JOIN t3_purpose_grok_calls c USING(session_key,call_id,provider_turn_id) "
+                    "LEFT JOIN t3_source_inputs i ON i.source_path=s.source_path AND i.session_key=s.session_key "
+                    "AND i.provider_turn_id=s.provider_turn_id AND i.validation='grok_prompt_index' "
+                    "LEFT JOIN t3_purpose_inputs a ON a.session_key=i.session_key AND a.native_id=i.native_id "
+                    "AND a.provider_turn_id=i.provider_turn_id AND a.validation=i.validation "
+                    "WHERE s.session_key=? AND (c.call_id IS NULL OR (i.native_id IS NOT NULL AND a.native_id IS NULL))",
+                    (session_key,)):
+                disputed.update(calls.get(call, ()))
     # One native index claiming two different prompt ids is contradictory,
     # including when the two claims came from different copies.
     disputed.update(pid for pids in indexes.values() if len(pids) > 1 for pid in pids)
@@ -3024,7 +3037,7 @@ def response_witnesses(con, session_key):
     result = {rid: refs[rid] for rid, in con.execute(
         "SELECT response_id FROM responses WHERE session_key=? AND is_overlap=0", (session_key,)
     ) if rid in refs}
-    return result, tool_witnesses.intersection(result)
+    return result, tool_witnesses.intersection(result), {f"{session_key}:{pid}" for pid in disputed}
 
 
 def response_inputs(con, session_key):

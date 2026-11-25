@@ -139,6 +139,18 @@ class NativePurposeTest(LedgerCase):
         other = sqlite3.connect(other_path)
         self.addCleanup(other.close)
         self.native.backup(other)
+        task = "git.example.org/example/project#7"
+        self.con.execute("INSERT INTO session_assignments VALUES(?,?,'capture',1)", ("grok:" + sid, task))
+        other.execute(f"""UPDATE {PREFIX}runs SET payload_json=json_set(
+            payload_json,'$.purpose.scope.reference.number',8) WHERE run_id='g'""")
+        other.commit()
+        self.assertEqual(t3.sync(self.con, source=other_path)["failed"], [])
+        rep = report.task_report(self.con, task)
+        self.assertIn(rid, rep["native_purpose"]["conflicting_responses"])
+        self.assertEqual(rep["attributed"]["responses"], 0)
+        self.assertFalse(report.timeline(self.con, task)["events"])
+        other.execute(f"""UPDATE {PREFIX}runs SET payload_json=json_set(
+            payload_json,'$.purpose.scope.reference.number',7) WHERE run_id='g'""")
         other.execute(f"""UPDATE {PREFIX}turn_items SET payload_json=json_set(
             payload_json,'$.nativeItemRef.nativeId','a-different-call')""")
         other.commit()
