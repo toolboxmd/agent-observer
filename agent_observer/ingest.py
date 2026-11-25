@@ -271,7 +271,8 @@ class JsonlSource:
     def finish(self, session_id: str | None = None,
                thread_id: str | None = None,
                cli_version: str | None = None,
-               thread_source: str | None = None) -> dict:
+               thread_source: str | None = None, *,
+               advance_imported_at: bool = True) -> dict:
         # Fresh stat at finish: the file may have grown while records were
         # parsed, so the persisted size/mtime/ino describe the current file,
         # not the import-start snapshot. Only offsets and hashes persist;
@@ -297,7 +298,7 @@ class JsonlSource:
             " thread_source=COALESCE(?, thread_source),"
             " privacy_version=?, mtime_ns=?, ino=? WHERE id=?",
             (fingerprint, self.size, self.end_offset, tail, self.end_offset,
-             ordinal_max, now(),
+             ordinal_max, now() if advance_imported_at else self.row["imported_at"],
              int((time.monotonic() - self.started) * 1000),
              session_id, thread_id, cli_version, thread_source,
              privacy.PRIVACY_VERSION, self.mtime_ns, self.ino,

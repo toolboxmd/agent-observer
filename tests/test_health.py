@@ -507,18 +507,24 @@ class LedgerFreshnessTest(unittest.TestCase):
             self.assertIsNone(grok.newest_metadata_import(con))
 
     def test_bad_grok_metadata_keeps_health_stale(self):
-        for filename, content in (("summary.json", '{"incomplete":'),
-                                  ("chat_history.jsonl", 'invalid json\n')):
-            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as tmp:
+        cases = (
+            ("summary.json", '{"incomplete":', "updates.jsonl", "{}\n", False),
+            ("summary.json", '{"incomplete":', "events.jsonl", "", False),
+            ("summary.json", '{"incomplete":', "updates.jsonl", "{}\n", True),
+            ("chat_history.jsonl", "invalid json\n", None, "", False),
+        )
+        for filename, content, log, log_content, full in cases:
+            with self.subTest(filename=filename, log=log, full=full), \
+                    tempfile.TemporaryDirectory() as tmp:
                 base = Path(tmp)
                 session = base / "grok/project/session-one"
                 session.mkdir(parents=True)
-                if filename == "summary.json":
-                    transcript = session / "updates.jsonl"
-                    transcript.write_text("{}\n")
+                if log is not None:
+                    transcript = session / log
+                    transcript.write_text(log_content)
                     os.utime(transcript, (10_000, 10_000))
                 summary = session / "summary.json"
-                summary.write_text("{}")
+                summary.write_text('{"head_branch":"fixture"}')
                 os.utime(summary, (10_000, 10_000))
                 ledger = base / "observer.db"
                 with contextlib.closing(db.connect(str(ledger))) as con:
@@ -531,7 +537,8 @@ class LedgerFreshnessTest(unittest.TestCase):
                     os.utime(metadata, (20_000, 20_000))
                     with patch.object(db, "now", return_value=21_000), \
                             patch.object(ingest, "now", return_value=21_000):
-                        self.assertTrue(grok.sync(con, root=str(base / "grok"))["failed"])
+                        result = grok.sync(con, root=str(base / "grok"), full=full)
+                        self.assertTrue(result["failed"])
                     self.assertEqual(grok.newest_metadata_import(con), 11_000)
                 with patch.object(grok, "DEFAULT_ROOT", str(base / "grok")), \
                         patch.object(self, "ledger", ledger):

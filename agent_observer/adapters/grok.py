@@ -1932,7 +1932,12 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
         _store_meta(con, r.session_key, summary_fp, chat_fp_current, chat, metadata_imported_at)
     for source in (updates_src, events_src):
         if source is not None and (not metadata_errors or not source.unchanged):
-            stats.update(source.finish(session_id=r.native_sid))
+            # Empty files and forced replays can require bookkeeping even
+            # when the transcript on disk has not changed.
+            same_snapshot = (source.mtime_ns, source.ino, source.size) == (
+                source.row["mtime_ns"], source.row["ino"], source.row["size_bytes"])
+            stats.update(source.finish(session_id=r.native_sid,
+                                       advance_imported_at=not metadata_errors or not same_snapshot))
     stats["session_key"] = r.session_key
     stats["unchanged"] = bool(
         (updates_src is None or updates_src.unchanged)
