@@ -1215,6 +1215,13 @@ def _bind_trees(con: sqlite3.Connection, threads: dict,
     sessions = _tree_sessions(con, threads, roots)
     aware_roots = {_lineage_root(t, lineage) for t in aware_threads}
     protected = {row[0] for row in con.execute("SELECT session_key FROM t3_purpose_sessions")}
+    # When a run has contradictory purposes, neither candidate can regain
+    # whole-session credit through an unrelated legacy tree for that task.
+    disputed_tasks = {r[0] for r in con.execute(
+        "SELECT DISTINCT s.task_id FROM t3_source_runs s LEFT JOIN t3_purpose_runs r USING(run_id)"
+        " WHERE r.run_id IS NULL AND s.task_id IS NOT NULL")}
+    con.executemany("DELETE FROM session_assignments WHERE task_id=? AND evidence GLOB 't3:*:https://*'",
+                    ((task,) for task in disputed_tasks))
     # Historical/rotated sessions can outlive their cursor and their tree.
     # This read proves previous whole-session placement unsafe for these keys.
     con.execute("DELETE FROM session_assignments WHERE evidence GLOB 't3:*:https://*'"
@@ -1240,6 +1247,8 @@ def _bind_trees(con: sqlite3.Connection, threads: dict,
                 (task_id, repository, task_id, link["url"], HARNESS,
                  db.now()))
             tasks += cur.rowcount
+            if task_id in disputed_tasks:
+                continue
             for session_key in sorted(sessions.get(root, set()) - protected):
                 wanted.add((session_key, task_id))
                 cur = con.execute(

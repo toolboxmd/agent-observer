@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import os
 import re
+import sqlite3
 from typing import NamedTuple
 
 from .. import db
@@ -188,12 +190,20 @@ def _rows(native, tables, name, where="", args=()):
         yield row, _obj(payload)
 
 
-def _insert(con, table, *values):
-    con.execute("INSERT OR IGNORE INTO t3_purpose_" + table + " VALUES("
-                + ",".join("?" for _ in values) + ")", values)
+class Snapshot(NamedTuple):
+    con: sqlite3.Connection
+    path: str
+
+    def insert(self, table, *values):
+        values = (self.path, *values)
+        self.con.execute(f"INSERT INTO t3_source_{table} VALUES("
+                         + ",".join("?" for _ in values) + ")", values)
+
+    def task(self, ref):
+        return _task(self.con, ref)
 
 
-def _participant(con, run, thread, kind, participant, *, child=None, child_run=None, remote=None,
+def _participant(snapshot, run, thread, kind, participant, *, child=None, child_run=None, remote=None,
                  status=None, group=None, declaration=None):
     remote = _obj(remote)
     scope, reason, ref, provenance = _purpose(declaration)
@@ -201,8 +211,8 @@ def _participant(con, run, thread, kind, participant, *, child=None, child_run=N
     if declaration is not None:
         declared = dict(scope=scope, reason=reason, reference=ref, provenance=provenance)
         if ref:
-            _task(con, ref)
-    _insert(con, "participants", run, thread, kind, _id(participant), _id(remote.get("threadId") or child),
+            snapshot.task(ref)
+    snapshot.insert("participants", run, thread, kind, _id(participant), _id(remote.get("threadId") or child),
             _id(child_run or remote.get("runId")), _id(remote.get("environmentId")), _enum(status, STATES),
             _id(group), _enum(remote.get("availability"), ("current", "stale", "unsupported", "lost")),
             _json(declared))
@@ -239,7 +249,7 @@ def _strong(value, driver):
         return _id(ref.get("nativeId"))
 
 
-def _deliveries(con, native, tables):
+def _deliveries(snapshot, native, tables):
     aware = set()
     for row, p in _rows(native, tables, "threads"):
         thread = _id(row.get("thread_id"))
@@ -251,12 +261,12 @@ def _deliveries(con, native, tables):
             purpose, pr = _reference(d.get("purpose")), _reference(d.get("pullRequest"))
             at = _date(d.get("declaredAt"))
             if _v1(d) and purpose and pr and pr["kind"] == "pr" and at:
-                _insert(con, "deliveries", _task(con, purpose), thread, pr["host"],
+                snapshot.insert("deliveries", snapshot.task(purpose), thread, pr["host"],
                         pr["repository"], pr["number"], _url(pr), at)
     return aware
 
 
-def _runs(con, native, tables):
+def _runs(snapshot, native, tables):
     runs = {}
     for row, p in _rows(native, tables, "runs"):
         run, thread = _id(row.get("run_id")), _id(row.get("thread_id"))
@@ -265,11 +275,11 @@ def _runs(con, native, tables):
         purpose = _purpose(p.get("purpose")) if _matches(
             row, p, ("run_id", "id"), ("thread_id", "threadId")) else INVALID
         scope, reason, ref, provenance = purpose
-        key = _task(con, ref) if ref else None
+        key = snapshot.task(ref) if ref else None
         coords = ref or {}
         status = _enum(row.get("status"), STATES)
         version = _obj(p.get("purpose")).get("version")
-        _insert(con, "runs", run, thread, key, scope, reason, coords.get("host"),
+        snapshot.insert("runs", run, thread, key, scope, reason, coords.get("host"),
                 coords.get("repository"), coords.get("kind"), coords.get("number"),
                 _json(provenance), status, version if _number(version) else None,
                 _id(p.get("activeAttemptId")))
@@ -277,15 +287,15 @@ def _runs(con, native, tables):
         delivery = _obj(_obj(p.get("delegatedCompletion")).get("delivery"))
         for task in _list(delivery.get("taskIds")):
             if _id(task):
-                _participant(con, run, thread, "completion_member", task)
+                _participant(snapshot, run, thread, "completion_member", task)
         for cause in map(_obj, _list(delivery.get("purposeCauses"))):
             if _id(cause.get("taskId")) and _id(cause.get("runId")):
-                _participant(con, run, thread, "completion_cause", cause["taskId"],
+                _participant(snapshot, run, thread, "completion_cause", cause["taskId"],
                              child_run=cause["runId"], declaration=cause.get("purpose"))
         for work in map(_obj, _list(p.get("restartCancelledBackgroundWork"))):
             category = _enum(work.get("kind"), ("subagent", "shell", "monitor", "task"))
             if category:
-                _participant(con, run, thread, "cancelled_" + category, work.get("id"), status="cancelled")
+                _participant(snapshot, run, thread, "cancelled_" + category, work.get("id"), status="cancelled")
     return runs
 
 
@@ -324,19 +334,19 @@ def _usage(value, context=False):
     return _json(result)
 
 
-def _capabilities(con, native, tables):
+def _capabilities(snapshot, native, tables):
     for row, p in _rows(native, tables, "provider_sessions"):
         session = _id(row.get("provider_session_id"))
         cap = _obj(_obj(p.get("capabilities")).get("purposeEvidence"))
         if session and session == p.get("id") and _v1(cap):
-            _insert(con, "capabilities", session, _enum(p.get("driver"), DRIVERS),
+            snapshot.insert("capabilities", session, _enum(p.get("driver"), DRIVERS),
                     _enum(cap.get("nativeInputs"), ("native_turn", "input_echo", "admitted_message", "unsupported")),
                     _enum(cap.get("childSegments"), ("initial_turn_only", "initial_input_only", "causes_only", "unsupported")),
                     _enum(cap.get("backgroundInventory"), ("observed_causes", "unsupported")),
                     _enum(cap.get("nativeUsageFinality"), ("main_agent_only", "unavailable")))
 
 
-def _providers(con, native, tables, runs, segments):
+def _providers(snapshot, native, tables, runs, segments):
     providers = {}
     for row, p in _rows(native, tables, "provider_threads"):
         pt = _id(row.get("provider_thread_id"))
@@ -352,12 +362,12 @@ def _providers(con, native, tables, runs, segments):
         for task in map(_obj, _list(p.get("pendingBackgroundTasks"))):
             run = _id(task.get("runId"))
             if run in runs and runs[run][0] == thread and _id(task.get("taskId")):
-                _participant(con, run, thread, "pending_background", task["taskId"],
+                _participant(snapshot, run, thread, "pending_background", task["taskId"],
                              child=task.get("childThreadId"), remote={"environmentId": task.get("childEnvironmentId")})
     return providers
 
 
-def _subagents(con, native, tables, runs, segments):
+def _subagents(snapshot, native, tables, runs, segments):
     children = {}
     for row, p in _rows(native, tables, "subagents"):
         child = _id(row.get("subagent_id"))
@@ -371,15 +381,15 @@ def _subagents(con, native, tables, runs, segments):
         run = _id(row["run_id"])
         if run in runs and runs[run][0] == thread:
             remote = _obj(p.get("remoteChild"))
-            _participant(con, run, thread, origin, child, child=p.get("childThreadId"), remote=remote,
+            _participant(snapshot, run, thread, origin, child, child=p.get("childThreadId"), remote=remote,
                          status=p.get("status"), group=p.get("runGroupId"), declaration=p.get("purpose"))
             completion = _obj(p.get("completionSource"))
             if _id(completion.get("runId")):
-                _participant(con, run, thread, "child_completion", child, child=p.get("childThreadId"),
+                _participant(snapshot, run, thread, "child_completion", child, child=p.get("childThreadId"),
                              remote=remote, child_run=completion["runId"], declaration=completion.get("purpose"))
         for member in map(_obj, _list(_obj(p.get("workflow")).get("agents"))):
             if _number(member.get("index")):
-                _insert(con, "workflow_members", thread, child, member["index"],
+                snapshot.insert("workflow_members", thread, child, member["index"],
                         member["attempt"] if _number(member.get("attempt")) else None,
                         _id(member.get("agentId")), _id(member.get("childThreadId")),
                         _enum(member.get("state"), ("queued", "running", "completed", "failed")),
@@ -392,7 +402,7 @@ def _subagents(con, native, tables, runs, segments):
     return children
 
 
-def _expected_children(con, native, tables, runs):
+def _expected_children(snapshot, native, tables, runs):
     # A subagent turn item names the expected child even if its own projection
     # or the remote ledger is missing. Avoid reading unrelated text/tool items.
     for row, p in _rows(native, tables, "turn_items", " WHERE type='subagent'"):
@@ -403,11 +413,11 @@ def _expected_children(con, native, tables, runs):
                 or not _id(p.get("subagentId"))):
             continue
         remote = _obj(p.get("remoteChild"))
-        _participant(con, run, row["thread_id"], "subagent_item", p["subagentId"],
+        _participant(snapshot, run, row["thread_id"], "subagent_item", p["subagentId"],
                      child=p.get("childThreadId"), remote=remote, status=p.get("status"))
 
 
-def _attempts(con, native, tables, runs, providers):
+def _attempts(snapshot, native, tables, runs, providers):
     attempts = {}
     for row, p in _rows(native, tables, "run_attempts"):
         aid, run = _id(row.get("attempt_id")), _id(row.get("run_id"))
@@ -428,14 +438,14 @@ def _attempts(con, native, tables, runs, providers):
             sid = _id(p.get("nativeThreadId"))
             if sid:
                 key = f"{DRIVERS[driver]}:{sid}"
-                _insert(con, "sessions", run, key)
+                snapshot.insert("sessions", run, key)
             attempts[aid] = (run, provider.thread, pt, root, turn, driver, sid, "nativeThreadId" in p)
-        _insert(con, "attempts", aid, run, pt, turn, _enum(p.get("status"), STATES),
+        snapshot.insert("attempts", aid, run, pt, turn, _enum(p.get("status"), STATES),
                 key, provider.session if valid else None)
     return attempts
 
 
-def _grok_call_refs(con, native, tables, owner, columns):
+def _grok_call_refs(snapshot, native, tables, owner, columns):
     if "provider_turn_id" not in columns:
         return
     key, run, thread, pt, turn = owner
@@ -447,11 +457,11 @@ def _grok_call_refs(con, native, tables, owner, columns):
                                 ("turn_item_id", "id"), ("type", "type"))):
             continue
         call = _strong(item.get("nativeItemRef"), "grok")
-        if call:
-            _insert(con, "grok_calls", key, call, turn)
+        if call and _id(row["turn_item_id"]):
+            snapshot.insert("grok_calls", key, call, turn, row["turn_item_id"])
 
 
-def _turns(con, native, tables, attempts):
+def _turns(snapshot, native, tables, attempts):
     item_columns = {r[1] for r in native.execute("PRAGMA table_info(orchestration_v2_projection_turn_items)")}
     for row, p in _rows(native, tables, "provider_turns", " WHERE run_attempt_id IS NOT NULL"):
         aid = _id(row.get("run_attempt_id"))
@@ -471,11 +481,11 @@ def _turns(con, native, tables, attempts):
         else:
             sid = turn_sid or sid
         key = f"{DRIVERS[driver]}:{sid}" if sid else None
-        _insert(con, "turns", turn, aid, run, key, _enum(p.get("status"), STATES),
+        snapshot.insert("turns", turn, aid, run, key, _enum(p.get("status"), STATES),
                 _usage(p.get("turnTokenUsage")), _usage(p.get("tokenUsage"), context=True))
         if not key:
             continue
-        _insert(con, "sessions", run, key)
+        snapshot.insert("sessions", run, key)
         witnesses = set()
         for i in map(_obj, _list(p.get("nativeInputs"))):
             identity = _id(i.get("nativeId"))
@@ -483,13 +493,13 @@ def _turns(con, native, tables, attempts):
             if identity and _v1(i) and INPUT_TYPES.get(driver) == pair:
                 witnesses.add((identity, *pair))
         if driver == "grok":
-            _grok_call_refs(con, native, tables, (key, run, thread, pt, turn), item_columns)
+            _grok_call_refs(snapshot, native, tables, (key, run, thread, pt, turn), item_columns)
             identity = _strong(p.get("nativeTurnRef"), driver)
             if identity and re.fullmatch(r"prompt:(0|[1-9][0-9]{0,15})", identity) and int(identity[7:]) <= MAX_INT:
                 witnesses.add((identity, "message", "grok_prompt_index"))
         if p.get("promptDropped") is not True:
             for identity, kind, validation in sorted(witnesses):
-                _insert(con, "inputs", run, key, identity, kind, validation, aid, turn, None)
+                snapshot.insert("inputs", run, key, identity, kind, validation, aid, turn, None)
 
 
 # Native unresolved reasons are open strings. Only known codes can leave the source.
@@ -525,7 +535,7 @@ def _boundary(value):
     return {"state": "unresolved", "reason": _enum(b.get("reason"), REASONS) or "unknown"}
 
 
-def _segments(con, rows, runs, children):
+def _segments(snapshot, rows, runs, children):
     child_boundaries = {}
     # An enclosing subagent's runId names its original launch. Each segment
     # carries its own initiating run or earlier segment, including on resume.
@@ -545,8 +555,8 @@ def _segments(con, rows, runs, children):
         else:
             segments[key] = data
 
-    destinations = {(r[0], r[1]) for r in con.execute(
-        "SELECT run_id,session_key FROM t3_purpose_sessions")}
+    destinations = {(r[0], r[1]) for r in snapshot.con.execute(
+        "SELECT run_id,session_key FROM t3_source_sessions WHERE source_path=?", (snapshot.path,))}
     resolved = {}
     # Resolve exact predecessor edges independent of projection table order.
     # Unresolved edges, cycles, crossed scopes and crossed sessions stay gaps.
@@ -588,8 +598,8 @@ def _segments(con, rows, runs, children):
         child = _id(p.get("nativeChildId"))
         run = resolved.get(key)
         ref = purpose[2]
-        _insert(con, "segments", owner, thread, segment, subagent, run,
-                _task(con, ref) if ref else None,
+        snapshot.insert("segments", owner, thread, segment, subagent, run,
+                snapshot.task(ref) if ref else None,
                 kind, driver, sid, operation, child, _json(source), _json(boundary),
                 _enum(p.get("status"), ("running", "ended", "roster_absent", "interrupted", "unknown")),
                 _enum(p.get("usageFinality"), ("unreconciled",)),
@@ -602,7 +612,7 @@ def _segments(con, rows, runs, children):
         if driver not in ("codex", "opencode"):
             continue
         child_key = f"{DRIVERS[driver]}:{child}"
-        _insert(con, "sessions", run, child_key)
+        snapshot.insert("sessions", run, child_key)
         # Current native contracts certify only Codex child turn boundaries
         # and OpenCode child input boundaries. Claude task ids are reusable.
         if driver == "codex" and boundary["state"] == "native_turns":
@@ -615,7 +625,7 @@ def _segments(con, rows, runs, children):
             continue
         child_thread, child_pt = children[(thread, subagent)]
         for identity in sorted(set(ids)):
-            _insert(con, "inputs", run, child_key, identity, input_kind,
+            snapshot.insert("inputs", run, child_key, identity, input_kind,
                     "segment_" + boundary["state"], None, None, segment)
             if child_thread and child_pt:
                 lookup = (child_thread, child_pt, driver, child, identity)
@@ -623,7 +633,7 @@ def _segments(con, rows, runs, children):
     return child_boundaries
 
 
-def _child_turns(con, native, tables, boundaries, providers):
+def _child_turns(snapshot, native, tables, boundaries, providers):
     if not boundaries:
         return
     for row, p in _rows(native, tables, "provider_turns", " WHERE run_attempt_id IS NULL"):
@@ -640,31 +650,137 @@ def _child_turns(con, native, tables, boundaries, providers):
             if not native_id or not _v1(i) or (i.get("kind"), i.get("validation")) != INPUT_TYPES.get(driver):
                 continue
             for run, segment in boundaries.get((thread, pt, driver, sid, native_id), ()):
-                _insert(con, "child_turns", run, segment, turn, f"{DRIVERS[driver]}:{sid}",
+                snapshot.insert("child_turns", run, segment, turn, f"{DRIVERS[driver]}:{sid}",
                         _enum(p.get("status"), STATES), _usage(p.get("turnTokenUsage")),
                         _usage(p.get("tokenUsage"), context=True))
 
 
+# In a snapshot the primary key identifies the native object. Across snapshots
+# an object's immutable coordinates must agree. Different mutable readings
+# leave that field unknown until the snapshots agree again.
+MUTABLE = {
+    "runs": {"status", "active_attempt_id"},
+    "attempts": {"status"},
+    "turns": {"status", "usage_json", "context_usage_json"},
+    "segments": {"status", "observed_at", "notice_ids_json", "wake_dispositions_json"},
+    "child_turns": {"status", "usage_json", "context_usage_json"},
+}
+
+
+def _source_tables(con, path):
+    # The previous writer replaced the *whole* mirror, then recorded its path
+    # and import time in the same savepoint. Preserve that last source on upgrade.
+    prior = con.execute("SELECT path,imported_at FROM sources WHERE harness='t3'"
+                        " ORDER BY imported_at DESC LIMIT 2").fetchall()
+    old_path = (os.path.realpath(prior[0][0]) if prior and
+                (len(prior) == 1 or prior[0][1] != prior[1][1]) else None)
+    for table, columns in TABLES.items():
+        mirror, source = f"t3_purpose_{table}", f"t3_source_{table}"
+        con.execute(f"CREATE TABLE IF NOT EXISTS {mirror} ({columns})")
+        if not db._has_table(con, source):
+            con.execute(f"CREATE TABLE {source} AS SELECT CAST(NULL AS TEXT) AS source_path,"
+                        f" * FROM {mirror} WHERE 0")
+            if table == "grok_calls":
+                con.execute(f"ALTER TABLE {source} ADD COLUMN turn_item_id TEXT")
+            con.execute(f"CREATE INDEX {source}_path ON {source}(source_path)")
+            if old_path and old_path != path:
+                extra = ",NULL" if table == "grok_calls" else ""
+                con.execute(f"INSERT INTO {source} SELECT ?,*{extra} FROM {mirror}", (old_path,))
+        con.execute(f"DELETE FROM {source} WHERE source_path=?", (path,))
+
+
+def _materialize(con, table):
+    mirror, source = f"t3_purpose_{table}", f"t3_source_{table}"
+    info = con.execute(f"PRAGMA table_info({mirror})").fetchall()
+    names = [row["name"] for row in info]
+    keys = [row["name"] for row in info if row["pk"]]
+    mutable = MUTABLE.get(table, set())
+    con.execute(f"DELETE FROM {mirror}")
+    if not keys:
+        con.execute(f"INSERT INTO {mirror} SELECT DISTINCT {','.join(names)} FROM {source}")
+        return
+
+    def agreed(name):
+        # COUNT ignores NULL. Missing and present values also disagree.
+        return (f"CASE WHEN count({name})=count(*) AND min({name})=max({name})"
+                f" THEN min({name}) END" if name in mutable else name)
+
+    immutable = [name for name in names if name not in mutable and name not in keys]
+    having = (f" HAVING count(DISTINCT json_array({','.join(immutable)}))=1" if immutable else "")
+    con.execute(f"INSERT INTO {mirror} SELECT {','.join(map(agreed, names))}"
+                f" FROM {source} GROUP BY {','.join(keys)}{having}")
+
+
+def _exclude_disputed_calls(con):
+    # A turn item is immutable even when two copies disagree about its call
+    # ID. Do not let either version establish a call-to-completion bridge.
+    con.execute("""WITH disputed AS (
+        SELECT turn_item_id FROM t3_source_grok_calls WHERE turn_item_id IS NOT NULL
+        GROUP BY turn_item_id HAVING count(DISTINCT json_array(session_key,call_id,provider_turn_id))>1
+    )
+    DELETE FROM t3_purpose_grok_calls WHERE (session_key,call_id) IN (
+        SELECT session_key,call_id FROM t3_source_grok_calls WHERE turn_item_id IN disputed)""")
+
+
+def _exclude_disputed_inputs(con):
+    # Inputs are parsed under source-local parents. Withhold the native input
+    # on every path if one parent key has contradictory immutable coordinates.
+    # This also prevents a different claimant from winning by elimination.
+    con.execute("""WITH disputed_segment_runs AS (
+        -- A nested segment can inherit the disputed segment as a predecessor.
+        SELECT s.run_id FROM t3_source_segments s LEFT JOIN t3_purpose_segments t
+        USING(thread_id,owner_id,segment_id) WHERE t.owner_id IS NULL
+    ), turn_sources AS (
+        SELECT provider_turn_id,count(DISTINCT source_path) AS copies
+        FROM t3_source_turns GROUP BY provider_turn_id
+    ), disputed_inputs AS (
+        SELECT i.session_key,i.native_id FROM t3_source_inputs i
+        LEFT JOIN t3_purpose_runs r ON r.run_id=i.run_id
+        LEFT JOIN t3_purpose_attempts a ON a.attempt_id=i.attempt_id
+        LEFT JOIN t3_purpose_turns t ON t.provider_turn_id=i.provider_turn_id
+        WHERE r.run_id IS NULL OR (i.attempt_id IS NOT NULL AND a.attempt_id IS NULL)
+           OR (i.provider_turn_id IS NOT NULL AND t.provider_turn_id IS NULL)
+           OR (i.segment_id IS NOT NULL AND i.run_id IN disputed_segment_runs)
+        UNION
+        -- Only source-local turn/input joins can witness a response. In
+        -- particular a Grok call in one copy cannot borrow another copy's
+        -- prompt index when its own turn has no such index.
+        SELECT i.session_key,i.native_id FROM t3_source_inputs i JOIN turn_sources USING(provider_turn_id)
+        GROUP BY i.session_key,i.native_id,i.provider_turn_id
+        HAVING count(DISTINCT i.source_path)<copies
+    )
+    DELETE FROM t3_purpose_inputs WHERE (session_key,native_id) IN disputed_inputs""")
+
 
 def refresh(con, native, tables):
-    """Replace the evidence under the caller's snapshot and ledger savepoint."""
-    for table, columns in TABLES.items():
-        con.execute(f"CREATE TABLE IF NOT EXISTS t3_purpose_{table} ({columns})")
-        con.execute(f"DELETE FROM t3_purpose_{table}")
+    """Replace one source and publish the consensus under the caller's savepoint."""
+    path = native.execute("PRAGMA database_list").fetchone()[2]
+    _source_tables(con, path)
+    snapshot = Snapshot(con, path)
     con.execute("CREATE INDEX IF NOT EXISTS t3_purpose_runs_task ON t3_purpose_runs(task_id)")
     con.execute("CREATE INDEX IF NOT EXISTS t3_purpose_inputs_native"
                 " ON t3_purpose_inputs(session_key,native_id)")
     con.execute("CREATE INDEX IF NOT EXISTS t3_purpose_inputs_run ON t3_purpose_inputs(run_id)")
-    aware = _deliveries(con, native, tables)
-    runs = _runs(con, native, tables)
+    aware = _deliveries(snapshot, native, tables)
+    runs = _runs(snapshot, native, tables)
     if runs:
-        _capabilities(con, native, tables)
+        _capabilities(snapshot, native, tables)
         segments = []
-        providers = _providers(con, native, tables, runs, segments)
-        attempts = _attempts(con, native, tables, runs, providers)
-        _turns(con, native, tables, attempts)
-        children = _subagents(con, native, tables, runs, segments)
-        _expected_children(con, native, tables, runs)
-        boundaries = _segments(con, segments, runs, children)
-        _child_turns(con, native, tables, boundaries, providers)
-    return aware | {thread for thread, _ in runs.values()}
+        providers = _providers(snapshot, native, tables, runs, segments)
+        attempts = _attempts(snapshot, native, tables, runs, providers)
+        _turns(snapshot, native, tables, attempts)
+        children = _subagents(snapshot, native, tables, runs, segments)
+        _expected_children(snapshot, native, tables, runs)
+        boundaries = _segments(snapshot, segments, runs, children)
+        _child_turns(snapshot, native, tables, boundaries, providers)
+    con.execute("CREATE TABLE IF NOT EXISTS t3_source_aware_threads("
+                "source_path TEXT, thread_id TEXT, PRIMARY KEY(source_path,thread_id))")
+    con.execute("DELETE FROM t3_source_aware_threads WHERE source_path=?", (path,))
+    con.executemany("INSERT INTO t3_source_aware_threads VALUES(?,?)", ((path, t) for t in aware))
+    for table in TABLES:
+        _materialize(con, table)
+    _exclude_disputed_calls(con)
+    _exclude_disputed_inputs(con)
+    return {r[0] for r in con.execute(
+        "SELECT thread_id FROM t3_source_aware_threads UNION SELECT thread_id FROM t3_source_runs"
+        " UNION SELECT thread_id FROM t3_source_deliveries")}

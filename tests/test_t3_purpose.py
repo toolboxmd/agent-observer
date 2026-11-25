@@ -7,6 +7,7 @@ from pathlib import Path
 from agent_observer import report
 from agent_observer.adapters import grok, t3
 from tests.helpers import LedgerCase
+from tests.test_t3_v2 import write_v2
 
 PREFIX = "orchestration_v2_projection_"
 TIME = "2026-11-25T01:00:00.000Z"
@@ -129,6 +130,34 @@ class NativePurposeTest(LedgerCase):
         self.refresh()
         rid = "grok:historic-grok:done"
         self.assertEqual(membership()[rid]["validation"], "grok_tool_call")
+        legacy = write_v2(os.path.join(self.tmp.name, "legacy.sqlite"))
+        self.assertEqual(t3.sync(self.con, source=legacy)["failed"], [])
+        self.assertEqual(membership()[rid]["validation"], "grok_tool_call")
+        # Independent copies can contradict either the item's literal call
+        # or its provider turn's literal prompt index.
+        other_path = os.path.join(self.tmp.name, "other.sqlite")
+        other = sqlite3.connect(other_path)
+        self.addCleanup(other.close)
+        self.native.backup(other)
+        other.execute(f"""UPDATE {PREFIX}turn_items SET payload_json=json_set(
+            payload_json,'$.nativeItemRef.nativeId','a-different-call')""")
+        other.commit()
+        self.assertEqual(t3.sync(self.con, source=other_path)["failed"], [])
+        self.assertEqual(membership(), {})
+        self.assertEqual(self.refresh()["failed"], [])
+        self.assertEqual(membership(), {})
+        other.execute(f"UPDATE {PREFIX}turn_items SET payload_json=?", (json.dumps(item),))
+        other.execute(f"""UPDATE {PREFIX}provider_turns SET payload_json=json_set(
+            payload_json,'$.nativeTurnRef.nativeId','prompt:4') WHERE provider_turn_id='turn-g'""")
+        other.commit()
+        self.assertEqual(t3.sync(self.con, source=other_path)["failed"], [])
+        self.assertEqual(membership(), {})
+        self.assertEqual(self.refresh()["failed"], [])
+        self.assertEqual(membership(), {})
+        other.execute(f"DELETE FROM {PREFIX}runs WHERE run_id='g'")
+        other.commit()
+        self.assertEqual(t3.sync(self.con, source=other_path)["failed"], [])
+        self.assertEqual(membership()[rid]["validation"], "grok_tool_call")
         self.native.execute(f"UPDATE {PREFIX}turn_items SET provider_thread_id='wrong'")
         self.refresh()
         self.assertEqual(membership(), {})
@@ -239,6 +268,72 @@ class NativePurposeTest(LedgerCase):
         self.assertEqual(self.values("SELECT provider_turn_id FROM t3_purpose_attempts WHERE run_id='a'"),
                          [("turn-a",)])
 
+    def test_duplicate_snapshots_conflict_and_recover_independently(self):
+        other_path = os.path.join(self.tmp.name, "other.sqlite")
+        other = sqlite3.connect(other_path)
+        self.addCleanup(other.close)
+        self.native.commit()
+        self.native.backup(other)
+        self.sync("codex-mini.jsonl")
+        for source in (self.native, other):
+            source.execute(f"""UPDATE {PREFIX}provider_turns SET payload_json=json_set(
+                payload_json,'$.nativeInputs[0].nativeId','turn-mini-aaa') WHERE run_attempt_id='attempt-a'""")
+            source.execute(f"""UPDATE {PREFIX}run_attempts SET payload_json=json_set(
+                payload_json,'$.nativeThreadId','sess-fixture-mini-01') WHERE run_id='a'""")
+            source.commit()
+
+        def refresh_other():
+            other.commit()
+            self.assertEqual(t3.sync(self.con, source=other_path)["failed"], [])
+
+        def credited(n):
+            return report.task_report(self.con, f"example/project#{n}")["measured"]["attributed_responses"]
+
+        refresh_other()
+        self.assertEqual(self.refresh()["failed"], [])
+        expected = ["codex:resp-mini-001", "codex:resp-mini-002"]
+        self.assertEqual(credited(7), expected)
+        self.assertEqual(self.values("SELECT count(*) FROM t3_purpose_inputs WHERE run_id='a'"), [(1,)])
+        other.execute(f"UPDATE {PREFIX}runs SET status='running' WHERE run_id='a'")
+        refresh_other()
+        self.assertEqual(self.values("SELECT status FROM t3_purpose_runs WHERE run_id='a'"), [(None,)])
+        self.assertEqual(credited(7), expected)
+        self.con.execute("INSERT INTO session_assignments VALUES"
+                         "('codex:historic','example/project#7','t3:old:https://github.com/example/project/issues/7',1)")
+        other.execute(f"""UPDATE {PREFIX}runs SET payload_json=json_set(
+            payload_json,'$.purpose.scope.reference.number',8) WHERE run_id='a'""")
+        refresh_other()
+        self.assertEqual(self.values("SELECT task_id FROM session_assignments WHERE session_key='codex:historic'"), [])
+        self.assertEqual((credited(7), credited(8)), ([], []))
+        self.assertEqual(self.refresh()["failed"], [])
+        self.assertEqual((credited(7), credited(8)), ([], []))
+
+        other.execute(f"DELETE FROM {PREFIX}runs WHERE run_id='a'")
+        refresh_other()
+        self.assertEqual((credited(7), credited(8)), (expected, []))
+        self.native.execute(f"UPDATE {PREFIX}runs SET status='interrupted' WHERE run_id='a'")
+        self.assertEqual(self.refresh()["failed"], [])
+        self.assertEqual(self.values("SELECT status FROM t3_purpose_runs WHERE run_id='a'"),
+                         [("interrupted",)])
+        self.native.execute(f"DELETE FROM {PREFIX}runs")
+        self.assertEqual(self.refresh()["failed"], [])
+        self.assertEqual(self.values("SELECT run_id FROM t3_purpose_runs ORDER BY run_id"), [("b",), ("g",)])
+
+    def test_pre_source_mirror_survives_first_refresh_of_a_different_path(self):
+        self.assertEqual(self.refresh()["failed"], [])
+        # A ledger from the earlier schema has the materialized projection and
+        # its import receipt, but no per-source tables.
+        for name, in self.values("SELECT name FROM sqlite_master WHERE type='table'"
+                                 " AND name GLOB 't3_source_*'"):
+            self.con.execute(f"DROP TABLE {name}")
+        legacy = write_v2(os.path.join(self.tmp.name, "legacy.sqlite"))
+        self.assertEqual(t3.sync(self.con, source=legacy)["failed"], [])
+        self.assertEqual(self.values("SELECT native_id FROM t3_purpose_inputs ORDER BY native_id"),
+                         [("cx-A",), ("prompt:3",)])
+        self.native.execute(f"DELETE FROM {PREFIX}runs WHERE run_id='a'")
+        self.assertEqual(self.refresh()["failed"], [])
+        self.assertEqual(self.values("SELECT native_id FROM t3_purpose_inputs"), [("prompt:3",)])
+
     def test_failed_refresh_preserves_previous_projection_and_outer_transaction(self):
         self.assertEqual(self.refresh()["failed"], [])
         self.con.execute("CREATE TRIGGER abort_input BEFORE INSERT ON t3_purpose_inputs"
@@ -254,7 +349,7 @@ class NativePurposeTest(LedgerCase):
 
     def test_explicitly_unscoped_run_retires_legacy_tree_but_keeps_other_bindings(self):
         from agent_observer import db
-        from tests.test_t3_v2 import CHILD, CX9, write_v2
+        from tests.test_t3_v2 import CHILD, CX9
         self.path = write_v2(os.path.join(self.tmp.name, "formerly-legacy.sqlite"))
         self.native.close()
         self.native = sqlite3.connect(self.path)
@@ -277,6 +372,29 @@ class NativePurposeTest(LedgerCase):
         self.assertEqual(self.values("SELECT task_id FROM session_assignments"), [("separate",)])
         self.assertEqual(self.values("SELECT DISTINCT task_id,reason FROM t3_purpose_runs"),
                          [(None, "deliberate")])
+
+    def test_selection_in_another_source_keeps_legacy_tree_unbound_until_removed(self):
+        from agent_observer import db
+        from tests.test_t3_v2 import CHILD, CX9
+        legacy = write_v2(os.path.join(self.tmp.name, "legacy.sqlite"))
+        self.con.execute("INSERT INTO sources(harness,path,sha256,imported_at) VALUES('codex','fixture','x',1)")
+        source = self.con.execute("SELECT last_insert_rowid()").fetchone()[0]
+        db.upsert_session(self.con, "codex:" + CX9, "codex", CX9, source)
+        self.row("threads", [CHILD, TIME], dict(id=CHILD, purposeSelection={"version": 1}))
+
+        def bindings():
+            return self.values("SELECT task_id FROM session_assignments WHERE task_id='example/beta#5'")
+
+        self.assertEqual(t3.sync(self.con, source=legacy)["failed"], [])
+        self.assertEqual(bindings(), [("example/beta#5",)])
+        self.assertEqual(self.refresh()["failed"], [])
+        self.assertEqual(bindings(), [])
+        self.assertEqual(t3.sync(self.con, source=legacy)["failed"], [])
+        self.assertEqual(bindings(), [])
+        self.native.execute(f"DELETE FROM {PREFIX}threads WHERE thread_id=?", (CHILD,))
+        self.assertEqual(self.refresh()["failed"], [])
+        self.assertEqual(t3.sync(self.con, source=legacy)["failed"], [])
+        self.assertEqual(bindings(), [("example/beta#5",)])
 
     def test_navigation_migration_and_same_issue_numbers_on_two_hosts(self):
         self.con.execute("CREATE TABLE t3_links(thread_id,kind,host,repository,number,url,source,"
