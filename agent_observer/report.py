@@ -676,7 +676,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
             unmeasured_attributed.add(key)
         elif subs:
             unmeasured_shared.add(key)
-    has_purpose = native and (canonical or native["deliveries"])
+    has_purpose = native and (canonical or native["deliveries"] or native["conflicting_source_runs"])
     inventory_gaps = outcome.check_inventory(con, native, attributed) if has_purpose else False
     unavailable_usage = bool(unbound_usage or conflicts or inventory_gaps or legacy_links
                              or not scope_keys or missing_sessions or empty_sessions

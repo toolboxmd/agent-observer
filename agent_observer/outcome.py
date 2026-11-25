@@ -53,6 +53,11 @@ def evidence(con, task_id, scope):
         "SELECT * FROM t3_purpose_runs WHERE task_id=? ORDER BY run_id", (task_id,))]
     deliveries = [dict(r) for r in con.execute(
         "SELECT * FROM t3_purpose_deliveries WHERE task_id=? ORDER BY declared_at, url, thread_id", (task_id,))]
+    disputed_runs = []
+    if _has_table(con, "t3_source_runs"):
+        disputed_runs = [r[0] for r in con.execute(
+            "SELECT DISTINCT s.run_id FROM t3_source_runs s LEFT JOIN t3_purpose_runs r USING(run_id) "
+            "WHERE s.task_id=? AND r.run_id IS NULL ORDER BY s.run_id", (task_id,))]
     reference_conflict = len({r["kind"] for r in runs}) > 1
     session_runs = {}
     members = {}
@@ -66,10 +71,10 @@ def evidence(con, task_id, scope):
         session_runs[key] = sorted(by_run)
         _session_ownership(con, key, task_id, by_run, reference_conflict, result, members, conflicts)
 
-    if runs or deliveries or session_runs:
+    if runs or deliveries or session_runs or disputed_runs:
         result.native = {"version": 1, "task_id": task_id, "runs": runs, "deliveries": deliveries,
                          "membership": members, "sessions": session_runs, "conflicting_responses": sorted(conflicts),
-                         "conflicting_reference_kinds": reference_conflict}
+                         "conflicting_reference_kinds": reference_conflict, "conflicting_source_runs": disputed_runs}
     return result
 
 
@@ -257,6 +262,8 @@ def check_inventory(con, native, rows):
                     "USING(response_id) WHERE r.session_key=?", (key,)))
     gaps = set()
     main_gaps = set()
+    if native["conflicting_source_runs"]:
+        main_gaps.add("conflicting_native_run_records")
     if not native["runs"]:
         main_gaps.add("purpose_run_unavailable")
     checks = []

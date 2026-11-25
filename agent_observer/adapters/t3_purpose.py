@@ -756,6 +756,7 @@ def refresh(con, native, tables):
     """Replace one source and publish the consensus under the caller's savepoint."""
     path = native.execute("PRAGMA database_list").fetchone()[2]
     _source_tables(con, path)
+    con.execute("CREATE INDEX IF NOT EXISTS t3_source_runs_task ON t3_source_runs(task_id,run_id)")
     snapshot = Snapshot(con, path)
     con.execute("CREATE INDEX IF NOT EXISTS t3_purpose_runs_task ON t3_purpose_runs(task_id)")
     con.execute("CREATE INDEX IF NOT EXISTS t3_purpose_inputs_native"

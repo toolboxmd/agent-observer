@@ -305,6 +305,10 @@ class NativePurposeTest(LedgerCase):
         refresh_other()
         self.assertEqual(self.values("SELECT task_id FROM session_assignments WHERE session_key='codex:historic'"), [])
         self.assertEqual((credited(7), credited(8)), ([], []))
+        for n in (7, 8):
+            native = report.task_report(self.con, f"example/project#{n}")["native_purpose"]
+            self.assertEqual(native["conflicting_source_runs"], ["a"])
+            self.assertIn("conflicting_native_run_records", native["coverage_gaps"])
         self.assertEqual(self.refresh()["failed"], [])
         self.assertEqual((credited(7), credited(8)), ([], []))
 

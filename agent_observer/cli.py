@@ -173,9 +173,9 @@ def _text(payload) -> str:
             f"session span {r.get('time', {}).get('session_span_s')} "
             f"({r.get('time', {}).get('session_span_label')})",
         ]
-        if r.get("native_purpose", {}).get("runs"):
-            native = r["native_purpose"]
-            lines.append(f"  native purpose: {len(native['runs'])} runs; "
+        native = r.get("native_purpose") or {}
+        if native.get("runs") or native.get("deliveries") or native.get("conflicting_source_runs"):
+            lines.append(f"  native purpose: {len(native['runs'])} runs, "
                          f"{len(native['membership'])} joined responses")
             if native.get("coverage_gaps"):
                 lines.append("  native coverage: " + ", ".join(native["coverage_gaps"]))

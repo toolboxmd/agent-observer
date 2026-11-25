@@ -434,7 +434,7 @@ def render(summary: dict, target: str | None = None) -> str:
               _counted(sessions, "session", "sessions"), wall]
     lines = [MARKER, f"### {title}", "", " · ".join(parts), ""]
     native = summary.get("native_purpose") or {}
-    if native.get("runs") or native.get("deliveries"):
+    if native.get("runs") or native.get("deliveries") or native.get("conflicting_source_runs"):
         lines.append(f"Outcome: {_safe_field(summary['task_id'])}.")
         if native.get("coverage_gaps"):
             lines.append("Full outcome cost unknown. Native coverage: " +
