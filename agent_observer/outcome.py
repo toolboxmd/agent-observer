@@ -10,9 +10,14 @@ from .db import _has_table
 def sessions(con, task_id):
     if not _has_table(con, "t3_purpose_runs"):
         return set()
-    return {row[0] for row in con.execute(
+    keys = {row[0] for row in con.execute(
         "SELECT DISTINCT s.session_key FROM t3_purpose_sessions s "
         "JOIN t3_purpose_runs r USING(run_id) WHERE r.task_id=?", (task_id,))}
+    if _has_table(con, "t3_source_runs"):
+        keys.update(row[0] for row in con.execute(
+            "SELECT DISTINCT s.session_key FROM t3_source_runs r JOIN t3_purpose_sessions s USING(run_id) "
+            "WHERE r.task_id=?", (task_id,)))
+    return keys
 
 
 def active(con, task_id):
@@ -66,6 +71,11 @@ def evidence(con, task_id, scope):
         by_run = dict(con.execute(
             "SELECT r.run_id, r.task_id FROM t3_purpose_sessions s "
             "JOIN t3_purpose_runs r USING(run_id) WHERE s.session_key=?", (key,)))
+        if _has_table(con, "t3_source_runs"):
+            for run, in con.execute(
+                    "SELECT DISTINCT s.run_id FROM t3_purpose_sessions s JOIN t3_source_runs x USING(run_id) "
+                    "LEFT JOIN t3_purpose_runs r USING(run_id) WHERE s.session_key=? AND r.run_id IS NULL", (key,)):
+                by_run[run] = None
         if not by_run:
             continue
         session_runs[key] = sorted(by_run)
@@ -86,6 +96,14 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
             "SELECT run_id,native_id,provider_turn_id,segment_id,validation FROM t3_purpose_inputs "
             "WHERE session_key=?", (key,)):
         by_input[native_id].add((run, turn, segment, validation))
+    if _has_table(con, "t3_source_inputs"):
+        for native_id, in con.execute(
+                "SELECT DISTINCT s.native_id FROM t3_source_inputs s WHERE s.session_key=? "
+                "AND NOT EXISTS (SELECT 1 FROM t3_purpose_inputs i "
+                "WHERE i.session_key=s.session_key AND i.native_id=s.native_id)", (key,)):
+            # A rejected identity still contradicts explicit or whole-session
+            # credit. Carry it through the same report and event filters.
+            by_input[native_id].add((None, None, None, "conflicting_snapshot"))
     whole = {r["task_id"] for r in con.execute(
         "SELECT task_id, evidence FROM session_assignments WHERE session_key=?", (key,))
         if not legacy_link(r["evidence"])}
@@ -157,7 +175,7 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
 
         run, turn, segment, validation = next(iter(candidates))
         owner = by_run.get(run)
-        disputed = (len(input_ids) != 1 or len(candidates) != 1
+        disputed = (validation == "conflicting_snapshot" or len(input_ids) != 1 or len(candidates) != 1
                     or (reference_conflict and owner == task_id)
                     or (claims and claims != {owner}))
         if disputed or owner != task_id:

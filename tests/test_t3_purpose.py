@@ -312,6 +312,12 @@ class NativePurposeTest(LedgerCase):
         self.assertEqual(self.refresh()["failed"], [])
         self.assertEqual((credited(7), credited(8)), ([], []))
 
+        self.con.execute("INSERT INTO assignments(user_message_id,task_id,created_at) "
+                         "SELECT native_id,'example/project#7',0 FROM user_messages WHERE turn_id='codex:turn-mini-aaa'")
+        disputed = report.task_report(self.con, "example/project#7")
+        self.assertEqual(disputed["native_purpose"]["conflicting_responses"], expected)
+        self.assertEqual(credited(7), [])
+        self.assertFalse(report.timeline(self.con, "example/project#7", turn_id="codex:turn-mini-aaa")["events"])
         other.execute(f"DELETE FROM {PREFIX}runs WHERE run_id='a'")
         refresh_other()
         self.assertEqual((credited(7), credited(8)), (expected, []))
