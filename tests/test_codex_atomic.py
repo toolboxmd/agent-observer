@@ -175,3 +175,32 @@ class CodexAtomicTest(LedgerCase):
 
     def test_already_indexed_archive_recovers_when_the_live_copy_vanishes(self):
         self.check_archived_tail(True)
+
+    def test_historical_archive_must_identify_the_missing_file(self):
+        live = Path(self.tmp.name, "sessions")
+        archive = live.with_name("archived_sessions")
+        live.mkdir()
+        archive.mkdir()
+        with patch.object(codex, "DEFAULT_ROOT", str(live)), patch.object(codex, "ARCHIVE_ROOT", str(archive)):
+            original = self.source("sessions/rollout-original", "A", 1100)
+            pending = self.source("sessions/rollout-pending", "B", 91100)
+            prefix = pending.read_bytes()
+            tail = json.dumps(self.context) + "\n"
+            with pending.open("a") as fh:
+                fh.write(tail[:20])
+            codex.sync(self.con, source=str(pending))
+            # The previous parser recorded the inode and complete atoms but
+            # did not fingerprint the bytes of the unfinished line.
+            self.con.execute("UPDATE codex_incomplete_sources SET prefix_bytes=NULL,prefix_digest=NULL")
+            write_records(original, [self.meta])
+            codex.sync(self.con, source=str(original))
+            target = archive / pending.name
+            target.write_bytes(prefix + b'{"type":"turn_context","payload":{"effort":"high"}}\n')
+            with pending.open("a") as fh:
+                fh.write(tail[20:])
+            saved = pending.rename(live.with_name("saved"))
+            codex.sync(self.con, source=str(target))
+            self.check_owners(None, None)
+            saved.replace(target)
+            codex.sync(self.con, source=str(target))
+            self.check_owners(None, 91100)

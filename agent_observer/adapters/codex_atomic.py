@@ -53,6 +53,10 @@ def relocated_source(src):
         if row.get("prefix_bytes") is not None:
             if not row["prefix_digest"] or _prefix_digest(path, row["prefix_bytes"]) != row["prefix_digest"]:
                 continue
+        elif row["ino"] != src.ino:
+            # Legacy receipts did not hash the torn line. Matching complete
+            # records in a different file cannot identify its missing tail.
+            continue
         matches.append(row)
     return matches[0] if len(matches) == 1 else None
 
