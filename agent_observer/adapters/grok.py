@@ -1718,10 +1718,6 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             # yields no turn model and keeps updates unparsed.
             updates_records = _load_jsonl_records(updates_path) \
                 if updates_path and os.path.isfile(updates_path) else []
-    if updates_records is not None and updates_src is not None:
-        _record_prompt_bridges(r, updates_src, updates_records)
-        con.execute("INSERT OR IGNORE INTO grok_bridge_sources VALUES(?)",
-                    (updates_src.source_id,))
     if updates_records is not None:
         try:
             _spawns = _extract_spawns_from_records(updates_records)
@@ -1874,6 +1870,10 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                 " WHERE session_key=?",
                 (json.dumps(evidence, sort_keys=True) if evidence else None, version, r.session_key))
     _store_meta(con, r.session_key, summary_fp, chat_fp_current, chat)
+    if updates_records is not None and updates_src is not None:
+        _record_prompt_bridges(r, updates_src, updates_records)
+        con.execute("INSERT OR IGNORE INTO grok_bridge_sources VALUES(?)",
+                    (updates_src.source_id,))
     if updates_src is not None:
         stats.update(updates_src.finish(session_id=r.native_sid))
     if events_src is not None:
@@ -2948,7 +2948,14 @@ def _record_prompt_bridges(r, src, records):
             ids = {_valid_native_id(update[k]) for k in ("prompt_id", "promptId") if k in update}
             if len(ids) == 1 and None not in ids:
                 pid, = ids
-                witnesses.add((pid, ""))  # A scoped completion, independent of input order.
+                try:
+                    counters = _validated_usage_counters(update)
+                except _AdapterError:
+                    continue
+                row = r.con.execute("SELECT * FROM responses WHERE session_key=? AND response_id=?",
+                                    (r.session_key, f"{r.session_key}:{pid}")).fetchone()
+                if row and all(value is None or row[name] == value for name, value in counters.items()):
+                    witnesses.add((pid, ""))  # An accepted, scoped completion.
         elif kind == "tool_call":
             meta = params.get("_meta")
             pid = _valid_native_id(meta.get("promptId")) if isinstance(meta, dict) else None

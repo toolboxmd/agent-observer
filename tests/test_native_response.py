@@ -162,6 +162,24 @@ class NativeResponseTest(LedgerCase):
         grok.import_grok_session(self.con, str(source_dirs[2]))
         self.assertEqual(native_response.inputs(self.con, key), {})
 
+    def test_grok_quarantined_completion_cannot_supply_session_scope(self):
+        path = Path(self.tmp.name, "sid")
+        path.mkdir()
+        completed = {"sessionUpdate": "turn_completed", "prompt_id": "p", "usage": {"inputTokens": 4}}
+        chunk = {"sessionUpdate": "user_message_chunk", "_meta": {"promptIndex": 2},
+                 "content": {"type": "text", "text": "question"}}
+        def frame(session, update, **meta):
+            return {"method": "session/update", "params": {"sessionId": session, "update": update, "_meta": meta}}
+        records = [frame("sid", completed), frame("sid", chunk, promptId="p")]
+        write_records(path / "updates.jsonl", records)
+        grok.import_grok_session(self.con, str(path))
+        self.assertEqual(native_response.inputs(self.con, "grok:sid"), {"grok:sid:p": {"prompt:2"}})
+        records[0]["params"]["sessionId"] = None
+        records.append(frame("sid", dict(completed, usage={"inputTokens": "malformed"})))
+        write_records(path / "updates.jsonl", records)
+        grok.import_grok_session(self.con, str(path), full=True)
+        self.assertEqual(native_response.inputs(self.con, "grok:sid"), {})
+
     def test_opencode_different_copies_preserve_competing_native_parents(self):
         for copy, parent in enumerate(("msg_u1", "msg_u2")):
             path = Path(self.tmp.name, f"copy-{copy}.db")
