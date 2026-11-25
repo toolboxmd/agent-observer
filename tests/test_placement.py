@@ -1,11 +1,12 @@
 """A session shared by several PRs splits per response by checkout (#43)."""
 
+import hashlib
 import io
 import json
 import os
 import shutil
 import subprocess
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from unittest.mock import patch
 
 from agent_observer import cli, db, placement, report
@@ -45,11 +46,11 @@ class PlacementTest(LedgerCase):
                 " head_branch) VALUES('t','pr','github.com',?,?,?,?)",
                 (f"o/{repo}", n, f"https://github.com/o/{repo}/pull/{n}", branch))
 
-    def session(self, harness, calls):
+    def session(self, harness, calls, *, tasks=("o/alpha#1", "o/beta#2")):
         """calls: (response ordinal, tool-call ordinal, target) per response."""
         key = f"{harness}:s"
         db.upsert_session(self.con, key, harness, "s", None, project_dir="/nowhere")
-        for task in ("o/alpha#1", "o/beta#2"):
+        for task in tasks:
             self.con.execute("INSERT INTO session_assignments(session_key, task_id,"
                              " evidence, created_at) VALUES(?,?,'t3',0)", (key, task))
         for i, (resp, call, target) in enumerate(calls):
@@ -104,6 +105,78 @@ class PlacementTest(LedgerCase):
             shutil.rmtree(root)
         placed = placement.read_placements(self.con, "claude:s")
         self.assertEqual((placed["r0"], placed["r1"]), ("o/alpha#1", "o/beta#2"))
+
+    def test_checkout_on_another_forge_does_not_credit_github(self):
+        root = self.checkouts["alpha"]
+        _git("-C", root, "remote", "set-url", "origin", "git@forge.example:o/alpha.git")
+        key = self.claude_session()
+        placement.record_shared_checkouts(self.con)
+        placed = placement.read_placements(self.con, key)
+        self.assertIsNone(placed["r0"])
+        self.assertEqual(placed["r1"], "o/beta#2")
+
+    def test_same_repository_and_head_on_two_forges(self):
+        github = self.checkouts["alpha"]
+        hosted = os.path.join(self.tmp.name, "hosted-alpha")
+        shutil.copytree(github, hosted)
+        _git("-C", hosted, "remote", "set-url", "origin", "https://FORGE.example/o/alpha.git")
+        task = "forge.example/o/alpha#1"
+        self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES(?,0)", (task,))
+        self.con.execute(
+            "INSERT INTO t3_links(thread_id,kind,host,repository,number,url,head_branch)"
+            " VALUES('t','pr','Forge.Example','o/alpha',1,"
+            " 'https://forge.example/o/alpha/pull/1','fix/a')")
+        key = self.session("claude", [
+            (1, 2, f"ls {github}"),
+            (3, 4, f"ls {hosted}"),
+            (5, 6, f"diff {github}/f {hosted}/f"),
+        ], tasks=("o/alpha#1", task))
+        expected = {"r0": "o/alpha#1", "r1": task, "r2": None}
+        placement.record_shared_checkouts(self.con)
+        self.assertEqual(placement.read_placements(self.con, key), expected)
+        shutil.rmtree(github)
+        shutil.rmtree(hosted)
+        with closing(db.connect_read_only(self.db_path)) as ro, patch.object(
+                placement, "_git", side_effect=AssertionError("report ran git")):
+            self.assertEqual(placement.read_placements(ro, key), expected)
+            for task_id, response in (("o/alpha#1", "r0"), (task, "r1")):
+                measured = report.task_report(ro, task_id, schedule=SCHEDULE)["measured"]
+                self.assertEqual(measured["attributed_responses"], [response])
+                self.assertEqual(measured["unplaced_responses"], ["r2"])
+
+    def test_pr_head_from_another_forge_cannot_supply_a_github_match(self):
+        root = self.checkouts["alpha"]
+        _git("-C", root, "checkout", "-q", "-b", "fix/hosted")
+        self.con.execute(
+            "INSERT INTO t3_links(thread_id,kind,host,repository,number,url,head_branch)"
+            " VALUES('t','pr','forge.example','o/alpha',1,"
+            " 'https://forge.example/o/alpha/pull/1','fix/hosted')")
+        key = self.claude_session()
+        placement.record_shared_checkouts(self.con)
+        self.assertIsNone(placement.read_placements(self.con, key)["r0"])
+
+    def test_historical_checkout_without_host_cannot_supply_or_hide_a_match(self):
+        alpha, beta = self.checkouts["alpha"], self.checkouts["beta"]
+        key = self.session("claude", [
+            (1, 2, f"diff {alpha}/f {beta}/f"),
+            (3, 4, f"ls {alpha}/f"),
+        ])
+        self.con.execute(
+            "CREATE TABLE response_checkouts("
+            " event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,"
+            " path_digest BLOB NOT NULL, response_id TEXT, repository TEXT, branch TEXT,"
+            " PRIMARY KEY(event_id, path_digest))")
+        event_id = self.con.execute("SELECT id FROM events WHERE native_id='e0'").fetchone()[0]
+        digest = hashlib.sha256(f"{alpha}/f".encode()).digest()
+        self.con.execute("INSERT INTO response_checkouts VALUES(?,?,'r0','o/alpha','fix/old')",
+                         (event_id, digest))
+        self.con.commit()
+        with closing(db.connect_read_only(self.db_path)) as ro:
+            self.assertIsNone(placement.read_placements(ro, key).get("r0"))
+        for _ in range(2):
+            placement.record_shared_checkouts(self.con)
+            self.assertEqual(placement.read_placements(self.con, key),
+                             {"r0": None, "r1": "o/alpha#1"})
 
     def test_without_head_branches_the_session_stays_shared_whole(self):
         self.claude_session()
