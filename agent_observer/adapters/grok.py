@@ -1523,30 +1523,12 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             recorded_id = _valid_native_id(row["session_id"])
             if recorded_id is not None:
                 break
-    if (summary_unavailable or not summary) and recorded_id is None and updates_path:
-        # The first import has no stored spelling. Prefer the native id in
-        # a complete notification, which may differ from the directory.
-        try:
-            for _ordinal, raw in _complete_lines(updates_path):
-                try:
-                    record = json.loads(raw)
-                except ValueError:
-                    continue
-                if isinstance(record, dict) and record.get("method") in METHODS:
-                    params = record.get("params")
-                    if isinstance(params, dict):
-                        recorded_id = _valid_native_id(params.get("sessionId"))
-                        if recorded_id is not None:
-                            break
-        except FileNotFoundError:
-            pass
-    if recorded_id is None and (summary_unavailable or (
-            not summary and (updates_path or events_path))):
-        # A directory name is only a fallback after a readable summary
-        # supplies some evidence. An absent summary can precede a different ID.
-        if not metadata_errors:
-            metadata_errors.append("Grok session identity unavailable")
-        return stats
+    if recorded_id is None and valid_info_id is None:
+        recorded_id = _notification_session_id(updates_path, events_path)
+        if recorded_id is None and (summary_unavailable or safe_basename is not None):
+            if not metadata_errors:
+                metadata_errors.append("Grok session identity unavailable")
+            return stats
     native_sid = recorded_id or valid_info_id or safe_basename
     if native_sid is None:
         # No safe native id: quarantine under the fixed missing_id
@@ -2084,6 +2066,35 @@ def _read_chat(session_dir: str, r: _Reader) -> dict:
                 if isinstance(effort, str) and _safe_token(effort) is not None:
                     chat["effort"] = effort
     return chat
+
+
+def _notification_session_id(updates_path, events_path) -> str | None:
+    """Read identity evidence only from complete native records."""
+    for path, updates in ((updates_path, True), (events_path, False)):
+        if not path:
+            continue
+        try:
+            for _ordinal, raw in _complete_lines(path):
+                try:
+                    record = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if updates:
+                    params = record.get("params")
+                    if record.get("method") not in METHODS or not isinstance(params, dict):
+                        continue
+                    native_id = params.get("sessionId")
+                else:
+                    if record.get("type") != "turn_started":
+                        continue
+                    native_id = record.get("session_id")
+                if (session_id := _valid_native_id(native_id)) is not None:
+                    return session_id
+        except FileNotFoundError:
+            continue
+    return None
 
 
 def _complete_lines(path: str):

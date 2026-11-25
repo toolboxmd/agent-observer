@@ -412,7 +412,7 @@ class LedgerFreshnessTest(unittest.TestCase):
         session = self.root / "grok/project/session-one"
         session.mkdir(parents=True)
         summary = session / "summary.json"
-        summary.write_text("{}")
+        summary.write_text('{"info":{"id":"session-one"}}')
         os.utime(summary, (20_000, 20_000))
         self.imports(grok=11_000)
 
@@ -447,7 +447,7 @@ class LedgerFreshnessTest(unittest.TestCase):
     def test_grok_revalidates_identical_metadata_and_retries_denied_reads(self):
         summary = self.root / "grok/project/session-one/summary.json"
         self.source("grok/project/session-one/summary.json", 10_000)
-        summary.write_text("{}")
+        summary.write_text('{"info":{"id":"session-one"}}')
         os.utime(summary, (10_000, 10_000))
         self.imports()
         with contextlib.closing(db.connect(str(self.ledger))) as con:
@@ -458,7 +458,7 @@ class LedgerFreshnessTest(unittest.TestCase):
             with patch.object(db, "now", return_value=21_000):
                 self.assertEqual(grok.sync(con)["failed"], [])
             self.assertEqual(self.run_health("--json")[0], 0)
-            summary.write_text('{"head_branch": "fresh"}')
+            summary.write_text('{"info":{"id":"session-one"},"head_branch":"fresh"}')
             os.utime(summary, (30_000, 30_000))
             real_open = open
 
@@ -564,7 +564,7 @@ class LedgerFreshnessTest(unittest.TestCase):
         self.assertEqual(json.loads(output)["ledger_freshness"]["grok"]["status"], "never_synced")
 
         summary = self.root / "grok/project/session-one/summary.json"
-        summary.write_text('{"model":"grok-4"}')
+        summary.write_text('{"info":{"id":"session-one"}}')
         with contextlib.closing(db.connect(str(self.ledger))) as con:
             self.assertEqual(grok.sync(con)["failed"], [])
             self.assertIsNotNone(grok.newest_metadata_import(con))
@@ -630,7 +630,7 @@ class LedgerFreshnessTest(unittest.TestCase):
             with patch("builtins.open", denied_open):
                 self.assertTrue(grok.sync(con)["failed"])
             self.assertEqual(con.execute("SELECT COUNT(*) FROM responses").fetchone()[0], 0)
-            for contents in (None, "{}"):
+            for contents in (None, "{}", '{"head_branch":"main"}'):
                 if contents is None:
                     summary.unlink()
                 else:
@@ -644,6 +644,19 @@ class LedgerFreshnessTest(unittest.TestCase):
             self.assertEqual(con.execute("SELECT session_key FROM responses").fetchone()[0],
                              "grok:native-id")
         self.assertEqual(self.run_health("--json")[0], 0)
+
+    def test_grok_first_event_supplies_native_id_without_summary(self):
+        self.source("grok/project/directory-id/events.jsonl", 20_000)
+        event = self.root / "grok/project/directory-id/events.jsonl"
+        event.write_text('{"type":"turn_started","session_id":"native-id",'
+                         '"ts":"2026-11-25T18:00:00Z"}\n')
+        self.imports()
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            result = grok.sync(con)
+            self.assertEqual(result["failed"], [])
+            self.assertEqual(result["events_inserted"], 1)
+            self.assertEqual(con.execute("SELECT session_key FROM events").fetchone()[0],
+                             "grok:native-id")
 
     def test_bad_grok_metadata_keeps_health_stale(self):
         cases = (
@@ -665,7 +678,7 @@ class LedgerFreshnessTest(unittest.TestCase):
                     transcript.write_text(log_content)
                     os.utime(transcript, (10_000, 10_000))
                 summary = session / "summary.json"
-                summary.write_text('{"head_branch":"fixture"}')
+                summary.write_text('{"info":{"id":"session-one"},"head_branch":"fixture"}')
                 os.utime(summary, (10_000, 10_000))
                 ledger = base / "observer.db"
                 with contextlib.closing(db.connect(str(ledger))) as con:
