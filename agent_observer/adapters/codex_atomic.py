@@ -21,7 +21,10 @@ def prepare(r):
     con.execute("CREATE INDEX IF NOT EXISTS codex_atomic_response ON codex_atomic_observations(response_id,session_key)")
     con.execute("CREATE INDEX IF NOT EXISTS codex_atomic_session ON codex_atomic_observations(session_key,response_id)")
     con.execute("""CREATE TABLE IF NOT EXISTS codex_incomplete_sources (
-        source_id INTEGER PRIMARY KEY REFERENCES sources(id),session_key TEXT NOT NULL,legacy_dispute INTEGER NOT NULL)""")
+        source_id INTEGER PRIMARY KEY REFERENCES sources(id),session_key TEXT NOT NULL,legacy_dispute INTEGER NOT NULL,
+        replay INTEGER NOT NULL DEFAULT 1)""")
+    if "replay" not in {c[1] for c in con.execute("PRAGMA table_info(codex_incomplete_sources)")}:
+        con.execute("ALTER TABLE codex_incomplete_sources ADD COLUMN replay INTEGER NOT NULL DEFAULT 1")
     r.atomic_ids = set()
     r.unreadable_atomic = False
     if not r.src.incremental:
@@ -60,9 +63,12 @@ def finish(r):
         legacy = (src.row["codex_context_version"] == 7 and con.execute(
             "SELECT 1 FROM import_errors WHERE harness='codex' AND source_path=? AND error='usage_conflict' LIMIT 1",
             (src.path,)).fetchone() is not None)
-        con.execute("INSERT INTO codex_incomplete_sources VALUES(?,?,?) ON CONFLICT(source_id) DO UPDATE SET "
-                    "legacy_dispute=MAX(legacy_dispute,excluded.legacy_dispute)", (src.source_id, r.session_key, legacy))
-    elif not src.incremental:
+        replay = r.unreadable_atomic or (not src.incremental and con.execute(
+            "SELECT 1 FROM prior_codex_atoms LIMIT 1").fetchone() is not None)
+        con.execute("INSERT INTO codex_incomplete_sources VALUES(?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET "
+                    "legacy_dispute=MAX(legacy_dispute,excluded.legacy_dispute),replay=excluded.replay",
+                    (src.source_id, r.session_key, legacy, replay))
+    else:
         con.execute("DELETE FROM codex_incomplete_sources WHERE source_id=?", (src.source_id,))
     if not src.incremental:
         r.atomic_ids.update(rid for rid, in con.execute("SELECT DISTINCT response_id FROM prior_codex_atoms"))
@@ -89,6 +95,11 @@ def _reconcile(con, rid, refreshing):
     if source["source_id"] != row["source_id"] and row["source_id"] != refreshing and (row["version"] or 0) < 8:
         return  # The original pre-upgrade source has not been replayed.
     measured = json.loads(source["measurement"])
+    if (source["source_id"] == row["source_id"] and len({o["source_id"] for o in copies}) == 1
+            and any(row[k] is not None and row[k] != measured[k] for k in FIELDS if k != "model")):
+        # One rewritten native atom cannot independently revise immutable
+        # counters. The task view withholds it while the raw ledger keeps it.
+        return
     turn = "codex:" + source["input_id"] if source["input_id"] else None
     if (row["source_id"] != source["source_id"] or row["turn_id"] != turn or
             any(row[k] != measured[k] for k in FIELDS)):

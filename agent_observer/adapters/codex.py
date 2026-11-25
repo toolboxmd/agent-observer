@@ -62,7 +62,7 @@ def _occurrences_ready(row) -> bool:
 
 
 HARNESS = "codex"
-_CONTEXT_VERSION = 8  # Keep the literal turn and measurement together across source snapshots.
+_CONTEXT_VERSION = 9  # Distinguish an unfinished append from an unreadable replacement.
 SEMANTICS = "codex:input_includes_cached,output_includes_reasoning"
 # Older rollouts carry usage only in token_count events: last_token_usage per
 # response and a cumulative total that repeats when nothing new happened.
@@ -818,7 +818,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         })
         return stats
     if src.incremental and db._has_table(con, "codex_incomplete_sources") and con.execute(
-            "SELECT 1 FROM codex_incomplete_sources WHERE source_id=?", (src.source_id,)).fetchone():
+            "SELECT 1 FROM codex_incomplete_sources WHERE source_id=? AND replay", (src.source_id,)).fetchone():
         src.start_offset = src.end_offset = 0
     reader = _Reader(con, src, stats)
     codex_atomic.prepare(reader)
