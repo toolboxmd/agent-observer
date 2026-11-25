@@ -624,8 +624,8 @@ def newest_metadata_import(con: sqlite3.Connection) -> float | None:
     return con.execute(f"SELECT MAX(imported_at) FROM {_GROK_META_TABLE}").fetchone()[0]
 
 
-def newest_complete_import(con: sqlite3.Connection) -> float | None:
-    """Watermark for complete sessions, including logs imported by older versions."""
+def complete_import_watermarks(con: sqlite3.Connection) -> tuple[float | None, float | None]:
+    """Return transcript and metadata watermarks for complete sessions."""
     columns = {row[1] for row in con.execute(f"PRAGMA table_info({_GROK_META_TABLE})")}
     where = ""
     if "pending" in columns:
@@ -633,8 +633,7 @@ def newest_complete_import(con: sqlite3.Connection) -> float | None:
                  " WHERE m.session_key='grok:' || s.session_id AND m.pending=1)")
     transcript = con.execute(
         f"SELECT MAX(s.imported_at) FROM sources s WHERE s.harness='grok'{where}").fetchone()[0]
-    metadata = newest_metadata_import(con)
-    return max((stamp for stamp in (transcript, metadata) if stamp is not None), default=None)
+    return transcript, newest_metadata_import(con)
 
 
 def _stored_meta(con: sqlite3.Connection, session_key: str):

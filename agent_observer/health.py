@@ -172,7 +172,8 @@ def check_opencode(processes: list[dict], db_path: str | None = None) -> list[di
         if con is not None:
             row = con.execute("SELECT MAX(time_updated) FROM session WHERE directory=?",
                               (proc["cwd"],)).fetchone()
-            seen = row[0] / 1000.0 if row and row[0] else None
+            if row and isinstance(row[0], (int, float)) and row[0]:
+                seen = row[0] / 1000.0
         if seen is None or (proc.get("started") and seen < proc["started"]):
             findings.append({
                 "host": "opencode", "pid": proc["pid"], "cwd": proc["cwd"],
@@ -245,22 +246,28 @@ def _opencode_record_times(paths):
             session_cols = {row[1] for row in native.execute("PRAGMA table_info(session)")}
             if "id" not in session_cols:
                 raise sqlite3.DatabaseError("OpenCode session table unavailable")
-            selects = [f"SELECT id AS session_id, {col} AS stamp FROM session"
+            selects = [f"SELECT id AS session_id, {col} AS oldest, {col} AS newest,"
+                       f" typeof({col}) NOT IN ('integer', 'real', 'null') AS invalid FROM session"
                        for col in ("time_created", "time_updated") if col in session_cols]
             for table in ("message", "part"):
                 cols = {row[1] for row in native.execute(f"PRAGMA table_info({table})")}
                 if {"session_id", "time_updated"} <= cols:
-                    selects.append(f"SELECT session_id, MAX(time_updated) AS stamp"
+                    selects.append(f"SELECT session_id, MIN(time_updated), MAX(time_updated),"
+                                   " MAX(typeof(time_updated) NOT IN ('integer', 'real', 'null'))"
                                    f" FROM {table} GROUP BY session_id")
             if not selects:
                 raise sqlite3.DatabaseError("OpenCode session timestamps unavailable")
             combined = " UNION ALL ".join(selects)
-            for (stamp,) in native.execute(
+            for oldest, newest, invalid in native.execute(
                     f"WITH activity AS ({combined})"
-                    " SELECT MAX(stamp) FROM activity JOIN session ON session.id = activity.session_id"
+                    " SELECT MIN(oldest), MAX(newest), MAX(invalid)"
+                    " FROM activity JOIN session ON session.id = activity.session_id"
                     " GROUP BY session.id"):
-                if isinstance(stamp, (int, float)):
-                    yield stamp / 1000
+                if invalid:
+                    raise ValueError("invalid timestamp")
+                if newest is not None:
+                    format_timestamp(oldest / 1000)
+                    yield newest / 1000
 
 
 def _native_record_times(harness, paths):
@@ -311,10 +318,10 @@ def _ledger_freshness(con, sync_interval_seconds, unavailable, ledger_error):
     imports = {}
     if con is not None:
         try:
-            imports = dict(con.execute(
+            imports = {harness: (stamp,) for harness, stamp in con.execute(
                 "SELECT harness, MAX(imported_at) FROM sources"
-                " WHERE harness != 'grok' GROUP BY harness"))
-            imports["grok"] = grok.newest_complete_import(con)
+                " WHERE harness != 'grok' GROUP BY harness")}
+            imports["grok"] = grok.complete_import_watermarks(con)
         except sqlite3.Error as exc:
             ledger_error = error_reason(exc)
     if ledger_error is not None:
@@ -322,31 +329,26 @@ def _ledger_freshness(con, sync_interval_seconds, unavailable, ledger_error):
 
     freshness = {}
     for harness, adapter in available().items():
-        imported = imports.get(harness)
+        import_times = imports.get(harness, ())
         try:
-            format_timestamp(imported)
+            for stamp in import_times:
+                format_timestamp(stamp)
         except (OverflowError, OSError, TypeError, ValueError):
             unavailable.append({"check": f"{harness} ledger import", "reason": "invalid timestamp"})
             freshness[harness] = {"newest_native_at": None, "newest_import_at": None,
                                   "newer_sources": None, "lag_seconds": None,
                                   "status": "unavailable"}
             continue
+        imported = max((stamp for stamp in import_times if stamp is not None), default=None)
         try:
             paths = _discover_native_paths(harness, adapter)
             records = list(_native_record_times(harness, paths))
-        except (OSError, sqlite3.Error) as exc:
-            unavailable.append({"check": f"{harness} native record scan", "reason": error_reason(exc)})
-            freshness[harness] = {"newest_native_at": None, "newest_import_at": imported,
-                                  "newer_sources": None, "lag_seconds": None,
-                                  "status": "unavailable"}
-            continue
-
-        newest = max(records, default=None)
-        try:
+            newest = max(records, default=None)
             format_timestamp(newest)
             format_timestamp(min(records, default=None))
-        except (OverflowError, OSError, TypeError, ValueError):
-            unavailable.append({"check": f"{harness} native record scan", "reason": "invalid timestamp"})
+        except (OverflowError, OSError, TypeError, ValueError, sqlite3.Error) as exc:
+            reason = error_reason(exc) if isinstance(exc, (OSError, sqlite3.Error)) else "invalid timestamp"
+            unavailable.append({"check": f"{harness} native record scan", "reason": reason})
             freshness[harness] = {"newest_native_at": None, "newest_import_at": imported,
                                   "newer_sources": None, "lag_seconds": None,
                                   "status": "unavailable"}

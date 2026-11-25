@@ -279,7 +279,8 @@ class LedgerFreshnessTest(unittest.TestCase):
                 CREATE TABLE part (session_id TEXT, time_updated INTEGER, data TEXT);
                 INSERT INTO session VALUES ('first', 10000000), ('second', 11000000);
                 INSERT INTO part VALUES ('first', 19900000, 'private fixture text'),
-                                        ('first', 20000000, 'private fixture text');
+                                        ('first', 20000000, 'private fixture text'),
+                                        ('second', NULL, 'private fixture text');
             """)
             self.imports(opencode=11_000)
             code, output = self.run_health("--json")
@@ -434,6 +435,43 @@ class LedgerFreshnessTest(unittest.TestCase):
         self.assertEqual(code, 4)
         rows = json.loads(output)["ledger_freshness"]
         self.assertEqual(rows["opencode"]["status"], "unavailable")
+        self.assertEqual(rows["claude"]["status"], "current")
+
+    def test_malformed_opencode_time_does_not_hide_newer_session(self):
+        with contextlib.closing(sqlite3.connect(self.root / "opencode")) as native:
+            native.executescript("""
+                CREATE TABLE session(id TEXT, time_updated INTEGER);
+                CREATE TABLE message(session_id TEXT, time_updated INTEGER);
+                INSERT INTO session VALUES ('fixture', 20000000);
+                INSERT INTO message VALUES ('fixture', NULL), ('fixture', 'private fixture text');
+            """)
+        self.source("claude/project/fixture.jsonl", 10_000)
+        self.imports(claude=11_000, opencode=11_000)
+        code, output = self.run_health()
+        self.assertEqual(code, 4)
+        self.assertIn("opencode native record scan unavailable: invalid timestamp", output)
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        rows = json.loads(output)["ledger_freshness"]
+        self.assertEqual(rows["opencode"]["status"], "unavailable")
+        self.assertEqual(rows["claude"]["status"], "current")
+
+    def test_malformed_grok_import_time_leaves_other_harnesses_available(self):
+        self.source("claude/project/fixture.jsonl", 10_000)
+        self.source("grok/project/session/events.jsonl", 20_000)
+        self.imports(claude=11_000, grok=11_000)
+        with contextlib.closing(db.connect(str(self.ledger))) as con, con:
+            con.executescript("""
+                CREATE TABLE grok_session_meta(session_key TEXT, imported_at REAL);
+                INSERT INTO grok_session_meta VALUES ('grok:fixture', 'private fixture text');
+            """)
+        code, output = self.run_health()
+        self.assertEqual(code, 4)
+        self.assertIn("grok ledger import unavailable: invalid timestamp", output)
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        rows = json.loads(output)["ledger_freshness"]
+        self.assertEqual(rows["grok"]["status"], "unavailable")
         self.assertEqual(rows["claude"]["status"], "current")
 
     def test_denied_chromeria_v2_state_is_unavailable_for_state_and_receipts(self):
@@ -879,6 +917,12 @@ class ProcessVisibilityTest(unittest.TestCase):
     def test_opencode_process_without_session_record(self):
         findings = health.check_opencode(self.procs("opencode", "opencode"), self.db)
         self.assertEqual([f["pid"] for f in findings], [202])
+
+    def test_opencode_process_with_malformed_session_timestamp(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as con, con:
+            con.execute("UPDATE session SET time_updated = 'invalid'")
+        findings = health.check_opencode(self.procs("opencode", "opencode"), self.db)
+        self.assertEqual([f["pid"] for f in findings], [201, 202])
 
     def test_codex_cli_without_rollout(self):
         findings = health.check_codex(self.procs("codex", "codex"),
