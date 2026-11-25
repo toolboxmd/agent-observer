@@ -18,7 +18,7 @@ import math
 import os
 import sqlite3
 
-from .. import db, native_response, placement, privacy
+from .. import db, native_response, privacy
 from ..identity import SessionIdentity, skill_from_path
 from ..ingest import (JsonlSource, MissingNativeId, fingerprint, insert_event,
                       iso_ts, stored_path, text_hash)
@@ -371,8 +371,6 @@ class _Reader:
         self.con = con
         self.src = src
         self.stats = stats
-        self.first_new_ordinal = src.first_new_ordinal()
-        self.checkout_events = []
         self.session_id = src.row["session_id"]
         self.thread_id = src.row["thread_id"]
         self.thread_source = src.row["thread_source"]
@@ -484,10 +482,7 @@ class _Reader:
                      native_id=native_id, ordinal=self.record_position,
                      ts=iso_ts(obj.get("timestamp")),
                      update=self.src.privacy_stale and same_source,
-                     migrate_ordinal=first and same_source,
-                     checkout_events=self.checkout_events
-                     if self.first_new_ordinal is not None
-                     and self.record_position >= self.first_new_ordinal else None, **kw)
+                     migrate_ordinal=first and same_source, **kw)
         event_id = prior["id"] if prior is not None else None
         if event_id is None:
             stored = self.con.execute(
@@ -976,7 +971,6 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         stats["moved_rows_with"] = sorted(settle)
     stats["session_key"] = reader.session_key
     con.commit()
-    placement.observe_new_checkouts(con, reader.checkout_events)
     return stats
 
 

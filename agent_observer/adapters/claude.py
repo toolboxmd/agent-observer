@@ -19,7 +19,7 @@ import os
 import sqlite3
 from collections import defaultdict, deque
 
-from .. import db, intervention_evidence, native_response, placement, privacy
+from .. import db, native_response, privacy, intervention_evidence
 from ..identity import SessionIdentity, skill_from_path
 from ..ingest import (JsonlSource, MissingNativeId, fingerprint, insert_event,
                       iso_ts, text_hash)
@@ -302,8 +302,6 @@ class _Reader:
         self.con = con
         self.src = src
         self.stats = stats
-        self.first_new_ordinal = src.first_new_ordinal()
-        self.checkout_events = []
         self.native_session = src.row["session_id"]
         self.agent_id = src.row["thread_id"]
         self.identity = SessionIdentity()
@@ -331,10 +329,7 @@ class _Reader:
         insert_event(self.con, self.stats, source_id=self.src.source_id,
                      session_key=self.session_key, family=family,
                      native_id=native_id, ordinal=ordinal, ts=ts,
-                     turn_id=self.turn, update=self.src.privacy_stale,
-                     checkout_events=self.checkout_events
-                     if self.first_new_ordinal is not None
-                     and ordinal >= self.first_new_ordinal else None, **kw)
+                     turn_id=self.turn, update=self.src.privacy_stale, **kw)
 
 
 def import_claude_file(con: sqlite3.Connection, path: str,
@@ -451,7 +446,6 @@ def import_claude_file(con: sqlite3.Connection, path: str,
                 (_IMPORT_VERSION, src.end_offset, src.source_id))
     stats["session_key"] = r.session_key
     con.commit()
-    placement.observe_new_checkouts(con, r.checkout_events)
     return stats
 
 
