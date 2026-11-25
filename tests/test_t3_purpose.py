@@ -2,8 +2,10 @@
 import json
 import os
 import sqlite3
+from pathlib import Path
 
-from agent_observer.adapters import t3
+from agent_observer import report
+from agent_observer.adapters import grok, t3
 from tests.helpers import LedgerCase
 
 PREFIX = "orchestration_v2_projection_"
@@ -100,6 +102,45 @@ class NativePurposeTest(LedgerCase):
             payload_json,'$.nativeTurnRef.strength','weak') WHERE run_attempt_id='attempt-g'""")
         self.assertEqual(self.refresh()["failed"], [])
         self.assertEqual(self.values("SELECT * FROM t3_purpose_inputs"), [])
+
+    def test_grok_call_identifies_the_completion_and_reused_calls_fail_closed(self):
+        self.native.execute(f"CREATE TABLE {PREFIX}turn_items (turn_item_id,thread_id,run_id,"
+                            "provider_thread_id,provider_turn_id,type,payload_json)")
+        cols = ["item", "t", "g", "pt-grok", "turn-g", "command_execution"]
+        item = dict(id="item", threadId="t", runId="g", providerThreadId="pt-grok",
+                    providerTurnId="turn-g", type="command_execution", nativeItemRef=strong("grok", "call"))
+        self.row("turn_items", cols, item)
+        sid = "historic-grok"
+        root = Path(self.tmp.name, sid)
+        root.mkdir()
+        records = []
+        def frame(update, **meta):
+            records.append(json.dumps(dict(method="session/update",
+                params=dict(sessionId=sid, update=update, _meta=meta))))
+        def ingest():
+            (root / "updates.jsonl").write_text("\n".join(records) + "\n")
+            grok.import_grok_session(self.con, str(root), full=True)
+        def membership():
+            return report.task_report(self.con, "git.example.org/example/project#7")["native_purpose"]["membership"]
+
+        frame(dict(sessionUpdate="turn_completed", prompt_id="done"))
+        frame(dict(sessionUpdate="tool_call", toolCallId="call"), promptId="done")
+        ingest()
+        self.refresh()
+        rid = "grok:historic-grok:done"
+        self.assertEqual(membership()[rid]["validation"], "grok_tool_call")
+        self.native.execute(f"UPDATE {PREFIX}turn_items SET provider_thread_id='wrong'")
+        self.refresh()
+        self.assertEqual(membership(), {})
+        self.native.execute(f"UPDATE {PREFIX}turn_items SET provider_thread_id='pt-grok',"
+                            "payload_json=json_set(payload_json,'$.nativeItemRef.strength','weak')")
+        self.refresh()
+        self.assertEqual(membership(), {})
+        self.native.execute(f"UPDATE {PREFIX}turn_items SET payload_json=?", (json.dumps(item),))
+        self.refresh()
+        frame(dict(sessionUpdate="tool_call", toolCallId="call"), promptId="another")
+        ingest()
+        self.assertEqual(membership(), {})
 
     def test_invalid_scope_and_cross_driver_evidence(self):
         self.provider("claudeAgent")

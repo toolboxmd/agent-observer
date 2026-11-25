@@ -219,7 +219,7 @@ def task_sessions(con: sqlite3.Connection, task_id: str) -> set:
     keys.update(outcome.sessions(con, task_id))
     for r in con.execute(
             "SELECT session_key, evidence FROM session_assignments WHERE task_id=?", (task_id,)):
-        if not (r["evidence"] or "").startswith("t3:") or not canonical:
+        if not outcome.legacy_link(r["evidence"]) or not canonical:
             keys.add(r["session_key"])
     keys |= {r["session_key"] for r in con.execute(
         "SELECT session_key FROM task_turns WHERE task_id=? AND session_key IS NOT NULL",
@@ -536,8 +536,8 @@ def task_report(con: sqlite3.Connection, task_id: str,
                         (key,)).fetchone() for key in scope_keys)):
         native, purpose_owners, native_turns = outcome.evidence(con, task_id, scope_keys)
         whole = {k: v for k, v in whole.items()
-                 if not (v or "").startswith("t3:") or (not canonical and k not in native["sessions"])}
-    legacy_links = {key for key, ev in whole.items() if ev == "t3" or (ev or "").startswith("t3:")}
+                 if not outcome.legacy_link(v) or (not canonical and k not in native["sessions"])}
+    legacy_links = {key for key, ev in whole.items() if outcome.legacy_link(ev)}
     whole_shared = {r["session_key"] for r in con.execute(
         "SELECT session_key FROM session_assignments GROUP BY session_key"
         " HAVING COUNT(DISTINCT task_id) > 1")}
@@ -908,7 +908,9 @@ def task_report(con: sqlite3.Connection, task_id: str,
         con, task_id, total_estimated, attributed, billed_shared, joint, whole)
     if canonical and inventory_gaps and total_estimated.get("priced_responses"):
         subtotal = total_estimated["estimated_cost_usd_partial"]
-        report["total_cost"]["text"] = f"unknown (observed priced subtotal ${subtotal:,.2f})"
+        amount = "under $0.01" if 0 < subtotal < 0.005 else f"${subtotal:,.2f}"
+        report["total_cost"].update(usd=None, observed_subtotal_usd=subtotal,
+                                    text=f"unknown (observed priced subtotal {amount})")
     report["total_cost"]["unplaced"] = {
         "text": _money(unplaced_estimated) if unplaced else None,
         "responses": len(unplaced),
@@ -1007,7 +1009,8 @@ def timeline(con: sqlite3.Connection, task_id: str | None = None,
             native, _, native_turns = outcome.evidence(con, task_id, outcome.sessions(con, task_id))
             matches = {rid: member for rid, member in native["membership"].items()
                        if (not session_key or member["session_key"] == session_key)
-                       and (not turn_id or turn_id == member["session_key"].partition(":")[0] + ":" + member["native_input_id"])}
+                       and (not turn_id or turn_id == (rid if member["session_key"].startswith("grok:")
+                            else member["session_key"].partition(":")[0] + ":" + member["native_input_id"]))}
             for key in sorted({m["session_key"] for m in matches.values() if m["session_key"].startswith("claude:")}):
                 # Claude gives each text event the transcript UUID and block
                 # index. Its parent chain proves the response independently of

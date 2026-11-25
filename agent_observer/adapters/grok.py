@@ -2924,9 +2924,7 @@ def _read_state(status):
 
 
 def _record_prompt_bridges(r, src, records):
-    """Chromeria's native input ref is prompt:<promptIndex>. The completion
-    has a different prompt_id; only an input frame carrying both can join it.
-    """
+    """Keep literal Grok input, tool call and completion witnesses per source."""
     r.con.execute("""
         CREATE TABLE IF NOT EXISTS grok_prompt_bridges (
             session_key TEXT NOT NULL, prompt_id TEXT NOT NULL, input_ref TEXT NOT NULL,
@@ -2951,6 +2949,12 @@ def _record_prompt_bridges(r, src, records):
             if len(ids) == 1 and None not in ids:
                 pid, = ids
                 witnesses.add((pid, ""))  # A scoped completion, independent of input order.
+        elif kind == "tool_call":
+            meta = params.get("_meta")
+            pid = _valid_native_id(meta.get("promptId")) if isinstance(meta, dict) else None
+            call = _valid_native_id(update.get("toolCallId"))
+            if pid and call:
+                witnesses.add((pid, "call:" + call))
         elif kind == "user_message_chunk":
             meta = update.get("_meta")
             if not isinstance(meta, dict):
@@ -2969,25 +2973,52 @@ def _record_prompt_bridges(r, src, records):
                       ((r.session_key, pid, ref, src.source_id) for pid, ref in witnesses))
 
 
-def response_inputs(con, session_key):
+def response_witnesses(con, session_key):
     if not db._has_table(con, "grok_prompt_bridges"):
-        return {}
+        return {}, set()
     completed = set()
     indexes = {}
+    calls = {}
     for pid, ref in con.execute("SELECT DISTINCT prompt_id,input_ref FROM grok_prompt_bridges"
                                 " WHERE session_key=?", (session_key,)):
-        if ref:
+        if ref.startswith("call:"):
+            calls.setdefault(ref[5:], set()).add(pid)
+        elif ref:
             indexes.setdefault(ref, set()).add(pid)
         else:
             completed.add(pid)
+    disputed = set()
+    tool_witnesses = set()
+    if calls and db._has_table(con, "t3_purpose_grok_calls"):
+        projected = {}
+        for call, turn, index in con.execute(
+                "SELECT c.call_id,c.provider_turn_id,i.native_id FROM t3_purpose_grok_calls c "
+                "LEFT JOIN t3_purpose_inputs i ON i.session_key=c.session_key "
+                "AND i.provider_turn_id=c.provider_turn_id AND i.validation='grok_prompt_index' "
+                "WHERE c.session_key=?", (session_key,)):
+            projected.setdefault(call, set()).add((turn, index))
+        for call in calls.keys() & projected.keys():
+            pids, owners = calls[call], projected[call]
+            if len(pids) != 1 or len(owners) != 1:
+                disputed.update(pids)
+                continue
+            _, index = next(iter(owners))
+            if index is not None:
+                indexes.setdefault(index, set()).update(pids)
+                tool_witnesses.update(f"{session_key}:{pid}" for pid in pids)
     # One native index claiming two different prompt ids is contradictory,
     # including when the two claims came from different copies.
-    disputed = {pid for pids in indexes.values() if len(pids) > 1 for pid in pids}
+    disputed.update(pid for pids in indexes.values() if len(pids) > 1 for pid in pids)
     eligible = completed - disputed
     refs = {}
     for ref, pids in indexes.items():
         for pid in pids & eligible:
             refs.setdefault(f"{session_key}:{pid}", set()).add(ref)
-    return {rid: refs[rid] for rid, in con.execute(
+    result = {rid: refs[rid] for rid, in con.execute(
         "SELECT response_id FROM responses WHERE session_key=? AND is_overlap=0", (session_key,)
     ) if rid in refs}
+    return result, tool_witnesses.intersection(result)
+
+
+def response_inputs(con, session_key):
+    return response_witnesses(con, session_key)[0]

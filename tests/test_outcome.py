@@ -40,11 +40,19 @@ class NativeOutcomeTest(LedgerCase):
         self.assertEqual(rep["measured"]["attributed_responses"], ["codex:resp-mini-001", "codex:resp-mini-002"])
         self.assertEqual(rep["native_purpose"]["turn_checks"][0]["status"], "reconciled")
         self.assertFalse(rep["complete"])
+        self.assertIsNone(rep["total_cost"]["usd"])
         self.assertIn("background_inventory_unavailable", rep["native_purpose"]["coverage_gaps"])
         self.con.execute("DELETE FROM responses WHERE response_id='codex:resp-mini-002'")
         late = report.task_report(self.con, self.task)
         self.assertEqual(late["native_purpose"]["turn_checks"][0]["status"], "counter_mismatch")
         self.assertNotEqual(late["snapshot_id"], rep["snapshot_id"])
+
+    def test_validated_inverse_turn_witness_when_attempt_has_no_turn_pointer(self):
+        self.con.execute("UPDATE t3_purpose_attempts SET provider_turn_id=NULL")
+        self.assertTrue(report.task_report(self.con, self.task)["native_purpose"]["main_agent_counters_reconciled"])
+        self.con.execute("DELETE FROM t3_purpose_turns")
+        gaps = report.task_report(self.con, self.task)["native_purpose"]["coverage_gaps"]
+        self.assertIn("expected_provider_turn_missing", gaps)
 
     def test_two_issues_share_a_planner_but_each_gets_its_own_responses(self):
         self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES('example/repo#12',0)")
@@ -93,3 +101,13 @@ class NativeOutcomeTest(LedgerCase):
         summary = publish.summarize(self.con, set(), self.task, task_id=self.task)
         self.assertIn("Delivery PR: https://github.com/example/repo/pull/42", publish.render(summary))
         self.assertTrue(report.timeline(self.con, self.task)["events"])
+
+    def test_delivery_survives_missing_run_with_unknown_cost(self):
+        self.con.execute("INSERT INTO t3_purpose_deliveries VALUES(?, 'planner', 'github.com',"
+                         "'example/repo',42,'https://github.com/example/repo/pull/42','2026-11-25T00:00:00Z')",
+                         (self.task,))
+        self.con.execute("DELETE FROM t3_purpose_runs")
+        rep = report.task_report(self.con, self.task)
+        self.assertEqual(rep["native_purpose"]["deliveries"][0]["number"], 42)
+        self.assertIn("purpose_run_unavailable", rep["native_purpose"]["coverage_gaps"])
+        self.assertIsNone(rep["total_cost"]["usd"])

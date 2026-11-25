@@ -25,6 +25,8 @@ TABLES = {
     "inputs": """run_id TEXT NOT NULL, session_key TEXT NOT NULL, native_id TEXT NOT NULL,
         kind TEXT NOT NULL, validation TEXT NOT NULL, attempt_id TEXT, provider_turn_id TEXT,
         segment_id TEXT""",
+    "grok_calls": """session_key TEXT NOT NULL, call_id TEXT NOT NULL, provider_turn_id TEXT NOT NULL,
+        PRIMARY KEY(session_key,call_id,provider_turn_id)""",
     "deliveries": """task_id TEXT NOT NULL, thread_id TEXT NOT NULL, host TEXT NOT NULL,
         repository TEXT NOT NULL, number INTEGER NOT NULL, url TEXT NOT NULL, declared_at TEXT NOT NULL,
         PRIMARY KEY(task_id,thread_id,url,declared_at)""",
@@ -174,10 +176,10 @@ def _purpose(value):
     return INVALID
 
 
-def _rows(native, tables, name, where=""):
+def _rows(native, tables, name, where="", args=()):
     if PROJECTION + name not in tables:
         return
-    for row in native.execute("SELECT * FROM " + PROJECTION + name + where):
+    for row in native.execute("SELECT * FROM " + PROJECTION + name + where, args):
         row = dict(row)
         try:
             payload = json.loads(row.pop("payload_json", None))
@@ -433,7 +435,24 @@ def _attempts(con, native, tables, runs, providers):
     return attempts
 
 
+def _grok_call_refs(con, native, tables, owner, columns):
+    if "provider_turn_id" not in columns:
+        return
+    key, run, thread, pt, turn = owner
+    for row, item in _rows(native, tables, "turn_items", " WHERE provider_turn_id=?", (turn,)):
+        if (row.get("type") not in {"dynamic_tool", "file_search", "web_search", "command_execution", "file_change"}
+                or (row.get("run_id"), row.get("thread_id"), row.get("provider_thread_id")) != (run, thread, pt)
+                or not _matches(row, item, ("run_id", "runId"), ("thread_id", "threadId"),
+                                ("provider_thread_id", "providerThreadId"), ("provider_turn_id", "providerTurnId"),
+                                ("turn_item_id", "id"), ("type", "type"))):
+            continue
+        call = _strong(item.get("nativeItemRef"), "grok")
+        if call:
+            _insert(con, "grok_calls", key, call, turn)
+
+
 def _turns(con, native, tables, attempts):
+    item_columns = {r[1] for r in native.execute("PRAGMA table_info(orchestration_v2_projection_turn_items)")}
     for row, p in _rows(native, tables, "provider_turns", " WHERE run_attempt_id IS NOT NULL"):
         aid = _id(row.get("run_attempt_id"))
         if aid not in attempts:
@@ -464,6 +483,7 @@ def _turns(con, native, tables, attempts):
             if identity and _v1(i) and INPUT_TYPES.get(driver) == pair:
                 witnesses.add((identity, *pair))
         if driver == "grok":
+            _grok_call_refs(con, native, tables, (key, run, thread, pt, turn), item_columns)
             identity = _strong(p.get("nativeTurnRef"), driver)
             if identity and re.fullmatch(r"prompt:(0|[1-9][0-9]{0,15})", identity) and int(identity[7:]) <= MAX_INT:
                 witnesses.add((identity, "message", "grok_prompt_index"))

@@ -16,8 +16,13 @@ def sessions(con, task_id):
 
 def active(con, task_id):
     return _has_table(con, "t3_purpose_runs") and con.execute(
-        "SELECT 1 FROM t3_purpose_runs WHERE task_id=? LIMIT 1", (task_id,)
+        "SELECT 1 FROM t3_purpose_runs WHERE task_id=? "
+        "UNION ALL SELECT 1 FROM t3_purpose_deliveries WHERE task_id=? LIMIT 1", (task_id, task_id)
     ).fetchone() is not None
+
+
+def legacy_link(evidence):
+    return evidence == "t3" or (evidence or "").startswith("t3:")
 
 
 def evidence(con, task_id, scope):
@@ -48,7 +53,7 @@ def evidence(con, task_id, scope):
             by_input[native_id].add((run, turn, segment, validation))
         whole = {r["task_id"] for r in con.execute(
             "SELECT task_id, evidence FROM session_assignments WHERE session_key=?", (key,))
-            if not (r["evidence"] or "").startswith("t3:")}
+            if not legacy_link(r["evidence"])}
         claimed_inputs = defaultdict(set)
         for msg, alias, turn, owner in con.execute(
                 "SELECT s.native_id,s.alias_id,s.turn_id,a.task_id FROM assignments a "
@@ -57,7 +62,13 @@ def evidence(con, task_id, scope):
                 if identity:
                     claimed_inputs[identity].add(owner)
         harness = key.partition(":")[0]
-        for rid, input_ids in native_response.inputs(con, key).items():
+        call_witnesses = set()
+        if harness == "grok":
+            from .adapters import grok
+            responses, call_witnesses = grok.response_witnesses(con, key)
+        else:
+            responses = native_response.inputs(con, key)
+        for rid, input_ids in responses.items():
             candidates = {run for identity in input_ids for run in by_input.get(identity, ())}
             if not candidates:
                 continue
@@ -67,12 +78,15 @@ def evidence(con, task_id, scope):
             run, turn, segment, validation = next(iter(candidates))
             owner = by_run.get(run)
             native_id = next(iter(input_ids))
-            claims = whole | claimed_inputs.get(f"{harness}:{native_id}", set())
+            assignment_id = f"{key}:{native_id}" if harness == "grok" else f"{harness}:{native_id}"
+            claims = whole | claimed_inputs.get(assignment_id, set())
             if (reference_conflict and owner == task_id) or (claims and claims != {owner}):
                 conflicts.add(rid)
                 continue
             ownership[rid] = owner
             if owner == task_id:
+                if rid in call_witnesses:
+                    validation = "grok_tool_call"
                 members[rid] = {"run_id": run, "session_key": key, "native_input_id": native_id,
                                 "provider_turn_id": turn, "segment_id": segment, "validation": validation}
                 if harness == "codex":
@@ -157,6 +171,8 @@ def check_inventory(con, native, rows):
                     "USING(response_id) WHERE r.session_key=?", (key,)))
     gaps = set()
     main_gaps = set()
+    if not native["runs"]:
+        main_gaps.add("purpose_run_unavailable")
     checks = []
     for run in native["runs"]:
         run_id = run["run_id"]
@@ -171,7 +187,8 @@ def check_inventory(con, native, rows):
         for a in attempts:
             turns = [dict(r) for r in con.execute(
                 "SELECT * FROM t3_purpose_turns WHERE attempt_id=? ORDER BY provider_turn_id", (a["attempt_id"],))]
-            if a["provider_turn_id"] not in {t["provider_turn_id"] for t in turns}:
+            if not turns or (a["provider_turn_id"] is not None and
+                             a["provider_turn_id"] not in {t["provider_turn_id"] for t in turns}):
                 main_gaps.add("expected_provider_turn_missing")
             for turn in turns:
                 state = _turn_check(turn, by_turn[turn["provider_turn_id"]], finalized)
