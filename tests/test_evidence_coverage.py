@@ -875,3 +875,51 @@ class EvidenceCoverageTest(LedgerCase):
 
     def test_remove_competing_cache_split_imported_second(self):
         self.check_removed_claude_final(False, True)
+
+    def test_upgrade_retires_cache_split_with_live_original_total(self):
+        a = Path(self.tmp.name, "aggregate.jsonl")
+        b = Path(self.tmp.name, "split.jsonl")
+        user = claude_user("p")
+        msg = claude_response("reply", "p", "id")
+        usage = dict(input_tokens=10, output_tokens=5, cache_read_input_tokens=0, cache_creation_input_tokens=100000)
+        msg["message"].update(model="claude-haiku-4-5", usage=usage)
+        write_records(a, [user, msg])
+        claude.import_claude_file(self.con, str(a))
+        self.assign("A", "claude:p")
+        del usage["input_tokens"]
+        usage["cache_creation"] = {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 100000}
+        write_records(b, [user, msg])
+        claude.import_claude_file(self.con, str(b))
+        priced = report.task_report(self.con, "A")["total_cost"]["usd"]
+        self.assertAlmostEqual(priced, .200035)
+        write_records(b, [user])
+        claude.import_claude_file(self.con, str(b))
+        # Version 15 lost the supporting copy but left its TTL fields and
+        # the original source id on the materialized response.
+        self.con.execute("UPDATE responses SET cache_write_5m_tokens=0,cache_write_1h_tokens=100000")
+        self.con.execute("UPDATE sources SET claude_usage_version=15")
+        for source in (a, b):
+            claude.import_claude_file(self.con, str(source))
+        rep = report.task_report(self.con, "A")
+        self.assertEqual(rep["attributed"]["total_tokens"], 100015)
+        self.assertIsNone(rep["total_cost"]["usd"])
+        self.assertIn("Estimated cost unknown", self.draft()["body"])
+
+    def test_legacy_trace_uses_events_present_in_surviving_copies(self):
+        user = claude_user("p")
+        msg = claude_response("reply", "p", "id")
+        del msg["parentUuid"]
+        a = Path(self.tmp.name, "first.jsonl")
+        b = Path(self.tmp.name, "second.jsonl")
+        for path, call in ((a, "retired-call"), (b, "surviving-call")):
+            msg["message"]["content"] = [{"type": "tool_use", "id": call, "name": "Read"}]
+            write_records(path, [user, msg])
+            claude.import_claude_file(self.con, str(path))
+        self.assign("A", "claude:p")
+        msg["uuid"] = "new-reply"
+        msg["message"].update(id="independent", content=[{"type":"tool_use", "id":"independent-call", "name":"Read"}])
+        write_records(a, [user, msg])
+        claude.import_claude_file(self.con, str(a))
+        for turn in (None, "claude:p"):
+            self.assertEqual({e["native_id"] for e in report.timeline(self.con, "A", turn_id=turn)["events"]},
+                             {"independent-call", "surviving-call"})

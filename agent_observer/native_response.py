@@ -109,9 +109,19 @@ def event_responses(con, session_key):
                                            "WHERE session_key=?", (session_key,)):
                 measured_sources[rid].add(source)
     claude = session_key.startswith("claude:")
+    current_events = defaultdict(set)
+    indexed_sources = set()
     if claude:
         from .adapters.claude import legacy_capture_sources
         legacy_sources = legacy_capture_sources(con, session_key)
+        if db._has_table(con, "claude_event_observations"):
+            indexed_sources.update(s for s, in con.execute(
+                "SELECT DISTINCT e.source_id FROM events e JOIN sources s ON e.source_id=s.id "
+                "WHERE e.session_key=? AND s.claude_usage_version>=17", (session_key,)))
+            for event, source, turn in con.execute(
+                    "SELECT o.event_id,o.source_id,o.turn_id FROM claude_event_observations o "
+                    "JOIN events e ON e.id=o.event_id WHERE e.session_key=?", (session_key,)):
+                current_events[event].add((source, turn or None))
     legacy_text = defaultdict(set)
     if claude and db._has_table(con, "claude_response_ancestry"):
         # Pre-event-edge ledgers still retain the UUID of each text block.
@@ -122,8 +132,15 @@ def event_responses(con, session_key):
             legacy_text[source, uuid].add(rid)
     for event, source, family, native_id, turn in con.execute(
             "SELECT id,source_id,family,native_id,turn_id FROM events WHERE session_key=?", (session_key,)):
-        if claude and source not in legacy_sources:
-            turn = None  # An event without a literal edge cannot inherit its display turn.
+        if claude:
+            observations = current_events.get(event, set())
+            if source in indexed_sources and not observations and not edges[family, native_id]:
+                yield event, None, None  # No current source contains this archived event.
+                continue
+            locations = {t if s in legacy_sources else None for s, t in observations}
+            if source not in indexed_sources:
+                locations.add(turn if source in legacy_sources else None)
+            turn = next(iter(locations)) if len(locations) == 1 else None
         if claude and family == "assistant_message":
             yield event, turn, edges[family, native_id] | legacy_text[source, native_id.rpartition(":")[0]]
         elif claude and family in {"tool_result", "permission", "skill_invoke", "file_change"}:

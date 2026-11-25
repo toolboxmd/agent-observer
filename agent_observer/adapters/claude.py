@@ -106,7 +106,9 @@ def _valid_counter(value) -> bool:
 
 _FINALITY_TABLE = "claude_response_finality"
 _NATIVE_KINDS_TABLE = "claude_native_kinds"
-_IMPORT_VERSION = 16  # Rebuild measurements from surviving finals after a source withdrawal.
+_IMPORT_VERSION = 17  # Recheck every priced field and the source of each legacy trace event.
+_FINAL_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens",
+                 "reasoning_output_tokens", "total_tokens", "cache_write_5m_tokens", "cache_write_1h_tokens", "model")
 
 
 def _ensure_native_kinds(con) -> None:
@@ -336,6 +338,9 @@ class _Reader:
                      checkout_events=self.checkout_events
                      if self.first_new_ordinal is not None
                      and ordinal >= self.first_new_ordinal else None, **kw)
+        self.con.execute("INSERT OR IGNORE INTO claude_event_observations(source_id,event_id,turn_id) "
+                         "SELECT ?,id,? FROM events WHERE session_key=? AND family=? AND native_id=?",
+                         (self.src.source_id, self.turn or "", self.session_key, family, native_id))
         if family in {"tool_call", "assistant_message"}:
             self.message_events.append((family, native_id))
 
@@ -699,25 +704,47 @@ def _reproject_withdrawn_finals(r):
         con.execute("DELETE FROM claude_withdrawn_finals WHERE session_key=? AND response_id=?", (key, rid))
 
 
+def _unsupported_projections(con, scope, args):
+    """Older projections may contain individual fields supplied only by a removed source."""
+    gaps = []
+    retained = db._has_table(con, "claude_retained_final_fields")
+    for field in _FINAL_FIELDS:
+        gap = (f"r.{field} IS NOT NULL AND NOT EXISTS (SELECT 1 FROM claude_final_observations o "
+               "WHERE o.session_key=r.session_key AND o.response_id=r.response_id "
+               f"AND json_extract(o.payload,'$.{field}') IS NOT NULL)")
+        if retained:
+            gap += (" AND NOT EXISTS (SELECT 1 FROM claude_retained_final_fields f WHERE f.session_key=r.session_key "
+                    f"AND f.response_id=r.response_id AND f.field='{field}' AND f.value=r.{field})")
+        gaps.append("(" + gap + ")")
+    gaps.append("NOT EXISTS (SELECT 1 FROM claude_final_observations o WHERE o.session_key=r.session_key "
+                "AND o.response_id=r.response_id AND o.source_id=r.source_id)")
+    return con.execute("SELECT r.session_key,r.response_id FROM responses r WHERE r.harness='claude' AND " + scope +
+                       " AND EXISTS (SELECT 1 FROM claude_final_observations o WHERE o.session_key=r.session_key "
+                       "AND o.response_id=r.response_id) AND (" + " OR ".join(gaps) + ")", args)
+
+
 def conflicting_final_measurements(con, session_key):
     """A task can bill a final row only when its source measurements agree."""
     if not db._has_table(con, "claude_final_observations"):
         return set()
-    fields = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens",
-              "reasoning_output_tokens", "total_tokens", "cache_write_5m_tokens", "cache_write_1h_tokens")
     mismatch = ["json_extract(o.payload,'$.model') IS NOT r.model"]
-    for name in fields:
+    for name in _FINAL_FIELDS:
+        if name == "model":
+            continue
         value = f"json_extract(o.payload,'$.{name}')"
         mismatch.append(f"({value} IS NOT NULL AND {value} IS NOT r.{name})")
     conflicts = {rid for rid, in con.execute(
         "SELECT DISTINCT o.response_id FROM claude_final_observations o JOIN responses r USING(session_key,response_id) "
         "WHERE o.session_key=? AND (" + " OR ".join(mismatch) + ")", (session_key,))}
     if db._has_table(con, "claude_retained_final_fields"):
-        column = "CASE p.field " + " ".join(f"WHEN '{name}' THEN r.{name}" for name in (*fields, "model")) + " END"
+        column = "CASE p.field " + " ".join(f"WHEN '{name}' THEN r.{name}" for name in _FINAL_FIELDS) + " END"
         conflicts.update(rid for rid, in con.execute(
             "SELECT DISTINCT p.response_id FROM claude_retained_final_fields p "
             "JOIN responses r USING(session_key,response_id) WHERE p.session_key=? AND p.value IS NOT " + column,
             (session_key,)))
+    conflicts.update(rid for _, rid in _unsupported_projections(
+        con, "r.session_key=? AND r.source_id IN (SELECT id FROM sources WHERE claude_usage_version BETWEEN 11 AND 16)",
+        (session_key,)))
     if db._has_table(con, "claude_withdrawn_finals"):
         conflicts.update(rid for rid, in con.execute(
             "SELECT response_id FROM claude_withdrawn_finals WHERE session_key=?", (session_key,)))
@@ -1331,18 +1358,17 @@ def _prepare_ancestry(r):
         uuid TEXT NOT NULL, parent TEXT NOT NULL, link_status TEXT NOT NULL, turn_id TEXT, ordinal_num INTEGER NOT NULL,
         ts REAL, PRIMARY KEY(session_key,response_id,source_id,ordinal_num)) WITHOUT ROWID""")
     r.con.execute("CREATE INDEX IF NOT EXISTS claude_block_source ON claude_final_blocks(source_id)")
-    if not db._has_table(r.con, "claude_withdrawn_finals"):
-        r.con.execute("""CREATE TABLE claude_withdrawn_finals (
-            session_key TEXT NOT NULL,response_id TEXT NOT NULL, PRIMARY KEY(session_key,response_id)) WITHOUT ROWID""")
-        # A pre-version-16 ledger could already have removed a source while
-        # retaining its total or its location in the materialized response.
-        r.con.execute("""INSERT INTO claude_withdrawn_finals SELECT r.session_key,r.response_id FROM responses r
-            WHERE r.harness='claude' AND EXISTS (SELECT 1 FROM claude_final_observations o
-            WHERE o.session_key=r.session_key AND o.response_id=r.response_id)
-            AND (NOT EXISTS (SELECT 1 FROM claude_final_observations o WHERE o.session_key=r.session_key
-            AND o.response_id=r.response_id AND o.source_id=r.source_id) OR (r.total_tokens IS NOT NULL
-            AND NOT EXISTS (SELECT 1 FROM claude_final_observations o WHERE o.session_key=r.session_key
-            AND o.response_id=r.response_id AND json_extract(o.payload,'$.total_tokens') IS NOT NULL)))""")
+    r.con.execute("""CREATE TABLE IF NOT EXISTS claude_withdrawn_finals (
+        session_key TEXT NOT NULL,response_id TEXT NOT NULL, PRIMARY KEY(session_key,response_id)) WITHOUT ROWID""")
+    r.con.execute("""CREATE TABLE IF NOT EXISTS claude_event_observations (
+        source_id INTEGER NOT NULL REFERENCES sources(id),event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+        turn_id TEXT NOT NULL, PRIMARY KEY(event_id,source_id,turn_id)) WITHOUT ROWID""")
+    r.con.execute("CREATE INDEX IF NOT EXISTS claude_event_observation_source ON claude_event_observations(source_id)")
+    if r.src.row["claude_usage_version"] and r.src.row["claude_usage_version"] < _IMPORT_VERSION:
+        stale = _unsupported_projections(r.con,
+            "(r.source_id=? OR (r.session_key,r.response_id) IN (SELECT session_key,response_id "
+            "FROM claude_final_observations WHERE source_id=?))", (r.src.source_id, r.src.source_id))
+        r.con.executemany("INSERT OR IGNORE INTO claude_withdrawn_finals VALUES(?,?)", stale)
     if not db._has_table(r.con, "claude_expected_finals"):
         r.con.execute("""CREATE TABLE claude_expected_finals (
             source_id INTEGER NOT NULL REFERENCES sources(id), session_key TEXT NOT NULL, response_id TEXT NOT NULL,
@@ -1361,6 +1387,7 @@ def _prepare_ancestry(r):
         PRIMARY KEY(session_key,source_id)) WITHOUT ROWID""")
     r.linked_sessions = set()
     if not r.src.incremental:
+        r.con.execute("DELETE FROM claude_event_observations WHERE source_id=?", (r.src.source_id,))
         r.con.execute("DELETE FROM claude_final_blocks WHERE source_id=?", (r.src.source_id,))
         # Keep identities only until the replacement proves it could read
         # every row. A broken line cannot silently retract a competing copy.
