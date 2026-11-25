@@ -29,6 +29,16 @@ def claude_response(uuid, parent, response_id):
 
 
 class NativeResponseTest(LedgerCase):
+    def test_quarantined_claude_copy_cannot_add_a_second_parent(self):
+        path = Path(self.tmp.name, "s.jsonl")
+        rejected = claude_response("copy", "b", "mid")
+        rejected["message"]["usage"]["output_tokens"] = 99
+        write_records(path, [claude_user("a"), claude_user("b"),
+                             claude_response("original", "a", "mid"), rejected])
+        imported = claude.import_claude_file(self.con, str(path))
+        self.assertGreater(imported["malformed"], 0)
+        self.assertEqual(native_response.inputs(self.con, "claude:s")["claude:mid"], {"a"})
+
     def test_claude_out_of_order_tool_chain_cycle_and_competing_streams(self):
         path = Path(self.tmp.name, "s.jsonl")
         write_records(path, [

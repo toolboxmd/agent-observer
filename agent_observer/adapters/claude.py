@@ -411,8 +411,8 @@ def import_claude_file(con: sqlite3.Connection, path: str,
                       line)
             continue
         try:
-            _record_ancestry(r, obj)
             _ingest(r, obj, ordinal)
+            _record_ancestry(r, obj)
             if obj.get("type") == "queue-operation":
                 con.execute("DELETE FROM import_errors WHERE harness=? AND source_path=?"
                             " AND ordinal_num=? AND error='unsupported_schema'",
