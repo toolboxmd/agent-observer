@@ -2084,12 +2084,20 @@ def _notification_session_id(updates_path, events_path) -> str | None:
                     if record.get("method") not in METHODS or not isinstance(params, dict):
                         continue
                     update = params.get("update")
-                    if (not isinstance(update, dict) or update.get("sessionUpdate") != "turn_completed"
-                            or _valid_native_id(update.get("prompt_id") or update.get("promptId")) is None):
+                    if not isinstance(update, dict):
                         continue
-                    try:
-                        _validated_usage_counters(update)
-                    except _AdapterError:
+                    kind = update.get("sessionUpdate")
+                    if kind in ("tool_call", "tool_call_update"):
+                        if _valid_native_id(update.get("toolCallId")) is None:
+                            continue
+                    elif kind == "turn_completed":
+                        if _valid_native_id(update.get("prompt_id") or update.get("promptId")) is None:
+                            continue
+                        try:
+                            _validated_usage_counters(update)
+                        except _AdapterError:
+                            continue
+                    else:
                         continue
                     native_id = params.get("sessionId")
                 else:
@@ -2828,10 +2836,9 @@ def _tool_name(update: dict):
 
 def _tool_call(r: _Reader, src: JsonlSource, update: dict, params: dict,
                ordinal: int, ts) -> None:
-    raw_call = update.get("toolCallId")
-    if not isinstance(raw_call, str) or _safe_token(raw_call) is None:
+    call_id = _valid_native_id(update.get("toolCallId"))
+    if call_id is None:
         raise _AdapterError("schema_error")
-    call_id = raw_call
     raw = update.get("rawInput")
     name = _tool_name(update)
     target = _safe_target(raw)
@@ -2844,10 +2851,9 @@ def _tool_call(r: _Reader, src: JsonlSource, update: dict, params: dict,
 
 def _tool_call_update(r: _Reader, src: JsonlSource, update: dict,
                       params: dict, ordinal: int, ts) -> None:
-    raw_call = update.get("toolCallId")
-    if not isinstance(raw_call, str) or _safe_token(raw_call) is None:
+    call_id = _valid_native_id(update.get("toolCallId"))
+    if call_id is None:
         raise _AdapterError("schema_error")
-    call_id = raw_call
     turn_id = _turn_id(r, params)
     # Keep every validated location until a later terminal update, rather
     # than relying on the single representative path stored on the read row.

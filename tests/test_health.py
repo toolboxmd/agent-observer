@@ -676,6 +676,23 @@ class LedgerFreshnessTest(unittest.TestCase):
                 "SELECT session_key FROM events WHERE name='turn_started'").fetchone()[0],
                 "grok:native-id")
 
+    def test_grok_valid_tool_call_supplies_id_with_bad_summary(self):
+        folder = self.root / "grok/project/directory-id"
+        folder.mkdir(parents=True)
+        (folder / "summary.json").write_text('{"incomplete":')
+        (folder / "updates.jsonl").write_text(
+            '{"method":"session/update","params":{"sessionId":"wrong-id",'
+            '"update":{"sessionUpdate":"tool_call"}}}\n'
+            '{"method":"session/update","params":{"sessionId":"native-id",'
+            '"update":{"sessionUpdate":"tool_call","toolCallId":"call-one"}}}\n')
+        self.imports()
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            result = grok.sync(con)
+            self.assertEqual(result["failed"][0]["error"], "invalid Grok summary JSON")
+            self.assertEqual(result["events_inserted"], 1)
+            self.assertEqual(con.execute("SELECT session_key FROM events").fetchone()[0],
+                             "grok:native-id")
+
     def test_bad_grok_metadata_keeps_health_stale(self):
         cases = (
             ("summary.json", '{"incomplete":', "updates.jsonl", "{}\n", False, None),
