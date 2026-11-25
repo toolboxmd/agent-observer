@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import urllib.parse
 
 from .. import db, privacy
@@ -29,6 +30,7 @@ from ..identity import SessionIdentity, skill_from_path
 from ..ingest import (JsonlSource, fingerprint, insert_event, iso_ts,
                       stored_path, text_hash)
 from . import bare
+from .discovery import path_info
 
 HARNESS = "grok"
 SEMANTICS = "grok:input_includes_cached,output_includes_reasoning"
@@ -237,9 +239,8 @@ def _classify_prompt(prompt_idx: str, chat: dict,
 
 def _default_paths(*, strict: bool = False) -> tuple[list[str], dict]:
     """The normal sessions plus every Chromeria bare root's, and the report."""
-    found, report = bare.discover(HARNESS, lambda root: _sessions_under(root, strict=strict))
-    if strict and any(gap["reason"] == "unreadable" for gap in report["gaps"]):
-        raise PermissionError("Grok bare session root unreadable")
+    found, report = bare.discover(HARNESS, lambda root: _sessions_under(root, strict=strict),
+                                  strict=strict)
     return _sessions_under(DEFAULT_ROOT, strict=strict) + found, report
 
 
@@ -282,22 +283,31 @@ def _session_entries(path: str, strict: bool) -> list[str]:
 
 
 def _sessions_under(root: str, *, strict: bool = False) -> list[str]:
-    if _looks_like_session(root):
+    if _looks_like_session(root, strict=strict):
         return [root]
     out = []
     for group in _session_entries(root, strict):
         group_dir = os.path.join(root, group)
-        if not os.path.isdir(group_dir):
+        if not _session_path_is(group_dir, stat.S_ISDIR, os.path.isdir, strict):
             continue
         for child in _session_entries(group_dir, strict):
             session_dir = os.path.join(group_dir, child)
-            if os.path.isdir(session_dir) and _looks_like_session(session_dir):
+            if (_session_path_is(session_dir, stat.S_ISDIR, os.path.isdir, strict)
+                    and _looks_like_session(session_dir, strict=strict)):
                 out.append(session_dir)
     return out
 
 
-def _looks_like_session(path: str) -> bool:
-    return any(os.path.isfile(os.path.join(path, name)) for name in
+def _session_path_is(path, is_mode, permissive, strict):
+    if not strict:
+        return permissive(path)
+    info = path_info(path)
+    return info is not None and is_mode(info.st_mode)
+
+
+def _looks_like_session(path: str, *, strict: bool = False) -> bool:
+    return any(_session_path_is(os.path.join(path, name), stat.S_ISREG, os.path.isfile, strict)
+               for name in
                ("updates.jsonl", "events.jsonl", "summary.json",
                 "chat_history.jsonl"))
 

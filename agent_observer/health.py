@@ -271,11 +271,9 @@ def _discover_native_paths(harness, adapter):
     from .adapters import router
     if harness == "t3":
         return [adapter.state_path()]
-    if harness == "grok":
-        return adapter.discover(strict=True)
-    paths = adapter.discover()
+    paths = adapter.discover(strict=True)
     if harness == "codex":
-        paths.extend(router.discover_rollouts())
+        paths.extend(router.discover_rollouts(strict=True))
         return [os.path.realpath(path) for path in paths]
     return paths
 

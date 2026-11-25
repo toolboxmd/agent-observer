@@ -547,6 +547,24 @@ class HealthBareRootsTest(BareRootCase):
                          [{"root": gone, "reason": "missing on this machine"}])
         self.assertEqual(result["bare_roots"]["grok"]["state"], "unused")
 
+    def test_unreadable_codex_bare_root_is_unavailable(self):
+        root = self.bare_sessions("codex", "denied")
+        self.receipts(("codex", root))
+        listdir = os.listdir
+
+        def checked_listdir(path):
+            if path == root:
+                raise PermissionError("fixture bare root unreadable")
+            return listdir(path)
+
+        with patch.object(os, "listdir", checked_listdir):
+            result = health.check(processes=[], registry=[])
+        self.assertEqual(result["ledger_freshness"]["codex"]["status"], "unavailable")
+        self.assertIn({"check": "codex native record scan",
+                       "reason": "fixture bare root unreadable"}, result["unavailable"])
+        self.assertEqual(result["bare_roots"]["codex"]["gaps"],
+                         [{"root": root, "reason": "unreadable"}])
+
     def test_health_without_lsof_reports_both_gaps_in_one_run(self):
         gone = self.bare_sessions("codex", "gone")
         self.receipts(("codex", gone))

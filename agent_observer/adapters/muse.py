@@ -34,7 +34,6 @@ memory text are never stored.
 
 from __future__ import annotations
 
-import glob
 import json
 import os
 import re
@@ -43,6 +42,7 @@ import sqlite3
 from .. import db
 from ..identity import SessionIdentity
 from ..ingest import JsonlSource, MissingNativeId, fingerprint, insert_event
+from .discovery import record_paths
 
 HARNESS = "muse"
 
@@ -99,11 +99,11 @@ def _str(value) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def discover(root: str | None = None) -> list[str]:
+def discover(root: str | None = None, *, strict: bool = False) -> list[str]:
     root = root or DEFAULT_ROOT
-    main = glob.glob(os.path.join(root, "*", "*", "*", "*", "session.jsonl"))
-    children = glob.glob(os.path.join(root, "*", "*", "*", "*", "subagent",
-                                      "*", "session.jsonl"))
+    main = record_paths(root, "*", "*", "*", "*", "session.jsonl", strict=strict)
+    children = record_paths(root, "*", "*", "*", "*", "subagent",
+                            "*", "session.jsonl", strict=strict)
     return sorted(main + children)
 
 

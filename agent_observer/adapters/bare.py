@@ -95,13 +95,16 @@ def receipt_roots(harness: str) -> tuple[list, dict]:
 
 
 def discover(harness: str,
-             paths_under: Callable[[str], list[str]]) -> tuple[list[str], dict]:
+             paths_under: Callable[[str], list[str]], *,
+             strict: bool = False) -> tuple[list[str], dict]:
     """Record paths under every receipt root for harness, plus the report.
 
     paths_under(root) lists one root's records. Roots are canonical, so
     aliases of one directory are read once.
     """
     rows, report = receipt_roots(harness)
+    if strict and report["state"] == "unreadable T3 state":
+        raise OSError(report["error"])
     roots, gaps = [], []
     for root in rows:
         if not isinstance(root, str) or not root:
@@ -116,6 +119,8 @@ def discover(harness: str,
             gaps.append({"root": real, "reason": "missing on this machine"})
             continue
         except OSError:
+            if strict:
+                raise
             gaps.append({"root": real, "reason": "unreadable"})
             continue
         roots.append(real)

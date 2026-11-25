@@ -342,6 +342,55 @@ class LedgerFreshnessTest(unittest.TestCase):
         self.assertEqual(result["unavailable"][0]["check"], "identity conflicts")
         self.assertEqual(result["ledger_freshness"]["claude"]["status"], "stale")
 
+    def test_denied_listing_in_glob_layouts_is_unavailable(self):
+        self.source("claude/project/new.jsonl", 20_000)
+        self.source("codex/2026/11/rollout-normal.jsonl", 20_000)
+        self.source("router/codex-sessions/2026/rollout-owned.jsonl", 20_000)
+        self.source("muse/2026/11/25/session/session.jsonl", 20_000)
+        self.imports(claude=11_000, codex=11_000, muse=11_000)
+        listdir = os.listdir
+        scandir = os.scandir
+        for harness, folder in (
+                ("claude", "claude/project"), ("codex", "codex/2026/11"),
+                ("codex", "router/codex-sessions/2026"), ("muse", "muse/2026/11")):
+            def checked_listdir(path):
+                if path == str(self.root / folder):
+                    raise PermissionError("fixture directory unreadable")
+                return listdir(path)
+
+            def checked_scandir(path):
+                if path == str(self.root / folder):
+                    raise PermissionError("fixture directory unreadable")
+                return scandir(path)
+
+            with self.subTest(folder=folder), patch.object(os, "listdir", checked_listdir), \
+                    patch.object(os, "scandir", checked_scandir):
+                code, output = self.run_health("--json")
+                self.assertEqual(code, 4)
+                result = json.loads(output)
+                self.assertEqual(result["ledger_freshness"][harness]["status"], "unavailable")
+                self.assertIn({"check": f"{harness} native record scan",
+                               "reason": "fixture directory unreadable"}, result["unavailable"])
+
+    def test_grok_file_stat_permission_failure_is_unavailable(self):
+        path = "grok/project/session/updates.jsonl"
+        self.source(path, 20_000)
+        self.imports(grok=11_000)
+        stat = os.stat
+
+        def checked_stat(target, *args, **kwargs):
+            if target == str(self.root / path):
+                raise PermissionError("fixture record unreachable")
+            return stat(target, *args, **kwargs)
+
+        with patch.object(os, "stat", checked_stat):
+            code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        result = json.loads(output)
+        self.assertEqual(result["ledger_freshness"]["grok"]["status"], "unavailable")
+        self.assertIn({"check": "grok native record scan",
+                       "reason": "fixture record unreachable"}, result["unavailable"])
+
 
 class ClaudeVisibilityTest(unittest.TestCase):
     def setUp(self):

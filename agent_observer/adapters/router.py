@@ -55,19 +55,20 @@ Stdlib only. Never writes the router database or rollout files.
 
 from __future__ import annotations
 
-import glob
 import hashlib
 import json
 import math
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import urllib.parse
 
 from .. import db, privacy
 from ..ingest import iso_ts
 from . import codex as _codex
+from .discovery import path_info, record_paths
 
 HARNESS = "router"
 ROUTER_SCHEMA_VERSION = 2
@@ -236,7 +237,7 @@ _COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _CONTENT_HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
-def discover(root: str | None = None) -> list[str]:
+def discover(root: str | None = None, *, strict: bool = False) -> list[str]:
     roots = [root] if root is not None else [
         os.environ.get("DURABLE_RUNNER_STATE_DIR"), DEFAULT_ROOT, LEGACY_ROOT]
     paths = []
@@ -245,7 +246,12 @@ def discover(root: str | None = None) -> list[str]:
             continue
         path, _ = _resolve_paths(os.path.expanduser(candidate), None)
         canonical = _canonical_source_path(path)
-        if os.path.isfile(canonical) and canonical not in paths:
+        if strict:
+            info = path_info(canonical)
+            exists = info is not None and stat.S_ISREG(info.st_mode)
+        else:
+            exists = os.path.isfile(canonical)
+        if exists and canonical not in paths:
             paths.append(canonical)
     return paths
 
@@ -1325,21 +1331,19 @@ def _validate_source_event(con: sqlite3.Connection, db_path: str,
     return False
 
 
-def _rollouts_under(rollout_root: str) -> list[str]:
-    patterns = (
-        os.path.join(rollout_root, "codex-sessions", "**", "rollout-*.jsonl"),
-        os.path.join(rollout_root, "kits", "*", "sessions", "**",
-                     "rollout-*.jsonl"))
-    paths = set()
-    for pattern in patterns:
-        paths.update(glob.glob(pattern, recursive=True))
+def _rollouts_under(rollout_root: str, *, strict: bool = False) -> list[str]:
+    paths = set(record_paths(rollout_root, "codex-sessions", "**", "rollout-*.jsonl",
+                             strict=strict))
+    paths.update(record_paths(rollout_root, "kits", "*", "sessions", "**",
+                              "rollout-*.jsonl", strict=strict))
     return list(dict.fromkeys(os.path.realpath(path) for path in sorted(paths)))
 
 
-def discover_rollouts() -> list[str]:
+def discover_rollouts(*, strict: bool = False) -> list[str]:
     """Codex rollouts read by default Router sync, including its fallback root."""
-    roots = [os.path.dirname(path) for path in discover()] or [DEFAULT_ROOT]
-    return list(dict.fromkeys(path for root in roots for path in _rollouts_under(root)))
+    roots = [os.path.dirname(path) for path in discover(strict=strict)] or [DEFAULT_ROOT]
+    return list(dict.fromkeys(path for root in roots
+                              for path in _rollouts_under(root, strict=strict)))
 
 
 def _sync_rollouts(con: sqlite3.Connection, rollout_root: str, totals: dict,

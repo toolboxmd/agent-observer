@@ -13,7 +13,6 @@ total_tokens = input + cache_creation + cache_read + output.
 
 from __future__ import annotations
 
-import glob
 import json
 import os
 import sqlite3
@@ -22,6 +21,7 @@ from .. import db, privacy, intervention_evidence
 from ..identity import SessionIdentity, skill_from_path
 from ..ingest import (JsonlSource, MissingNativeId, fingerprint, insert_event,
                       iso_ts, text_hash)
+from .discovery import record_paths
 
 HARNESS = "claude"
 SEMANTICS = "claude:input_excludes_cache,output_includes_thinking"
@@ -219,10 +219,10 @@ def _mark_finalized(con, rid: str) -> None:
         " VALUES(?, ?)", (rid, _time.time()))
 
 
-def discover(root: str | None = None) -> list[str]:
+def discover(root: str | None = None, *, strict: bool = False) -> list[str]:
     root = root or DEFAULT_ROOT
-    main = glob.glob(os.path.join(root, "*", "*.jsonl"))
-    subs = glob.glob(os.path.join(root, "*", "*", "subagents", "agent-*.jsonl"))
+    main = record_paths(root, "*", "*.jsonl", strict=strict)
+    subs = record_paths(root, "*", "*", "subagents", "agent-*.jsonl", strict=strict)
     return sorted(main + subs)
 
 
