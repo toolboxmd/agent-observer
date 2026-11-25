@@ -106,7 +106,7 @@ def _valid_counter(value) -> bool:
 
 _FINALITY_TABLE = "claude_response_finality"
 _NATIVE_KINDS_TABLE = "claude_native_kinds"
-_IMPORT_VERSION = 11  # Replay source-specific final measurements and ownership evidence.
+_IMPORT_VERSION = 12  # Replay incomplete finals independently of their surviving identity.
 
 
 def _ensure_native_kinds(con) -> None:
@@ -421,6 +421,11 @@ def import_claude_file(con: sqlite3.Connection, path: str,
                       "malformed_json" if obj is None else "unknown_record",
                       line)
             continue
+        if obj.get("type") == "assistant":
+            message = obj.get("message")
+            if (not isinstance(message, dict) or (message.get("model") != "<synthetic>" and (
+                    not native_response.identifier(message.get("id")) or message.get("role", "assistant") != "assistant"))):
+                unreadable = True
         try:
             r.message_events.clear()
             _ingest(r, obj, ordinal)
@@ -459,6 +464,17 @@ def import_claude_file(con: sqlite3.Connection, path: str,
                     AND a.session_key=p.session_key AND a.uuid=p.uuid AND a.parent=p.parent
                     AND a.response_id=p.response_id)""")
     if not src.incremental:
+        # Seeing the same message again without any final measurement cannot
+        # retract a previous final. Retain the gap until this source attests it.
+        con.execute("""INSERT OR IGNORE INTO claude_rejected_measurements
+            SELECT a.session_key,a.source_id,a.uuid,a.parent,a.response_id,'missing_final_usage'
+            FROM claude_response_ancestry a JOIN (
+                SELECT session_key,source_id,response_id FROM temp.claude_prior_finals UNION
+                SELECT session_key,source_id,response_id FROM temp.claude_prior_edges
+                WHERE reason IN ('missing_final_usage','malformed_final_usage')
+            ) p USING(session_key,source_id,response_id)
+            WHERE NOT EXISTS (SELECT 1 FROM claude_final_observations f WHERE f.session_key=a.session_key
+                              AND f.source_id=a.source_id AND f.response_id=a.response_id)""")
         con.execute("DROP TABLE temp.claude_prior_edges")
         con.execute("DROP TABLE temp.claude_prior_finals")
     con.executemany("INSERT OR IGNORE INTO claude_ancestry_sources VALUES(?,?)",
@@ -602,9 +618,15 @@ def conflicting_final_measurements(con, session_key):
     for name in ("cache_write_5m_tokens", "cache_write_1h_tokens"):
         value = f"json_extract(o.payload,'$.{name}')"
         mismatch.append(f"({value} IS NOT NULL AND r.{name} IS NOT NULL AND {value}<>r.{name})")
-    return {rid for rid, in con.execute(
+    conflicts = {rid for rid, in con.execute(
         "SELECT DISTINCT o.response_id FROM claude_final_observations o JOIN responses r USING(session_key,response_id) "
         "WHERE o.session_key=? AND (" + " OR ".join(mismatch) + ")", (session_key,))}
+    conflicts.update(rid for rid, in con.execute(
+        "SELECT DISTINCT q.response_id FROM claude_rejected_measurements q WHERE q.session_key=? "
+        "AND q.reason IN ('missing_final_usage','malformed_final_usage') AND NOT EXISTS ("
+        "SELECT 1 FROM claude_final_observations f WHERE f.session_key=q.session_key "
+        "AND f.source_id=q.source_id AND f.response_id=q.response_id)", (session_key,)))
+    return conflicts
 
 
 def _ingest_usage_row(r: _Reader, obj: dict, ordinal: int, ts, mid: str,
@@ -1167,9 +1189,9 @@ def _prepare_ancestry(r):
         # Keep identities only until the replacement proves it could read
         # every row. A broken line cannot silently retract a competing copy.
         r.con.execute("CREATE TEMP TABLE claude_prior_edges AS "
-                      "SELECT session_key,source_id,uuid,parent,response_id FROM claude_response_ancestry "
+                      "SELECT session_key,source_id,uuid,parent,response_id,'' AS reason FROM claude_response_ancestry "
                       "WHERE source_id=? AND response_id<>'' UNION "
-                      "SELECT session_key,source_id,uuid,parent,response_id FROM claude_rejected_measurements "
+                      "SELECT session_key,source_id,uuid,parent,response_id,reason FROM claude_rejected_measurements "
                       "WHERE source_id=?", (r.src.source_id, r.src.source_id))
         r.con.execute("CREATE TEMP TABLE claude_prior_finals AS SELECT session_key,response_id,source_id,payload "
                       "FROM claude_final_observations WHERE source_id=?", (r.src.source_id,))
@@ -1215,6 +1237,11 @@ def _record_ancestry(r, obj, rejected=None):
         mid = native_response.identifier(message.get("id"))
         if mid and message.get("model") != "<synthetic>":
             response_id = f"{HARNESS}:{mid}"
+            if message.get("stop_reason") is not None:
+                if rejected == "malformed_usage":
+                    rejected = "malformed_final_usage"
+                elif not rejected and not message.get("usage"):
+                    rejected = "missing_final_usage"
             for family, event_id in r.message_events:
                 native_response.record_event(r.con, r.src.source_id, r.session_key, family, event_id, response_id)
     elif kind == "attachment" and isinstance(obj.get("attachment"), dict):

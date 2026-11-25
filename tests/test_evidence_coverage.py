@@ -106,7 +106,8 @@ class EvidenceCoverageTest(LedgerCase):
         with closing(sqlite3.connect(path)) as source, source:
             # These task scopes exercise only the two copies of the parent.
             source.execute("DELETE FROM session WHERE parent_id IS NOT NULL")
-            source.execute("DELETE FROM message WHERE id='msg_a_unf'")
+            source.execute("DELETE FROM part WHERE message_id IN ('msg_a_unf','msg_a_err')")
+            source.execute("DELETE FROM message WHERE id IN ('msg_a_unf','msg_a_err')")
             source.execute("UPDATE message SET data=json_set(data,'$.parentID',?,'$.cost',?,"
                            "'$.tokens.output',?) WHERE id='msg_a1'", (parent, cost, output))
             if independent:
@@ -552,3 +553,45 @@ class EvidenceCoverageTest(LedgerCase):
         write_records(copy, rows)
         claude.import_claude_file(self.con, str(copy), full=True)
         self.assertEqual(report.task_report(self.con, "B")["attributed"]["responses"], 1)
+
+    def test_losing_measurement_or_message_cannot_clear_claude_final_dispute(self):
+        path = self.import_claude()
+        self.assign("B", "claude:b")
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        other = path.with_name("changed.jsonl")
+        msg = rows[-1]["message"]
+        msg["usage"]["output_tokens"] = 90000
+        write_records(other, rows)
+        claude.import_claude_file(self.con, str(other))
+        self.assertFalse(report.task_report(self.con, "B")["attributed"]["responses"])
+        del msg["usage"]
+        for replacement in (msg, [], None):
+            with self.subTest(message_type=type(replacement).__name__):
+                rows[-1]["message"] = replacement
+                write_records(other, rows)
+                for _ in range(2):
+                    claude.import_claude_file(self.con, str(other), full=True)
+                    self.assertFalse(report.task_report(self.con, "B")["attributed"]["responses"])
+                    self.assertFalse(report.timeline(self.con, "B")["events"])
+        other.write_bytes(path.read_bytes())
+        claude.import_claude_file(self.con, str(other), full=True)
+        self.assertEqual(report.task_report(self.con, "B")["attributed"]["responses"], 1)
+
+    def test_zero_counters_and_invalid_completion_time_withhold_opencode_cost(self):
+        path = self.opencode_store("unmeasured", "msg_u1", .20, 50, independent=True)
+        with closing(sqlite3.connect(path)) as src:
+            original = json.loads(src.execute("SELECT data FROM message WHERE id='msg_a1'").fetchone()[0])
+        opencode.sync(self.con, source=path)
+        self.assign("A", "opencode:msg_u1")
+        zero = dict(original, tokens={"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}})
+        invalid_times = [dict(original, time={"completed": v}) for v in (False, True, -1, "broken", {})]
+        for record in [zero, *invalid_times]:
+            with self.subTest(record=record["time"]["completed"]):
+                with closing(sqlite3.connect(path)) as src, src:
+                    src.execute("UPDATE message SET data=? WHERE id='msg_a1'", (json.dumps(record),))
+                opencode.sync(self.con, source=path, full=True)
+                rep = report.task_report(self.con, "A")
+                self.assertFalse(rep["complete"])
+                self.assertIsNone(rep["native_cost"]["total_usd"])
+                self.assertEqual(rep["native_cost"]["known_subtotal_usd"], .10)
+                self.assertIn("Evidence complete: no", self.draft()["body"])

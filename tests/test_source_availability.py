@@ -150,6 +150,7 @@ class SourceAvailabilityTest(LedgerCase):
         native_path = os.path.join(self.tmp.name, "opencode.db")
         build_native(native_path)
         with closing(sqlite3.connect(native_path)) as native, native:
+            native.execute("UPDATE message SET data=json_set(data,'$.tokens.output',1) WHERE id='msg_a_err'")
             native.execute("UPDATE message SET data=json_set(data,'$.time.completed',?) WHERE id='msg_a_unf'",
                            (T0 + 60,))
             native.execute("UPDATE part SET data=json_set(data,'$.state.status','completed','$.state.time.end',?) "

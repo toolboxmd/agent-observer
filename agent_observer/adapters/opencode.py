@@ -297,7 +297,7 @@ def _prepare_observations(con, session_key, source_id, *, identities_complete):
     # another copy can replace its projection. Only its own edge accompanies it.
     for row in con.execute(
             "SELECT r.* FROM responses r JOIN sources s ON s.id=r.source_id WHERE r.session_key=? "
-            "AND r.source_id<>? AND s.sha256 NOT GLOB 'oc[3-6]:*' AND NOT EXISTS "
+            "AND r.source_id<>? AND s.sha256 NOT GLOB 'oc[3-7]:*' AND NOT EXISTS "
             "(SELECT 1 FROM opencode_response_observations o WHERE o.session_key=r.session_key "
             "AND o.response_id=r.response_id AND o.source_id=r.source_id)", (session_key, source_id)):
         parent = con.execute(
@@ -380,7 +380,7 @@ def response_witnesses(con, session_key):
     if db._has_table(con, "native_response_events"):
         for rid, source in con.execute(
                 "SELECT DISTINCT e.response_id,e.source_id FROM native_response_events e "
-                "JOIN sources s ON s.id=e.source_id WHERE e.session_key=? AND s.sha256 NOT GLOB 'oc[4-6]:*'",
+                "JOIN sources s ON s.id=e.source_id WHERE e.session_key=? AND s.sha256 NOT GLOB 'oc[4-7]:*'",
                 (session_key,)):
             if rid in measured and source not in payload_sources.get(rid, {measured[rid]}):
                 conflicts.add(rid)
@@ -392,10 +392,10 @@ def has_unlocated_usage_error(con, session_key):
     # Keep the session's cost open without guessing which message failed.
     return con.execute(
         "SELECT 1 FROM sources s WHERE s.harness=? AND s.session_id=? AND "
-        "(s.sha256=? OR (s.sha256 NOT GLOB 'oc[4-6]:*' AND EXISTS (SELECT 1 FROM import_errors e "
+        "(s.sha256 GLOB 'oc[4-7]:unlocated' OR (s.sha256 NOT GLOB 'oc[4-7]:*' AND EXISTS (SELECT 1 FROM import_errors e "
         "WHERE e.harness=s.harness AND e.source_path=s.path AND e.error='malformed_usage' "
         "AND instr(','||e.line_excerpt||',', ',tokens,')>0))) LIMIT 1",
-        (HARNESS, session_key.partition(":")[2], _UNLOCATED_SNAPSHOT)).fetchone() is not None
+        (HARNESS, session_key.partition(":")[2])).fetchone() is not None
 
 
 def _project_response(con, stats, rid, session_key, session_id, locator, measurement):
@@ -498,7 +498,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     session_key = f"{HARNESS}:{sess_id}"
     msg_n, msg_m = _count_max(native, "message", sess_id)
     part_n, part_m = _count_max(native, "part", sess_id)
-    fp = "oc6:" + fingerprint(sess.get("time_updated"), msg_m, part_m, msg_n, part_n)
+    fp = "oc7:" + fingerprint(sess.get("time_updated"), msg_m, part_m, msg_n, part_n)
     row = con.execute(
         "SELECT * FROM sources WHERE harness=? AND path=?",
         (HARNESS, src_path)).fetchone()
@@ -652,8 +652,9 @@ def _ingest_message(con, native, stats, identity, src_path, source_id,
     timing = data.get("time") if isinstance(data.get("time"), dict) else {}
     completed = timing.get("completed")
     created = timing.get("created")
-    ts = iso_ts(completed if completed is not None else
-                (created if created is not None else msg.get("time_created")))
+    ts = _completion_time(completed)
+    if ts is None:
+        ts = iso_ts(created if created is not None else msg.get("time_created"))
     error = data.get("error")
     if isinstance(error, dict):
         detail = error.get("data") if isinstance(error.get("data"), dict) \
@@ -709,16 +710,28 @@ def _ingest_response(con, stats, src_path, source_id, session_key, sess,
 
 # The observation holds either the measured fields or a reason they are unavailable.
 _MAX_COUNTER = (1 << 63) - 1  # SQLite INTEGER.
-_UNLOCATED_SNAPSHOT = "oc6:unlocated"  # Never matches a complete snapshot fingerprint.
+_UNLOCATED_SNAPSHOT = "oc7:unlocated"  # Never matches a complete snapshot fingerprint.
 _MALFORMED_USAGE = "malformed_usage"
 _INVALID_OBSERVATIONS = {"null", json.dumps(_MALFORMED_USAGE), json.dumps("unknown_message"),
-                         json.dumps("unfinished")}
+                         json.dumps("unfinished"), json.dumps("unmeasured")}
+
+
+def _completion_time(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        ts = iso_ts(value)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return ts if ts is not None and 0 <= ts < 253402300800 else None
 
 
 def _measurement(data):
     timing = data.get("time") if isinstance(data.get("time"), dict) else {}
     if timing.get("completed") is None:
         return "unfinished"
+    if _completion_time(timing["completed"]) is None:
+        return _MALFORMED_USAGE
     raw_tokens = data.get("tokens")
     if raw_tokens is None:
         tokens: dict = {}
