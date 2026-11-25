@@ -106,7 +106,7 @@ def _valid_counter(value) -> bool:
 
 _FINALITY_TABLE = "claude_response_finality"
 _NATIVE_KINDS_TABLE = "claude_native_kinds"
-_IMPORT_VERSION = 8  # Distinguish unusable ancestry from historical records without an edge.
+_IMPORT_VERSION = 9  # Replay usable identities alongside rejected measurements.
 
 
 def _ensure_native_kinds(con) -> None:
@@ -428,9 +428,11 @@ def import_claude_file(con: sqlite3.Connection, path: str,
                             " AND ordinal_num=? AND error='unsupported_schema'",
                             (HARNESS, path, ordinal))
         except _UsageConflict:
+            _record_ancestry(r, obj, rejected="usage_conflict")
             stats["malformed"] += 1
             src.error(ordinal, "usage_conflict", line)
         except _MalformedUsage:
+            _record_ancestry(r, obj, rejected="malformed_usage")
             stats["malformed"] += 1
             src.error(ordinal, "malformed_usage", line)
         except MissingNativeId:
@@ -440,6 +442,8 @@ def import_claude_file(con: sqlite3.Connection, path: str,
             stats["malformed"] += 1
             src.error(ordinal, "unsupported_schema", line)
         except (KeyError, TypeError, ValueError, AttributeError):
+            if obj.get("type") == "assistant":
+                _record_ancestry(r, obj, rejected="schema_error")
             stats["malformed"] += 1
             src.error(ordinal, "schema_error", line)
     if r.native_session:
@@ -1090,13 +1094,18 @@ def _prepare_ancestry(r):
         source_id INTEGER NOT NULL REFERENCES sources(id), session_key TEXT NOT NULL,
         uuid TEXT NOT NULL, response_id TEXT NOT NULL,
         PRIMARY KEY(session_key, source_id, uuid, response_id)) WITHOUT ROWID""")
+    r.con.execute("""CREATE TABLE IF NOT EXISTS claude_rejected_measurements (
+        session_key TEXT NOT NULL, source_id INTEGER NOT NULL REFERENCES sources(id),
+        uuid TEXT NOT NULL, parent TEXT NOT NULL, response_id TEXT NOT NULL, reason TEXT NOT NULL,
+        PRIMARY KEY(session_key, source_id, uuid, parent, response_id, reason)) WITHOUT ROWID""")
     if not r.src.incremental:
         r.con.execute("DELETE FROM claude_response_ancestry WHERE source_id=?",
                       (r.src.source_id,))
         r.con.execute("DELETE FROM claude_invalid_ancestry WHERE source_id=?", (r.src.source_id,))
+        r.con.execute("DELETE FROM claude_rejected_measurements WHERE source_id=?", (r.src.source_id,))
 
 
-def _record_ancestry(r, obj):
+def _record_ancestry(r, obj, rejected=None):
     uuid = native_response.identifier(obj.get("uuid"))
     if (not r.native_session or obj.get("sessionId") != r.native_session
             or (obj.get("agentId") and obj["agentId"] != r.agent_id)):
@@ -1123,8 +1132,9 @@ def _record_ancestry(r, obj):
         mid = native_response.identifier(message.get("id"))
         if mid and message.get("model") != "<synthetic>":
             response_id = f"{HARNESS}:{mid}"
-            for family, event_id in r.message_events:
-                native_response.record_event(r.con, r.src.source_id, r.session_key, family, event_id, response_id)
+            if not rejected:
+                for family, event_id in r.message_events:
+                    native_response.record_event(r.con, r.src.source_id, r.session_key, family, event_id, response_id)
     elif kind == "attachment" and isinstance(obj.get("attachment"), dict):
         if obj["attachment"].get("type") == "queued_command":
             # A consumed queued input has its own identity. A missing identity
@@ -1140,6 +1150,10 @@ def _record_ancestry(r, obj):
         if uuid or response_id:
             r.con.execute("INSERT OR IGNORE INTO claude_invalid_ancestry VALUES(?,?,?,?)",
                           (r.src.source_id, r.session_key, uuid or "", response_id))
+        return
+    if rejected and response_id:
+        r.con.execute("INSERT OR IGNORE INTO claude_rejected_measurements VALUES(?,?,?,?,?,?)",
+                      (r.session_key, r.src.source_id, uuid or "", parent or "", response_id, rejected))
         return
     if not uuid:
         return
@@ -1169,6 +1183,7 @@ def response_witnesses(con, session_key):
             if response_id:
                 conflicts.add(response_id)
     recorded_parents = set()
+    accepted = set()
     for uuid, parent, input_id, response_id in con.execute(
         "SELECT DISTINCT uuid,parent,input_id,response_id FROM claude_response_ancestry"
         " WHERE session_key=?", (session_key,)
@@ -1186,6 +1201,22 @@ def response_witnesses(con, session_key):
             children[parent].add(uuid)
         if response_id:
             blocks[response_id].add(uuid)
+            accepted.add((uuid, parent, response_id))
+    if db._has_table(con, "claude_rejected_measurements"):
+        for uuid, parent, rid, reason, same_source in con.execute(
+                "SELECT q.uuid,q.parent,q.response_id,q.reason,EXISTS (SELECT 1 FROM claude_response_ancestry a "
+                "WHERE a.source_id=q.source_id AND a.session_key=q.session_key AND a.response_id=q.response_id) "
+                "FROM claude_rejected_measurements q WHERE q.session_key=?",
+                (session_key,)):
+            # Rejected measurements cannot grant ownership. A later usable
+            # block can confirm the same edge. A counter conflict on a new
+            # block cannot revise an already finalized response either.
+            if ((uuid, parent, rid) in accepted
+                    or (reason == "usage_conflict" and same_source and uuid not in seen)):
+                continue
+            conflicts.add(rid)
+            if uuid:
+                disputed.add(uuid)
     # Contradictory copies of any ancestor also dispute its descendants,
     # even when a missing parent keeps the ordinary walk from reaching them.
     pending = deque(disputed)

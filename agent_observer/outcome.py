@@ -164,14 +164,14 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
     elif harness == "opencode":
         from .adapters import opencode
         responses, disputed_completions = opencode.response_witnesses(con, key)
-        # A malformed native measurement can leave an ownership dispute
-        # without any projected usage row. It still makes coverage incomplete.
-        result.conflicts.update(disputed_completions)
     elif harness == "grok":
         from .adapters import grok
         responses, call_witnesses, disputed_completions = grok.response_witnesses(con, key)
     else:
         responses = native_response.inputs(con, key)
+    # Rejected native records can leave an ownership dispute without a
+    # projected usage row. It still makes coverage incomplete.
+    result.conflicts.update(disputed_completions)
     # In a contested whole session, only events on resolved turns can be
     # shown. Untagged events cannot be separated between the claimants.
     exclusive = not by_run or (whole == {task_id} and set(by_run.values()) == {task_id})

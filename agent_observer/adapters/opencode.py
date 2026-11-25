@@ -285,7 +285,7 @@ _MEASUREMENT_FIELDS = ("model", "provider", "effort", "input_tokens", "output_to
                        "total_tokens", "cost_usd")
 
 
-def _prepare_observations(con, session_key, source_id):
+def _prepare_observations(con, session_key, source_id, *, messages_read):
     # A snapshot replaces only this store's observations. Keep the projection
     # fields needed to restore a surviving copy when another store changes.
     con.execute("""CREATE TABLE IF NOT EXISTS opencode_response_observations (
@@ -297,7 +297,7 @@ def _prepare_observations(con, session_key, source_id):
     # another copy can replace its projection. Only its own edge accompanies it.
     for row in con.execute(
             "SELECT r.* FROM responses r JOIN sources s ON s.id=r.source_id WHERE r.session_key=? "
-            "AND r.source_id<>? AND s.sha256 NOT GLOB 'oc[34]:*' AND NOT EXISTS "
+            "AND r.source_id<>? AND s.sha256 NOT GLOB 'oc[3-5]:*' AND NOT EXISTS "
             "(SELECT 1 FROM opencode_response_observations o WHERE o.session_key=r.session_key "
             "AND o.response_id=r.response_id AND o.source_id=r.source_id)", (session_key, source_id)):
         parent = con.execute(
@@ -306,7 +306,15 @@ def _prepare_observations(con, session_key, source_id):
         measurement = {name: row[name] for name in _MEASUREMENT_FIELDS}
         _observe_response(con, session_key, row["response_id"], row["source_id"], parent[0] if parent else None,
                           measurement, row["ts"], row["ordinal_num"])
-    con.execute("DELETE FROM opencode_response_observations WHERE source_id=?", (source_id,))
+    if messages_read:
+        con.execute("DELETE FROM opencode_response_observations WHERE source_id=?", (source_id,))
+    else:
+        # A failed read cannot establish that the store removed a witness.
+        con.execute("UPDATE opencode_response_observations SET measurement='null' WHERE source_id=?", (source_id,))
+        con.execute("INSERT OR IGNORE INTO opencode_response_observations "
+                    "(session_key,response_id,source_id,measurement,ts,ordinal_num) "
+                    "SELECT session_key,response_id,source_id,'null',ts,ordinal_num FROM responses "
+                    "WHERE session_key=? AND source_id=?", (session_key, source_id))
 
 
 def _project_observations(con, stats, session_key, session_id):
@@ -318,7 +326,8 @@ def _project_observations(con, stats, session_key, session_id):
             "WHERE session_key=? ORDER BY response_id,s.path", (session_key,)):
         groups.setdefault(row["response_id"], []).append(row)
     for rid, copies in groups.items():
-        measured = [(row, json.loads(row["measurement"])) for row in copies if row["measurement"] != "null"]
+        payloads = ((row, json.loads(row["measurement"])) for row in copies)
+        measured = [(row, data) for row, data in payloads if isinstance(data, dict)]
         # A rejected payload has a durable ownership witness, but cannot
         # create a billable row. An all-zero lifecycle record has no usage.
         if not measured or all(data["total_tokens"] == 0 for _, data in measured):
@@ -342,13 +351,15 @@ def response_witnesses(con, session_key):
     payload_sources = {}
     observations = {}
     if db._has_table(con, "opencode_response_observations"):
-        for rid, source, parent, measurement in con.execute(
-                "SELECT o.response_id,o.source_id,o.parent,o.measurement FROM opencode_response_observations o "
+        for rid, source, parent, measurement, projected in con.execute(
+                "SELECT o.response_id,o.source_id,o.parent,o.measurement,r.response_id FROM opencode_response_observations o "
                 "LEFT JOIN responses r USING(session_key,response_id) WHERE o.session_key=? AND coalesce(r.is_overlap,0)=0",
                 (session_key,)):
+            if measurement == '"unfinished"' and not projected:
+                continue
             payload_sources.setdefault(rid, set()).add(source)
             observations.setdefault(rid, set()).add((parent, measurement))
-            if measurement == "null":
+            if measurement == "null" or (projected and measurement == '"unfinished"'):
                 conflicts.add(rid)
             if parent:
                 witnesses.setdefault(rid, set()).add(parent)
@@ -369,7 +380,7 @@ def response_witnesses(con, session_key):
     if db._has_table(con, "native_response_events"):
         for rid, source in con.execute(
                 "SELECT DISTINCT e.response_id,e.source_id FROM native_response_events e "
-                "JOIN sources s ON s.id=e.source_id WHERE e.session_key=? AND s.sha256 NOT GLOB 'oc[34]:*'",
+                "JOIN sources s ON s.id=e.source_id WHERE e.session_key=? AND s.sha256 NOT GLOB 'oc[3-5]:*'",
                 (session_key,)):
             if rid in measured and source not in payload_sources.get(rid, {measured[rid]}):
                 conflicts.add(rid)
@@ -476,7 +487,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     session_key = f"{HARNESS}:{sess_id}"
     msg_n, msg_m = _count_max(native, "message", sess_id)
     part_n, part_m = _count_max(native, "part", sess_id)
-    fp = "oc4:" + fingerprint(sess.get("time_updated"), msg_m, part_m, msg_n, part_n)
+    fp = "oc5:" + fingerprint(sess.get("time_updated"), msg_m, part_m, msg_n, part_n)
     row = con.execute(
         "SELECT * FROM sources WHERE harness=? AND path=?",
         (HARNESS, src_path)).fetchone()
@@ -533,6 +544,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
         _oops(con, stats, src_path, None, "source_unreadable")
         messages = []
         complete = False
+    messages_read = complete
     try:
         parts = _fetch_dicts(
             native, "part",
@@ -549,27 +561,35 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
         by_message.setdefault(part.get("message_id"), []).append(part)
     roles: dict[str, str | None] = {}
     parsed_messages: list[tuple] = []
+    unreadable = []
     for index, msg in enumerate(messages):
         raw = msg.get("data")
         msg_id = msg.get("id")
-        if not msg_id or raw is None:
+        if not msg_id:
             _oops(con, stats, src_path, index, "schema_error")
             continue
         try:
-            data = json.loads(raw)
+            data = json.loads(raw) if raw is not None else None
         except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
             _oops(con, stats, src_path, index, "malformed_json",
                   _record_line(raw))
-            continue
-        if not isinstance(data, dict):
-            _oops(con, stats, src_path, index, "schema_error",
-                  _record_line(raw, data))
-            continue
-        parsed_messages.append((index, msg, data))
-        roles[msg_id] = data.get("role")
+        else:
+            if isinstance(data, dict):
+                parsed_messages.append((index, msg, data))
+                roles[msg_id] = data.get("role")
+                if roles[msg_id] in ("assistant", "user"):
+                    continue
+            else:
+                _oops(con, stats, src_path, index, "schema_error", _record_line(raw, data))
+        # The SQLite primary key survives damage to the JSON body. Keep
+        # it even when this store is read before a measurable copy.
+        if native_response.identifier(msg_id):
+            unreadable.append((msg_id, index))
     native_response.prepare(con, source_id, replace=True)
     native_response.prepare_events(con, source_id, replace=True)
-    _prepare_observations(con, session_key, source_id)
+    _prepare_observations(con, session_key, source_id, messages_read=messages_read)
+    for msg_id, index in unreadable:
+        _observe_response(con, session_key, f"{HARNESS}:{msg_id}", source_id, None, None, None, index)
     ordinal = 0
     for index, msg, data in parsed_messages:
         ordinal += 1
@@ -658,8 +678,6 @@ def _ingest_message(con, native, stats, identity, src_path, source_id,
 def _ingest_response(con, stats, src_path, source_id, session_key, sess,
                      msg, data, index, ts, ordinal, roles) -> None:
     timing = data.get("time") if isinstance(data.get("time"), dict) else {}
-    if timing.get("completed") is None:
-        return
     parent = native_response.identifier(data.get("parentID"))
     if roles.get(parent) != "user" or not native_response.identifier(msg["id"]):
         parent = None
@@ -668,6 +686,12 @@ def _ingest_response(con, stats, src_path, source_id, session_key, sess,
     if existing and tuple(existing) != (session_key, sess.get("id")):
         _oops(con, stats, src_path, ordinal, "usage_conflict", _record_line(msg.get("data"), data))
         stats["responses_duplicate"] += 1
+        return
+    if timing.get("completed") is None:
+        # A provisional copy cannot attest that another copy's measurement
+        # is final. The unfinished observation alone creates no usage row.
+        if native_response.identifier(msg["id"]):
+            _observe_response(con, session_key, rid, source_id, parent, "unfinished", ts, index)
         return
     try:
         measurement = _measurement(data)

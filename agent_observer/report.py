@@ -933,7 +933,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
     report["coverage"]["unavailable_sources"] = unavailable_sources
     report["total_cost"] = _total_cost(
         task_id, total_estimated, attributed, billed_shared, sharing_tasks)
-    if (inventory_gaps or unresolved_usage) and total_estimated.get("priced_responses"):
+    if unavailable_usage and total_estimated.get("priced_responses"):
         subtotal = total_estimated["estimated_cost_usd_partial"]
         amount = "under $0.01" if 0 < subtotal < 0.005 else f"${subtotal:,.2f}"
         report["total_cost"].update(usd=None, observed_subtotal_usd=subtotal,

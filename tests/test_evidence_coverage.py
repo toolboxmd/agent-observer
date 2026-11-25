@@ -206,6 +206,66 @@ class EvidenceCoverageTest(LedgerCase):
     def test_claude_malformed_parent_cannot_fall_back_to_display_turn(self):
         self.check_unusable_claude_ancestry("parentUuid", "bad parent")
 
+    def test_unreadable_opencode_message_still_disputes_its_copy(self):
+        first = self.opencode_store("one", "msg_u1", 0.20, 50, independent=True)
+        second = self.opencode_store("two", "other", 0.20, 50)
+        with closing(sqlite3.connect(second)) as source, source:
+            source.execute("INSERT INTO message SELECT 'other',session_id,time_created,time_updated,data "
+                           "FROM message WHERE id='msg_u1'")
+        for path in (first, second):
+            opencode.sync(self.con, source=path)
+        self.assign("A", "opencode:msg_u1")
+        self.assertEqual(report.task_report(self.con, "A")["attributed"]["responses"], 1)
+        with closing(sqlite3.connect(second)) as source, source:
+            source.execute("UPDATE message SET data='{' WHERE id='msg_a1'")
+            source.execute("UPDATE session SET time_updated=time_updated+1 WHERE id='ses_parent'")
+        self.assertEqual(opencode.sync(self.con, source=second)["malformed"], 1)
+        rep = report.task_report(self.con, "A")
+        self.assertEqual(rep["measured"]["attributed_responses"], ["opencode:msg_unique"])
+        self.assertFalse(report.timeline(self.con, "A")["events"])
+        self.assertEqual(rep["native_cost"]["known_subtotal_usd"], 0.10)
+        self.assertIn("Evidence complete: no", self.draft()["body"])
+        with closing(sqlite3.connect(first)) as original:
+            data = json.loads(original.execute("SELECT data FROM message WHERE id='msg_a1'").fetchone()[0])
+        del data["time"]["completed"]
+        with closing(sqlite3.connect(second)) as source, source:
+            source.execute("UPDATE message SET data=? WHERE id='msg_a1'", (json.dumps(data),))
+        opencode.sync(self.con, source=second, full=True)
+        self.assertEqual(report.task_report(self.con, "A")["measured"]["attributed_responses"], ["opencode:msg_unique"])
+
+    def test_rejected_claude_counters_do_not_resolve_conflicting_parents(self):
+        path = self.import_claude()
+        self.assign("B", "claude:b")
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        response = rows[-1]
+        response["parentUuid"] = "a"
+        copy = path.with_name("copy.jsonl")
+        write_records(copy, rows)
+        claude.import_claude_file(self.con, str(copy))
+        self.assertFalse(report.task_report(self.con, "B")["attributed"]["responses"])
+        response["message"]["usage"]["output_tokens"] = "bad"
+        write_records(copy, rows)
+        claude.import_claude_file(self.con, str(copy), full=True)
+        self.assertFalse(report.task_report(self.con, "B")["attributed"]["responses"])
+        self.assertFalse(report.timeline(self.con, "B")["events"])
+        self.assertIn("Evidence complete: no", self.draft()["body"])
+        response["message"]["usage"]["output_tokens"] = 5
+        response["parentUuid"] = "b"
+        write_records(copy, rows)
+        claude.import_claude_file(self.con, str(copy), full=True)
+        self.assertEqual(report.task_report(self.con, "B")["measured"]["attributed_responses"], ["claude:msg-b"])
+
+    def test_missing_usage_row_keeps_priced_subtotal_separate(self):
+        self.import_claude(legacy=True)
+        only = self.opencode_store("damaged", "msg_u1", 0.20, "bad")
+        opencode.sync(self.con, source=only)
+        self.assign("A", "opencode:msg_u1")
+        rep = report.task_report(self.con, "A")
+        self.assertFalse(rep["complete"])
+        self.assertIsNone(rep["total_cost"]["usd"])
+        self.assertGreater(rep["total_cost"]["observed_subtotal_usd"], 0)
+        self.assertIn("Estimated cost unknown", self.draft()["body"])
+
     def test_unresolved_literal_parent_cannot_use_legacy_capture(self):
         path = self.import_claude(legacy=True)
         records = [json.loads(line) for line in path.read_text().splitlines()]
