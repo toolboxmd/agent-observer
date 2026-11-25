@@ -111,3 +111,120 @@ class NativeOutcomeTest(LedgerCase):
         self.assertEqual(rep["native_purpose"]["deliveries"][0]["number"], 42)
         self.assertIn("purpose_run_unavailable", rep["native_purpose"]["coverage_gaps"])
         self.assertIsNone(rep["total_cost"]["usd"])
+
+    def assign(self, task, prompt):
+        self.con.execute("INSERT INTO assignments(user_message_id,task_id,created_at)"
+                         " VALUES(?,?,0)", ("codex:msg-mini-sub-" + prompt, task))
+
+    def test_capture_alongside_native_turn(self):
+        self.assign(self.task, "02")
+        rep = report.task_report(self.con, self.task)
+        self.assertEqual(rep["measured"]["attributed_responses"],
+                         ["codex:resp-mini-001", "codex:resp-mini-002", "codex:resp-mini-003"])
+        self.assertNotIn("codex:resp-mini-003", rep["native_purpose"]["membership"])
+        trace = report.timeline(self.con, self.task, turn_id="codex:turn-mini-bbb")
+        self.assertEqual({e["native_id"] for e in trace["events"]},
+                         {"call-mini-spawn-01", "task_complete:turn-mini-bbb"})
+        self.assertEqual(trace["native_response_count"], 0)
+        self.assertTrue(rep["reconciles"])
+
+    def test_conflicting_capture_without_native_run(self):
+        other = "example/repo#12"
+        self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES(?,0)", (other,))
+        self.assign(other, "01")
+        self.assign(other, "02")
+        for task in (other, self.task):
+            rep = report.task_report(self.con, task)
+            self.assertEqual(rep["measured"]["unplaced_responses"],
+                             ["codex:resp-mini-001", "codex:resp-mini-002"])
+            self.assertTrue(rep["reconciles"])
+            trace = report.timeline(self.con, task)
+            if task == other:
+                self.assertEqual(rep["measured"]["attributed_responses"], ["codex:resp-mini-003"])
+                self.assertEqual({e["native_id"] for e in trace["events"]},
+                                 {"call-mini-spawn-01", "task_complete:turn-mini-bbb"})
+            else:
+                self.assertEqual(rep["measured"]["other_task_responses"], ["codex:resp-mini-003"])
+                self.assertFalse(trace["events"])
+
+    def test_router_whole_session_conflict_only_exposes_uncontested_turn(self):
+        other = "router-job"
+        self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES(?,0)", (other,))
+        self.con.execute("INSERT INTO session_assignments VALUES(?,?,'router:job',0)", (self.session, other))
+        for task in (other, self.task):
+            rep = report.task_report(self.con, task)
+            self.assertEqual(rep["measured"]["unplaced_responses"],
+                             ["codex:resp-mini-001", "codex:resp-mini-002"])
+            self.assertTrue(rep["reconciles"])
+            trace = report.timeline(self.con, task)
+            if task == other:
+                self.assertEqual(rep["measured"]["attributed_responses"], ["codex:resp-mini-003"])
+                self.assertEqual({e["native_id"] for e in trace["events"]},
+                                 {"call-mini-spawn-01", "task_complete:turn-mini-bbb"})
+            else:
+                self.assertFalse(trace["events"])
+
+    def test_compatible_router_binding_keeps_whole_session_events(self):
+        self.con.execute("INSERT INTO session_assignments VALUES(?,?,'router:job',0)", (self.session, self.task))
+        self.con.execute("INSERT INTO events(session_key,turn_id,native_id,family) "
+                         "VALUES('codex:unrelated','codex:turn-mini-aaa','foreign-call','tool_call')")
+        rep = report.task_report(self.con, self.task)
+        self.assertEqual(rep["attributed"]["responses"], 3)
+        task_trace = report.timeline(self.con, self.task)
+        session_trace = report.timeline(self.con, session_key=self.session)
+        self.assertEqual([e["id"] for e in task_trace["events"]], [e["id"] for e in session_trace["events"]])
+        self.assertEqual(task_trace["native_response_count"], 2)
+
+    def test_claude_display_turn_cannot_override_native_ancestry_in_capture_trace(self):
+        from pathlib import Path
+        from agent_observer.adapters import claude
+        from tests.test_native_response import claude_response, claude_user, write_records
+
+        path = Path(self.tmp.name, "s.jsonl")
+        answers = [claude_response("answer-a", "a", "first"), claude_response("answer-b", "b", "second")]
+        for answer in answers:
+            answer["message"]["content"] = [{"type": "text", "text": "answer"}]
+        answers[0]["message"]["content"].append({"type": "tool_use", "id": "foreign-call", "name": "Read"})
+        # Both assistant events carry the latest display turn, but their parents differ.
+        write_records(path, [claude_user("a"), claude_user("b"), *answers])
+        claude.import_claude_file(self.con, str(path))
+        self.con.execute("INSERT INTO t3_purpose_sessions VALUES('a','claude:s')")
+        self.con.execute("INSERT INTO t3_purpose_inputs(run_id,session_key,native_id,kind,validation)"
+                         " VALUES('a','claude:s','a','message','claude_prompt_echo')")
+        other = "example/repo#12"
+        self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES(?,0)", (other,))
+        self.con.execute("INSERT INTO assignments(user_message_id,task_id,created_at) VALUES('claude:b',?,0)",
+                         (other,))
+        for task, expected, excluded in ((self.task, "first", "second"), (other, "second", "first")):
+            rep = report.task_report(self.con, task)
+            self.assertIn("claude:" + expected, rep["measured"]["attributed_responses"])
+            self.assertIn("claude:" + excluded, rep["measured"]["other_task_responses"])
+            trace = report.timeline(self.con, task, session_key="claude:s", family="assistant_message")
+            self.assertEqual([e["native_id"] for e in trace["events"]],
+                             ["answer-a:0" if task == self.task else "answer-b:0"])
+            selected = report.timeline(self.con, task, session_key="claude:s",
+                                       turn_id="claude:a" if task == self.task else "claude:b")
+            self.assertEqual([e["native_id"] for e in selected["events"]],
+                             ["answer-a:0" if task == self.task else "answer-b:0"])
+
+    def test_delivery_alone_preserves_legacy_placement_and_capture_trace(self):
+        from unittest.mock import patch
+        self.con.execute("DELETE FROM t3_purpose_runs")
+        other = "example/repo#12"
+        self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES(?,0)", (other,))
+        self.con.executemany("INSERT INTO session_assignments VALUES(?,?,'t3',0)",
+                             [(self.session, self.task), (self.session, other)])
+        placed = {"codex:resp-mini-001": self.task, "codex:resp-mini-002": other}
+        with patch("agent_observer.placement.read_placements", return_value=placed):
+            before = report.task_report(self.con, self.task)
+            self.con.execute("INSERT INTO t3_purpose_deliveries VALUES(?, 'planner', 'github.com',"
+                             "'example/repo',42,'https://github.com/example/repo/pull/42','now')", (self.task,))
+            after = report.task_report(self.con, self.task)
+        self.assertEqual(before["measured"]["attributed_responses"], ["codex:resp-mini-001"])
+        self.assertEqual(after["measured"], before["measured"])
+        self.assertIn("purpose_run_unavailable", after["native_purpose"]["coverage_gaps"])
+        self.assign(self.task, "02")
+        trace = report.timeline(self.con, self.task)
+        self.assertEqual({e["native_id"] for e in trace["events"]},
+                         {"call-mini-spawn-01", "task_complete:turn-mini-bbb"})
+        self.assertNotIn("native_response_count", trace)
