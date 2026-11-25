@@ -151,6 +151,61 @@ class EvidenceCoverageTest(LedgerCase):
     def test_opencode_parentless_then_proved_copy(self):
         self.check_opencode_copies(True)
 
+    def test_malformed_refresh_preserves_competing_parent(self):
+        first = self.opencode_store("one", "msg_u1", 0.20, 50, independent=True)
+        second = self.opencode_store("two", "other", 0.20, 50)
+        with closing(sqlite3.connect(second)) as source, source:
+            source.execute("INSERT INTO message SELECT 'other',session_id,time_created,time_updated,data "
+                           "FROM message WHERE id='msg_u1'")
+        for path in (first, second):
+            opencode.sync(self.con, source=path)
+        self.assign("A", "opencode:msg_u1")
+        self.assertEqual(report.task_report(self.con, "A")["attributed"]["responses"], 1)
+        with closing(sqlite3.connect(second)) as source, source:
+            source.execute("UPDATE message SET data=json_set(data,'$.tokens.output','bad') WHERE id='msg_a1'")
+            source.execute("UPDATE session SET time_updated=time_updated+1 WHERE id='ses_parent'")
+        refresh = opencode.sync(self.con, source=second)
+        self.assertEqual(refresh["failed"], [])
+        self.assertEqual(refresh["malformed"], 1)
+        rep = report.task_report(self.con, "A")
+        self.assertEqual(rep["measured"]["attributed_responses"], ["opencode:msg_unique"])
+        self.assertEqual(rep["measured"]["unplaced_responses"], ["opencode:msg_a1"])
+        self.assertFalse(report.timeline(self.con, "A")["events"])
+        draft = self.draft()
+        self.assertIn("Evidence complete: no", draft["body"])
+        self.assertEqual(draft["summary"]["native_cost"]["known_subtotal_usd"], 0.10)
+        with closing(sqlite3.connect(second)) as source, source:
+            source.execute("UPDATE message SET data=json_set(data,'$.tokens.output',50,'$.parentID','msg_u1') "
+                           "WHERE id='msg_a1'")
+            source.execute("UPDATE session SET time_updated=time_updated+1 WHERE id='ses_parent'")
+        opencode.sync(self.con, source=second)
+        self.assertAlmostEqual(report.task_report(self.con, "A")["native_cost"]["known_subtotal_usd"], 0.30)
+
+    def check_unusable_claude_ancestry(self, field, value):
+        path = self.import_claude()
+        self.assign("B", "claude:b")
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        response = rows[-1]
+        self.assertEqual(response["parentUuid"], "b")
+        if value is None:
+            del response[field]
+        else:
+            response[field] = value
+        write_records(path, rows)
+        claude.import_claude_file(self.con, str(path), full=True)
+        rep = report.task_report(self.con, "A")
+        self.assertEqual(rep["measured"]["attributed_responses"], ["claude:msg-a"])
+        self.assertEqual(rep["measured"]["unplaced_responses"], ["claude:msg-b"])
+        self.assertFalse(report.task_report(self.con, "B")["measured"]["attributed_responses"])
+        self.assertEqual([e["native_id"] for e in report.timeline(self.con, "A")["events"]], ["a-call"])
+        self.assertIn("Evidence complete: no", self.draft()["body"])
+
+    def test_claude_parent_without_node_cannot_fall_back_to_display_turn(self):
+        self.check_unusable_claude_ancestry("uuid", None)
+
+    def test_claude_malformed_parent_cannot_fall_back_to_display_turn(self):
+        self.check_unusable_claude_ancestry("parentUuid", "bad parent")
+
     def test_unresolved_literal_parent_cannot_use_legacy_capture(self):
         path = self.import_claude(legacy=True)
         records = [json.loads(line) for line in path.read_text().splitlines()]

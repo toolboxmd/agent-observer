@@ -297,7 +297,7 @@ def _prepare_observations(con, session_key, source_id):
     # another copy can replace its projection. Only its own edge accompanies it.
     for row in con.execute(
             "SELECT r.* FROM responses r JOIN sources s ON s.id=r.source_id WHERE r.session_key=? "
-            "AND r.source_id<>? AND s.sha256 NOT LIKE 'oc3:%' AND NOT EXISTS "
+            "AND r.source_id<>? AND s.sha256 NOT GLOB 'oc[34]:*' AND NOT EXISTS "
             "(SELECT 1 FROM opencode_response_observations o WHERE o.session_key=r.session_key "
             "AND o.response_id=r.response_id AND o.source_id=r.source_id)", (session_key, source_id)):
         parent = con.execute(
@@ -318,10 +318,16 @@ def _project_observations(con, stats, session_key, session_id):
             "WHERE session_key=? ORDER BY response_id,s.path", (session_key,)):
         groups.setdefault(row["response_id"], []).append(row)
     for rid, copies in groups.items():
-        copy = copies[0]
-        data = json.loads(copy["measurement"])
-        for other in copies[1:]:
-            for field, value in json.loads(other["measurement"]).items():
+        measured = [(row, json.loads(row["measurement"])) for row in copies if row["measurement"] != "null"]
+        # A rejected payload has a durable ownership witness, but cannot
+        # create a billable row. An all-zero lifecycle record has no usage.
+        if not measured or all(data["total_tokens"] == 0 for _, data in measured):
+            if not con.execute("SELECT 1 FROM responses WHERE session_key=? AND response_id=?",
+                               (session_key, rid)).fetchone():
+                continue
+        copy, data = measured[0] if measured else (copies[0], dict.fromkeys(_MEASUREMENT_FIELDS))
+        for _, other in measured[1:]:
+            for field, value in other.items():
                 if data[field] != value:
                     data[field] = None
         _project_response(con, stats, rid, session_key, session_id, copy, data)
@@ -338,9 +344,12 @@ def response_witnesses(con, session_key):
     if db._has_table(con, "opencode_response_observations"):
         for rid, source, parent, measurement in con.execute(
                 "SELECT o.response_id,o.source_id,o.parent,o.measurement FROM opencode_response_observations o "
-                "JOIN responses r USING(session_key,response_id) WHERE o.session_key=? AND r.is_overlap=0", (session_key,)):
+                "LEFT JOIN responses r USING(session_key,response_id) WHERE o.session_key=? AND coalesce(r.is_overlap,0)=0",
+                (session_key,)):
             payload_sources.setdefault(rid, set()).add(source)
             observations.setdefault(rid, set()).add((parent, measurement))
+            if measurement == "null":
+                conflicts.add(rid)
             if parent:
                 witnesses.setdefault(rid, set()).add(parent)
         for rid, variants in observations.items():
@@ -360,7 +369,7 @@ def response_witnesses(con, session_key):
     if db._has_table(con, "native_response_events"):
         for rid, source in con.execute(
                 "SELECT DISTINCT e.response_id,e.source_id FROM native_response_events e "
-                "JOIN sources s ON s.id=e.source_id WHERE e.session_key=? AND s.sha256 NOT LIKE 'oc3:%'",
+                "JOIN sources s ON s.id=e.source_id WHERE e.session_key=? AND s.sha256 NOT GLOB 'oc[34]:*'",
                 (session_key,)):
             if rid in measured and source not in payload_sources.get(rid, {measured[rid]}):
                 conflicts.add(rid)
@@ -467,7 +476,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     session_key = f"{HARNESS}:{sess_id}"
     msg_n, msg_m = _count_max(native, "message", sess_id)
     part_n, part_m = _count_max(native, "part", sess_id)
-    fp = "oc3:" + fingerprint(sess.get("time_updated"), msg_m, part_m, msg_n, part_n)
+    fp = "oc4:" + fingerprint(sess.get("time_updated"), msg_m, part_m, msg_n, part_n)
     row = con.execute(
         "SELECT * FROM sources WHERE harness=? AND path=?",
         (HARNESS, src_path)).fetchone()
@@ -651,6 +660,26 @@ def _ingest_response(con, stats, src_path, source_id, session_key, sess,
     timing = data.get("time") if isinstance(data.get("time"), dict) else {}
     if timing.get("completed") is None:
         return
+    parent = native_response.identifier(data.get("parentID"))
+    if roles.get(parent) != "user" or not native_response.identifier(msg["id"]):
+        parent = None
+    rid = f"{HARNESS}:{msg['id']}"
+    existing = con.execute("SELECT session_key,session_id FROM responses WHERE response_id=?", (rid,)).fetchone()
+    if existing and tuple(existing) != (session_key, sess.get("id")):
+        _oops(con, stats, src_path, ordinal, "usage_conflict", _record_line(msg.get("data"), data))
+        stats["responses_duplicate"] += 1
+        return
+    try:
+        measurement = _measurement(data)
+    except ValueError:
+        _oops(con, stats, src_path, ordinal, "malformed_usage", _record_line(msg.get("data"), data))
+        if not native_response.identifier(msg["id"]):
+            return
+        measurement = None
+    _observe_response(con, session_key, rid, source_id, parent, measurement, ts, index)
+
+
+def _measurement(data):
     raw_tokens = data.get("tokens")
     if raw_tokens is None:
         tokens: dict = {}
@@ -659,18 +688,14 @@ def _ingest_response(con, stats, src_path, source_id, session_key, sess,
     else:
         # A present non-object tokens block is malformed usage, never
         # silently unknown; quarantine before any response insert.
-        _oops(con, stats, src_path, ordinal, "malformed_usage",
-              _record_line(msg.get("data"), data))
-        return
+        raise ValueError("malformed_usage")
     raw_cache = tokens.get("cache")
     if raw_cache is None:
         cache: dict = {}
     elif isinstance(raw_cache, dict):
         cache = raw_cache
     else:
-        _oops(con, stats, src_path, ordinal, "malformed_usage",
-              _record_line(msg.get("data"), data))
-        return
+        raise ValueError("malformed_usage")
     # A present counter must be a non-boolean integer; only a missing
     # key stays unknown and maps to NULL. An explicitly present null,
     # bool, string, float, list or other non-integer quarantines the
@@ -688,33 +713,18 @@ def _ingest_response(con, stats, src_path, source_id, session_key, sess,
             continue
         raw = container[key]
         if not isinstance(raw, int) or isinstance(raw, bool):
-            _oops(con, stats, src_path, ordinal, "malformed_usage",
-                  _record_line(msg.get("data"), data))
-            return
+            raise ValueError("malformed_usage")
         values[field] = raw
-    if all(v == 0 for v in values.values()):
-        return
     total = None
     if all(v is not None for v in values.values()):
         total = sum(values.values())
     cost = data.get("cost")
     cost_usd = float(cost) if isinstance(cost, (int, float)) \
         and not isinstance(cost, bool) else None
-    parent = native_response.identifier(data.get("parentID"))
-    if roles.get(parent) != "user" or not native_response.identifier(msg["id"]):
-        parent = None
-    rid = f"{HARNESS}:{msg['id']}"
-    existing = con.execute("SELECT session_key,session_id FROM responses WHERE response_id=?", (rid,)).fetchone()
-    if existing and tuple(existing) != (session_key, sess.get("id")):
-        _oops(con, stats, src_path, ordinal, "usage_conflict", _record_line(msg.get("data"), data))
-        stats["responses_duplicate"] += 1
-        return
     if any(data.get(k) is not None and not isinstance(data[k], str) for k in ("modelID", "providerID", "variant")):
-        _oops(con, stats, src_path, ordinal, "malformed_usage", _record_line(msg.get("data"), data))
-        return
-    measurement = dict(values, total_tokens=total, model=data.get("modelID"), provider=data.get("providerID"),
-                       effort=data.get("variant"), cost_usd=cost_usd)
-    _observe_response(con, session_key, rid, source_id, parent, measurement, ts, index)
+        raise ValueError("malformed_usage")
+    return dict(values, total_tokens=total, model=data.get("modelID"), provider=data.get("providerID"),
+                effort=data.get("variant"), cost_usd=cost_usd)
 
 
 def _observe_response(con, session_key, rid, source_id, parent, measurement, ts, index):

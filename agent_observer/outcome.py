@@ -164,6 +164,9 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
     elif harness == "opencode":
         from .adapters import opencode
         responses, disputed_completions = opencode.response_witnesses(con, key)
+        # A malformed native measurement can leave an ownership dispute
+        # without any projected usage row. It still makes coverage incomplete.
+        result.conflicts.update(disputed_completions)
     elif harness == "grok":
         from .adapters import grok
         responses, call_witnesses, disputed_completions = grok.response_witnesses(con, key)

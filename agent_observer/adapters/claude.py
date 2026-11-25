@@ -106,7 +106,7 @@ def _valid_counter(value) -> bool:
 
 _FINALITY_TABLE = "claude_response_finality"
 _NATIVE_KINDS_TABLE = "claude_native_kinds"
-_IMPORT_VERSION = 7  # Replay literal event-to-message edges from existing sources.
+_IMPORT_VERSION = 8  # Distinguish unusable ancestry from historical records without an edge.
 
 
 def _ensure_native_kinds(con) -> None:
@@ -1086,9 +1086,14 @@ def _prepare_ancestry(r):
         ) WITHOUT ROWID""")
     r.con.execute("CREATE INDEX IF NOT EXISTS claude_ancestry_source"
                   " ON claude_response_ancestry(source_id)")
+    r.con.execute("""CREATE TABLE IF NOT EXISTS claude_invalid_ancestry (
+        source_id INTEGER NOT NULL REFERENCES sources(id), session_key TEXT NOT NULL,
+        uuid TEXT NOT NULL, response_id TEXT NOT NULL,
+        PRIMARY KEY(session_key, source_id, uuid, response_id)) WITHOUT ROWID""")
     if not r.src.incremental:
         r.con.execute("DELETE FROM claude_response_ancestry WHERE source_id=?",
                       (r.src.source_id,))
+        r.con.execute("DELETE FROM claude_invalid_ancestry WHERE source_id=?", (r.src.source_id,))
 
 
 def _record_ancestry(r, obj):
@@ -1129,6 +1134,13 @@ def _record_ancestry(r, obj):
                 return
     elif kind not in ("system", "progress"):
         return
+    # A supplied edge needs both endpoints. Keep its independently valid
+    # identities so a damaged copy cannot turn into historical display capture.
+    if not input_id and "parentUuid" in obj and (not uuid or not parent):
+        if uuid or response_id:
+            r.con.execute("INSERT OR IGNORE INTO claude_invalid_ancestry VALUES(?,?,?,?)",
+                          (r.src.source_id, r.session_key, uuid or "", response_id))
+        return
     if not uuid:
         return
     r.con.execute("INSERT OR IGNORE INTO claude_response_ancestry"
@@ -1148,6 +1160,14 @@ def response_witnesses(con, session_key):
         return {}, set()
     parents, children, anchors, blocks = (defaultdict(set) for _ in range(4))
     seen, disputed = set(), set()
+    conflicts = set()
+    if db._has_table(con, "claude_invalid_ancestry"):
+        for uuid, response_id in con.execute(
+                "SELECT uuid,response_id FROM claude_invalid_ancestry WHERE session_key=?", (session_key,)):
+            if uuid:
+                disputed.add(uuid)
+            if response_id:
+                conflicts.add(response_id)
     recorded_parents = set()
     for uuid, parent, input_id, response_id in con.execute(
         "SELECT DISTINCT uuid,parent,input_id,response_id FROM claude_response_ancestry"
@@ -1186,7 +1206,6 @@ def response_witnesses(con, session_key):
             if not parents[child]:
                 ready.append(child)
     results = {}
-    conflicts = set()
     for response_id, in con.execute("SELECT response_id FROM responses"
                                     " WHERE session_key=? AND is_overlap=0", (session_key,)):
         nodes = blocks.get(response_id)
