@@ -1508,6 +1508,20 @@ class RouterAdapterTest(LedgerCase):
         self.assertEqual(stats["bindings"], first["bindings"])
         self.assertEqual(stats["bindings"], 7)
 
+    def test_unchanged_source_revalidates_newer_database_mtime(self):
+        from unittest.mock import patch
+
+        with patch.object(router.db, "now", return_value=11_000):
+            self.assertEqual(router.sync(self.con, root=self.state)["failed"], [])
+        os.utime(self.db_path, (20_000, 20_000))
+        with patch.object(router.db, "now", return_value=21_000):
+            stats = router.sync(self.con, root=self.state)
+        self.assertEqual(stats["unchanged"], 1)
+        self.assertEqual(stats["failed"], [])
+        row = self.con.execute(
+            "SELECT imported_at FROM sources WHERE harness='router'").fetchone()
+        self.assertEqual(row["imported_at"], 21_000)
+
     def test_stale_source_version_refreshes_and_replaces_errors(self):
         src = sqlite3.connect(self.db_path)
         src.execute(

@@ -22,7 +22,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .adapters import bare as bare_adapter
-from .adapters.discovery import path_info
+from .adapters.discovery import path_info, sqlite_mtime
 
 CLAUDE_FIX = ("start the session with the parent's CLAUDE_CODE_*, CLAUDECODE, CLAUDE_PID "
               "and CLAUDE_EFFORT variables unset, or with CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1")
@@ -211,9 +211,9 @@ def bare_roots() -> dict:
                 grok.HARNESS: bare_adapter.discover(grok.HARNESS, grok._sessions_under)[1]}
 
 
-def _mtime(path: str, *, min_size: int = 0) -> float | None:
+def _mtime(path: str) -> float | None:
     info = path_info(path)
-    if info is not None and stat.S_ISREG(info.st_mode) and info.st_size >= min_size:
+    if info is not None and stat.S_ISREG(info.st_mode):
         return info.st_mtime
     return None
 
@@ -267,9 +267,7 @@ def _native_record_times(harness, paths):
                 yield info.st_mtime
             continue
         elif harness in ("t3", "router"):
-            # A SQLite source can advance before its main file is checkpointed.
-            path = os.path.realpath(path)
-            times = (_mtime(path), _mtime(path + "-wal", min_size=33))
+            times = (sqlite_mtime(path),)
         else:
             times = (_mtime(path),)
         newest = max((stamp for stamp in times if stamp is not None), default=None)

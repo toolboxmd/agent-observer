@@ -366,6 +366,8 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
         except (OSError, sqlite3.DatabaseError, UnicodeDecodeError) as exc:
             totals["failed"].append({"path": path, "error": str(exc)})
             continue
+        for error in stats.get("metadata_errors", []):
+            totals["failed"].append({"path": path, "error": error})
         if "session_key" in stats:
             imported.update(new_files.values())
         totals["sources"] += 1
@@ -1467,12 +1469,25 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
     events_path = source_paths.get("events.jsonl")
     metadata_imported_at = db.now()
     summary_path = os.path.join(session_dir, "summary.json")
-    metadata_stamps = (path_info(path) for path in
-                       (summary_path, os.path.join(session_dir, "chat_history.jsonl")))
-    metadata_mtime = max((info.st_mtime for info in metadata_stamps if info is not None),
-                         default=None)
-    summary = _read_summary(summary_path)
-    chat_fp_current = _chat_fingerprint(session_dir)
+    metadata_errors = []
+    metadata_mtime = None
+    summary = {}
+    chat_fp_current = None
+    try:
+        summary_stat = path_info(summary_path)
+        summary = _read_summary(summary_path)
+        if summary_stat is not None:
+            metadata_mtime = summary_stat.st_mtime
+    except OSError as exc:
+        metadata_errors.append(str(exc))
+    try:
+        chat_stat = path_info(os.path.join(session_dir, "chat_history.jsonl"))
+        chat_fp_current = _chat_fingerprint(session_dir)
+        if chat_stat is not None:
+            metadata_mtime = max(metadata_mtime or 0, chat_stat.st_mtime)
+    except OSError as exc:
+        metadata_errors.append(str(exc))
+    stats["metadata_errors"] = metadata_errors
     info = summary.get("info") if isinstance(summary.get("info"), dict) else {}
     # Fail closed on unsafe identifiers: the native session id comes only
     # from a validated summary.info.id or a validated directory basename.
@@ -1632,7 +1647,11 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                                      stored_chat_reliable)
             if chat is not None:
                 return chat
-        chat = _read_chat(session_dir, r)
+        try:
+            chat = _read_chat(session_dir, r)
+        except OSError as exc:
+            metadata_errors.append(str(exc))
+            chat = {"reliable": False}
         return chat
 
     if known and not updates_new and not events_new and not privacy_stale \
@@ -1656,7 +1675,7 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
             updates_new = updates_src is not None and not updates_src.unchanged
             events_new = events_src is not None and not events_src.unchanged
             if not updates_new and not events_new:
-                if metadata_mtime is not None and (
+                if not metadata_errors and metadata_mtime is not None and (
                         stored_imported_at is None or metadata_mtime > stored_imported_at):
                     # The reads above revalidated the same metadata bytes.
                     con.execute(f"UPDATE {_GROK_META_TABLE} SET imported_at=?"
@@ -1695,8 +1714,9 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                     **late_fields)
                 # Reclassify without records is covered by the force above
                 # (no parse, no duplicates).
-                _store_meta(con, r.session_key, summary_fp, chat_fp_current,
-                            chat, metadata_imported_at)
+                if not metadata_errors:
+                    _store_meta(con, r.session_key, summary_fp, chat_fp_current,
+                                chat, metadata_imported_at)
                 con.commit()
                 stats["unchanged"] = False
                 stats["session_key"] = r.session_key
@@ -1901,7 +1921,8 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                 "(SELECT version FROM agentsmd_versions WHERE sha256=sessions.instructions_sha256), ?)"
                 " WHERE session_key=?",
                 (json.dumps(evidence, sort_keys=True) if evidence else None, version, r.session_key))
-    _store_meta(con, r.session_key, summary_fp, chat_fp_current, chat, metadata_imported_at)
+    if not metadata_errors:
+        _store_meta(con, r.session_key, summary_fp, chat_fp_current, chat, metadata_imported_at)
     if updates_src is not None:
         stats.update(updates_src.finish(session_id=r.native_sid))
     if events_src is not None:

@@ -489,6 +489,23 @@ class LedgerFreshnessTest(unittest.TestCase):
         self.assertEqual(row["newest_native_at"], 20_000)
         self.assertEqual(row["status"], "stale")
 
+    def test_bad_grok_summary_keeps_transcript_ingestion(self):
+        updates = "grok/project/session-one/updates.jsonl"
+        self.source(updates, 20_000)
+        completion = {"timestamp": 20_000, "method": "_x.ai/session/update",
+                      "params": {"sessionId": "session-one",
+                                 "update": {"sessionUpdate": "turn_completed",
+                                            "prompt_id": "prompt-one",
+                                            "usage": {"inputTokens": 10, "outputTokens": 2}}}}
+        (self.root / updates).write_text(json.dumps(completion) + "\n")
+        (self.root / "grok/project/session-one/summary.json").write_text('{"incomplete":')
+        self.imports()
+        with contextlib.closing(db.connect(str(self.ledger))) as con:
+            result = grok.sync(con)
+            self.assertEqual(result["responses_inserted"], 1)
+            self.assertEqual(result["failed"][0]["error"], "invalid Grok summary JSON")
+            self.assertIsNone(grok.newest_metadata_import(con))
+
 
 class ClaudeVisibilityTest(unittest.TestCase):
     def setUp(self):

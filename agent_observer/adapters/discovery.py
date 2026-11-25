@@ -14,6 +14,17 @@ def path_info(path: str) -> os.stat_result | None:
         return None
 
 
+def sqlite_mtime(path: str) -> float | None:
+    """Newest database or WAL with frames, following the database's symlinks."""
+    path = os.path.realpath(path)
+    stamps = []
+    for candidate, min_size in ((path, 0), (path + "-wal", 33)):
+        info = path_info(candidate)
+        if info is not None and stat.S_ISREG(info.st_mode) and info.st_size >= min_size:
+            stamps.append(info.st_mtime)
+    return max(stamps, default=None)
+
+
 def record_paths(root: str, *parts: str, strict: bool = False) -> list[str]:
     """Match adapter layouts. Strict discovery must distinguish empty and unreadable."""
     if not strict:

@@ -68,7 +68,7 @@ import urllib.parse
 from .. import db, privacy
 from ..ingest import iso_ts
 from . import codex as _codex
-from .discovery import path_info, record_paths
+from .discovery import path_info, record_paths, sqlite_mtime
 
 HARNESS = "router"
 ROUTER_SCHEMA_VERSION = 2
@@ -508,6 +508,8 @@ def _sync_ledger(con: sqlite3.Connection, db_path: str, totals: dict,
     Returns (changed, invocations, bound) so the caller can reconcile
     usage after the router-owned rollouts are imported.
     """
+    checked_at = db.now()
+    source_mtime = sqlite_mtime(db_path)
     src = _open_ro(db_path)
     try:
         row = _get_source_row(con, db_path)
@@ -549,6 +551,9 @@ def _sync_ledger(con: sqlite3.Connection, db_path: str, totals: dict,
             # reconciliation once the router-owned rollouts land.
             bound, bound_pairs = _snapshot_bindings(con, jobs, invocations)
             totals["bindings"] = len(bound_pairs)
+            if source_mtime is not None and source_mtime > row["imported_at"]:
+                con.execute("UPDATE sources SET imported_at=? WHERE id=?",
+                            (checked_at, row["id"]))
             return False, invocations, bound
         task_ids = {j.get("request_id"): _job_task_id(j) for j in jobs}
         for job in jobs:
