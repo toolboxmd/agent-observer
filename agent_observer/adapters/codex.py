@@ -18,7 +18,7 @@ import math
 import os
 import sqlite3
 
-from .. import db, privacy
+from .. import db, native_response, privacy
 from ..identity import SessionIdentity, skill_from_path
 from ..ingest import (JsonlSource, MissingNativeId, fingerprint, insert_event,
                       iso_ts, stored_path, text_hash)
@@ -61,6 +61,7 @@ def _occurrences_ready(row) -> bool:
 
 
 HARNESS = "codex"
+_CONTEXT_VERSION = 7  # Record literal turn witnesses from every atomic occurrence.
 SEMANTICS = "codex:input_includes_cached,output_includes_reasoning"
 # Older rollouts carry usage only in token_count events: last_token_usage per
 # response and a cumulative total that repeats when nothing new happened.
@@ -760,10 +761,9 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         "events_duplicate": 0, "compactions": 0, "malformed": 0,
     }
     src = JsonlSource(con, HARNESS, path, full=full)
-    if (src.row["codex_context_version"] != 6
+    if (src.row["codex_context_version"] != _CONTEXT_VERSION
             or src.row["codex_context_offset"] != src.row["read_offset"]):
-        # Replay older indexes once, including search extensions previously
-        # discarded from otherwise unchanged sources (#94).
+        # Replay older indexes once to recover literal turn witnesses from copies.
         src.start_offset = 0
         src.end_offset = 0
         src.unchanged = False
@@ -811,6 +811,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         })
         return stats
     reader = _Reader(con, src, stats)
+    native_response.prepare(con, src.source_id, replace=not src.incremental)
     _ensure_cumulative_table(con)
     own = _first_meta(path)
     boundary = _history_file_boundary(path, own) if own is not None else None
@@ -960,9 +961,9 @@ def import_codex_file(con: sqlite3.Connection, path: str,
                             thread_source=reader.thread_source))
     backfill = 1 if _backfill_complete(
         con, src.source_id, getattr(src, "last_ordinal", None)) else 0
-    con.execute("UPDATE sources SET codex_context_version=6,codex_context_offset=?,"
+    con.execute("UPDATE sources SET codex_context_version=?,codex_context_offset=?,"
                 "codex_model=?,codex_effort=?,occurrence_backfill=? WHERE id=?",
-                (src.end_offset, reader.model, reader.effort, backfill,
+                (_CONTEXT_VERSION, src.end_offset, reader.model, reader.effort, backfill,
                  src.source_id))
     for key, (native, lost_rows) in settle.items():
         _settle(con, key, native, lost_rows)
@@ -1599,6 +1600,11 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
     th = th_raw if isinstance(th_raw, dict) else {}
     rid = f"{HARNESS}:{p['response_id']}"
     turn_id = f"{HARNESS}:{p['turn_id']}" if p.get("turn_id") else None
+    native_turn = native_response.identifier(p.get("turn_id"))
+    if (native_turn and (r.thread_id or r.session_id)
+            and native_response.identifier(p.get("response_id"))
+            and p.get("thread_id") in (None, r.thread_id)):
+        native_response.record(r.con, r.src.source_id, r.session_key, rid, native_turn)
     cur = r.con.execute(
         "INSERT OR IGNORE INTO responses(response_id, source_id, harness,"
         " session_key, thread_id, turn_id, root_turn_id, session_id,"
@@ -2191,3 +2197,24 @@ def _function_read(r, obj, call_id, path, state, turn_id):
     r.event(obj, family, call_id, turn_id=turn_id, name=os.path.basename(path),
             target=skill if family == "skill_read" else path, status=state,
             detail={"skill": skill, "skill_path": path} if family == "skill_read" else None)
+
+
+def legacy_response_inputs(con, session_key):
+    """Atomic records imported before per-occurrence evidence still have
+    their literal turn_id. Retouch touches Claude exclusively. Fallback
+    token_count records have a separate semantics and no native response id.
+    """
+    columns = {row[1] for row in con.execute("PRAGMA table_info(sources)")}
+    old = (" AND COALESCE(s.codex_context_version,0)<7"
+           if "codex_context_version" in columns else "")
+    for rid, turn in con.execute(
+        "SELECT r.response_id,r.turn_id FROM responses r JOIN sources s ON s.id=r.source_id"
+        " WHERE r.harness='codex' AND r.session_key=? AND r.semantics=? AND r.is_overlap=0"
+        " AND (r.thread_id IS NULL OR 'codex:'||r.thread_id=r.session_key)" + old,
+        (session_key, SEMANTICS)
+    ):
+        if (isinstance(turn, str) and turn.startswith("codex:")
+                and native_response.identifier(turn[6:])
+                and isinstance(rid, str) and rid.startswith("codex:")
+                and native_response.identifier(rid[6:])):
+            yield rid, turn[6:]

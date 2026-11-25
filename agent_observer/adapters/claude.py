@@ -17,8 +17,9 @@ import glob
 import json
 import os
 import sqlite3
+from collections import defaultdict, deque
 
-from .. import db, privacy, intervention_evidence
+from .. import db, native_response, privacy, intervention_evidence
 from ..identity import SessionIdentity, skill_from_path
 from ..ingest import (JsonlSource, MissingNativeId, fingerprint, insert_event,
                       iso_ts, text_hash)
@@ -105,7 +106,7 @@ def _valid_counter(value) -> bool:
 
 _FINALITY_TABLE = "claude_response_finality"
 _NATIVE_KINDS_TABLE = "claude_native_kinds"
-_IMPORT_VERSION = 5  # Replay T3 completion-report parsing once (#142).
+_IMPORT_VERSION = 6  # Replay UUID ancestry from existing sources.
 
 
 def _ensure_native_kinds(con) -> None:
@@ -382,6 +383,7 @@ def import_claude_file(con: sqlite3.Connection, path: str,
     _ensure_finality_table(con)
     _ensure_native_kinds(con)
     _seed_queue_identity(r)
+    _prepare_ancestry(r)
     # Durable per-response finality is authoritative for accepted final
     # rows. It covers copied sources, full reimports and incremental
     # appends. The file prefix is never authority on its own, so a malformed
@@ -409,6 +411,7 @@ def import_claude_file(con: sqlite3.Connection, path: str,
                       line)
             continue
         try:
+            _record_ancestry(r, obj)
             _ingest(r, obj, ordinal)
             if obj.get("type") == "queue-operation":
                 con.execute("DELETE FROM import_errors WHERE harness=? AND source_path=?"
@@ -1060,3 +1063,101 @@ def _system(r: _Reader, obj: dict, ordinal: int, ts) -> None:
     elif subtype in ("api_error", "stop_hook_summary", "informational"):
         r.event("lifecycle", native, ordinal, ts, name=subtype,
                 status=obj.get("level"))
+
+
+def _prepare_ancestry(r):
+    r.con.execute("""
+        CREATE TABLE IF NOT EXISTS claude_response_ancestry (
+            session_key TEXT NOT NULL, uuid TEXT NOT NULL, parent TEXT NOT NULL,
+            input_id TEXT NOT NULL, response_id TEXT NOT NULL,
+            source_id INTEGER NOT NULL REFERENCES sources(id),
+            PRIMARY KEY(session_key, uuid, parent, input_id, response_id, source_id)
+        ) WITHOUT ROWID""")
+    r.con.execute("CREATE INDEX IF NOT EXISTS claude_ancestry_source"
+                  " ON claude_response_ancestry(source_id)")
+    if not r.src.incremental:
+        r.con.execute("DELETE FROM claude_response_ancestry WHERE source_id=?",
+                      (r.src.source_id,))
+
+
+def _record_ancestry(r, obj):
+    uuid = native_response.identifier(obj.get("uuid"))
+    if (not uuid or not r.native_session or obj.get("sessionId") != r.native_session
+            or (obj.get("agentId") and obj["agentId"] != r.agent_id)):
+        return
+    parent = native_response.identifier(obj.get("parentUuid"))
+    kind = obj.get("type")
+    message = obj.get("message")
+    if kind in ("user", "assistant") and (
+            not isinstance(message, dict) or message.get("role", kind) != kind):
+        return
+    input_id = response_id = ""
+    if kind == "user":
+        content = message.get("content")
+        if ((isinstance(content, str) and content) or
+                (isinstance(content, list) and any(
+                    isinstance(block, dict) and block.get("type") in ("text", "image", "document")
+                    for block in content))):
+            input_id = uuid
+        elif not (isinstance(content, list) and content and all(
+                isinstance(block, dict) and block.get("type") == "tool_result"
+                for block in content)):
+            return
+    elif kind == "assistant":
+        mid = native_response.identifier(message.get("id"))
+        if mid and message.get("model") != "<synthetic>":
+            response_id = f"{HARNESS}:{mid}"
+    elif kind == "attachment" and isinstance(obj.get("attachment"), dict):
+        if obj["attachment"].get("type") == "queued_command":
+            # A consumed queued input has its own identity. A missing identity
+            # must not send its descendants back to the previous prompt.
+            input_id = native_response.identifier(obj["attachment"].get("source_uuid"))
+            if input_id is None:
+                return
+    elif kind not in ("system", "progress"):
+        return
+    r.con.execute("INSERT OR IGNORE INTO claude_response_ancestry"
+                  "(session_key,uuid,parent,input_id,response_id,source_id)"
+                  " VALUES(?,?,?,?,?,?)",
+                  (r.session_key, uuid, "" if input_id else parent or "",
+                   input_id, response_id, r.src.source_id))
+
+
+def response_inputs(con, session_key):
+    """Resolve every UUID once, stopping each chain at its nearest native input.
+
+    A missing parent or cycle leaves that chain unresolved. Multiple observed
+    parents must all resolve, and competing inputs survive for the consumer.
+    """
+    if not db._has_table(con, "claude_response_ancestry"):
+        return {}
+    parents, children, anchors, blocks = (defaultdict(set) for _ in range(4))
+    for uuid, parent, input_id, response_id in con.execute(
+        "SELECT DISTINCT uuid,parent,input_id,response_id FROM claude_response_ancestry"
+        " WHERE session_key=?", (session_key,)
+    ):
+        if input_id:
+            anchors[uuid].add(input_id)
+        elif parent:
+            parents[uuid].add(parent)
+            children[parent].add(uuid)
+        if response_id:
+            blocks[response_id].add(uuid)
+    # Process an interior node only after all its parents have resolved.
+    ready = deque(uuid for uuid in anchors if uuid not in parents)
+    resolved = set()
+    while ready:
+        uuid = ready.popleft()
+        resolved.add(uuid)
+        for child in children.get(uuid, ()):
+            parents[child].remove(uuid)
+            anchors[child].update(anchors[uuid])
+            if not parents[child]:
+                ready.append(child)
+    results = {}
+    for response_id, in con.execute("SELECT response_id FROM responses"
+                                    " WHERE session_key=? AND is_overlap=0", (session_key,)):
+        nodes = blocks.get(response_id)
+        if nodes and nodes <= resolved:
+            results[response_id] = set.union(*(anchors[node] for node in nodes))
+    return results

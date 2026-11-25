@@ -19,7 +19,7 @@ import os
 import sqlite3
 import time
 
-from .. import db, privacy
+from .. import db, native_response, privacy
 from ..identity import SessionIdentity, skill_from_path
 from ..ingest import fingerprint, insert_event, iso_ts, text_hash
 
@@ -410,7 +410,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     session_key = f"{HARNESS}:{sess_id}"
     msg_n, msg_m = _count_max(native, "message", sess_id)
     part_n, part_m = _count_max(native, "part", sess_id)
-    fp = fingerprint(sess.get("time_updated"), msg_m, part_m, msg_n, part_n)
+    fp = fingerprint("native-parent-v1", sess.get("time_updated"), msg_m, part_m, msg_n, part_n)
     row = con.execute(
         "SELECT * FROM sources WHERE harness=? AND path=?",
         (HARNESS, src_path)).fetchone()
@@ -501,13 +501,14 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
             continue
         parsed_messages.append((index, msg, data))
         roles[msg_id] = data.get("role")
+    native_response.prepare(con, source_id, replace=True)
     ordinal = 0
     for index, msg, data in parsed_messages:
         ordinal += 1
         _ingest_message(con, native, stats, identity, src_path, source_id,
                         session_key, sess, msg, data, index, ordinal,
                         by_message.get(msg.get("id"), []),
-                        privacy_stale=privacy_stale)
+                        roles=roles, privacy_stale=privacy_stale)
     for part in parts:
         ordinal += 1
         _ingest_part(con, stats, identity, src_path, source_id,
@@ -539,7 +540,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     con.execute(
         "UPDATE sources SET sha256=?, size_bytes=?, imported_at=?,"
         " import_ms=?, session_id=?, privacy_version=? WHERE id=?",
-        (fp, size_bytes, db.now(),
+        (fp if complete else "", size_bytes, db.now(),
          int((time.monotonic() - started) * 1000), sess_id,
          new_version, source_id))
     con.commit()
@@ -549,7 +550,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
 
 def _ingest_message(con, native, stats, identity, src_path, source_id,
                     session_key, sess, msg, data, index, ordinal,
-                    msg_parts, privacy_stale: bool = False) -> None:
+                    msg_parts, *, roles, privacy_stale: bool = False) -> None:
     msg_id = msg.get("id")
     timing = data.get("time") if isinstance(data.get("time"), dict) else {}
     completed = timing.get("completed")
@@ -575,7 +576,7 @@ def _ingest_message(con, native, stats, identity, src_path, source_id,
     role = data.get("role")
     if role == "assistant":
         _ingest_response(con, stats, src_path, source_id, session_key,
-                         sess, msg, data, index, ts, ordinal)
+                         sess, msg, data, index, ts, ordinal, roles)
     elif role == "user":
         _ingest_submission(con, stats, identity, src_path, source_id,
                            session_key, sess, msg, data, index, ts,
@@ -586,7 +587,7 @@ def _ingest_message(con, native, stats, identity, src_path, source_id,
 
 
 def _ingest_response(con, stats, src_path, source_id, session_key, sess,
-                     msg, data, index, ts, ordinal) -> None:
+                     msg, data, index, ts, ordinal, roles) -> None:
     timing = data.get("time") if isinstance(data.get("time"), dict) else {}
     if timing.get("completed") is None:
         return
@@ -639,6 +640,9 @@ def _ingest_response(con, stats, src_path, source_id, session_key, sess,
     cost = data.get("cost")
     cost_usd = cost if isinstance(cost, (int, float)) \
         and not isinstance(cost, bool) else None
+    parent = native_response.identifier(data.get("parentID"))
+    if parent and roles.get(parent) == "user" and native_response.identifier(msg["id"]):
+        native_response.record(con, source_id, session_key, f"{HARNESS}:{msg['id']}", parent)
     _upsert_response(
         con, stats, src_path, response_id=f"{HARNESS}:{msg.get('id')}",
         source_id=source_id, session_key=session_key,
