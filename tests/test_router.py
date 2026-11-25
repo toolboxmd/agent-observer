@@ -1522,6 +1522,19 @@ class RouterAdapterTest(LedgerCase):
             "SELECT imported_at FROM sources WHERE harness='router'").fetchone()
         self.assertEqual(row["imported_at"], 21_000)
 
+    def test_router_sync_keeps_importing_when_timestamp_probe_is_denied(self):
+        from unittest.mock import patch
+
+        with patch.object(router, "sqlite_mtime", side_effect=PermissionError("WAL denied")):
+            self.assertEqual(router.sync(self.con, root=self.state)["failed"], [])
+            query = "SELECT imported_at FROM sources WHERE harness='router'"
+            recorded = self.con.execute(query).fetchone()[0]
+            with patch.object(router.db, "now", return_value=recorded + 100):
+                result = router.sync(self.con, root=self.state)
+            self.assertEqual(result["failed"], [])
+            self.assertEqual(result["unchanged"], 1)
+            self.assertEqual(self.con.execute(query).fetchone()[0], recorded)
+
     def test_stale_source_version_refreshes_and_replaces_errors(self):
         src = sqlite3.connect(self.db_path)
         src.execute(

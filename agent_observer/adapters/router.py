@@ -509,7 +509,12 @@ def _sync_ledger(con: sqlite3.Connection, db_path: str, totals: dict,
     usage after the router-owned rollouts are imported.
     """
     checked_at = db.now()
-    source_mtime = sqlite_mtime(db_path)
+    try:
+        source_mtime = sqlite_mtime(db_path)
+    except OSError:
+        # Metadata inspection is optional for sync. SQLite determines
+        # whether the database snapshot itself can be read.
+        source_mtime = None
     src = _open_ro(db_path)
     try:
         row = _get_source_row(con, db_path)
