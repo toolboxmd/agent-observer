@@ -106,7 +106,7 @@ def _valid_counter(value) -> bool:
 
 _FINALITY_TABLE = "claude_response_finality"
 _NATIVE_KINDS_TABLE = "claude_native_kinds"
-_IMPORT_VERSION = 14  # Reconcile partial final measurements on a fully readable snapshot.
+_IMPORT_VERSION = 15  # Reconcile source-specific final fields and their cache split.
 
 
 def _ensure_native_kinds(con) -> None:
@@ -479,8 +479,25 @@ def import_claude_file(con: sqlite3.Connection, path: str,
                     SELECT session_key,response_id FROM claude_response_ancestry WHERE source_id=?
                     UNION SELECT session_key,response_id FROM claude_rejected_measurements WHERE source_id=?
                 )""", (src.source_id, src.source_id, src.source_id))
+        # A replacement can revise a field by measuring it again. Omitting
+        # the field cannot settle a disagreement, even across partial finals.
+        con.execute("""INSERT OR IGNORE INTO claude_retained_final_fields
+            SELECT p.session_key,p.response_id,p.source_id,j.key,j.value
+            FROM claude_prior_finals p JOIN claude_expected_finals e USING(session_key,response_id,source_id),
+            json_each(p.payload) j WHERE j.value IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM claude_final_observations o WHERE o.session_key=p.session_key
+                AND o.response_id=p.response_id AND o.source_id=p.source_id
+                AND json_extract(o.payload,'$.'||j.key) IS NOT NULL)""")
         con.execute("DROP TABLE temp.claude_prior_edges")
         con.execute("DROP TABLE temp.claude_prior_finals")
+    # Retained values supply negative evidence only. A readable removal of
+    # the response, or a new measurement for this field, retires that value.
+    con.execute("""DELETE FROM claude_retained_final_fields AS p WHERE p.source_id=? AND (
+        NOT EXISTS (SELECT 1 FROM claude_expected_finals e WHERE e.session_key=p.session_key
+        AND e.response_id=p.response_id AND e.source_id=p.source_id) OR EXISTS (
+        SELECT 1 FROM claude_final_observations o WHERE o.session_key=p.session_key
+        AND o.response_id=p.response_id AND o.source_id=p.source_id
+        AND json_extract(o.payload,'$.'||p.field) IS NOT NULL))""", (src.source_id,))
     con.executemany("INSERT OR IGNORE INTO claude_ancestry_sources VALUES(?,?)",
                     ((key, src.source_id) for key in r.linked_sessions))
     if r.native_session:
@@ -535,6 +552,13 @@ def _ingest(r: _Reader, obj: dict, ordinal: int) -> None:
         raise _UnsupportedSchema(f"unsupported record type: {kind!r}")
 
 
+def _cache_consistent(total, five, hour):
+    if total is None:
+        return five is None or hour is None or _valid_counter(five + hour)
+    return ((five is None or five <= total) and (hour is None or hour <= total)
+            and (five is None or hour is None or five + hour == total))
+
+
 def _usage_values(usage) -> dict:
     """Native usage buckets with unknown preserved as NULL.
 
@@ -573,8 +597,7 @@ def _usage_values(usage) -> dict:
     if not _valid_counter(five) or not _valid_counter(hour):
         raise _MalformedUsage("malformed cache creation counter")
     total_write = usage.get("cache_creation_input_tokens")
-    if five is not None and hour is not None and total_write is not None \
-            and five + hour != total_write:
+    if not _cache_consistent(total_write, five, hour):
         raise _MalformedUsage("inconsistent cache creation counters")
     values = [usage.get(k) for k in _CLAUDE_COUNTER_KEYS]
     total = sum(values) if all(type(v) is int for v in values) else None
@@ -601,15 +624,34 @@ def _stored_counters(r: _Reader, rid: str) -> dict:
     return dict(row) if row is not None else {}
 
 
-def _matching_corrected_finals(r, rid, payload):
-    # A single later block cannot revise immutable final usage. Independent
-    # copies, including the original measured source, can establish a correction.
+def _corroborated_final(r, rid, seen):
+    """A changed counter needs matching measurements from its original source and a copy."""
     rows = r.con.execute(
-        "SELECT o.source_id,o.payload,r.source_id AS original FROM claude_final_observations o "
+        "SELECT o.source_id,o.payload,r.source_id AS original,r.model FROM claude_final_observations o "
         "JOIN responses r USING(session_key,response_id) WHERE o.session_key=? AND o.response_id=?",
         (r.session_key, rid)).fetchall()
-    return (len({row["source_id"] for row in rows}) > 1 and all(row["payload"] == payload for row in rows)
-            and any(row["source_id"] == row["original"] for row in rows))
+    sources = {row["source_id"] for row in rows}
+    if len(sources) < 2 or rows[0]["original"] not in sources:
+        return None
+    agreed = {}
+    witnesses = defaultdict(set)
+    for row in rows:
+        for field, value in json.loads(row["payload"]).items():
+            if value is None or (field != "model" and field not in seen):
+                continue
+            if field in agreed and agreed[field] != value:
+                return None
+            agreed[field] = value
+            witnesses[field].add(row["source_id"])
+    # A single native final must actually have measured the full total.
+    # Its constituent counters, when revised, must also be corroborated.
+    if "total_tokens" not in agreed:
+        return None
+    for field, old in dict(seen, model=rows[0]["model"]).items():
+        if field != "total_tokens" and old is not None and field in agreed and old != agreed[field]:
+            if len(witnesses[field]) < 2 or rows[0]["original"] not in witnesses[field]:
+                return None
+    return agreed
 
 
 def conflicting_final_measurements(con, session_key):
@@ -625,6 +667,17 @@ def conflicting_final_measurements(con, session_key):
     conflicts = {rid for rid, in con.execute(
         "SELECT DISTINCT o.response_id FROM claude_final_observations o JOIN responses r USING(session_key,response_id) "
         "WHERE o.session_key=? AND (" + " OR ".join(mismatch) + ")", (session_key,))}
+    if db._has_table(con, "claude_retained_final_fields"):
+        column = "CASE p.field " + " ".join(f"WHEN '{name}' THEN r.{name}" for name in (*fields, "model")) + " END"
+        conflicts.update(rid for rid, in con.execute(
+            "SELECT DISTINCT p.response_id FROM claude_retained_final_fields p "
+            "JOIN responses r USING(session_key,response_id) WHERE p.session_key=? AND p.value IS NOT " + column,
+            (session_key,)))
+    # Read-only ledgers may already contain an incoherent pre-version-15 row.
+    conflicts.update(rid for rid, in con.execute(
+        "SELECT response_id FROM responses WHERE session_key=? AND (cache_write_5m_tokens>cache_write_input_tokens "
+        "OR cache_write_1h_tokens>cache_write_input_tokens "
+        "OR cache_write_1h_tokens<>cache_write_input_tokens-cache_write_5m_tokens)", (session_key,)))
     if db._has_table(con, "claude_expected_finals"):
         complete = ""
         if "requires_complete" in {c[1] for c in con.execute("PRAGMA table_info(claude_expected_finals)")}:
@@ -675,26 +728,30 @@ def _ingest_usage_row(r: _Reader, obj: dict, ordinal: int, ts, mid: str,
         r.finalized.add(mid)
         seen = _stored_counters(r, rid)
         ttl_keys = ("cache_write_5m_tokens", "cache_write_1h_tokens")
-        if final and values["total_tokens"] is not None and _matching_corrected_finals(r, rid, payload):
-            # All fields come from the validated usage parser, never from JSON keys.
-            names = tuple(k for k in values if k not in ttl_keys or values[k] is not None)
-            r.con.execute("UPDATE responses SET model=?," + ",".join(f"{k}=?" for k in names)
-                          + " WHERE session_key=? AND response_id=?",
-                          (model, *(values[k] for k in names), r.session_key, rid))
-            seen = values
         if not final:
             if any(seen.get(k) != v for k, v in values.items() if k not in ttl_keys):
                 raise _UsageConflict("usage conflict")
             r.stats["responses_duplicate"] += 1
             return
-        if any(seen.get(k) is not None and v is not None and seen[k] != v for k, v in values.items()):
+        corrected = _corroborated_final(r, rid, seen)
+        supplied = corrected if corrected is not None else {k: v for k, v in values.items() if v is not None}
+        combined = {**seen, **supplied}
+        if not _cache_consistent(combined.get("cache_write_input_tokens"), *(combined.get(k) for k in ttl_keys)):
+            raise _UsageConflict("usage conflict")
+        changes = {k: v for k, v in supplied.items() if seen.get(k) != v}
+        revisions = {k for k in changes if seen.get(k) is not None}
+        # Version 14 could already have combined incompatible cache fields.
+        # A coherent complete measurement can repair those fields on replay.
+        repair_cache = (values["total_tokens"] is not None and
+                        not _cache_consistent(seen.get("cache_write_input_tokens"), *(seen.get(k) for k in ttl_keys))
+                        and revisions <= {*ttl_keys, "cache_write_input_tokens", "total_tokens"})
+        if revisions and corrected is None and not repair_cache:
             raise _UsageConflict("usage conflict")
         # Only the native parser can supply a total. Never sum fields
         # assembled across partial measurements.
-        additions = {k: v for k, v in values.items() if seen.get(k) is None and v is not None}
-        if additions:
-            r.con.execute("UPDATE responses SET " + ",".join(f"{k}=?" for k in additions)
-                          + " WHERE session_key=? AND response_id=?", (*additions.values(), r.session_key, rid))
+        if changes:
+            r.con.execute("UPDATE responses SET " + ",".join(f"{k}=?" for k in changes)
+                          + " WHERE session_key=? AND response_id=?", (*changes.values(), r.session_key, rid))
         r.stats["responses_duplicate"] += 1
         return
     cur = r.con.execute(
@@ -1211,6 +1268,11 @@ def _prepare_ancestry(r):
         session_key TEXT NOT NULL, response_id TEXT NOT NULL, source_id INTEGER NOT NULL REFERENCES sources(id),
         payload TEXT NOT NULL, PRIMARY KEY(session_key,response_id,source_id,payload)) WITHOUT ROWID""")
     r.con.execute("CREATE INDEX IF NOT EXISTS claude_final_observation_source ON claude_final_observations(source_id)")
+    r.con.execute("""CREATE TABLE IF NOT EXISTS claude_retained_final_fields (
+        session_key TEXT NOT NULL, response_id TEXT NOT NULL, source_id INTEGER NOT NULL REFERENCES sources(id),
+        field TEXT NOT NULL, value NOT NULL,
+        PRIMARY KEY(session_key,response_id,source_id,field,value)) WITHOUT ROWID""")
+    r.con.execute("CREATE INDEX IF NOT EXISTS claude_retained_field_source ON claude_retained_final_fields(source_id)")
     if not db._has_table(r.con, "claude_expected_finals"):
         r.con.execute("""CREATE TABLE claude_expected_finals (
             source_id INTEGER NOT NULL REFERENCES sources(id), session_key TEXT NOT NULL, response_id TEXT NOT NULL,

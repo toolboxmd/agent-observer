@@ -730,3 +730,104 @@ class EvidenceCoverageTest(LedgerCase):
                 rep = report.task_report(self.con, "B")
                 self.assertEqual(rep["complete"], output == 5)
                 self.assertEqual(rep["attributed"]["responses"], int(output == 5))
+
+    def check_withdrawn_field(self, ttl):
+        path = Path(self.tmp.name, "original.jsonl")
+        response = claude_response("reply", "b", "response")
+        usage = dict(input_tokens=10, output_tokens=5, cache_read_input_tokens=0,
+                     cache_creation_input_tokens=10 if ttl else 0)
+        if ttl:
+            usage["cache_creation"] = {"ephemeral_5m_input_tokens": 10, "ephemeral_1h_input_tokens": 0}
+        response["message"].update(usage=usage, model="claude-haiku-4-5",
+                                   content=[{"type": "tool_use", "id": "b-call", "name": "Read"}])
+        rows = [claude_user("b"), response]
+        write_records(path, rows)
+        claude.import_claude_file(self.con, str(path))
+        self.assign("B", "claude:b")
+        rid = "claude:" + rows[-1]["message"]["id"]
+        call = rows[-1]["message"]["content"][0]["id"]
+        copy = path.with_name("competing.jsonl")
+        if ttl:
+            usage["cache_creation"] = {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 10}
+        else:
+            del usage["input_tokens"]
+            usage["output_tokens"] = 90000
+        for step in ("different", "withdrawn", "repeat", "restored"):
+            if step == "withdrawn":
+                if ttl:
+                    del usage["cache_creation"]
+                else:
+                    usage["input_tokens"] = 10
+                    del usage["output_tokens"]
+            if step == "restored":
+                rows = [json.loads(line) for line in path.read_text().splitlines()]
+            write_records(copy, rows)
+            claude.import_claude_file(self.con, str(copy))
+            with self.subTest(step=step):
+                rep = report.task_report(self.con, "B")
+                self.assertEqual(rid in rep["measured"]["attributed_responses"], step == "restored")
+                self.assertEqual(call in [e["native_id"] for e in report.timeline(self.con, "B")["events"]],
+                                 step == "restored")
+                if step != "restored":
+                    self.assertIsNone(rep["total_cost"]["usd"])
+
+    def test_withdrawing_partial_disputed_output_does_not_resolve_it(self):
+        self.check_withdrawn_field(False)
+
+    def test_withdrawing_disputed_cache_split_does_not_resolve_it(self):
+        self.check_withdrawn_field(True)
+
+    def check_contradictory_cache_enrichment(self, append):
+        path = Path(self.tmp.name, "cache.jsonl")
+        msg = claude_response("reply", "p", "cache")
+        usage = dict(input_tokens=5, output_tokens=7, cache_read_input_tokens=0,
+                     cache_creation=dict(ephemeral_5m_input_tokens=100000, ephemeral_1h_input_tokens=0))
+        msg["message"].update(model="claude-haiku-4-5", usage=usage,
+                              content=[{"type": "tool_use", "id": "cache-call", "name": "Read"}])
+        write_records(path, [claude_user("p"), msg])
+        claude.import_claude_file(self.con, str(path))
+        self.assign("A", "claude:p")
+        del usage["cache_creation"]
+        usage["cache_creation_input_tokens"] = 0
+        write_records(path, [msg] if append else [claude_user("p"), msg], mode="a" if append else "w")
+        claude.import_claude_file(self.con, str(path))
+        rep = report.task_report(self.con, "A")
+        self.assertFalse(rep["attributed"]["responses"])
+        self.assertFalse(rep["complete"])
+        self.assertIsNone(rep["total_cost"]["usd"])
+        self.assertFalse(report.timeline(self.con, "A")["events"])
+        self.assertIn("Evidence complete: no", self.draft()["body"])
+        # A readable replacement with the matching aggregate can still seal the bill.
+        usage["cache_creation_input_tokens"] = 100000
+        write_records(path, [claude_user("p"), msg])
+        claude.import_claude_file(self.con, str(path))
+        rep = report.task_report(self.con, "A")
+        self.assertTrue(rep["complete"])
+        self.assertEqual(rep["attributed"]["total_tokens"], 100012)
+
+    def test_appending_incompatible_cache_components_withholds_usage(self):
+        self.check_contradictory_cache_enrichment(True)
+
+    def test_rewriting_incompatible_cache_components_withholds_usage(self):
+        self.check_contradictory_cache_enrichment(False)
+
+    def test_complete_copy_and_corrected_partial_confirm_the_same_measurement(self):
+        partial = Path(self.tmp.name, "first.jsonl")
+        complete = Path(self.tmp.name, "second.jsonl")
+        msg = claude_response("reply", "p", "id")
+        rows = [claude_user("p"), msg]
+        usage = dict(output_tokens=90000, cache_read_input_tokens=0, cache_creation_input_tokens=0)
+        msg["message"].update(usage=usage, model="claude-haiku-4-5")
+        write_records(partial, rows)
+        claude.import_claude_file(self.con, str(partial))
+        self.assign("A", "claude:p")
+        usage.update(output_tokens=5, input_tokens=10)
+        write_records(complete, rows)
+        claude.import_claude_file(self.con, str(complete))
+        self.assertFalse(report.task_report(self.con, "A")["attributed"]["responses"])
+        del usage["input_tokens"]
+        write_records(partial, rows)
+        claude.import_claude_file(self.con, str(partial))
+        rep = report.task_report(self.con, "A")
+        self.assertTrue(rep["complete"])
+        self.assertEqual(rep["attributed"]["total_tokens"], 15)
