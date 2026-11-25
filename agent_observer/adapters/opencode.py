@@ -711,13 +711,14 @@ def _ingest_response(con, stats, src_path, source_id, session_key, sess,
 _MAX_COUNTER = (1 << 63) - 1  # SQLite INTEGER.
 _UNLOCATED_SNAPSHOT = "oc6:unlocated"  # Never matches a complete snapshot fingerprint.
 _MALFORMED_USAGE = "malformed_usage"
-_INVALID_OBSERVATIONS = {"null", json.dumps(_MALFORMED_USAGE), json.dumps("unknown_message")}
+_INVALID_OBSERVATIONS = {"null", json.dumps(_MALFORMED_USAGE), json.dumps("unknown_message"),
+                         json.dumps("unfinished")}
 
 
 def _measurement(data):
     timing = data.get("time") if isinstance(data.get("time"), dict) else {}
     if timing.get("completed") is None:
-        return "unmeasured"
+        return "unfinished"
     raw_tokens = data.get("tokens")
     if raw_tokens is None:
         tokens: dict = {}

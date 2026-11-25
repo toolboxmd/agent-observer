@@ -106,6 +106,7 @@ class EvidenceCoverageTest(LedgerCase):
         with closing(sqlite3.connect(path)) as source, source:
             # These task scopes exercise only the two copies of the parent.
             source.execute("DELETE FROM session WHERE parent_id IS NOT NULL")
+            source.execute("DELETE FROM message WHERE id='msg_a_unf'")
             source.execute("UPDATE message SET data=json_set(data,'$.parentID',?,'$.cost',?,"
                            "'$.tokens.output',?) WHERE id='msg_a1'", (parent, cost, output))
             if independent:
@@ -476,3 +477,78 @@ class EvidenceCoverageTest(LedgerCase):
             claude.import_claude_file(self.con, str(path), full=True)
             self.assertEqual(report.task_report(self.con, "A")["measured"]["unplaced_responses"], ["claude:msg-a"])
             self.assertFalse(report.timeline(self.con, "A")["events"])
+
+    def test_claude_disagreeing_final_measurements_in_both_orders(self):
+        path = self.import_claude()
+        self.assign("B", "claude:b")
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        other = path.with_name("final-copy.jsonl")
+        for first, second, rid in ((path, other, "high-first"), (other, path, "low-first")):
+            with self.subTest(rid=rid):
+                response = dict(rows[-1], uuid=rid, message=dict(rows[-1]["message"], id=rid))
+                for loc, count in ((first, 90000 if rid == "high-first" else 5000),
+                                   (second, 5000 if rid == "high-first" else 90000)):
+                    response["message"]["usage"]["output_tokens"] = count
+                    write_records(loc, [*rows[:2], response])
+                    claude.import_claude_file(self.con, str(loc), full=True)
+                rep = report.task_report(self.con, "B")
+                self.assertNotIn("claude:" + rid, rep["measured"]["attributed_responses"])
+                self.assertIn("claude:" + rid, rep["measured"]["unplaced_responses"])
+                self.assertIsNone(rep["total_cost"]["usd"])
+                # Repair the first copy to the second final. A first-import
+                # preference would preserve the wrong measurement here.
+                first.write_bytes(second.read_bytes())
+                claude.import_claude_file(self.con, str(first), full=True)
+                rep = report.task_report(self.con, "B")
+                self.assertIn("claude:" + rid, rep["measured"]["attributed_responses"])
+                self.assertEqual(self.con.execute("SELECT output_tokens FROM responses WHERE response_id=?",
+                                                  ("claude:" + rid,)).fetchone()[0], count)
+
+    def test_unfinished_opencode_message_keeps_owned_total_open(self):
+        path = self.opencode_store("pending", "msg_u1", 0.20, 50, independent=True)
+        with closing(sqlite3.connect(path)) as source, source:
+            source.execute("UPDATE message SET data=json_remove(data,'$.time.completed') WHERE id='msg_a1'")
+        opencode.sync(self.con, source=path)
+        self.assign("A", "opencode:msg_u1")
+        rep = report.task_report(self.con, "A")
+        self.assertEqual(rep["measured"]["attributed_responses"], ["opencode:msg_unique"])
+        self.assertFalse(rep["complete"])
+        self.assertIsNone(rep["native_cost"]["total_usd"])
+        self.assertEqual(rep["native_cost"]["known_subtotal_usd"], 0.10)
+        self.assertIn("Evidence complete: no", self.draft()["body"])
+        with closing(sqlite3.connect(path)) as source, source:
+            source.execute("UPDATE message SET data=json_set(data,'$.time.completed',123) WHERE id='msg_a1'")
+        opencode.sync(self.con, source=path, full=True)
+        self.assertAlmostEqual(report.task_report(self.con, "A")["native_cost"]["total_usd"], 0.30)
+
+    def test_rejected_claude_event_has_no_display_turn_fallback(self):
+        path = Path(self.tmp.name, "initial.jsonl")
+        a, b = [claude_response("reply-" + p, p, "msg-" + p) for p in ("a", "b")]
+        for response, call in ((a, "a-call"), (b, "b-call")):
+            response["message"]["content"] = [{"type": "tool_use", "id": call, "name": "Read"}]
+        b["message"]["usage"]["output_tokens"] = "bad"
+        write_records(path, [claude_user("b"), claude_user("a"), a, b])
+        claude.import_claude_file(self.con, str(path))
+        self.assign("A", "claude:a")
+        self.assign("B", "claude:b")
+        self.assertEqual([e["native_id"] for e in report.timeline(self.con, "A")["events"]], ["a-call"])
+        self.assertFalse(report.timeline(self.con, "B")["events"])
+
+    def test_unreadable_claude_line_cannot_erase_a_dispute(self):
+        path = self.import_claude()
+        self.assign("B", "claude:b")
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        copy = path.with_name("damaged.jsonl")
+        rows[-1]["parentUuid"] = "a"
+        write_records(copy, rows)
+        claude.import_claude_file(self.con, str(copy), full=True)
+        write_records(copy, rows[:-1])
+        with copy.open("a") as source:
+            source.write("{\n")
+        for _ in range(2):
+            claude.import_claude_file(self.con, str(copy), full=True)
+            self.assertFalse(report.task_report(self.con, "B")["attributed"]["responses"])
+        rows[-1]["parentUuid"] = "b"
+        write_records(copy, rows)
+        claude.import_claude_file(self.con, str(copy), full=True)
+        self.assertEqual(report.task_report(self.con, "B")["attributed"]["responses"], 1)

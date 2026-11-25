@@ -167,7 +167,11 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
     if harness == "claude":
         from .adapters import claude
         responses, disputed_completions = claude.response_witnesses(con, key)
+        disputed_completions |= claude.conflicting_final_measurements(con, key)
         result.conflicts.update(disputed_completions)
+        if _has_table(con, "claude_unreadable_sources") and con.execute(
+                "SELECT 1 FROM claude_unreadable_sources WHERE session_key=? LIMIT 1", (key,)).fetchone():
+            result.unlocated_usage_sessions.add(key)
     elif harness == "opencode":
         from .adapters import opencode
         responses, disputed_completions, malformed = opencode.response_witnesses(con, key)
