@@ -404,6 +404,38 @@ class LedgerFreshnessTest(unittest.TestCase):
                     self.assertIn("permission denied", output)
                     self.assertNotIn("private-project-name", output)
 
+    def test_health_keeps_ledger_permission_diagnostic_path_free(self):
+        from errno import EACCES
+
+        stat = os.stat
+
+        def checked_stat(path, *args, **kwargs):
+            if path == str(self.ledger):
+                raise PermissionError(EACCES, "Permission denied", "/private-ledger/observer.db")
+            return stat(path, *args, **kwargs)
+
+        with patch.object(os, "stat", checked_stat):
+            for args in ((), ("--json",)):
+                code, output = self.run_health(*args)
+                self.assertEqual(code, 4)
+                self.assertIn("permission denied", output)
+                self.assertNotIn("private-ledger", output)
+
+    def test_out_of_range_opencode_time_reports_unavailable_in_both_formats(self):
+        with contextlib.closing(sqlite3.connect(self.root / "opencode")) as native:
+            native.executescript("CREATE TABLE session(id TEXT, time_updated INTEGER);"
+                                 "INSERT INTO session VALUES ('fixture', 1760000000000000);")
+        self.source("claude/project/fixture.jsonl", 10_000)
+        self.imports(claude=11_000)
+        code, output = self.run_health()
+        self.assertEqual(code, 4)
+        self.assertIn("opencode native record scan unavailable: invalid timestamp", output)
+        code, output = self.run_health("--json")
+        self.assertEqual(code, 4)
+        rows = json.loads(output)["ledger_freshness"]
+        self.assertEqual(rows["opencode"]["status"], "unavailable")
+        self.assertEqual(rows["claude"]["status"], "current")
+
     def test_denied_chromeria_v2_state_is_unavailable_for_state_and_receipts(self):
         path = self.root / "t3/userdata/chromeria-v2.sqlite"
         path.parent.mkdir(parents=True)

@@ -19,6 +19,7 @@ import stat
 import subprocess
 import time
 from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 
 from .adapters import bare as bare_adapter
@@ -29,6 +30,23 @@ CLAUDE_FIX = ("start the session with the parent's CLAUDE_CODE_*, CLAUDECODE, CL
 GRACE_SECONDS = 120
 SCAN_TIMEOUT_SECONDS = 5
 DEFAULT_SYNC_INTERVAL_SECONDS = 3600
+
+
+def error_reason(exc: Exception) -> str:
+    """Describe a freshness failure without rendering paths or source text."""
+    if isinstance(exc, PermissionError):
+        return "permission denied"
+    if isinstance(exc, OSError):
+        return os.strerror(exc.errno) if exc.errno is not None else "source unavailable"
+    if isinstance(exc, sqlite3.Error):
+        return getattr(exc, "sqlite_errorname", "SQLite read failed")
+    return "ledger unavailable"
+
+
+def format_timestamp(stamp) -> str:
+    if stamp is None:
+        return "unknown"
+    return datetime.fromtimestamp(stamp).astimezone().isoformat(timespec="seconds")
 
 
 def _alive(pid: int) -> bool:
@@ -298,7 +316,7 @@ def _ledger_freshness(con, sync_interval_seconds, unavailable, ledger_error):
                 " WHERE harness != 'grok' GROUP BY harness"))
             imports["grok"] = grok.newest_complete_import(con)
         except sqlite3.Error as exc:
-            ledger_error = str(exc)
+            ledger_error = error_reason(exc)
     if ledger_error is not None:
         unavailable.append({"check": "ledger freshness", "reason": ledger_error})
 
@@ -306,22 +324,33 @@ def _ledger_freshness(con, sync_interval_seconds, unavailable, ledger_error):
     for harness, adapter in available().items():
         imported = imports.get(harness)
         try:
+            format_timestamp(imported)
+        except (OverflowError, OSError, TypeError, ValueError):
+            unavailable.append({"check": f"{harness} ledger import", "reason": "invalid timestamp"})
+            freshness[harness] = {"newest_native_at": None, "newest_import_at": None,
+                                  "newer_sources": None, "lag_seconds": None,
+                                  "status": "unavailable"}
+            continue
+        try:
             paths = _discover_native_paths(harness, adapter)
             records = list(_native_record_times(harness, paths))
         except (OSError, sqlite3.Error) as exc:
-            if isinstance(exc, PermissionError):
-                reason = "permission denied"
-            elif isinstance(exc, OSError):
-                reason = os.strerror(exc.errno) if exc.errno is not None else "source unavailable"
-            else:
-                reason = getattr(exc, "sqlite_errorname", "SQLite read failed")
-            unavailable.append({"check": f"{harness} native record scan", "reason": reason})
+            unavailable.append({"check": f"{harness} native record scan", "reason": error_reason(exc)})
             freshness[harness] = {"newest_native_at": None, "newest_import_at": imported,
                                   "newer_sources": None, "lag_seconds": None,
                                   "status": "unavailable"}
             continue
 
         newest = max(records, default=None)
+        try:
+            format_timestamp(newest)
+            format_timestamp(min(records, default=None))
+        except (OverflowError, OSError, TypeError, ValueError):
+            unavailable.append({"check": f"{harness} native record scan", "reason": "invalid timestamp"})
+            freshness[harness] = {"newest_native_at": None, "newest_import_at": imported,
+                                  "newer_sources": None, "lag_seconds": None,
+                                  "status": "unavailable"}
+            continue
         newer = lag = None
         if ledger_error is not None:
             status = "unavailable"
@@ -365,7 +394,7 @@ def check(processes=None, registry=None, con=None, bare=None, *,
         try:
             conflicts = identity_conflicts(con)
         except sqlite3.Error as exc:
-            unavailable.append({"check": "identity conflicts", "reason": str(exc)})
+            unavailable.append({"check": "identity conflicts", "reason": error_reason(exc)})
     return {"cue": cue.health(con), "findings": findings,
             "unavailable": unavailable,
             "identity_conflicts": conflicts,

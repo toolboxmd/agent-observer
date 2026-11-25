@@ -8,7 +8,6 @@ import os
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime
 
 from . import CAPTURE_CONTRACT_VERSION, EVENT_CONTRACT_VERSION, SCHEMA_VERSION
 from . import adapters as _adapters
@@ -745,7 +744,7 @@ def _health_check(ns) -> int:
     except FileNotFoundError:
         pass
     except (OSError, RuntimeError, sqlite3.Error) as exc:
-        ledger_error = str(exc)
+        ledger_error = _health.error_reason(exc)
     try:
         result = _health.check(con=con, ledger_error=ledger_error,
                                sync_interval_seconds=ns.sync_interval_seconds)
@@ -777,8 +776,8 @@ def _health_check(ns) -> int:
                 print(f"- {harness} {line.strip()}")
         print(f"Ledger freshness (sync interval: {result['sync_interval_seconds']} seconds)")
         for harness, row in result["ledger_freshness"].items():
-            native = _health_timestamp(row["newest_native_at"])
-            imported = _health_timestamp(row["newest_import_at"])
+            native = _health.format_timestamp(row["newest_native_at"])
+            imported = _health.format_timestamp(row["newest_import_at"])
             status = row["status"].replace("_", " ")
             gap = f", {row['newer_sources']} newer sources" if row["newer_sources"] is not None else ""
             if row["lag_seconds"] is not None:
@@ -788,12 +787,6 @@ def _health_check(ns) -> int:
                 for row in result["ledger_freshness"].values())
     cue_failed = result["cue"]["status"] in {"schema_drift", "unreadable_database"}
     return 4 if stale or result["findings"] or result["unavailable"] or cue_failed else 0
-
-
-def _health_timestamp(stamp) -> str:
-    if stamp is None:
-        return "unknown"
-    return datetime.fromtimestamp(stamp).astimezone().isoformat(timespec="seconds")
 
 
 def _capabilities(ns) -> int:
