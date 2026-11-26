@@ -563,14 +563,14 @@ def _sort_context(con, key, harness, timeline):
             sources = {point["source_id"] for point in timeline}
             positions = {identity: point["ordinal_num"] for identity, point in by_identity.items()}
             # A malformed atom can have a physical locator but no indexed
-            # occurrence. Use a common source if indexed copies agree with it.
+            # occurrence. Check the indexed subset for conflicts before using
+            # common-source locations to place the unindexed samples.
             if len(sources) == 1 and None not in sources and None not in positions.values():
-                for sequence in sequences:
-                    projected = [pos for group in sequence
-                                 for pos in sorted(positions[identity] for identity in group)]
-                    if projected != sorted(projected):
-                        break
-                else:
+                covered = {item for sequence in sequences for group in sequence for item in group}
+                state, groups, _ = codex_order.resolve(con, key, covered) if covered else ("absent", [], [])
+                indexed = [pos for group in groups or ()
+                           for pos in sorted(positions[item] for item in group)]
+                if state in {"absent", "known"} and indexed == sorted(indexed):
                     timeline[:] = [by_identity[identity] for identity in
                                    sorted(by_identity, key=lambda item: (positions[item], item))]
                     return "native"

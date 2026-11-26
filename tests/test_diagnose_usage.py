@@ -163,6 +163,12 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertEqual(session["timeline"][-1]["response_id"], "codex:unindexed")
         self.assertEqual(session["order"], "native")
 
+        copied = Path(self.tmp.name) / "rollout-boundary-only.jsonl"
+        copied.write_text("\n".join(map(json.dumps, (lines[0], boundary))) + "\n")
+        codex.import_codex_file(self.con, str(copied))
+        session, = self.run_diagnose("--harness", "codex")["context_growth"]
+        self.assertEqual(session["order"], "timestamp")
+
     def test_claude_disputed_cache_reads_stay_unknown_in_both_import_orders(self):
         for index, reads in enumerate(((20, 80), (80, 20))):
             with self.subTest(reads=reads):
