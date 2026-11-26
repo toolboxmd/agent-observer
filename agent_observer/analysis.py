@@ -646,12 +646,15 @@ def _diagnose_usage(con, sessions, since, until):
             " input_tokens, cached_input_tokens, cache_write_input_tokens"
             " FROM responses WHERE session_key=? AND is_overlap=0", (key,))
         disputes = set()
+        agreed_turns = {}
         gaps = ()
         incomplete_semantics = None
         session_usage_disputed = False
         if harness == "codex":
             conflicts, incomplete, _ = codex_atomic.disputes(con, key, codex.SEMANTICS)
             disputes.update(conflicts)
+            if disputes:
+                agreed_turns = codex_atomic.agreed_turn_ids(con, key)
             gaps = _unmeasured_rows(codex_atomic.unmeasured_locations(con, key), harness, codex.SEMANTICS)
             if incomplete:
                 incomplete_semantics = codex.SEMANTICS
@@ -680,7 +683,8 @@ def _diagnose_usage(con, sessions, since, until):
                                    or until is not None and ts >= until):
                 continue
             if row["response_id"] in disputes:
-                row = dict(row, turn_id=None, input_tokens=None, cached_input_tokens=None,
+                turn = agreed_turns.get(row["response_id"]) if harness == "codex" else row["turn_id"]
+                row = dict(row, turn_id=turn, input_tokens=None, cached_input_tokens=None,
                            cache_write_input_tokens=None)
             elif session_usage_disputed:
                 row = dict(row, input_tokens=None, cached_input_tokens=None,

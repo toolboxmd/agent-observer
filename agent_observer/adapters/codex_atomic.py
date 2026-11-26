@@ -310,6 +310,20 @@ def unmeasured_locations(con, session_key):
             " ORDER BY s.path,o.position", (session_key,))
 
 
+def agreed_turn_ids(con, session_key):
+    """Recorded turn identity can agree even when a measurement is disputed."""
+    if not db._has_table(con, "codex_atomic_observations"):
+        return {}
+    return dict(con.execute(
+        "SELECT o.response_id,'codex:'||MIN(o.input_id)"
+        " FROM codex_atomic_observations o"
+        " WHERE o.response_id IN (SELECT response_id FROM codex_atomic_observations WHERE session_key=?)"
+        " GROUP BY o.response_id"
+        " HAVING MIN(o.session_key)=? AND MAX(o.session_key)=?"
+        " AND MIN(o.input_id)<>'' AND MIN(o.input_id)=MAX(o.input_id)",
+        (session_key, session_key, session_key)))
+
+
 def disputes(con, session_key, semantics):
     """Only current agreeing source measurements can support positive ownership."""
     if "codex_context_version" not in {c[1] for c in con.execute("PRAGMA table_info(sources)")}:

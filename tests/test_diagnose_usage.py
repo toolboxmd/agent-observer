@@ -161,6 +161,7 @@ class DiagnoseUsageTest(LedgerCase):
         session, = self.run_diagnose("--harness", "codex")["context_growth"]
         self.assertEqual([p["kind"] for p in session["timeline"]], ["input", "compaction", "input"])
         self.assertEqual(session["timeline"][-1]["response_id"], "codex:unindexed")
+        self.assertEqual(session["timeline"][-1]["turn_id"], "codex:turn-mini-aaa")
         self.assertEqual(session["order"], "native")
 
         copied = Path(self.tmp.name) / "z-rollout-copy.jsonl"
