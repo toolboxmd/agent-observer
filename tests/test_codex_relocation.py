@@ -17,7 +17,7 @@ import sqlite3
 from unittest.mock import patch
 
 from agent_observer import report
-from agent_observer.adapters import codex, t3_purpose
+from agent_observer.adapters import codex, codex_atomic, t3_purpose
 from tests.helpers import LedgerCase, fixture
 
 NAME = "rollout-2026-09-10T10-00-00-sess-fixture-mini-01.jsonl"
@@ -233,3 +233,54 @@ class PreAtomicArchiveTest(LedgerCase):
             stream.write(b'"redacted bodY"')
         codex.sync(self.con)
         self.assert_conflicting()
+
+    # A verified move gives exactly the verdict an in-place replay gives.
+    def stored_counters(self):
+        names = ",".join(("response_id", "turn_id") + codex_atomic.COUNTERS)
+        return self.con.execute(f"SELECT {names} FROM responses ORDER BY response_id").fetchall()
+
+    def replay(self, move, third=False):
+        # An older parser stored a counter the native bytes do not hold.
+        self.downgrade(self.original)
+        self.con.execute("UPDATE responses SET output_tokens=output_tokens+9 WHERE response_id='codex:resp-mini-001'")
+        self.con.commit()
+        if third:
+            # Another rollout observes the same atom with the native counters.
+            # Its name sorts before the archived rollout.
+            other = self.archive / "rollout-2026-09-09T10-00-00-copy.jsonl"
+            meta = self.original.read_text().splitlines()[0]
+            other.write_text(meta + "\n" + json.dumps(self.atom("resp-mini-001")) + "\n")
+        if move:
+            self.original.rename(self.archived)
+        codex.sync(self.con)
+        owner = self.owners()["codex:resp-mini-001"]
+        return self.native(), [tuple(r) for r in self.stored_counters()], owner
+
+    def in_place(self, third=False):
+        other = PreAtomicArchiveTest("test_differing_stored_counter_keeps_its_conflict")
+        other.setUp()
+        try:
+            verdict = other.replay(False, third)
+            other.assert_second_sync_is_a_no_op()
+            return verdict, str(other.original)
+        finally:
+            other.tearDown()
+            other.doCleanups()
+
+    def test_differing_stored_counter_keeps_its_conflict(self):
+        (expected, counters, owner), original = self.in_place()
+        self.assertEqual(expected, (["codex:resp-mini-002"], ["codex:resp-mini-001"], ["counter_mismatch"]))
+        self.assertEqual(owner, original)
+        moved, moved_counters, moved_owner = self.replay(True)
+        self.assertEqual((moved, moved_counters), (expected, counters))
+        self.assertEqual(moved_owner, str(self.original))
+        self.assert_second_sync_is_a_no_op()
+        self.assertEqual((self.native(), [tuple(r) for r in self.stored_counters()]), (expected, counters))
+
+    def test_agreeing_copy_elsewhere_does_not_take_the_moved_files_response(self):
+        (expected, counters, owner), original = self.in_place(third=True)
+        self.assertEqual(owner, original)
+        moved, moved_counters, moved_owner = self.replay(True, third=True)
+        self.assertEqual((moved, moved_counters), (expected, counters))
+        self.assertEqual(moved_owner, str(self.archived))
+        self.assert_second_sync_is_a_no_op()

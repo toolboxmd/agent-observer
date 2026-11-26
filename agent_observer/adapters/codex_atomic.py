@@ -209,19 +209,24 @@ def _reconcile(con, rid, refreshing):
                       "WHERE r.response_id=?", (rid,)).fetchone()
     if row is None or row["session_key"] != first["session_key"]:
         return
-    source = next((o for o in copies if o["source_id"] == row["source_id"]), first)
-    if (source["source_id"] != row["source_id"] and row["source_id"] != refreshing
+    # A recorded relocation's successor is the same file as its predecessor.
+    # Every rule below treats it so, which gives a verified move exactly the
+    # verdict an in-place replay of that file would give.
+    same_file = {row["source_id"], row["successor_id"]} - {None}
+    source = next((o for o in copies if o["source_id"] in same_file), first)
+    same_source = source["source_id"] in same_file
+    if (not same_source and row["source_id"] != refreshing
             and (row["version"] or 0) < 8 and row["successor_id"] is None):
         return  # The original pre-upgrade source has not been replayed.
     measured = json.loads(source["measurement"])
-    same_source = source["source_id"] == row["source_id"]
-    if (same_source and len({o["source_id"] for o in copies}) == 1
+    if (same_source and {o["source_id"] for o in copies} <= same_file
             and any(row[k] is not None and row[k] != measured[k] for k in COUNTERS)):
         # One rewritten native atom cannot independently revise immutable
         # counters. The task view withholds it while the raw ledger keeps it.
         return
     turn = "codex:" + source["input_id"] if source["input_id"] else None
-    if not same_source or row["turn_id"] != turn or any(row[k] != measured[k] for k in COUNTERS):
+    if (source["source_id"] != row["source_id"] or row["turn_id"] != turn
+            or any(row[k] != measured[k] for k in COUNTERS)):
         con.execute("UPDATE responses SET " + ",".join(f"{k}=?" for k in COUNTERS) +
                     ",source_id=?,turn_id=?,ordinal_num=?,ts=?,model=?,effort=?,thread_id=?,root_turn_id=?,session_id=? "
                     "WHERE response_id=?",

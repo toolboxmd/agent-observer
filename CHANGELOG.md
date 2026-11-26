@@ -4,7 +4,7 @@
 
 ### Changed
 
-- Archived Codex rollouts an older version imported reconcile their responses after one ordinary sync (#152)
+- Archived Codex rollouts an older version imported reconcile their responses after one ordinary sync (#152). A row imported before context versions existed is not handed off and stays conflicting.
 
 ## [1.7.0] - 2026-11-25
 
