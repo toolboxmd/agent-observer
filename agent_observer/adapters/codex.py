@@ -62,7 +62,7 @@ def _occurrences_ready(row) -> bool:
 
 
 HARNESS = "codex"
-_CONTEXT_VERSION = 10  # Recover atoms deferred while a formerly incomplete source was growing.
+_CONTEXT_VERSION = 11  # Preserve the counter family of each quarantined usage record.
 SEMANTICS = "codex:input_includes_cached,output_includes_reasoning"
 # Older rollouts carry usage only in token_count events: last_token_usage per
 # response and a cumulative total that repeats when nothing new happened.
@@ -770,7 +770,14 @@ def import_codex_file(con: sqlite3.Connection, path: str,
     codex_atomic.adopt_moved_source(con, path)
     src = JsonlSource(con, HARNESS, path, full=full)
     predecessor = codex_atomic.relocated_source(src)
-    if (predecessor is not None or src.row["codex_context_version"] != _CONTEXT_VERSION
+    prior_context = src.row["codex_context_version"]
+    # Version 10 already has native turn witnesses. Only sources with usage
+    # quarantine need replay to recover their counter family at each offset.
+    replay_quarantine = prior_context == 10 and con.execute(
+        "SELECT 1 FROM import_errors WHERE harness=? AND source_path=?"
+        " AND error IN ('malformed_usage','usage_conflict') LIMIT 1",
+        (HARNESS, src.path)).fetchone()
+    if (predecessor is not None or prior_context not in (10, _CONTEXT_VERSION) or replay_quarantine
             or src.row["codex_context_offset"] != src.row["read_offset"]):
         # Replay older indexes once to recover literal turn witnesses from copies.
         src.start_offset = 0

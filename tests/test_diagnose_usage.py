@@ -214,6 +214,18 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertEqual(groups[codex.TOKEN_COUNT_SEMANTICS]["cached_input_share"], 200 / 900)
         self.assertIsNone(groups[codex.SEMANTICS]["cached_input_share"])
 
+        # Version 10 recorded the quarantine, but only the first location
+        # for the pair of identical conflicting atomic observations.
+        self.con.execute("DELETE FROM codex_occurrences WHERE row_kind='atomic_usage_error'")
+        self.con.execute("UPDATE sources SET codex_context_version=10 WHERE path IN (?,?)",
+                         (str(atomic), str(fallback)))
+        self.assertEqual(codex.import_codex_file(self.con, str(fallback))["lines"], 0)
+        self.assertGreater(codex.import_codex_file(self.con, str(atomic))["lines"], 0)
+        self.assertEqual(codex.import_codex_file(self.con, str(atomic))["lines"], 0)
+        replayed = {item["semantics"]: item for item in
+                    self.run_diagnose("--harness", "codex")["cache_observations"]}
+        self.assertEqual(replayed, groups)
+
     def test_codex_unindexed_atom_keeps_same_source_compaction_order(self):
         lines = [json.loads(line) for line in Path(fixture("codex-mini.jsonl")).read_text().splitlines()]
         valid = next(row for row in lines if row["type"] == "token_usage_record")
