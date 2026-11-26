@@ -16,7 +16,7 @@ import sqlite3
 import statistics
 from collections import defaultdict
 
-from . import codex_order
+from . import codex_order, native_response
 
 TEST_COMMAND_RE = re.compile(
     r"(\bpytest\b|\bunittest\b|scripts/test\.py|\bnpm (run )?test\b|\bpnpm (run )?test\b"
@@ -516,6 +516,84 @@ def _large_outputs(session, events) -> list:
                                                  or e["truncated"])]
 
 
+def _context_input(response):
+    """Input represented by one usage record under its counter semantics."""
+    semantics = (response["semantics"] or "").partition(";")[0].partition(":")[2]
+    meaning = semantics.partition(",")[0]
+    tokens = response["input_tokens"]
+    read = response["cached_input_tokens"]
+    write = response["cache_write_input_tokens"]
+    if meaning == "input_includes_cached":
+        return tokens
+    if meaning == "input_excludes_cache" and None not in (tokens, read, write):
+        return tokens + read + write
+    return None
+
+
+def _cache_observation(harness, semantics, rows):
+    def total(counter):
+        values = [row[counter] for row in rows]
+        return sum(values) if values and None not in values else None
+
+    reads = total("cached_input_tokens")
+    writes = total("cache_write_input_tokens")
+    inputs = [_context_input(row) for row in rows]
+    # Validate the subset for each record before adding the counters.
+    valid = reads is not None and all(
+        size is not None and 0 <= row["cached_input_tokens"] <= size
+        for row, size in zip(rows, inputs))
+    input_total = sum(inputs) if valid else None
+    return {"harness": harness, "semantics": semantics, "responses": len(rows),
+            "cached_input_tokens": reads, "cache_write_input_tokens": writes,
+            "cached_input_share": reads / input_total if input_total else None}
+
+
+def _diagnose_usage(con, sessions, since, until):
+    window = ""
+    bounds = []
+    if since is not None:
+        window += " AND ts>=?"
+        bounds.append(since)
+    if until is not None:
+        window += " AND ts<?"
+        bounds.append(until)
+    context = []
+    cache = defaultdict(list)
+    for session in sorted(sessions, key=lambda row: row["session_key"]):
+        key, harness = session["session_key"], session["harness"]
+        args = (key, *bounds)
+        timeline = []
+        responses = con.execute(
+            "SELECT response_id, source_id, ordinal_num, ts, turn_id, harness, semantics,"
+            " input_tokens, cached_input_tokens, cache_write_input_tokens"
+            " FROM responses WHERE session_key=? AND is_overlap=0" + window, args)
+        inputs = native_response.inputs(con, key) if harness == "opencode" else {}
+        for row in responses:
+            cache[row["harness"], row["semantics"]].append(row)
+            point = {field: row[field] for field in (
+                "response_id", "source_id", "ordinal_num", "ts", "turn_id", "semantics")}
+            parents = inputs.get(row["response_id"], ())
+            if point["turn_id"] is None and len(parents) == 1:
+                point["turn_id"] = f"opencode:{next(iter(parents))}"
+            timeline.append(dict(point, kind="input", input_tokens=_context_input(row)))
+        for row in con.execute(
+                "SELECT id AS event_id, source_id, ordinal_num, ts, turn_id"
+                " FROM events WHERE session_key=? AND family='compaction'" + window, args):
+            timeline.append(dict(row, kind="compaction"))
+        timeline.sort(key=lambda point: (
+            point["ts"] is None, point["ts"] or 0,
+            point["source_id"] or 0, point["ordinal_num"] or 0,
+            point["kind"], point.get("response_id", point.get("event_id"))))
+        context.append({"session": key, "harness": harness, "timeline": timeline})
+
+    measured = {harness for harness, _ in cache}
+    for harness in {row["harness"] for row in sessions} - measured:
+        cache[harness, None] = []
+    observations = [_cache_observation(harness, semantics, cache[harness, semantics])
+                    for harness, semantics in sorted(cache, key=lambda group: (group[0], group[1] or ""))]
+    return context, observations
+
+
 def diagnose(con, detectors=None, limit=200, **filters) -> dict:
     wanted = set(detectors or DETECTORS)
     incidents = []
@@ -533,8 +611,10 @@ def diagnose(con, detectors=None, limit=200, **filters) -> dict:
     counts: dict = defaultdict(int)
     for i in incidents:
         counts[i["detector"]] += 1
+    context, cache = _diagnose_usage(con, sessions, since, until)
     return {"sessions": len(sessions), "counts": dict(counts),
             "incidents": incidents[:limit], "truncated": len(incidents) > limit,
+            "context_growth": context, "cache_observations": cache,
             "note": "Candidates with evidence, not verdicts. Heuristic detectors are marked."}
 
 
