@@ -411,6 +411,15 @@ class DiagnoseUsageTest(LedgerCase):
         point, = result["context_growth"][0]["timeline"]
         self.assertEqual((point["input_tokens"], point["source_id"], point["ordinal_num"]),
                          (100, second, 1))
+        copy = Path(self.tmp.name) / "z-final-copy.jsonl"
+        shutil.copyfile(final, copy)
+        third = claude.import_claude_file(self.con, str(copy))["source_id"]
+        result = self.run_diagnose("--session", f"claude:{session}")
+        point, = result["context_growth"][0]["timeline"]
+        self.assertEqual((point["input_tokens"], point["source_id"], point["ordinal_num"]),
+                         (100, second, 1))
+        alternate, = point["alternate_locations"]
+        self.assertEqual((alternate["source_id"], alternate["ordinal_num"]), (third, 1))
 
     def test_opencode_import_surfaces_completed_response_without_counters(self):
         path = str(Path(self.tmp.name) / "opencode.db")

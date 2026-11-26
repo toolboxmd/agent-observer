@@ -653,10 +653,11 @@ def _native_context_rows(measured, locations, disputes, harness, semantics, sinc
         if harness == "claude":
             # A final block in another copy can update the projected time
             # and ordinal while the response retains its provisional source.
-            sources = {copy["source_id"] for copy in others if copy["measured"]
-                       and (copy["ts"], copy["ordinal_num"]) == (row["ts"], row["ordinal_num"])}
-            if len(sources) == 1:
-                row = dict(row, source_id=next(iter(sources)))
+            matches = [copy for copy in others if copy["measured"]
+                       and (copy["ts"], copy["ordinal_num"]) == (row["ts"], row["ordinal_num"])]
+            matches.sort(key=lambda copy: copy["source_id"] != row["source_id"])
+            if matches:
+                row = dict(row, **_select_usage_location(matches, None, None))
         if rid in disputes and not _in_usage_window(row["ts"], since, until):
             place = _select_usage_location([row, *others], since, until)
             if place is not None:
