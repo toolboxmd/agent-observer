@@ -166,3 +166,16 @@ class DiagnoseUsageTest(LedgerCase):
         cache, = result["cache_observations"]
         self.assertEqual(cache["responses"], 1)
         self.assertIsNone(cache["cached_input_share"])
+
+        with contextlib.closing(sqlite3.connect(copied)) as native:
+            native.execute("UPDATE message SET data='{' WHERE id='cache_measured'")
+            native.commit()
+        opencode.sync(self.con, source=copied, full=True)
+        result = self.run_diagnose("--session", "opencode:cache_gap",
+                                   "--until", str((T0 + 40) / 1000))
+        timeline = result["context_growth"][0]["timeline"]
+        self.assertEqual([p["response_id"] for p in timeline], ["opencode:cache_measured"])
+        self.assertIsNone(timeline[0]["input_tokens"])
+        cache, = result["cache_observations"]
+        self.assertEqual(cache["responses"], 1)
+        self.assertIsNone(cache["cached_input_share"])

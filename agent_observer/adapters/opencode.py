@@ -395,13 +395,19 @@ def unavailable_usage_locations(con, session_key):
     """One source locator per response with missing or unusable counters."""
     if not db._has_table(con, "opencode_response_observations"):
         return {}
+    invalid = sorted(_INVALID_OBSERVATIONS)
+    placeholders = ",".join("?" for _ in invalid)
     found = {}
     for row in con.execute(
             "SELECT o.response_id,o.source_id,o.ordinal_num,o.ts"
             " FROM opencode_response_observations o JOIN sources s ON s.id=o.source_id"
-            " WHERE o.session_key=? AND o.measurement IN (?,?)"
+            f" WHERE o.session_key=? AND o.measurement IN ({placeholders})"
+            # A standalone observation needs evidence of an assistant usage
+            # record. An unusable copy can still qualify an existing projection.
+            " AND (o.measurement IN (?,?) OR EXISTS (SELECT 1 FROM responses r"
+            " WHERE r.session_key=o.session_key AND r.response_id=o.response_id AND r.is_overlap=0))"
             " ORDER BY o.response_id,s.path",
-            (session_key, json.dumps("unmeasured"), json.dumps(_MALFORMED_USAGE))):
+            (session_key, *invalid, json.dumps("unmeasured"), json.dumps(_MALFORMED_USAGE))):
         found.setdefault(row["response_id"], row)
     return found
 
