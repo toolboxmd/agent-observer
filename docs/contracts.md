@@ -267,7 +267,14 @@ are counted separately and excluded from useful-work comparisons.
   total for the task's work: its own usage plus the whole shared pool,
   never a divided share, with `shared_with_tasks` naming the other tasks
   that count the same pool (sums across tasks overlap by it). Text
-  output leads with it. Exit 3 when
+  output leads with it. When the only coverage gaps are interrupted or
+  failed turns with no final usage, `status` is `lower_bound`, `usd` is
+  null, `lower_bound_usd` is the priced subtotal, and the text is
+  `>=$X (lower bound, N interrupted turns)` (failed turns are named
+  failed). Any other gap keeps the text
+  `unknown (observed priced subtotal $X)` with `usd` null. A task with
+  no such gap keeps its known total. Published summaries use that same
+  text and never present the figure as exact. Exit 3 when
   missing, conflicting or wholly unbound ownership exists: a task whose
   sessions hold measured responses but nothing attributed or shared
   reports those sessions as `unbound_usage` instead of a silent

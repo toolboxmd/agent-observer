@@ -709,9 +709,10 @@ def task_report(con: sqlite3.Connection, task_id: str,
     has_purpose = outcome.purpose_evidence(native)
     inventory_gaps = outcome.check_inventory(con, native, attributed) if has_purpose else False
     unresolved_usage = bool(unplaced or unassigned or ownership.unavailable_usage or ownership.unlocated_usage_sessions)
-    unavailable_usage = bool(unresolved_usage or conflicts or inventory_gaps or legacy_links
-                             or not scope_keys or missing_sessions or empty_sessions
-                             or unbound_children or unbound_delegations or whole_conflicts)
+    other_usage_gap = bool(unresolved_usage or conflicts or legacy_links
+                           or not scope_keys or missing_sessions or empty_sessions
+                           or unbound_children or unbound_delegations or whole_conflicts)
+    unavailable_usage = bool(other_usage_gap or inventory_gaps)
     cutoff = _source_cutoff(con, scope_keys)
     task_turns = _task_turn_ids(con, ownership.turns, ownership.whole)
     diagnostics = _task_diagnostics(con, scope_keys, ownership.whole, task_turns)
@@ -940,8 +941,20 @@ def task_report(con: sqlite3.Connection, task_id: str,
     if unavailable_usage and total_estimated.get("priced_responses"):
         subtotal = total_estimated["estimated_cost_usd_partial"]
         amount = "under $0.01" if 0 < subtotal < 0.005 else f"${subtotal:,.2f}"
-        report["total_cost"].update(usd=None, observed_subtotal_usd=subtotal,
-                                    text=f"unknown (observed priced subtotal {amount})")
+        bound = (outcome.interrupted_turn_bound(con, native)
+                 if native and not other_usage_gap else None)
+        if bound:
+            interrupted, failed = bound
+            label = ", ".join(part for part in (
+                _counted(interrupted, "interrupted turns") if interrupted else "",
+                _counted(failed, "failed turns") if failed else "") if part)
+            report["total_cost"].update(
+                usd=None, status="lower_bound", lower_bound_usd=subtotal,
+                observed_subtotal_usd=subtotal,
+                text=f">={amount} (lower bound, {label})")
+        else:
+            report["total_cost"].update(usd=None, observed_subtotal_usd=subtotal,
+                                        text=f"unknown (observed priced subtotal {amount})")
     report["total_cost"]["unplaced"] = {
         "text": _money(unplaced_estimated) if unplaced else None,
         "responses": len(unplaced),

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.9.0] - 2026-11-26
+
+### Added
+
+- Print a lower-bound task cost when the only gaps are interrupted or failed turns without final usage (#158)
+
 ## [1.8.0] - 2026-11-26
 
 ### Added

@@ -1008,3 +1008,111 @@ class UsageClosureTest(LedgerCase):
         rep = self.native_report()
         self.assertEqual(rep["native_purpose"]["coverage_gaps"], [])
         self.assertEqual(rep["total_cost"]["status"], "complete")
+
+    # Interrupted and failed turns ------------------------------------------
+
+    def _bound(self, status):
+        """A reconciled turn plus one turn of `status` that never got final usage.
+
+        The reconciled turn is large enough that its price formats as dollars,
+        so the lower-bound text is `>=$X` rather than the under-one-cent form.
+        """
+        self.claude_transcript([claude_user("u-a", None, "a"),
+                                assistant("r1", "u-a", "msg-1", 100_000, 0)])
+        self.run_turn("c1", "claudeAgent", "s", inputs=["u-a"], usage=claude_usage(100_000, 0),
+                      closure=CLOSED_CLAUDE, response_ids=["msg-1"])
+        known = self.native_report()
+        self.run_turn("late", "claudeAgent", "s", run_status=status, status=status,
+                      usage=claude_usage(253345, 0))
+        return known, self.native_report()
+
+    def test_interrupted_turn_is_a_labeled_lower_bound(self):
+        known, rep = self._bound("interrupted")
+        total = rep["total_cost"]
+        priced = known["total_cost"]["usd"]
+        self.assertEqual(self.gaps(rep), {"native_final_usage_missing": (1, "turns"),
+                                          "usage_closure_missing": (1, "turns")})
+        self.assertEqual(total["status"], "lower_bound")
+        self.assertIsNone(total["usd"])
+        self.assertEqual(total["lower_bound_usd"], priced)
+        self.assertEqual(total["observed_subtotal_usd"], priced)
+        self.assertEqual(total["text"], f">=${priced:,.2f} (lower bound, 1 interrupted turn)")
+        text = self.cli()
+        self.assertIn(total["text"], text)
+        self.assertIn("native_final_usage_missing (1 turn)", text)
+        payload = json.loads(self.cli("--json"))["total_cost"]
+        self.assertEqual(payload["status"], "lower_bound")
+        self.assertIsNone(payload["usd"])
+        self.assertEqual(payload["lower_bound_usd"], priced)
+        body = publish.render(publish.summarize(self.con, set(), TASK, task_id=TASK))
+        # Publish escapes the bound marker so the comment cannot be read as exact.
+        self.assertIn("**Estimated cost &gt;=$0.10 (lower bound, 1 interrupted turn)**", body)
+        self.assertNotIn("Full outcome cost unknown", body)
+        self.assertIn("Estimated cost is a lower bound.", body)
+        self.assertIn("native final usage missing (1 turn)", body)
+        self.assertNotRegex(body, r"\*\*Estimated cost \$")
+
+    def test_failed_turn_is_a_labeled_lower_bound(self):
+        known, rep = self._bound("failed")
+        total = rep["total_cost"]
+        priced = known["total_cost"]["usd"]
+        self.assertEqual(total["status"], "lower_bound")
+        self.assertIsNone(total["usd"])
+        self.assertEqual(total["lower_bound_usd"], priced)
+        self.assertEqual(total["text"], f">=${priced:,.2f} (lower bound, 1 failed turn)")
+        self.assertIn(total["text"], self.cli())
+
+    def test_interrupted_turn_beside_another_gap_stays_unknown(self):
+        known, rep = self._bound("interrupted")
+        self.row("subagents", ["far", "t", "c1", "app_owned", "remote", None], {
+            "id": "far", "threadId": "t", "runId": "c1", "driver": "remote", "origin": "app_owned",
+            "childThreadId": None, "status": "completed",
+            "remoteChild": dict(environmentId="env-2", threadId="remote-thread", runId="remote-run")})
+        rep = self.native_report()
+        total = rep["total_cost"]
+        self.assertIn("remote_participation", rep["native_purpose"]["coverage_gaps"])
+        self.assertIn("native_final_usage_missing", rep["native_purpose"]["coverage_gaps"])
+        self.assertNotEqual(total["status"], "lower_bound")
+        self.assertIsNone(total["usd"])
+        self.assertNotIn("lower_bound_usd", total)
+        self.assertIn("unknown (observed priced subtotal", total["text"])
+        self.assertNotIn("lower bound", total["text"])
+        text = self.cli()
+        for name in ("native_final_usage_missing", "usage_closure_missing", "remote_participation"):
+            self.assertIn(name, text)
+        body = publish.render(publish.summarize(self.con, set(), TASK, task_id=TASK))
+        self.assertIn("Full outcome cost unknown", body)
+        self.assertIn("unknown (observed priced subtotal", body)
+        self.assertNotIn("lower bound", body)
+        self.assertIsNone(total.get("lower_bound_usd"))
+        self.assertNotEqual(known["total_cost"]["status"], "lower_bound")
+
+    def test_reconciled_task_keeps_its_known_total(self):
+        self.closed_turn()
+        rep = self.native_report()
+        total = rep["total_cost"]
+        self.assertEqual(rep["native_purpose"]["coverage_gaps"], [])
+        self.assertEqual(total["status"], "complete")
+        self.assertIsNotNone(total["usd"])
+        self.assertNotIn("lower_bound_usd", total)
+        self.assertNotIn("lower bound", total["text"])
+        self.assertNotIn("unknown", total["text"])
+        self.assertIn(total["text"], self.cli())
+
+    def test_cancelled_or_partial_turn_without_final_usage_stays_unknown(self):
+        """`native_final_usage_missing` is not itself a lower bound.
+
+        Cancelled turns and completed turns whose usage is not final share
+        that check state with interrupted turns. Only interrupted and failed
+        turns qualify.
+        """
+        self.closed_turn()
+        self.run_turn("cancel", "claudeAgent", "s", run_status="cancelled", status="cancelled",
+                      usage=claude_usage(253345, 0))
+        self.run_turn("part", "claudeAgent", "s", status="completed",
+                      usage=dict(claude_usage(253345, 0), usageStatus="partial"))
+        rep = self.native_report()
+        self.assertEqual(self.gaps(rep)["native_final_usage_missing"], (2, "turns"))
+        self.assertNotEqual(rep["total_cost"]["status"], "lower_bound")
+        self.assertIsNone(rep["total_cost"]["usd"])
+        self.assertIn("unknown (observed priced subtotal", rep["total_cost"]["text"])
