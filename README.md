@@ -556,8 +556,9 @@ ledger also kept no task reference for runs it could not parse: such a run
 keeps every task of its source unknown until a sync sees it valid in its
 source, or for good once it is deleted. A run that a newer Chromeria wrote
 in a shape Observer did not yet read heals the same way once Observer
-reads it. A turn on a provider Observer cannot read (such as `devReplay`)
-is a `provider_unsupported` gap. A delegated child
+reads it. A run whose turns or native operations are on a provider
+Observer cannot read (such as `devReplay`) is a `provider_unsupported` gap,
+counted in runs. A delegated child
 that declared another task, or was deliberately unscoped, is another task's
 cost; `not counted` says how many there were. Native child agents, children
 without a declared purpose, active or remote children, and unpriced models

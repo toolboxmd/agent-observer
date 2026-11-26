@@ -928,6 +928,27 @@ class UsageClosureTest(LedgerCase):
     def test_a_retained_source_from_a_ledger_before_the_run_record_stays_present(self):
         self.retained_source(["t3_source_classes", "t3_purpose_classes", "t3_seen_runs"])
 
+    def test_a_retained_invalid_run_keeps_its_task_reference(self):
+        self.closed_turn()
+        self.raw_run("bad", "t-bad", dict(id="bad", threadId="t-bad", status="completed", startedAt=None,
+                                          activeAttemptId=None, purpose=dict(PURPOSE, provenance=dict(type="future_kind"))),
+                     attempt=False)
+        self.native_report()
+        # A ledger from before current classes; a second copy without those runs is synced.
+        for table in ("t3_source_classes", "t3_purpose_classes"):
+            self.con.execute(f"DROP TABLE {table}")
+        self.con.commit()
+        other = os.path.join(self.tmp.name, "second-copy.sqlite")
+        copy = sqlite3.connect(other)
+        self.addCleanup(copy.close)
+        self.native.backup(copy)
+        copy.execute(f"DELETE FROM {PREFIX}runs")
+        copy.commit()
+        self.assertEqual(t3.sync(self.con, source=other)["failed"], [])
+        gaps = self.gaps(report.task_report(self.con, TASK))
+        self.assertEqual(gaps["native_run_invalid"], (1, "runs"))
+        self.assertNotIn("conflicting_native_run_records", gaps)
+
     def test_an_untied_invalid_run_that_reads_as_legacy_is_a_conflict_not_a_heal(self):
         self.closed_turn()
         self.raw_run("odd", "t-odd", {}, attempt=False)
@@ -953,6 +974,19 @@ class UsageClosureTest(LedgerCase):
         self.assertEqual(rep["total_cost"]["status"], "complete")
         other = report.task_report(self.con, "example/project#8")
         self.assertEqual(self.gaps(other), {"provider_unsupported": (1, "runs")})
+
+    def test_an_unsupported_operation_declaring_another_task_than_its_run_keeps_that_task_unknown(self):
+        self.closed_turn()
+        self.provider_thread("pt-replay", "t", "devReplay")
+        self.run_turn("replay", "devReplay", "replay-s", usage=claude_usage(0, 0), pt="pt-replay", purpose=OTHER)
+        # Its source run belongs to the other task, but it declares this one.
+        operation = dict(self.segment("background", source_run="replay", child="shell"), purpose=PURPOSE)
+        self.native.execute(f"UPDATE {PREFIX}provider_threads SET payload_json=json_set(payload_json,"
+                            "'$.nativeOperations',json(?)) WHERE provider_thread_id='pt-replay'",
+                            (json.dumps([operation]),))
+        rep = self.native_report()
+        self.assertNotEqual(rep["total_cost"]["status"], "complete")
+        self.assertEqual(self.gaps(rep)["native_rows_rejected"], (1, "rows"))
 
     # Upgrade ----------------------------------------------------------------
 

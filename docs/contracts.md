@@ -592,9 +592,11 @@ re-read every sync; workload bindings are durable ledger rows.
   name Observer cannot read (for example `devReplay`, `acpRegistry`,
   `cursor`) is mirrored. Its runs' provider turns are kept as
   `t3_purpose_unsupported_turns`, and its native operations whose source is
-  one of its runs as `t3_purpose_unsupported_operations`. They join no
-  response, and each run with either is a `provider_unsupported` run. A
-  native operation on such a driver whose run cannot be resolved is
+  one of its runs, with the same purpose, as
+  `t3_purpose_unsupported_operations`. They join no response, and each run
+  with either is a `provider_unsupported` run. A native operation on such a
+  driver whose declared purpose disagrees with its run is rejected, tied to
+  that run and to the task it declares; one whose run cannot be resolved is
   rejected, tied to its thread.
 - Never ran: the refresh decides from raw rows before validation whether a
   run never ran: terminal, an explicit null `startedAt`, an active attempt

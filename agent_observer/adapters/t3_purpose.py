@@ -521,8 +521,13 @@ def _providers(snapshot, native, tables, runs, legacy, segments):
                 continue
             source = _source(segment.get("source"))
             run = source.get("runId")
-            if source["type"] == "app_run" and run in runs and runs[run][0] == thread and _id(segment.get("id")):
+            if (source["type"] == "app_run" and runs.get(run) == (thread, _purpose(segment.get("purpose")))
+                    and _id(segment.get("id"))):
                 snapshot.insert("unsupported_operations", thread, pt, segment["id"], run, driver)
+            elif source["type"] == "app_run" and run in runs:
+                # Its run and its own declared purpose disagree: keep both tasks unknown.
+                snapshot.reject("segments", "unsupported_driver", segment.get("id"), run=run,
+                                purpose=segment.get("purpose"))
             else:
                 snapshot.reject("segments", "unsupported_driver", segment.get("id"), thread=thread,
                                 purpose=segment.get("purpose"))
@@ -940,7 +945,9 @@ def _run_record(con):
     # classes come from the runs they mirror.
     con.execute("""INSERT INTO t3_source_classes SELECT r.source_path,r.run_id,r.thread_id,
         CASE WHEN r.scope='single' AND r.task_id IS NOT NULL THEN 'task' WHEN r.scope='unscoped' THEN 'unscoped'
-        ELSE 'invalid' END, CASE WHEN r.scope='single' THEN r.task_id END FROM t3_source_runs r
+        ELSE 'invalid' END, CASE WHEN r.scope='single' THEN r.task_id
+        ELSE (SELECT s.task_id FROM t3_seen_runs s WHERE s.source_path=r.source_path AND s.run_id=r.run_id
+              AND s.class='invalid') END FROM t3_source_runs r
         WHERE NOT EXISTS (SELECT 1 FROM t3_source_classes c WHERE c.source_path=r.source_path
         AND c.run_id=r.run_id)""")
     con.execute("INSERT OR IGNORE INTO t3_seen_runs SELECT source_path,run_id,thread_id,class,task_id"
