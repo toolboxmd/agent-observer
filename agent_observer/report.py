@@ -950,6 +950,28 @@ def task_report(con: sqlite3.Connection, task_id: str,
     return report
 
 
+def _counted(n: int, unit: str) -> str:
+    return f"{n} {unit[:-1] if n == 1 else unit}"
+
+
+def gap_text(native: dict) -> str:
+    """Each coverage gap with the number of turns, runs or children it affects."""
+    counts = native.get("coverage_gap_counts") or {}
+    return ", ".join(f"{name} ({_counted(counts[name]['count'], counts[name]['unit'])})" if name in counts
+                     else name for name in native.get("coverage_gaps") or [])
+
+
+def not_counted_text(children: dict) -> str:
+    """Delegated children whose usage belongs to no part of this task's total."""
+    parts = []
+    if children.get("declared_elsewhere"):
+        n = children["declared_elsewhere"]
+        parts.append(f"{n} delegated {'child' if n == 1 else 'children'} declared another task")
+    if children.get("deliberately_unscoped"):
+        parts.append(f"{children['deliberately_unscoped']} deliberately unscoped")
+    return ", ".join(parts)
+
+
 def _place(con, session_key: str):
     from . import placement
     return placement.read_placements(con, session_key)

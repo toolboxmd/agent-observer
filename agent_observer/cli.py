@@ -179,7 +179,9 @@ def _text(payload) -> str:
             lines.append(f"  native purpose: {len(native['runs'])} runs, "
                          f"{len(native['membership'])} joined responses")
             if native.get("coverage_gaps"):
-                lines.append("  native coverage: " + ", ".join(native["coverage_gaps"]))
+                lines.append("  native coverage: " + _report.gap_text(native))
+            if any((native.get("children_not_counted") or {}).values()):
+                lines.append("  not counted: " + _report.not_counted_text(native["children_not_counted"]))
             for pr in native["deliveries"]:
                 lines.append(f"  delivery PR: {pr['url']}")
         est = r.get("estimated_cost") or {}

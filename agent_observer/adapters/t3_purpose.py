@@ -21,7 +21,7 @@ from .. import db
 TABLES = {
     "runs": """run_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, task_id TEXT,
         scope TEXT NOT NULL, reason TEXT, host TEXT, repository TEXT, kind TEXT, number INTEGER,
-        provenance_json TEXT, status TEXT, version INTEGER, active_attempt_id TEXT""",
+        provenance_json TEXT, status TEXT, version INTEGER, active_attempt_id TEXT, start_state TEXT""",
     "sessions": """run_id TEXT NOT NULL, session_key TEXT NOT NULL,
         PRIMARY KEY(run_id,session_key)""",
     "inputs": """run_id TEXT NOT NULL, session_key TEXT NOT NULL, native_id TEXT NOT NULL,
@@ -33,9 +33,10 @@ TABLES = {
         repository TEXT NOT NULL, number INTEGER NOT NULL, url TEXT NOT NULL, declared_at TEXT NOT NULL,
         PRIMARY KEY(task_id,thread_id,url,declared_at)""",
     "attempts": """attempt_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, provider_thread_id TEXT,
-        provider_turn_id TEXT, status TEXT, session_key TEXT, provider_session_id TEXT""",
+        provider_turn_id TEXT, status TEXT, session_key TEXT, provider_session_id TEXT, start_state TEXT""",
     "turns": """provider_turn_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, run_id TEXT NOT NULL,
-        session_key TEXT, status TEXT, usage_json TEXT, context_usage_json TEXT""",
+        session_key TEXT, status TEXT, usage_json TEXT, context_usage_json TEXT,
+        native_response_ids_json TEXT, usage_closure_json TEXT""",
     "capabilities": """provider_session_id TEXT PRIMARY KEY, driver TEXT, native_inputs TEXT,
         child_segments TEXT, background_inventory TEXT, native_usage_finality TEXT""",
     "segments": """owner_id TEXT NOT NULL, thread_id TEXT NOT NULL, segment_id TEXT NOT NULL,
@@ -51,6 +52,11 @@ TABLES = {
     "participants": """run_id TEXT, thread_id TEXT NOT NULL, kind TEXT NOT NULL, participant_id TEXT,
         child_thread_id TEXT, child_run_id TEXT, environment_id TEXT, status TEXT, group_id TEXT, availability TEXT, declaration_json TEXT""",
 }
+# Columns added after the first release of a mirror table. A ledger written by
+# an earlier version gains them on its next refresh; readers treat a missing
+# column as no statement.
+ADDED = {"runs": ("start_state",), "attempts": ("start_state",),
+         "turns": ("native_response_ids_json", "usage_closure_json")}
 PROJECTION = "orchestration_v2_projection_"
 ID = re.compile(r"[a-zA-Z0-9._:%/@+~=,-]{1,8192}", re.ASCII)
 HOST = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]+)?", re.I | re.ASCII)
@@ -64,6 +70,8 @@ INPUT_TYPES = {"codex": ("turn", "codex_turn_started"),
 STATES = ("pending", "preparing", "queued", "starting", "running", "waiting", "completed",
           "failed", "cancelled", "superseded", "interrupted", "rolled_back")
 INVALID = ("invalid", "invalid_purpose", None, None)
+WITNESSES = {"claudeAgent": "process_ledger", "codex": "event_stream"}
+REASON = re.compile(r"[a-z][a-z0-9_]{0,63}", re.ASCII)
 
 
 def _id(value):
@@ -98,6 +106,37 @@ def _date(value):
         except ValueError:
             pass
     return None
+
+
+def _start(payload):
+    """A run or attempt start: explicit null means it never started; absent proves nothing."""
+    if "startedAt" not in payload:
+        return None
+    if payload["startedAt"] is None:
+        return "not_started"
+    return "started" if _date(payload["startedAt"]) else None
+
+
+def _closure(value, driver):
+    """Parse a v1 usage closure strictly. Anything else is no statement (None)."""
+    c = _obj(value)
+    if not _v1(c):
+        return None
+    if (c.get("state") == "main_agent_only" and c.get("witness") == WITNESSES.get(driver)
+            and _number(c.get("uncountedCompactions"))):
+        return _json(dict(version=1, state="main_agent_only", witness=c["witness"],
+                          uncountedCompactions=c["uncountedCompactions"]))
+    if (c.get("state") == "open" and driver in WITNESSES and isinstance(c.get("reason"), str)
+            and REASON.fullmatch(c["reason"])):
+        return _json(dict(version=1, state="open", reason=c["reason"]))
+    return None
+
+
+def _response_ids(value, driver):
+    """Claude's listed main-agent response ids; malformed lists are no statement."""
+    if driver != "claudeAgent" or not isinstance(value, list) or not all(_id(i) for i in value):
+        return None
+    return _json(sorted(set(value)))
 
 
 def _json(value):
@@ -283,7 +322,7 @@ def _runs(snapshot, native, tables):
         snapshot.insert("runs", run, thread, key, scope, reason, coords.get("host"),
                 coords.get("repository"), coords.get("kind"), coords.get("number"),
                 _json(provenance), status, version if _number(version) else None,
-                _id(p.get("activeAttemptId")))
+                _id(p.get("activeAttemptId")), _start(p))
         runs[run] = (thread, purpose)
         delivery = _obj(_obj(p.get("delegatedCompletion")).get("delivery"))
         for task in _list(delivery.get("taskIds")):
@@ -442,7 +481,7 @@ def _attempts(snapshot, native, tables, runs, providers):
                 snapshot.insert("sessions", run, key)
             attempts[aid] = (run, provider.thread, pt, root, turn, driver, sid, "nativeThreadId" in p)
         snapshot.insert("attempts", aid, run, pt, turn, _enum(p.get("status"), STATES),
-                key, provider.session if valid else None)
+                key, provider.session if valid else None, _start(p))
     return attempts
 
 
@@ -483,7 +522,8 @@ def _turns(snapshot, native, tables, attempts):
             sid = turn_sid or sid
         key = f"{DRIVERS[driver]}:{sid}" if sid else None
         snapshot.insert("turns", turn, aid, run, key, _enum(p.get("status"), STATES),
-                _usage(p.get("turnTokenUsage")), _usage(p.get("tokenUsage"), context=True))
+                _usage(p.get("turnTokenUsage")), _usage(p.get("tokenUsage"), context=True),
+                _response_ids(p.get("nativeResponseIds"), driver), _closure(p.get("usageClosure"), driver))
         if not key:
             continue
         snapshot.insert("sessions", run, key)
@@ -660,9 +700,9 @@ def _child_turns(snapshot, native, tables, boundaries, providers):
 # an object's immutable coordinates must agree. Different mutable readings
 # leave that field unknown until the snapshots agree again.
 MUTABLE = {
-    "runs": {"status", "active_attempt_id"},
-    "attempts": {"status"},
-    "turns": {"status", "usage_json", "context_usage_json"},
+    "runs": {"status", "active_attempt_id", "start_state"},
+    "attempts": {"status", "start_state"},
+    "turns": {"status", "usage_json", "context_usage_json", "native_response_ids_json", "usage_closure_json"},
     "segments": {"status", "observed_at", "notice_ids_json", "wake_dispositions_json"},
     "child_turns": {"status", "usage_json", "context_usage_json"},
 }
@@ -678,6 +718,12 @@ def _source_tables(con, path):
     for table, columns in TABLES.items():
         mirror, source = f"t3_purpose_{table}", f"t3_source_{table}"
         con.execute(f"CREATE TABLE IF NOT EXISTS {mirror} ({columns})")
+        for name in ADDED.get(table, ()):
+            # Appending keeps the positional source layout: path, then mirror columns.
+            for target in (mirror, source):
+                if db._has_table(con, target) and name not in {
+                        r[1] for r in con.execute(f"PRAGMA table_info({target})")}:
+                    con.execute(f"ALTER TABLE {target} ADD COLUMN {name} TEXT")
         if not db._has_table(con, source):
             con.execute(f"CREATE TABLE {source} AS SELECT CAST(NULL AS TEXT) AS source_path,"
                         f" * FROM {mirror} WHERE 0")

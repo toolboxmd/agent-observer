@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.8.0] - 2026-11-26
+
+### Added
+
+- Report a known task cost when Chromeria usage closures prove every turn complete, and count each coverage gap (#154)
+
 ## [1.7.1] - 2026-11-26
 
 ### Changed

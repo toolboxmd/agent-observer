@@ -529,10 +529,21 @@ A tool call can also supply that connection when Chromeria and Grok record
 the same call ID for the turn. A tool-free response without either witness
 stays unplaced.
 
-A provider turn can reconcile while the full outcome cost remains unknown.
-Chromeria v1 records observed background causes for some drivers and has no
-background inventory for others. A missing child boundary or unavailable
-price leaves any priced work as a subtotal. The same scope appears in
+`task show` prints a known estimated cost only when every Claude and Codex
+provider turn of the task carries a closed usage closure and its final
+counters reconcile with the joined responses. Chromeria writes the closure on
+each finished turn, so turns recorded before it did keep the total unknown. A
+Claude turn that lists its native response ids has exactly those responses.
+A Codex turn's compaction responses, named by the rollout's
+`compaction_response_id`, must number what the closure states; they stay in
+the cost but outside the turn counter. Otherwise the total stays unknown, the
+priced subtotal is shown, and `native coverage` names each reason with the
+number of turns, attempts, runs, segments, children, responses or sessions it
+affects. A run that ended before it started adds nothing. A delegated child
+that declared another task, or was deliberately unscoped, is another task's
+cost; `not counted` says how many there were. Native child agents, children
+without a declared purpose, active or remote children, and unpriced models
+still leave any priced work as a subtotal. The same scope appears in
 `publish --task`. For legacy PR links, `legacy_checkout_observations`
 shows which checkout Observer saw when it imported a tool call. The observation
 survives checkout retirement. A path can change hands before import, so a

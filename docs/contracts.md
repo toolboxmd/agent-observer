@@ -164,7 +164,7 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
 | `skill_read` | Read under an installed Skill directory | validated skill identifier in `target` (never a title or directory path); installed file path only in detail `skill_path`; skill name and AgentsMD version from the path |
 | `skill_invoke` | Explicit Skill invocation (for example Claude's `Skill` tool) | validated skill identifier in `target`; installed `SKILL.md` path only in detail `skill_path` when the native record supplies a directory |
 | `file_change` | Edit or write by the agent | path, change kind, content size and hash |
-| `compaction` | Context compaction boundary | trigger, before and after sizes when recorded |
+| `compaction` | Context compaction boundary | trigger, before and after sizes when recorded; Codex native `compaction_response_id` and `turn_id` in detail |
 | `lifecycle` | Turn start, completion, abort, subagent activity, stop reasons | duration, reason |
 | `assistant_message` | Native assistant text | last 400 characters per Claude block, Codex message, Grok chunk or OpenCode text part |
 | `permission` | Permission request or denial | tool, outcome; Claude's denial kind (`user-rejected`, `permission-rule`, `automode-blocked`, `interrupted`) in detail `denial` |
@@ -528,6 +528,14 @@ re-read every sync; workload bindings are durable ledger rows.
   Native Claude uuid evidence takes precedence. Legacy copies of V1
   messages (`user` from `server`) are no evidence. No prompt text or hash
   is used for attribution. Prompts classified at import keep their excerpt.
+- Usage closure: a finished Claude or Codex provider turn may carry
+  `usageClosure` and, for Claude, `nativeResponseIds`. The mirror keeps a
+  version 1 closure only as `main_agent_only` with the driver's witness
+  (`process_ledger` for Claude, `event_stream` for Codex) and its
+  `uncountedCompactions` count, or as `open` with a snake_case reason; any
+  other version, state, witness or malformed value is no statement. Listed
+  response ids must all be native identifiers. Runs and attempts keep only
+  whether `startedAt` was set, explicitly null, or absent.
 
 - Turn origin: `thread.turn-start-requested` `actor_kind` (`client` human,
   `server` dispatch) joins the native Claude user-message uuid through

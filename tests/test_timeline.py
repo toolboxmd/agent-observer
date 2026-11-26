@@ -25,12 +25,15 @@ class TimelineTest(LedgerCase):
         self.assertEqual(len(row), 1)
         self.assertEqual(report.scope_totals(self.con)["responses"], 3)
         # Sparse native compaction markers import as boundaries with no
-        # free-text detail, never quarantined as malformed.
+        # free-text detail, never quarantined as malformed. A compacted
+        # record keeps only the native ids of its response and turn.
         markers = [e for e in tl["events"]
                    if e["native_id"] == "ctx-mini-001"]
         self.assertEqual(len(markers), 1)
         for event in tl["events"]:
-            self.assertIsNone(event["detail"])
+            self.assertEqual(event["detail"], {"compaction_response_id": "resp-mini-002",
+                                               "turn_id": "turn-mini-aaa"}
+                             if event["native_id"] == "window-mini-01" else None)
 
     def test_tool_call_result_join_only_on_equal_call_id(self):
         tl = report.timeline(self.con)

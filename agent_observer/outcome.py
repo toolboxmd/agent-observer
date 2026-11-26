@@ -159,6 +159,7 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
     literal_messages = harness in {"claude", "opencode"}
     if not by_run and not whole and not claimed_inputs:
         return
+    listed, listed_turns = _listed_responses(con, key, by_run) if harness == "claude" else ({}, set())
     if literal_messages:
         result.literal_sessions.add(key)
     call_witnesses = set()
@@ -228,6 +229,31 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
                 display_turn in input_turns[identity] for identity in identities):
             unsafe_display.add(display_turn)
         candidates = {candidate for identity in input_ids for candidate in by_input.get(identity, ())}
+        if listed_turns and (rid in listed or any(c[1] in listed_turns for c in candidates)):
+            # The turn's own list names its members. Ancestry may agree, reach
+            # an unwitnessed injected input, or reach no input at all; it must
+            # never place the response on a different witnessed turn.
+            entries = listed.get(rid, set())
+            entry = next(iter(entries)) if len(entries) == 1 else None
+            owner = by_run.get(entry[0]) if entry else None
+            claims = whole | {o for identity in identities for o in claimed_inputs[identity]}
+            if (entry is None or any(c[3] == "conflicting_snapshot" or c[1] != entry[1] for c in candidates)
+                    or (claims and claims != {owner}) or (reference_conflict and owner == task_id)):
+                result.conflicts.add(rid)
+                blocked_turns.add(display_turn)
+                exclusive = False
+                continue
+            result.owners[rid] = {owner} if owner else set()
+            if owner != task_id:
+                blocked_turns.add(display_turn)
+                continue
+            result.response_turns[key, rid] = identities
+            if rid in measured_turns:
+                members[rid] = {"run_id": entry[0], "session_key": key,
+                                "native_input_id": next(iter(input_ids)) if len(input_ids) == 1 else "",
+                                "provider_turn_id": entry[1], "segment_id": None,
+                                "validation": "claude_native_response_id"}
+            continue
         unresolved_ancestry = harness == "claude" and rid in responses and not input_ids
         claims = set() if unresolved_ancestry else whole.copy()
         if unresolved_ancestry:
@@ -305,6 +331,25 @@ def _session_ownership(con, key, task_id, by_run, reference_conflict, result, me
     result.turns.difference_update((key, turn) for turn in blocked_turns)
 
 
+def _columns(con, table):
+    return {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+
+
+def _listed_responses(con, key, by_run):
+    """Claude responses each turn of this session lists, by response id."""
+    listed, turns = defaultdict(set), set()
+    if not by_run or "native_response_ids_json" not in _columns(con, "t3_purpose_turns"):
+        return listed, turns
+    for run, turn, ids in con.execute(
+            "SELECT run_id,provider_turn_id,native_response_ids_json FROM t3_purpose_turns "
+            "WHERE session_key=? AND native_response_ids_json IS NOT NULL", (key,)):
+        if run in by_run:
+            turns.add(turn)
+            for native_id in json.loads(ids):
+                listed["claude:" + native_id].add((run, turn))
+    return listed, turns
+
+
 def _normalized_counters(row):
     """Render the native response in Chromeria's inclusive comparison units."""
     from .adapters import claude, codex, grok, opencode
@@ -328,14 +373,41 @@ def _normalized_counters(row):
             "reasoningTokens": row["reasoning_output_tokens"]}
 
 
-def _turn_check(turn, responses, finalized):
+TERMINAL = frozenset({"completed", "failed", "cancelled", "superseded", "interrupted", "rolled_back"})
+CHILD_SEGMENTS = frozenset({"start", "resume", "workflow_member"})
+
+
+def _closure(turn):
+    """The mirrored usage closure, or None when the producer made no statement."""
+    closure = json.loads(turn.get("usage_closure_json") or "null")
+    return closure if isinstance(closure, dict) else None
+
+
+def _turn_check(turn, responses, finalized, listed=None, compactions=None):
+    """Reconcile one provider turn's final counter with its joined responses.
+
+    ``listed`` is the response ids the turn names. ``compactions`` is, for a
+    closed turn, its stated uncounted compactions and the compaction
+    responses the native records identify; those stay in the cost but not in
+    the counter.
+    """
     usage = json.loads(turn["usage_json"]) if turn["usage_json"] else {}
     if turn["status"] != "completed" or usage.get("usageStatus") != "complete":
         return "native_final_usage_missing"
+    joined = {r["response_id"] for r in responses}
+    if listed is not None and not listed <= joined:
+        return "listed_response_missing"
     if not responses:
         return "no_joined_responses"
     if any(r["harness"] == "claude" and r["response_id"] not in finalized for r in responses):
         return "response_not_final"
+    if compactions is not None:
+        expected, identified = compactions
+        if not identified <= joined:
+            return "compaction_response_missing"
+        if len(identified) != expected:
+            return "compaction_count_mismatch"
+        responses = [r for r in responses if r["response_id"] not in identified]
     normalized = [_normalized_counters(r) for r in responses]
     for name in ("inputTokens", "outputTokens", "cachedInputTokens", "cacheCreationTokens", "reasoningTokens"):
         if name not in usage:
@@ -348,11 +420,85 @@ def _turn_check(turn, responses, finalized):
     return "reconciled"
 
 
-def check_inventory(con, native, rows):
-    """Compare independent provider final counters and the expected attempt/turn edges.
+def _compaction_responses(con, turn):
+    """Codex compaction responses the rollout records for this provider turn."""
+    key = turn.get("session_key") or ""
+    if not key.startswith("codex:"):
+        return set()
+    native_turns = {r[0] for r in con.execute(
+        "SELECT native_id FROM t3_purpose_inputs WHERE provider_turn_id=? AND session_key=?",
+        (turn["provider_turn_id"], key))}
+    found = set()
+    for detail, in con.execute("SELECT detail_json FROM events WHERE session_key=? AND family='compaction'"
+                               " AND detail_json IS NOT NULL", (key,)):
+        detail = json.loads(detail)
+        if detail.get("turn_id") in native_turns and detail.get("compaction_response_id"):
+            found.add("codex:" + detail["compaction_response_id"])
+    return found
 
-    The v1 capability records observed background causes, or no inventory.
-    Neither can certify that the entire outcome has been collected.
+
+class _Gaps:
+    """Each reason the total stays unknown, with the distinct items it affects."""
+
+    def __init__(self):
+        self.items = {}
+
+    def add(self, name, unit, item):
+        self.items.setdefault(name, (unit, set()))[1].add(item)
+
+    def counts(self):
+        return {name: {"count": len(items), "unit": unit} for name, (unit, items) in sorted(self.items.items())}
+
+
+def _child_runs(con, participant, task_id):
+    return participant["child_thread_id"] and con.execute(
+        "SELECT 1 FROM t3_purpose_runs WHERE thread_id=? AND task_id=? LIMIT 1",
+        (participant["child_thread_id"], task_id)).fetchone() is not None
+
+
+def _children(con, task_id, run, gaps, not_counted):
+    """Apply the delegated-child rule to one run's participants."""
+    from .adapters import t3_purpose
+    expected = {r["participant_id"] for r in run["participants"] if r["kind"] == "subagent_item"}
+    observed = {r["participant_id"] for r in run["participants"]
+                if r["kind"] not in {"subagent_item", "pending_background", "completion_member", "completion_cause"}}
+    run["missing_children"] = sorted(expected - observed)
+    for child in run["missing_children"]:
+        gaps.add("expected_child_missing", "children", child)
+    for p in run["participants"]:
+        child = (run["run_id"], p["participant_id"])
+        if p["environment_id"]:
+            gaps.add("remote_participation", "children", child)
+        elif p["kind"] == "pending_background":
+            gaps.add("child_active", "children", child)
+        elif p["kind"] == "provider_native":
+            gaps.add("native_child_agent", "children", child)
+        if p["kind"] != "app_owned" or p["environment_id"]:
+            continue
+        declared = json.loads(p["declaration_json"] or "null") or {}
+        reference = declared.get("reference")
+        if declared.get("scope") == "single" and reference:
+            if t3_purpose.task_id(con, reference) != task_id:
+                not_counted["declared_elsewhere"] += 1
+            elif p["status"] not in TERMINAL:
+                gaps.add("child_active", "children", child)
+            elif not _child_runs(con, p, task_id):
+                gaps.add("child_runs_missing", "children", child)
+        elif declared.get("scope") == "unscoped" and declared.get("reason") == "deliberate":
+            not_counted["deliberately_unscoped"] += 1
+        elif declared.get("scope") == "unscoped" and declared.get("reason") == "legacy_no_intent":
+            gaps.add("child_purpose_undeclared", "children", child)
+        else:
+            gaps.add("child_purpose_unknown", "children", child)
+
+
+def check_inventory(con, native, rows):
+    """Decide whether the task's native evidence is complete, naming each gap with a count.
+
+    A provider turn is complete when its usage closure states that the main
+    agent's counters are all of its model usage and those counters reconcile
+    with its joined responses. Runs, segments and delegated children add only
+    the gaps their own evidence supports.
     """
     by_turn = defaultdict(list)
     by_segment = defaultdict(list)
@@ -374,55 +520,16 @@ def check_inventory(con, native, rows):
                 finalized.update(r[0] for r in con.execute(
                     "SELECT f.response_id FROM responses r JOIN claude_response_finality f "
                     "USING(response_id) WHERE r.session_key=?", (key,)))
-    gaps = set()
+    gaps = _Gaps()
     main_gaps = set()
-    if native["conflicting_source_runs"]:
-        main_gaps.add("conflicting_native_run_records")
+    for run_id in native["conflicting_source_runs"]:
+        gaps.add("conflicting_native_run_records", "runs", run_id)
     if not native["runs"]:
-        main_gaps.add("purpose_run_unavailable")
-    checks = []
-    for run in native["runs"]:
-        run_id = run["run_id"]
-        if run["status"] != "completed":
-            main_gaps.add("run_not_completed")
-        attempts = [dict(r) for r in con.execute(
-            "SELECT a.*,c.native_inputs,c.child_segments,c.background_inventory,c.native_usage_finality "
-            "FROM t3_purpose_attempts a LEFT JOIN t3_purpose_capabilities c USING(provider_session_id) "
-            "WHERE a.run_id=? ORDER BY a.attempt_id", (run_id,))]
-        if run["active_attempt_id"] not in {a["attempt_id"] for a in attempts}:
-            main_gaps.add("expected_attempt_missing")
-        for a in attempts:
-            turns = [dict(r) for r in con.execute(
-                "SELECT * FROM t3_purpose_turns WHERE attempt_id=? ORDER BY provider_turn_id", (a["attempt_id"],))]
-            if not turns or (a["provider_turn_id"] is not None and
-                             a["provider_turn_id"] not in {t["provider_turn_id"] for t in turns}):
-                main_gaps.add("expected_provider_turn_missing")
-            for turn in turns:
-                state = _turn_check(turn, by_turn[turn["provider_turn_id"]], finalized)
-                checks.append({"run_id": run_id, "attempt_id": a["attempt_id"],
-                               "provider_turn_id": turn["provider_turn_id"], "status": state,
-                               "provider_usage": json.loads(turn["usage_json"] or "null")})
-                if state != "reconciled":
-                    main_gaps.add(state)
-            # Even a valid final main-agent counter omits independent background work.
-            gaps.add("observed_background_causes_only" if a["background_inventory"] == "observed_causes"
-                     else "background_inventory_unavailable")
-        run["attempts"] = attempts
-        run["participants"] = [dict(r) for r in con.execute(
-            "SELECT * FROM t3_purpose_participants WHERE run_id=? ORDER BY kind,participant_id", (run_id,))]
-        expected = {r["participant_id"] for r in run["participants"] if r["kind"] == "subagent_item"}
-        observed = {r["participant_id"] for r in run["participants"]
-                    if r["kind"] not in {"subagent_item", "pending_background", "completion_member", "completion_cause"}}
-        run["missing_children"] = sorted(expected - observed)
-        if run["missing_children"]:
-            gaps.add("expected_child_missing")
-        if any(p["environment_id"] for p in run["participants"]):
-            gaps.add("remote_participation")
-        if run["participants"]:
-            gaps.add("child_inventory_requires_reconciliation")
+        gaps.add("purpose_run_unavailable", "tasks", native["task_id"])
     native["segments"] = [dict(r) for r in con.execute(
         "SELECT * FROM t3_purpose_segments WHERE task_id=? ORDER BY thread_id,owner_id,segment_id",
         (native["task_id"],))]
+    child_segment_runs = set()
     for segment in native["segments"]:
         segment["provider_turns"] = [dict(r) for r in con.execute(
             "SELECT * FROM t3_purpose_child_turns WHERE run_id=? AND segment_id=? ORDER BY provider_turn_id",
@@ -432,14 +539,81 @@ def check_inventory(con, native, rows):
             group = by_segment[(turn["run_id"], turn["segment_id"], turn["session_key"])]
             turn["counter_check"] = (_turn_check(turn, group, finalized) if len(turns) == 1
                                      else "segment_turn_boundary_unresolved")
-        gaps.add("segment_final_usage_unreconciled")
+        item = (segment["thread_id"], segment["owner_id"], segment["segment_id"])
+        if segment["kind"] in CHILD_SEGMENTS:
+            # Native child agents are not reconciled; their usage stays unknown.
+            gaps.add("native_child_segment", "segments", item)
+            child_segment_runs.add(segment["run_id"])
+        elif segment["run_id"] is None:
+            gaps.add("background_segment_unresolved", "segments", item)
+    checks = []
+    not_counted = {"declared_elsewhere": 0, "deliberately_unscoped": 0}
+    for run in native["runs"]:
+        run_id = run["run_id"]
+        attempts = [dict(r) for r in con.execute(
+            "SELECT a.*,c.native_inputs,c.child_segments,c.background_inventory,c.native_usage_finality "
+            "FROM t3_purpose_attempts a LEFT JOIN t3_purpose_capabilities c USING(provider_session_id) "
+            "WHERE a.run_id=? ORDER BY a.attempt_id", (run_id,))]
+        for a in attempts:
+            a["turns"] = [dict(r) for r in con.execute(
+                "SELECT * FROM t3_purpose_turns WHERE attempt_id=? ORDER BY provider_turn_id", (a["attempt_id"],))]
+        # A terminal run that never started, and none of whose attempts
+        # started or reached a provider turn, used no model.
+        run["never_started"] = (run["status"] in TERMINAL and run.get("start_state") == "not_started"
+                                and all(a.get("start_state") == "not_started" and not a["turns"]
+                                        for a in attempts))
+        if run["status"] not in TERMINAL:
+            gaps.add("run_not_terminal", "runs", run_id)
+        if not run["never_started"] and run["active_attempt_id"] not in {a["attempt_id"] for a in attempts}:
+            gaps.add("expected_attempt_missing", "runs", run_id)
+            main_gaps.add("expected_attempt_missing")
+        for a in attempts:
+            turns = a.pop("turns")
+            unstarted = a.get("start_state") == "not_started"
+            if (not turns and not unstarted) or (a["provider_turn_id"] is not None and turns and
+                                                 a["provider_turn_id"] not in {t["provider_turn_id"] for t in turns}):
+                gaps.add("expected_provider_turn_missing", "attempts", a["attempt_id"])
+                main_gaps.add("expected_provider_turn_missing")
+            for turn in turns:
+                closure = _closure(turn)
+                closed = closure is not None and closure["state"] == "main_agent_only"
+                listed = turn.get("native_response_ids_json")
+                listed = {"claude:" + i for i in json.loads(listed)} if listed else None
+                compactions = ((closure["uncountedCompactions"], _compaction_responses(con, turn))
+                               if closed else None)
+                state = _turn_check(turn, by_turn[turn["provider_turn_id"]], finalized, listed, compactions)
+                turn_id = turn["provider_turn_id"]
+                checks.append({"run_id": run_id, "attempt_id": a["attempt_id"],
+                               "provider_turn_id": turn_id, "status": state,
+                               "usage_closure": closure["state"] if closure else "missing",
+                               **({"usage_closure_reason": closure["reason"]}
+                                  if closure and closure["state"] == "open" else {}),
+                               "provider_usage": json.loads(turn["usage_json"] or "null")})
+                if state != "reconciled":
+                    gaps.add(state, "turns", turn_id)
+                    main_gaps.add(state)
+                if closure is None:
+                    gaps.add("usage_closure_missing", "turns", turn_id)
+                elif not closed:
+                    gaps.add("usage_closure_open", "turns", turn_id)
+                elif run_id in child_segment_runs:
+                    gaps.add("usage_closure_contradiction", "turns", turn_id)
+        run["attempts"] = attempts
+        run["participants"] = [dict(r) for r in con.execute(
+            "SELECT * FROM t3_purpose_participants WHERE run_id=? ORDER BY kind,participant_id", (run_id,))]
+        _children(con, native["task_id"], run, gaps, not_counted)
     if native["conflicting_reference_kinds"]:
-        gaps.add("conflicting_reference_kinds")
-    if native["unavailable_response_usage"] or native["unlocated_usage_sessions"]:
-        gaps.add("native_response_usage_unavailable")
-    if native["conflicting_responses"]:
-        gaps.add("conflicting_response_ownership")
+        for run in native["runs"]:
+            gaps.add("conflicting_reference_kinds", "runs", run["run_id"])
+    for rid in native["unavailable_response_usage"]:
+        gaps.add("native_response_usage_unavailable", "responses", rid)
+    for key in native["unlocated_usage_sessions"]:
+        gaps.add("native_usage_unlocated", "sessions", key)
+    for rid in native["conflicting_responses"]:
+        gaps.add("conflicting_response_ownership", "responses", rid)
     native["turn_checks"] = checks
     native["main_agent_counters_reconciled"] = bool(checks) and not main_gaps
-    native["coverage_gaps"] = sorted(gaps | main_gaps)
+    native["coverage_gap_counts"] = gaps.counts()
+    native["coverage_gaps"] = sorted(native["coverage_gap_counts"])
+    native["children_not_counted"] = not_counted
     return bool(native["coverage_gaps"])

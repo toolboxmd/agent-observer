@@ -184,6 +184,8 @@ def line_excerpt(line: object) -> str:
 # - assistant_message.excerpt: analysis._permission_seeking
 # - tool_call/tool_result.tool_source/mcp_server/mcp_tool: report activity
 #   MCP counts (closed tool_source set; server and tool are identifiers)
+# - compaction.compaction_response_id/turn_id: outcome usage-closure checks
+#   (Codex native response and turn identifiers)
 # Every other family keeps no detail. Values may be numbers, booleans,
 # fixed-length hex hashes, native identifiers of the expected type, file
 # paths, shell commands, or closed status/kind strings; anything else is
@@ -203,7 +205,7 @@ EVENT_DETAIL_ALLOWLIST: dict[str, dict[str, str]] = {
     "tool_call": {"timeout_sec": "int", "tool_source": "tool_source",
                   "mcp_server": "identifier", "mcp_tool": "identifier"},
     "skill_invoke": {"skill_path": "path"},
-    "compaction": {},
+    "compaction": {"compaction_response_id": "native_id", "turn_id": "native_id"},
     "lifecycle": {},
     "permission": {"denial": "identifier"},
 }
@@ -512,6 +514,7 @@ def argument_text(value: object) -> str | None:
 # any truncation; an overlong value fails closed instead of being cut.
 _NATIVE_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.:/-]{0,79}")
 _HTTP_CODE_RE = re.compile(r"[0-9]{3}")
+_NATIVE_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,200}")
 
 _IDENTIFIER_FAMILIES = frozenset({
     "tool_call", "tool_result", "read", "skill_read", "skill_invoke",
@@ -637,6 +640,10 @@ def filter_detail(family: str, detail: object) -> dict:
             kept = _valid_identifier(value)
             if kept is not None:
                 out[key] = kept
+        elif kind == "native_id":
+            # Native record identity (response or turn id), never free text.
+            if isinstance(value, str) and _NATIVE_ID_RE.fullmatch(value):
+                out[key] = value
         elif kind == "command":
             kept = _valid_command(value)
             if kept is not None:

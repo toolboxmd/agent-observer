@@ -2169,11 +2169,13 @@ def _ingest_compacted(r: _Reader, obj: dict) -> None:
         r.event(obj, "compaction", f"compacted:{obj.get('ordinal')}",
                 name="context_compaction")
         return
-    latest = p.get("latest_token_usage_record") or {}
-    rid = latest.get("response_id")
+    latest = p.get("latest_token_usage_record")
+    turn = latest.get("turn_id") if isinstance(latest, dict) else None
     # The embedded latest usage repeats an already counted response and is
-    # never inserted; the boundary event alone marks the compaction.
-    r.event(obj, "compaction", p.get("window_id"), name="context_compaction")
+    # never inserted; the boundary event marks the compaction and names the
+    # native response that performed it and the turn it ran in.
+    r.event(obj, "compaction", p.get("window_id"), name="context_compaction",
+            detail={"compaction_response_id": p.get("compaction_response_id"), "turn_id": turn})
 
 
 def _duration(item: dict):

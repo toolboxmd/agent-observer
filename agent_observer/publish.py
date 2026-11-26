@@ -448,7 +448,9 @@ def render(summary: dict, target: str | None = None) -> str:
         lines.append(f"Outcome: {task_label}.")
         if native.get("coverage_gaps"):
             lines.append("Full outcome cost unknown. Native coverage: " +
-                         ", ".join(_safe_field(g.replace("_", " ")) for g in native["coverage_gaps"]) + ".")
+                         _safe_field(report.gap_text(native).replace("_", " ")) + ".")
+        if any((native.get("children_not_counted") or {}).values()):
+            lines.append("Not counted: " + _safe_field(report.not_counted_text(native["children_not_counted"])) + ".")
         for pr in native["deliveries"]:
             reference = _safe_ref(pr["url"])
             if reference is not None:
