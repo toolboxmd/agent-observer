@@ -93,8 +93,8 @@ def _passed(row) -> bool:
 
 
 def _session_filter(since=None, until=None, project=None, harness=None,
-                    agentsmd_version=None, session=None):
-    where = ["(s.role IS NULL OR s.role != 'subagent')"]
+                    agentsmd_version=None, session=None, include_subagents=False):
+    where = ["1=1"] if include_subagents else ["(s.role IS NULL OR s.role != 'subagent')"]
     args: list = []
     if session:
         where.append("s.session_key = ?")
@@ -582,6 +582,15 @@ def _cache_observation(harness, semantics, rows):
             "cached_input_share": reads / input_total if input_total else None}
 
 
+def _legacy_codex_turns(con, key):
+    by_source = defaultdict(list)
+    for turn in con.execute(
+            "SELECT source_id, turn_id, started_at, completed_at FROM turns"
+            " WHERE session_key=? AND started_at IS NOT NULL AND completed_at IS NOT NULL", (key,)):
+        by_source[turn["source_id"]].append(turn)
+    return by_source
+
+
 def _diagnose_usage(con, sessions, since, until):
     window = ""
     bounds = []
@@ -602,12 +611,21 @@ def _diagnose_usage(con, sessions, since, until):
             " input_tokens, cached_input_tokens, cache_write_input_tokens"
             " FROM responses WHERE session_key=? AND is_overlap=0" + window, args)
         disputed, inputs = _usage_evidence(con, session)
+        legacy_turns = None
         for row in responses:
             point = {field: row[field] for field in (
                 "response_id", "source_id", "ordinal_num", "ts", "turn_id", "semantics")}
             parents = inputs.get(row["response_id"], ())
             if point["turn_id"] is None and len(parents) == 1 and row["response_id"] not in disputed:
                 point["turn_id"] = f"opencode:{next(iter(parents))}"
+            if point["turn_id"] is None and row["semantics"] == codex.TOKEN_COUNT_SEMANTICS \
+                    and row["ts"] is not None:
+                if legacy_turns is None:
+                    legacy_turns = _legacy_codex_turns(con, key)
+                matches = [turn["turn_id"] for turn in legacy_turns.get(row["source_id"], ())
+                           if turn["started_at"] <= row["ts"] <= turn["completed_at"]]
+                if len(matches) == 1:
+                    point["turn_id"] = matches[0]
             known = row["response_id"] not in disputed
             timeline.append(dict(point, kind="input", input_tokens=_context_input(row) if known else None))
             if not known or (bounds and row["ts"] is None):
@@ -631,7 +649,7 @@ def _diagnose_usage(con, sessions, since, until):
 def diagnose(con, detectors=None, limit=200, **filters) -> dict:
     wanted = set(detectors or DETECTORS)
     incidents = []
-    sessions = sessions_in_scope(con, **filters)
+    sessions = sessions_in_scope(con, include_subagents=bool(filters.get("session")), **filters)
     since, until = filters.get("since"), filters.get("until")
     for s in sessions:
         incidents += [i for i in detect_session(con, s) if i["detector"] in wanted]

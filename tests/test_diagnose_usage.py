@@ -6,8 +6,10 @@ import json
 from pathlib import Path
 
 from agent_observer import cli, db, native_response
-from agent_observer.adapters import claude
+from agent_observer.adapters import claude, codex, grok
 from tests.helpers import LedgerCase
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class DiagnoseUsageTest(LedgerCase):
@@ -118,6 +120,29 @@ class DiagnoseUsageTest(LedgerCase):
         timeline = self.run_diagnose()["context_growth"][0]["timeline"]
         self.assertEqual([point["input_tokens"] for point in timeline], [60, 60])
         self.assertEqual([point["turn_id"] for point in timeline], ["opencode:prompt-1", None])
+
+    def test_legacy_codex_usage_uses_recorded_turn_bounds(self):
+        codex.import_codex_file(self.con, str(FIXTURES / "codex-legacy-a.jsonl"))
+        key = "codex:sess-fixture-legacy-01"
+        result = self.run_diagnose("--session", key)
+        timeline = result["context_growth"][0]["timeline"]
+        self.assertEqual([(p["ordinal_num"], p["input_tokens"], p["turn_id"]) for p in timeline],
+                         [(4, 400, "codex:turn-legacy-aaa"), (5, 600, "codex:turn-legacy-aaa")])
+        self.con.execute(
+            "INSERT INTO turns(turn_id, session_key, source_id, started_at, completed_at)"
+            " VALUES('codex:overlapping-turn',?,?,?,?)",
+            (key, timeline[0]["source_id"], timeline[0]["ts"], timeline[0]["ts"]))
+        timeline = self.run_diagnose("--session", key)["context_growth"][0]["timeline"]
+        self.assertEqual([p["turn_id"] for p in timeline], [None, "codex:turn-legacy-aaa"])
+
+    def test_explicit_session_can_select_grok_subagent(self):
+        grok.sync(self.con, root=str(FIXTURES / "grok"))
+        key = "grok:01fixture2-bbbb-4b5c-8d6e-000000000002"
+        self.assertNotIn(key, [item["session"] for item in self.run_diagnose()["context_growth"]])
+        result = self.run_diagnose("--session", key)
+        session, = result["context_growth"]
+        self.assertEqual(session["session"], key)
+        self.assertIn(f"{key}:p-sub1", [p.get("response_id") for p in session["timeline"]])
 
     def test_claude_streaming_sample_keeps_its_turn_and_source_together(self):
         session = "streaming-fixture"
