@@ -534,12 +534,14 @@ provider turn of the task carries a closed usage closure and its final
 counters reconcile with the joined responses. Chromeria writes the closure on
 each finished turn, so turns recorded before it did keep the total unknown. A
 Claude turn that lists its native response ids has exactly those responses.
-A Codex turn's compaction responses, named by the rollout's
-`compaction_response_id`, must number what the closure states; they stay in
-the cost but outside the turn counter. Otherwise the total stays unknown, the
+Every compaction the Codex rollout records in a turn must name a response
+of that turn (`compaction_response_id`), and the compactions must number what
+the closure states; their responses stay in the cost but outside the turn
+counter. Otherwise the total stays unknown, the
 priced subtotal is shown, and `native coverage` names each reason with the
 number of turns, attempts, runs, segments, children, responses or sessions it
-affects. A run that ended before it started adds nothing. A delegated child
+affects. A run that the Chromeria records prove never ran adds nothing; a missing
+or unreadable record is a gap, never proof. A delegated child
 that declared another task, or was deliberately unscoped, is another task's
 cost; `not counted` says how many there were. Native child agents, children
 without a declared purpose, active or remote children, and unpriced models

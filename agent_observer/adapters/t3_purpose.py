@@ -6,6 +6,7 @@ evidence even when no input boundary or reconciled final usage exists.
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import datetime
 import json
 import os
@@ -21,7 +22,7 @@ from .. import db
 TABLES = {
     "runs": """run_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, task_id TEXT,
         scope TEXT NOT NULL, reason TEXT, host TEXT, repository TEXT, kind TEXT, number INTEGER,
-        provenance_json TEXT, status TEXT, version INTEGER, active_attempt_id TEXT, start_state TEXT""",
+        provenance_json TEXT, status TEXT, version INTEGER, active_attempt_id TEXT, never_ran TEXT, raw_rows_json TEXT""",
     "sessions": """run_id TEXT NOT NULL, session_key TEXT NOT NULL,
         PRIMARY KEY(run_id,session_key)""",
     "inputs": """run_id TEXT NOT NULL, session_key TEXT NOT NULL, native_id TEXT NOT NULL,
@@ -33,7 +34,7 @@ TABLES = {
         repository TEXT NOT NULL, number INTEGER NOT NULL, url TEXT NOT NULL, declared_at TEXT NOT NULL,
         PRIMARY KEY(task_id,thread_id,url,declared_at)""",
     "attempts": """attempt_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, provider_thread_id TEXT,
-        provider_turn_id TEXT, status TEXT, session_key TEXT, provider_session_id TEXT, start_state TEXT""",
+        provider_turn_id TEXT, status TEXT, session_key TEXT, provider_session_id TEXT""",
     "turns": """provider_turn_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, run_id TEXT NOT NULL,
         session_key TEXT, status TEXT, usage_json TEXT, context_usage_json TEXT,
         native_response_ids_json TEXT, usage_closure_json TEXT""",
@@ -52,11 +53,11 @@ TABLES = {
     "participants": """run_id TEXT, thread_id TEXT NOT NULL, kind TEXT NOT NULL, participant_id TEXT,
         child_thread_id TEXT, child_run_id TEXT, environment_id TEXT, status TEXT, group_id TEXT, availability TEXT, declaration_json TEXT""",
 }
+COLUMNS = {table: re.findall(r"(\w+) (?:TEXT|INTEGER)", spec) for table, spec in TABLES.items()}
 # Columns added after the first release of a mirror table. A ledger written by
 # an earlier version gains them on its next refresh; readers treat a missing
 # column as no statement.
-ADDED = {"runs": ("start_state",), "attempts": ("start_state",),
-         "turns": ("native_response_ids_json", "usage_closure_json")}
+ADDED = {"runs": ("never_ran", "raw_rows_json"), "turns": ("native_response_ids_json", "usage_closure_json")}
 PROJECTION = "orchestration_v2_projection_"
 ID = re.compile(r"[a-zA-Z0-9._:%/@+~=,-]{1,8192}", re.ASCII)
 HOST = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]+)?", re.I | re.ASCII)
@@ -108,15 +109,6 @@ def _date(value):
         except ValueError:
             pass
     return None
-
-
-def _start(payload):
-    """A run or attempt start: explicit null means it never started; absent proves nothing."""
-    if "startedAt" not in payload:
-        return None
-    if payload["startedAt"] is None:
-        return "not_started"
-    return "started" if _date(payload["startedAt"]) else None
 
 
 def _closure(value, driver):
@@ -238,8 +230,10 @@ class Snapshot(NamedTuple):
     path: str
 
     def insert(self, table, *values):
+        # Named columns: an upgraded ledger appends new columns in its own order.
+        names = ["source_path", *COLUMNS[table], *(["turn_item_id"] if table == "grok_calls" else [])]
         values = (self.path, *values)
-        self.con.execute(f"INSERT INTO t3_source_{table} VALUES("
+        self.con.execute(f"INSERT INTO t3_source_{table}({','.join(names)}) VALUES("
                          + ",".join("?" for _ in values) + ")", values)
 
     def task(self, ref):
@@ -309,8 +303,83 @@ def _deliveries(snapshot, native, tables):
     return aware
 
 
+TERMINAL = frozenset({"completed", "failed", "cancelled", "superseded", "interrupted", "rolled_back"})
+
+
+def _raw(native, tables, name):
+    """Every row of one projection table with its payload, or None when unreadable."""
+    for row in native.execute("SELECT * FROM " + PROJECTION + name):
+        row = dict(row)
+        try:
+            payload = json.loads(row.pop("payload_json", None))
+        except (ValueError, TypeError, RecursionError):
+            payload = None
+        yield row, payload if isinstance(payload, dict) else None
+
+
+def _raw_runs(native, tables):
+    """Facts about each run read from the raw projection, before any row validation.
+
+    Returns the runs proven never to have run, and for each run the ids of
+    every raw attempt and provider turn that belongs to it (None when a row
+    that could belong to it is unreadable). The consumer compares the mirror
+    against those ids, so a row dropped by validation stays visible as a gap.
+
+    A run is proven never to have run only when it is terminal with an
+    explicit null start, its active attempt is null or one of its raw
+    attempts, and each raw attempt has an explicit null start, names no
+    provider turn, and is referenced by no raw provider turn.
+    """
+    if not all(PROJECTION + t in tables for t in ("runs", "run_attempts", "provider_turns")):
+        return set(), {}
+    attempts, spoiled, unreadable, run_of = defaultdict(set), set(), set(), defaultdict(set)
+    named = defaultdict(set)
+    for row, p in _raw(native, tables, "run_attempts"):
+        aid, run = row.get("attempt_id"), row.get("run_id")
+        owners = {run, (p or {}).get("runId")} - {None}
+        if not owners:
+            return set(), {}  # An attempt no run can be ruled out from owning.
+        for owner in owners:
+            attempts[owner].add(aid)
+            run_of[aid].add(owner)
+            if p is None or p.get("id") != aid or len(owners) != 1:
+                unreadable.add(owner)
+            for turn in {row.get("provider_turn_id"), (p or {}).get("providerTurnId")} - {None}:
+                named[owner].add(turn)
+            if (p is None or "startedAt" not in p or p["startedAt"] is not None
+                    or "providerTurnId" not in p or p["providerTurnId"] is not None
+                    or row.get("provider_turn_id") is not None):
+                spoiled.add(owner)
+    turns = defaultdict(set)
+    for row, p in _raw(native, tables, "provider_turns"):
+        refs = {row.get("run_attempt_id"), (p or {}).get("runAttemptId")} - {None}
+        if p is None and not refs:
+            return set(), {}  # A turn whose attempt cannot be read could be any run's.
+        for aid in refs:
+            for owner in run_of[aid]:
+                turns[owner].add(row.get("provider_turn_id"))
+                if p is None or p.get("id") != row.get("provider_turn_id"):
+                    unreadable.add(owner)
+    proven, seen, inventory = set(), set(), {}
+    for row, p in _raw(native, tables, "runs"):
+        run = row.get("run_id")
+        ok = (p is not None and p.get("id") == run and row.get("status") in TERMINAL
+              and p.get("status") == row.get("status") and "startedAt" in p and p["startedAt"] is None
+              and "activeAttemptId" in p and (p["activeAttemptId"] is None or p["activeAttemptId"] in attempts[run])
+              and run not in spoiled and run not in unreadable and not turns[run])
+        if ok and run not in seen:
+            proven.add(run)
+        elif not ok:
+            proven.discard(run)
+        seen.add(run)
+        inventory[run] = None if run in unreadable or None in attempts[run] | turns[run] else _json(
+            dict(attempts=sorted(attempts[run]), turns=sorted(turns[run] | named[run])))
+    return proven, inventory
+
+
 def _runs(snapshot, native, tables):
     runs = {}
+    never_ran, inventory = _raw_runs(native, tables)
     for row, p in _rows(native, tables, "runs"):
         run, thread = _id(row.get("run_id")), _id(row.get("thread_id"))
         if not run or not thread or (p and "purpose" not in p):
@@ -325,7 +394,7 @@ def _runs(snapshot, native, tables):
         snapshot.insert("runs", run, thread, key, scope, reason, coords.get("host"),
                 coords.get("repository"), coords.get("kind"), coords.get("number"),
                 _json(provenance), status, version if _number(version) else None,
-                _id(p.get("activeAttemptId")), _start(p))
+                _id(p.get("activeAttemptId")), "proven" if run in never_ran else None, inventory.get(run))
         runs[run] = (thread, purpose)
         delivery = _obj(_obj(p.get("delegatedCompletion")).get("delivery"))
         for task in _list(delivery.get("taskIds")):
@@ -484,7 +553,7 @@ def _attempts(snapshot, native, tables, runs, providers):
                 snapshot.insert("sessions", run, key)
             attempts[aid] = (run, provider.thread, pt, root, turn, driver, sid, "nativeThreadId" in p)
         snapshot.insert("attempts", aid, run, pt, turn, _enum(p.get("status"), STATES),
-                key, provider.session if valid else None, _start(p))
+                key, provider.session if valid else None)
     return attempts
 
 
@@ -703,8 +772,8 @@ def _child_turns(snapshot, native, tables, boundaries, providers):
 # an object's immutable coordinates must agree. Different mutable readings
 # leave that field unknown until the snapshots agree again.
 MUTABLE = {
-    "runs": {"status", "active_attempt_id", "start_state"},
-    "attempts": {"status", "start_state"},
+    "runs": {"status", "active_attempt_id", "never_ran", "raw_rows_json"},
+    "attempts": {"status"},
     "turns": {"status", "usage_json", "context_usage_json", "native_response_ids_json", "usage_closure_json"},
     "segments": {"status", "observed_at", "notice_ids_json", "wake_dispositions_json"},
     "child_turns": {"status", "usage_json", "context_usage_json"},
@@ -722,7 +791,6 @@ def _source_tables(con, path):
         mirror, source = f"t3_purpose_{table}", f"t3_source_{table}"
         con.execute(f"CREATE TABLE IF NOT EXISTS {mirror} ({columns})")
         for name in ADDED.get(table, ()):
-            # Appending keeps the positional source layout: path, then mirror columns.
             for target in (mirror, source):
                 if db._has_table(con, target) and name not in {
                         r[1] for r in con.execute(f"PRAGMA table_info({target})")}:

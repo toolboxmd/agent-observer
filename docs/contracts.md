@@ -534,8 +534,19 @@ re-read every sync; workload bindings are durable ledger rows.
   (`process_ledger` for Claude, `event_stream` for Codex) and its
   `uncountedCompactions` count, or as `open` with a snake_case reason; any
   other version, state, witness, key or malformed value is no statement.
-  Listed response ids must all be distinct native identifiers. Runs and attempts keep only
-  whether `startedAt` was set, explicitly null, or absent.
+  Listed response ids must all be distinct native identifiers.
+- Run inventory: before validating any row, the refresh records for each
+  run the ids of every raw attempt and provider turn that belongs to it,
+  and whether the raw rows prove the run never ran: terminal, an explicit
+  null `startedAt`, an active attempt that is null or one of its attempts,
+  and every attempt with a null `startedAt`, no named turn and no turn that
+  references it. An unreadable or disagreeing row proves nothing, and a
+  report treats any raw row missing from the mirror as a gap.
+- Codex compaction: one native compaction writes a `compacted` record,
+  whose event keeps the native response and turn, and a `ContextCompaction`
+  marker tagged with the same turn. A closed turn's compactions must each
+  name a joined response and must number what the closure states; a
+  compaction no turn can own leaves the session's closed turns unresolved.
 
 - Turn origin: `thread.turn-start-requested` `actor_kind` (`client` human,
   `server` dispatch) joins the native Claude user-message uuid through

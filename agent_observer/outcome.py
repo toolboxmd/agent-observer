@@ -387,9 +387,8 @@ def _turn_check(turn, responses, finalized, listed=None, compactions=None):
     """Reconcile one provider turn's final counter with its joined responses.
 
     ``listed`` is the response ids the turn names. ``compactions`` is, for a
-    closed turn, its stated uncounted compactions and the compaction
-    responses the native records identify; those stay in the cost but not in
-    the counter.
+    closed turn, its stated uncounted compactions and what the native records
+    show; compaction responses stay in the cost but not in the counter.
     """
     usage = json.loads(turn["usage_json"]) if turn["usage_json"] else {}
     if turn["status"] != "completed" or usage.get("usageStatus") != "complete":
@@ -402,12 +401,14 @@ def _turn_check(turn, responses, finalized, listed=None, compactions=None):
     if any(r["harness"] == "claude" and r["response_id"] not in finalized for r in responses):
         return "response_not_final"
     if compactions is not None:
-        expected, identified = compactions
-        if not identified <= joined:
+        expected, found = compactions
+        if found["unattributed"]:
+            return "compaction_unattributed"
+        if found["missing"] or not found["identified"] <= joined:
             return "compaction_response_missing"
-        if len(identified) != expected:
+        if found["count"] != expected:
             return "compaction_count_mismatch"
-        responses = [r for r in responses if r["response_id"] not in identified]
+        responses = [r for r in responses if r["response_id"] not in found["identified"]]
     normalized = [_normalized_counters(r) for r in responses]
     for name in ("inputTokens", "outputTokens", "cachedInputTokens", "cacheCreationTokens", "reasoningTokens"):
         if name not in usage:
@@ -420,20 +421,39 @@ def _turn_check(turn, responses, finalized, listed=None, compactions=None):
     return "reconciled"
 
 
-def _compaction_responses(con, turn):
-    """Codex compaction responses the rollout records for this provider turn."""
+def _compactions(con, turn, closure):
+    """The compactions a Codex rollout records for one provider turn.
+
+    One native compaction writes a `compacted` record, whose event detail
+    names its response and turn, and a ContextCompaction marker tagged with
+    the same turn. A compaction no turn can own leaves every closed turn of
+    its session unresolved.
+    """
+    found = {"identified": set(), "count": 0, "missing": False, "unattributed": False}
     key = turn.get("session_key") or ""
     if not key.startswith("codex:"):
-        return set()
+        found["unattributed"] = closure.get("witness") == "event_stream"
+        return found
     native_turns = {r[0] for r in con.execute(
         "SELECT native_id FROM t3_purpose_inputs WHERE provider_turn_id=? AND session_key=?",
         (turn["provider_turn_id"], key))}
-    found = set()
-    for detail, in con.execute("SELECT detail_json FROM events WHERE session_key=? AND family='compaction'"
-                               " AND detail_json IS NOT NULL", (key,)):
-        detail = json.loads(detail)
-        if detail.get("turn_id") in native_turns and detail.get("compaction_response_id"):
-            found.add("codex:" + detail["compaction_response_id"])
+    if not native_turns:
+        found["unattributed"] = True
+        return found
+    records, markers = [], 0
+    for detail, event_turn in con.execute(
+            "SELECT detail_json,turn_id FROM events WHERE session_key=? AND family='compaction'", (key,)):
+        detail = json.loads(detail) if detail else {}
+        if detail.get("turn_id"):
+            if detail["turn_id"] in native_turns:
+                records.append(detail.get("compaction_response_id"))
+        elif event_turn:
+            markers += event_turn.partition(":")[2] in native_turns
+        else:
+            found["unattributed"] = True
+    found["identified"] = {"codex:" + rid for rid in records if rid}
+    found["count"] = max(len(records), markers)
+    found["missing"] = None in records or markers > len(records)
     return found
 
 
@@ -557,24 +577,27 @@ def check_inventory(con, native, rows):
         for a in attempts:
             a["turns"] = [dict(r) for r in con.execute(
                 "SELECT * FROM t3_purpose_turns WHERE attempt_id=? ORDER BY provider_turn_id", (a["attempt_id"],))]
-        # A terminal run that never started, and none of whose attempts
-        # started, named a provider turn or reached one, used no model. An
-        # active attempt or a named turn the record does not hold is unknown,
-        # never proof of absence.
-        run["never_started"] = (run["status"] in TERMINAL and run.get("start_state") == "not_started"
-                                and run["active_attempt_id"] in {None, *(a["attempt_id"] for a in attempts)}
-                                and all(a.get("start_state") == "not_started" and a["provider_turn_id"] is None
-                                        and not a["turns"] for a in attempts))
+        # Only the refresh, which reads the raw projection before validation,
+        # can prove a run never ran; absence in the mirror proves nothing.
+        run["never_ran"] = run.get("never_ran") == "proven" and not any(a["turns"] for a in attempts)
         if run["status"] not in TERMINAL:
             gaps.add("run_not_terminal", "runs", run_id)
-        if not run["never_started"] and run["active_attempt_id"] not in {a["attempt_id"] for a in attempts}:
+        if not run["never_ran"] and run["active_attempt_id"] not in {a["attempt_id"] for a in attempts}:
             gaps.add("expected_attempt_missing", "runs", run_id)
             main_gaps.add("expected_attempt_missing")
+        # Every raw attempt and provider turn of the run must be in the mirror:
+        # a row that validation or a disagreeing copy dropped is hidden work.
+        raw = json.loads(run.get("raw_rows_json") or "null")
+        if not run["never_ran"] and (
+                raw is None or not set(raw["attempts"]) <= {a["attempt_id"] for a in attempts}
+                or not set(raw["turns"]) <= {t["provider_turn_id"] for a in attempts for t in a["turns"]}):
+            gaps.add("native_rows_unmirrored", "runs", run_id)
+            main_gaps.add("native_rows_unmirrored")
         for a in attempts:
             turns = a.pop("turns")
-            unstarted = a.get("start_state") == "not_started"
-            if (not turns and not unstarted) or (a["provider_turn_id"] is not None and
-                                                 a["provider_turn_id"] not in {t["provider_turn_id"] for t in turns}):
+            if not run["never_ran"] and (not turns or (
+                    a["provider_turn_id"] is not None
+                    and a["provider_turn_id"] not in {t["provider_turn_id"] for t in turns})):
                 gaps.add("expected_provider_turn_missing", "attempts", a["attempt_id"])
                 main_gaps.add("expected_provider_turn_missing")
             for turn in turns:
@@ -582,7 +605,7 @@ def check_inventory(con, native, rows):
                 closed = closure is not None and closure["state"] == "main_agent_only"
                 listed = turn.get("native_response_ids_json")
                 listed = {"claude:" + i for i in json.loads(listed)} if listed else None
-                compactions = ((closure["uncountedCompactions"], _compaction_responses(con, turn))
+                compactions = ((closure["uncountedCompactions"], _compactions(con, turn, closure))
                                if closed else None)
                 state = _turn_check(turn, by_turn[turn["provider_turn_id"]], finalized, listed, compactions)
                 turn_id = turn["provider_turn_id"]

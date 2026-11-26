@@ -46,7 +46,13 @@ def assistant(uuid, parent, mid, inp=10, out=5):
 
 
 def codex_rollout(path, session, turns):
-    """turns: (turn id, [(response id, input, output)], [compaction response ids])."""
+    """turns: (turn id, [(response id, input, output)], [compactions]).
+
+    A compaction is a response id, written as real rollouts write it: one
+    `compacted` record naming its response and turn, then a ContextCompaction
+    marker in the same turn. A tuple (response id or None, attributed, marker)
+    varies those parts.
+    """
     rows = [dict(type="session_meta", payload=dict(session_id=session, cwd="/fixture", source="vscode"))]
     for turn, responses, compactions in turns:
         rows += [dict(type="event_msg", payload=dict(type="task_started", turn_id=turn)),
@@ -62,11 +68,19 @@ def codex_rollout(path, session, turns):
             rows.append(dict(type="token_usage_record", payload=dict(
                 response_id=rid, turn_id=turn, root_turn_id=turn, session_id=session, thread_id=session,
                 usage=usage, turn_token_usage=usage, thread_token_usage=usage)))
-        for i, rid in enumerate(compactions):
-            rows.append(dict(type="compacted", payload=dict(
-                message="", window_id=f"window-{turn}-{i}", compaction_response_id=rid,
-                latest_token_usage_record=dict(response_id=rid, turn_id=turn, session_id=session,
-                                               thread_id=session))))
+        for i, spec in enumerate(compactions):
+            rid, attributed, marker = (spec, True, True) if isinstance(spec, str) else spec
+            record = dict(message="", window_id=f"window-{turn}-{i}")
+            if rid:
+                record["compaction_response_id"] = rid
+            if attributed:
+                record["latest_token_usage_record"] = dict(response_id=rid, turn_id=turn, session_id=session,
+                                                           thread_id=session)
+            rows.append(dict(type="compacted", payload=record))
+            if marker:
+                rows.append(dict(type="event_msg", payload=dict(
+                    type="item_completed", turn_id=turn, thread_id=session,
+                    item=dict(type="ContextCompaction", id=f"ctx-{turn}-{i}"))))
         rows.append(dict(type="event_msg", payload=dict(type="task_complete", turn_id=turn)))
     with open(path, "w") as out:
         for i, row in enumerate(rows):
@@ -248,6 +262,33 @@ class UsageClosureTest(LedgerCase):
                          ["compaction_count_mismatch"])
         self.assertIn("unknown (observed priced subtotal", rep["total_cost"]["text"])
 
+    def test_compaction_without_a_response_id_in_the_turn_leaves_a_zero_closure_unresolved(self):
+        self.codex_turn([(None, True, True)], CLOSED_CODEX, recorded=())
+        rep = self.native_report()
+        self.assertEqual([c["status"] for c in rep["native_purpose"]["turn_checks"]],
+                         ["compaction_response_missing"])
+        self.assertIn("unknown (observed priced subtotal", rep["total_cost"]["text"])
+
+    def test_compaction_no_turn_can_own_leaves_the_sessions_closed_turns_unresolved(self):
+        self.codex_turn([("resp-c", False, False)], CLOSED_CODEX, recorded=())
+        rep = self.native_report()
+        self.assertEqual([c["status"] for c in rep["native_purpose"]["turn_checks"]],
+                         ["compaction_unattributed"])
+        self.assertEqual(self.gaps(rep), {"compaction_unattributed": (1, "turns")})
+
+    def test_compaction_marker_without_its_record_is_a_compaction_whose_response_is_missing(self):
+        # A pre-change import kept the marker's turn but not the record's ids.
+        self.codex_turn([("resp-c", False, True)], CLOSED_CODEX, recorded=())
+        self.con.execute("UPDATE events SET detail_json=NULL WHERE family='compaction'")
+        self.con.execute("UPDATE events SET turn_id=NULL WHERE family='compaction' AND native_id LIKE 'window-%'")
+        rep = self.native_report()
+        self.assertEqual([c["status"] for c in rep["native_purpose"]["turn_checks"]],
+                         ["compaction_unattributed"])
+        self.con.execute("DELETE FROM events WHERE family='compaction' AND native_id LIKE 'window-%'")
+        rep = report.task_report(self.con, TASK)
+        self.assertEqual([c["status"] for c in rep["native_purpose"]["turn_checks"]],
+                         ["compaction_response_missing"])
+
     # Closure states --------------------------------------------------------
 
     def test_open_missing_and_unknown_closures_keep_the_total_unknown_with_counts(self):
@@ -313,9 +354,62 @@ class UsageClosureTest(LedgerCase):
         gaps = self.gaps(rep)
         self.assertEqual(gaps["expected_provider_turn_missing"], (1, "attempts"))
         self.assertEqual(gaps["expected_attempt_missing"], (1, "runs"))
-        self.assertFalse(any(r["never_started"] for r in rep["native_purpose"]["runs"]
+        self.assertFalse(any(r["never_ran"] for r in rep["native_purpose"]["runs"]
                              if r["run_id"] in ("named", "ghost")))
         self.assertIn("unknown (observed priced subtotal", rep["total_cost"]["text"])
+
+    def hidden_turn(self, run, attempt_payload=None, turn_payload=None, started=None):
+        """A cancelled run whose unstarted, turnless-looking attempt has a raw turn row."""
+        pt, att = "pt-claudeAgent", "attempt-" + run
+        self.row("runs", [run, "t", "cancelled"], dict(
+            id=run, threadId="t", providerThreadId=pt, providerInstanceId="claudeAgent-custom", purpose=PURPOSE,
+            status="cancelled", startedAt=started, activeAttemptId=att))
+        self.row("run_attempts", [att, run, "t", pt, None, "node-" + run], dict(dict(
+            id=att, runId=run, providerThreadId=pt, rootNodeId="node-" + run,
+            providerInstanceId="claudeAgent-custom", nativeThreadId="s", providerTurnId=None,
+            status="cancelled", startedAt=None), **(attempt_payload or {})))
+        if turn_payload is not None:
+            self.row("provider_turns", ["turn-" + run, "t", pt, att, "node-" + run], dict(dict(
+                id="turn-" + run, nodeId="node-" + run, providerThreadId=pt, runAttemptId=att,
+                status="interrupted", nativeInputs=[], turnTokenUsage=dict(
+                    usageScope="main_agent", usageStatus="partial", hasSubagents=False, inputTokens=999,
+                    outputTokens=99)), **turn_payload))
+
+    def test_a_turn_the_mirror_dropped_is_not_proof_that_a_run_never_ran(self):
+        self.closed_turn()
+        # The attempt fails validation, so its turn is never mirrored.
+        self.hidden_turn("bad-attempt", attempt_payload=dict(providerInstanceId="other"), turn_payload={})
+        # The attempt is valid but its turn fails node validation.
+        self.hidden_turn("bad-turn", turn_payload=dict(nodeId="elsewhere"))
+        rep = self.native_report()
+        self.assertEqual(self.gaps(rep), {"expected_provider_turn_missing": (2, "attempts"),
+                                          "native_rows_unmirrored": (2, "runs")})
+        self.assertFalse(any(r["never_ran"] for r in rep["native_purpose"]["runs"] if r["run_id"].startswith("bad")))
+        self.assertIn("unknown (observed priced subtotal", rep["total_cost"]["text"])
+
+    def test_a_dropped_turn_or_attempt_beside_valid_ones_is_a_gap(self):
+        self.closed_turn()
+        # A second turn of the same attempt fails node validation.
+        self.row("provider_turns", ["turn-c1-b", "t", "pt-claudeAgent", "attempt-c1", "elsewhere"], dict(
+            id="turn-c1-b", nodeId="elsewhere", providerThreadId="pt-claudeAgent", runAttemptId="attempt-c1",
+            status="completed", nativeInputs=[], turnTokenUsage=claude_usage(500, 50)))
+        rep = self.native_report()
+        self.assertEqual(self.gaps(rep), {"native_rows_unmirrored": (1, "runs")})
+        self.native.execute(f"DELETE FROM {PREFIX}provider_turns WHERE provider_turn_id='turn-c1-b'")
+        # An earlier attempt of the run is on another thread, so it is never mirrored.
+        self.row("run_attempts", ["attempt-c1-0", "c1", "other-thread", "pt-claudeAgent", None, "node-0"], dict(
+            id="attempt-c1-0", runId="c1", providerThreadId="pt-claudeAgent", rootNodeId="node-0",
+            providerInstanceId="claudeAgent-custom", nativeThreadId="s", providerTurnId=None,
+            status="failed", startedAt=TIME))
+        rep = self.native_report()
+        self.assertEqual(self.gaps(rep), {"native_rows_unmirrored": (1, "runs")})
+        self.assertIn("unknown (observed priced subtotal", rep["total_cost"]["text"])
+
+    def test_a_started_run_whose_attempt_never_started_is_not_exempt(self):
+        self.closed_turn()
+        self.hidden_turn("started", started=TIME)
+        rep = self.native_report()
+        self.assertEqual(self.gaps(rep), {"expected_provider_turn_missing": (1, "attempts")})
 
     def test_run_without_a_start_time_is_judged_by_its_turn(self):
         self.closed_turn()
@@ -372,7 +466,7 @@ class UsageClosureTest(LedgerCase):
             self.row("threads", [thread, TIME], {"id": thread})
             self.row("runs", ["run-" + name, thread, "completed"], dict(
                 id="run-" + name, threadId=thread, purpose=purpose or PURPOSE, status="completed",
-                startedAt=None))
+                startedAt=None, activeAttemptId=None))
 
     def test_children_are_counted_by_their_declared_purpose(self):
         self.closed_turn()
@@ -429,7 +523,7 @@ class UsageClosureTest(LedgerCase):
         self.closed_turn()
         self.sync()
         # Recreate the 1.7.0 mirror: the new columns did not exist.
-        for table, column in (("runs", "start_state"), ("attempts", "start_state"),
+        for table, column in (("runs", "never_ran"), ("runs", "raw_rows_json"),
                               ("turns", "native_response_ids_json"), ("turns", "usage_closure_json")):
             for prefix in ("t3_purpose_", "t3_source_"):
                 self.con.execute(f"ALTER TABLE {prefix}{table} DROP COLUMN {column}")
