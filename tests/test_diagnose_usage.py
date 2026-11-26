@@ -259,6 +259,15 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertEqual(readings, {"codex:resp-mini-001": None, "codex:resp-mini-002": 2000})
         self.assertIsNone(result["cache_observations"][0]["cached_input_share"])
 
+        atoms[0]["timestamp"] = "2026-09-10T10:00:09Z"
+        copied = Path(self.tmp.name) / "z-rollout-later-copy.jsonl"
+        copied.write_text("\n".join(map(json.dumps, (lines[0], atoms[0]))) + "\n")
+        codex.import_codex_file(self.con, str(copied))
+        bounded = self.run_diagnose("--session", f"codex:{sid}", "--since", "2026-09-10T10:00:07.500Z")
+        timeline = bounded["context_growth"][0]["timeline"]
+        self.assertEqual({point["response_id"]: point["input_tokens"] for point in timeline}, readings)
+        self.assertIsNone(bounded["cache_observations"][0]["cached_input_share"])
+
     def test_codex_unindexed_atom_keeps_same_source_compaction_order(self):
         lines = [json.loads(line) for line in Path(fixture("codex-mini.jsonl")).read_text().splitlines()]
         valid = next(row for row in lines if row["type"] == "token_usage_record")
