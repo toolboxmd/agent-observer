@@ -830,6 +830,73 @@ class UsageClosureTest(LedgerCase):
             self.assertIn("conflicting_native_run_records", rep["native_purpose"]["coverage_gaps"], task)
             self.assertNotEqual(rep["total_cost"]["status"], "complete", task)
 
+    def parser_learns(self, run, path, value):
+        """Chromeria never changes a run's purpose; a changed payload stands in for a parser
+        that has learned a variant it rejected before."""
+        self.native.execute(f"UPDATE {PREFIX}runs SET payload_json=json_set(payload_json,?,json(?))"
+                            " WHERE run_id=?", (path, json.dumps(value), run))
+
+    def test_an_invalid_run_with_a_task_reference_heals_once_it_parses(self):
+        self.closed_turn()
+        self.raw_run("late", "t-late", dict(id="late", threadId="t-late", status="completed", startedAt=None,
+                                            activeAttemptId=None, purpose=dict(PURPOSE, provenance=dict(type="future_kind"))),
+                     attempt=False)
+        self.assertEqual(self.gaps(self.native_report())["native_run_invalid"], (1, "runs"))
+        self.parser_learns("late", "$.purpose.provenance", dict(type="selection", revision=2))
+        rep = self.native_report()
+        self.assertEqual(rep["native_purpose"]["coverage_gaps"], [])
+        self.assertEqual(rep["total_cost"]["status"], "complete")
+
+    def test_an_untied_invalid_run_heals_to_unscoped_once_it_parses(self):
+        self.closed_turn()
+        self.raw_run("loose", "t-loose", dict(id="loose", threadId="t-loose", status="completed",
+                                              purpose=dict(PURPOSE, scope=dict(type="unscoped", reason="future_reason"))))
+        self.assertEqual(self.gaps(self.native_report())["native_run_invalid"], (1, "runs"))
+        self.parser_learns("loose", "$.purpose.scope.reason", "deliberate")
+        for _ in range(2):
+            rep = self.native_report()
+            self.assertEqual(rep["native_purpose"]["coverage_gaps"], [])
+            self.assertEqual(rep["total_cost"]["status"], "complete")
+
+    def test_an_invalid_run_naming_one_task_that_parses_under_another_is_a_conflict_for_both(self):
+        self.closed_turn()
+        self.raw_run("x", "t-x", dict(id="x", threadId="t-x", status="completed", startedAt=None,
+                                      activeAttemptId=None, purpose=dict(PURPOSE, provenance=dict(type="future_kind"))),
+                     attempt=False)
+        self.native_report()
+        self.parser_learns("x", "$.purpose", OTHER)
+        self.native_report()
+        for task in (TASK, "example/project#8"):
+            rep = report.task_report(self.con, task)
+            self.assertIn("conflicting_native_run_records", rep["native_purpose"]["coverage_gaps"], task)
+
+    def test_a_legacy_run_that_gains_a_purpose_is_a_conflict(self):
+        self.closed_turn()
+        self.raw_run("old", "t-old", dict(id="old", threadId="t-old", status="completed", startedAt=None,
+                                          activeAttemptId=None), attempt=False)
+        self.native_report()
+        self.parser_learns("old", "$.purpose", PURPOSE)
+        rep = self.native_report()
+        self.assertIn("conflicting_native_run_records", rep["native_purpose"]["coverage_gaps"])
+
+    def test_a_run_with_an_unreadable_id_on_a_legacy_thread_keeps_the_source_unknown(self):
+        self.closed_turn()
+        self.raw_run("old", "t-old", dict(id="old", threadId="t-old", status="completed"))
+        self.raw_run("bad id", "t-old", dict(id="bad id", threadId="t-old", status="completed", purpose=None))
+        rep = self.native_report()
+        self.assertNotEqual(rep["total_cost"]["status"], "complete")
+        self.assertIn("native_rows_rejected", self.gaps(rep))
+
+    def test_a_turn_on_a_driver_observer_cannot_read_is_an_unsupported_provider_turn(self):
+        self.closed_turn()
+        self.provider_thread("pt-replay", "t-replay", "devReplay")
+        self.run_turn("replay", "devReplay", "replay-s", usage=claude_usage(0, 0), thread="t-replay",
+                      pt="pt-replay")
+        rep = self.native_report()
+        self.assertEqual(self.gaps(rep), {"provider_unsupported": (1, "turns")})
+        self.assertEqual(rep["native_purpose"]["rejected_rows"], [])
+        self.assertIn("provider_unsupported (1 turn)", self.cli())
+
     # Upgrade ----------------------------------------------------------------
 
     def test_ledger_from_1_7_0_upgrades_on_sync_and_reads_stay_read_only(self):

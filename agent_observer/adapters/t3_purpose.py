@@ -54,6 +54,11 @@ TABLES = {
         child_thread_id TEXT, child_run_id TEXT, environment_id TEXT, status TEXT, group_id TEXT, availability TEXT, declaration_json TEXT""",
     # A raw row Observer read to decide completeness but could not validate and
     # mirror, with the references it still carries. Never an absence.
+    # The class each raw run has in its source now (RUN_CLASSES), rebuilt each refresh.
+    "classes": """run_id TEXT NOT NULL, thread_id TEXT, class TEXT NOT NULL, task_id TEXT""",
+    # A provider turn on a driver Observer cannot read: it joins no response.
+    "unsupported_turns": """provider_turn_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, run_id TEXT NOT NULL,
+        driver TEXT NOT NULL, status TEXT""",
     "rejects": """origin TEXT NOT NULL, table_name TEXT NOT NULL, reason TEXT NOT NULL, row_id TEXT,
         run_id TEXT, thread_id TEXT, task_id TEXT""",
 }
@@ -63,6 +68,7 @@ COLUMNS = {table: re.findall(r"(\w+) (?:TEXT|INTEGER)", spec) for table, spec in
 # column as no statement.
 ADDED = {"runs": ("never_ran",), "turns": ("native_response_ids_json", "usage_closure_json")}
 PROJECTION = "orchestration_v2_projection_"
+DRIVER = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}", re.ASCII)
 # Every raw run row with a readable id is recorded once in t3_seen_runs with
 # exactly one class: "task" (valid single-task purpose), "unscoped" (valid
 # unscoped purpose), "legacy" (readable, no purpose key) or "invalid"
@@ -251,7 +257,8 @@ class Snapshot(NamedTuple):
         return _task(self.con, ref)
 
     def record(self, run, thread, cls, task=None):
-        """Record a raw run's class once; a later refresh never rewrites it."""
+        """Record a raw run's current class, and its first class in the durable record."""
+        self.insert("classes", run, _id(thread), cls, task)
         self.con.execute("INSERT OR IGNORE INTO t3_seen_runs VALUES(?,?,?,?,?)",
                          (self.path, run, _id(thread), cls, task))
 
@@ -494,7 +501,9 @@ def _providers(snapshot, native, tables, runs, legacy, segments):
     providers = {}
     for row, p in _rows(native, tables, "provider_threads"):
         pt = _id(row.get("provider_thread_id"))
-        thread, driver = _id(row.get("thread_id")), _enum(p.get("driver"), DRIVERS)
+        # A driver Observer cannot read is still a provider; its turns join no response.
+        driver = p.get("driver") if isinstance(p.get("driver"), str) and DRIVER.fullmatch(p["driver"]) else None
+        thread = _id(row.get("thread_id"))
         if (not pt or not thread or not driver or not _matches(row, p, ("provider_thread_id", "id"),
                 ("thread_id", "appThreadId")) or row.get("driver", driver) != driver
                 or row.get("provider_instance_id", p.get("providerInstanceId")) != p.get("providerInstanceId")):
@@ -504,7 +513,11 @@ def _providers(snapshot, native, tables, runs, legacy, segments):
         providers[pt] = Provider(thread, driver, _id(p.get("providerInstanceId")), _id(p.get("providerSessionId")),
                          _strong(p.get("nativeThreadRef"), driver))
         for segment in map(_obj, _list(p.get("nativeOperations"))):
-            segments.append((thread, pt, None, driver, segment))
+            if driver in DRIVERS:
+                segments.append((thread, pt, None, driver, segment))
+            else:
+                snapshot.reject("segments", "unsupported_driver", segment.get("id"), thread=thread,
+                                purpose=segment.get("purpose"))
         for task in map(_obj, _list(p.get("pendingBackgroundTasks"))):
             run = _id(task.get("runId"))
             if run in runs and runs[run][0] == thread and _id(task.get("taskId")):
@@ -522,8 +535,9 @@ def _subagents(snapshot, native, tables, runs, legacy, segments):
         child = _id(row.get("subagent_id"))
         thread, origin = _id(row.get("thread_id")), _enum(p.get("origin"), ("app_owned", "provider_native"))
         driver = _enum(p.get("driver"), DRIVERS)
-        # A child delegated to another environment has the driver "remote".
-        declared_driver = _enum(p.get("driver"), (*DRIVERS, "remote"))
+        # Any well-formed driver, including "remote" for a child in another
+        # environment; only a known driver's native segments are read.
+        declared_driver = p.get("driver") if isinstance(p.get("driver"), str) and DRIVER.fullmatch(p["driver"]) else None
         raw_run = row.get("run_id") or p.get("runId")
         if (not child or not thread or not origin or not _matches(row, p, ("subagent_id", "id"),
                 ("thread_id", "threadId"), ("origin", "origin"), ("run_id", "runId"))
@@ -582,8 +596,9 @@ def _expected_children(snapshot, native, tables, runs, legacy):
 
 
 def _attempts(snapshot, native, tables, runs, legacy, providers):
-    """Mirror run attempts. Returns the valid ones and each raw attempt's run."""
-    attempts, owners = {}, {}
+    """Mirror run attempts. Returns the valid ones, each raw attempt's run, and
+    the valid attempts on a driver Observer cannot read."""
+    attempts, owners, unsupported = {}, {}, {}
     for row, p in _rows(native, tables, "run_attempts"):
         aid, run = _id(row.get("attempt_id")), _id(row.get("run_id"))
         owners[row.get("attempt_id")] = row.get("run_id")
@@ -603,6 +618,9 @@ def _attempts(snapshot, native, tables, runs, legacy, providers):
                      ("provider_thread_id", "providerThreadId"), ("provider_turn_id", "providerTurnId"),
                      ("root_node_id", "rootNodeId")))
         key = None
+        if valid and provider.driver not in DRIVERS:
+            unsupported[aid] = (run, provider.thread, pt, root, turn, provider.driver)
+            valid = False
         if valid:
             driver = provider.driver
             sid = _id(p.get("nativeThreadId"))
@@ -612,7 +630,7 @@ def _attempts(snapshot, native, tables, runs, legacy, providers):
             attempts[aid] = (run, provider.thread, pt, root, turn, driver, sid, "nativeThreadId" in p)
         snapshot.insert("attempts", aid, run, pt, turn, _enum(p.get("status"), STATES),
                 key, provider.session if valid else None)
-    return attempts, owners
+    return attempts, owners, unsupported
 
 
 def _grok_call_refs(snapshot, native, tables, owner, columns):
@@ -631,7 +649,7 @@ def _grok_call_refs(snapshot, native, tables, owner, columns):
             snapshot.insert("grok_calls", key, call, turn, row["turn_item_id"])
 
 
-def _turns(snapshot, native, tables, attempts, owners, legacy, children):
+def _turns(snapshot, native, tables, attempts, owners, legacy, children, unsupported):
     item_columns = {r[1] for r in native.execute("PRAGMA table_info(orchestration_v2_projection_turn_items)")}
     child_threads = {pt for _, pt in children.values() if pt}
     for row, p in _rows(native, tables, "provider_turns"):
@@ -646,6 +664,17 @@ def _turns(snapshot, native, tables, attempts, owners, legacy, children):
         if owner in legacy:
             continue  # Out of scope: a turn of a legacy run.
         aid = _id(row.get("run_attempt_id"))
+        if aid in unsupported:
+            run, thread, pt, root, expected, driver = unsupported[aid]
+            turn = _id(row.get("provider_turn_id"))
+            if (turn and not (expected and turn != expected) and row.get("node_id") == root
+                    and row.get("thread_id") == thread and row.get("provider_thread_id") == pt
+                    and _matches(row, p, ("node_id", "nodeId"), ("provider_turn_id", "id"),
+                                 ("run_attempt_id", "runAttemptId"), ("provider_thread_id", "providerThreadId"))):
+                snapshot.insert("unsupported_turns", turn, aid, run, driver, _enum(p.get("status"), STATES))
+            else:
+                snapshot.reject("provider_turns", "invalid_row", row.get("provider_turn_id"), run, thread)
+            continue
         if aid not in attempts:
             # An attempt with no row, an invalid attempt, or a payload-only reference.
             snapshot.reject("provider_turns", "attempt_unresolved", row.get("provider_turn_id"), owner,
@@ -853,6 +882,7 @@ MUTABLE = {
     "runs": {"status", "active_attempt_id", "never_ran"},
     "attempts": {"status"},
     "turns": {"status", "usage_json", "context_usage_json", "native_response_ids_json", "usage_closure_json"},
+    "unsupported_turns": {"status"},
     "segments": {"status", "observed_at", "notice_ids_json", "wake_dispositions_json"},
     "child_turns": {"status", "usage_json", "context_usage_json"},
 }
@@ -896,9 +926,27 @@ def _run_record(con):
         con.execute("DROP TABLE t3_seen_runs")
     con.execute("CREATE TABLE IF NOT EXISTS t3_seen_runs(source_path TEXT NOT NULL, run_id TEXT NOT NULL,"
                 " thread_id TEXT, class TEXT NOT NULL, task_id TEXT, PRIMARY KEY(source_path,run_id))")
+    if db._has_table(con, "t3_source_classes"):
+        con.execute("INSERT OR IGNORE INTO t3_seen_runs SELECT source_path,run_id,thread_id,class,task_id"
+                    " FROM t3_source_classes")
     con.execute("""INSERT OR IGNORE INTO t3_seen_runs SELECT source_path,run_id,thread_id,
         CASE WHEN scope='single' AND task_id IS NOT NULL THEN 'task' WHEN scope='unscoped' THEN 'unscoped'
         ELSE 'invalid' END, CASE WHEN scope='single' THEN task_id END FROM t3_source_runs""")
+
+
+def _heal_invalid_runs(con, path):
+    """Let a run recorded invalid take the class it parses as now, while present.
+
+    The only change the record ever gets. Chromeria refuses to change a run's
+    purpose once the run exists, so a run that was invalid and now parses
+    can only have changed because Observer's parser learned its variant. A
+    stored task reference must agree with the class it heals to; otherwise
+    the disagreement stays and is a conflict for both tasks.
+    """
+    con.execute("""UPDATE t3_seen_runs AS s SET class=c.class, task_id=c.task_id
+        FROM t3_source_classes c WHERE s.source_path=? AND c.source_path=s.source_path
+        AND c.run_id=s.run_id AND s.class='invalid' AND c.class<>'invalid'
+        AND (s.task_id IS NULL OR (c.class='task' AND c.task_id=s.task_id))""", (path,))
 
 
 def _clear_source(con, path):
@@ -1017,6 +1065,7 @@ def refresh(con, native, tables):
     _clear_source(con, path)
     aware = _deliveries(snapshot, native, tables)
     runs, legacy = _runs(snapshot, native, tables)
+    _heal_invalid_runs(con, path)
     if runs:
         for table in COMPLETENESS_TABLES:
             if PROJECTION + table not in tables:
@@ -1025,9 +1074,9 @@ def refresh(con, native, tables):
         _capabilities(snapshot, native, tables)
         segments = []
         providers = _providers(snapshot, native, tables, runs, legacy, segments)
-        attempts, owners = _attempts(snapshot, native, tables, runs, legacy, providers)
+        attempts, owners, unsupported = _attempts(snapshot, native, tables, runs, legacy, providers)
         children = _subagents(snapshot, native, tables, runs, legacy, segments)
-        _turns(snapshot, native, tables, attempts, owners, legacy, children)
+        _turns(snapshot, native, tables, attempts, owners, legacy, children, unsupported)
         _expected_children(snapshot, native, tables, runs, legacy)
         boundaries = _segments(snapshot, segments, runs, children)
         _child_turns(snapshot, native, tables, boundaries, providers)

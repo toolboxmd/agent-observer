@@ -571,31 +571,50 @@ class RunRecord(NamedTuple):
                    or (kind == "invalid" and task is None and origin in origins) for kind, task in entries)
 
 
-def _recorded_runs(con, task_id, record):
-    """The task's runs as the record classes them, compared with their sources now.
+def _current_classes(con, paths):
+    """The class each run has in its source now, for the given sources."""
+    args = (json.dumps(sorted(paths)),)
+    if _has_table(con, "t3_source_classes"):
+        return {(r[0], r[1]): (r[2], r[3]) for r in con.execute(
+            "SELECT source_path,run_id,class,task_id FROM t3_source_classes WHERE source_path IN "
+            "(SELECT value FROM json_each(?))", args)}
+    # A ledger refreshed before current classes were kept: mirrored runs only.
+    return {(r[0], r[1]): (r[2], r[3]) for r in con.execute(
+        "SELECT source_path,run_id,CASE WHEN scope='single' AND task_id IS NOT NULL THEN 'task'"
+        " WHEN scope='unscoped' THEN 'unscoped' ELSE 'invalid' END,CASE WHEN scope='single' THEN task_id END"
+        " FROM t3_source_runs WHERE source_path IN (SELECT value FROM json_each(?))", args)}
 
-    Returns runs deleted from their source, invalid runs that reach the task
-    (present or deleted), and runs whose current record disagrees with their
-    recorded class or task. Assumption: a Chromeria run's purpose is fixed
-    when the run is created, so any disagreement is a conflict for both tasks.
+
+def _recorded_runs(con, task_id, record):
+    """The task's runs by recorded class, compared with the class each has in its source now.
+
+    Combined rule: a run absent from its source keeps its recorded class
+    (deleted task run: `native_run_deleted`; invalid run: `native_run_invalid`).
+    A present run whose recorded and current class and task agree is judged
+    by that class. A recorded invalid run has already healed to its current
+    class when that class is valid and agrees with its stored reference.
+    Any other disagreement between the recorded and current class or task is
+    a conflict for both tasks. Assumption: a Chromeria run's purpose is fixed
+    when the run is created, so such a disagreement is never a legitimate change.
     """
     if not _has_table(con, "t3_source_runs"):
         return [], [], set()
     origins = record.origins(task_id) | {r[0] for r in con.execute(
         "SELECT DISTINCT source_path FROM t3_source_runs WHERE task_id=?", (task_id,))}
-    current = {(r[0], r[1]): (r[2], r[3]) for r in con.execute(
-        "SELECT source_path,run_id,scope,task_id FROM t3_source_runs WHERE source_path IN "
-        "(SELECT value FROM json_each(?))", (json.dumps(sorted(origins)),))}
+    current = _current_classes(con, origins)
     deleted, invalid, changed = set(), set(), set()
     for path in origins:
         for run, (kind, task, _) in record.runs[path].items():
             now = current.get((path, run))
-            if kind == "invalid" and (task == task_id or task is None):
-                invalid.add(run)
-            elif kind == "task" and task == task_id and now is None:
-                deleted.add(run)
-            elif kind in ("task", "unscoped") and now is not None and (
-                    (now[1] == task_id) != (kind == "task" and task == task_id)):
+            if now is None:
+                if kind == "task" and task == task_id:
+                    deleted.add(run)
+                elif kind == "invalid" and task in (task_id, None):
+                    invalid.add(run)
+            elif now == (kind, task):
+                if kind == "invalid" and task in (task_id, None):
+                    invalid.add(run)
+            elif task_id in (task, now[1]) or (kind == "invalid" and task is None):
                 changed.add(run)
     return sorted(deleted), sorted(invalid), changed
 
@@ -614,7 +633,9 @@ def _rejected(con, native, record, origins):
         r = dict(r)
         if r["table_name"] == "runs" and r["run_id"] in record.runs[r["origin"]]:
             continue
-        if r["task_id"] == native["task_id"] or record.reaches(
+        # A run or attempt row whose run id cannot be read names a run in no class.
+        never_seen = r["run_id"] is None and r["table_name"] in ("runs", "run_attempts")
+        if r["task_id"] == native["task_id"] or (never_seen and r["origin"] in origins) or record.reaches(
                 r["origin"], r["run_id"], r["thread_id"], native["task_id"], origins):
             tied.append({k: r[k] for k in ("table_name", "reason", "row_id", "run_id", "thread_id")})
     return tied
@@ -682,12 +703,18 @@ def check_inventory(con, native, rows):
             "SELECT a.*,c.native_inputs,c.child_segments,c.background_inventory,c.native_usage_finality "
             "FROM t3_purpose_attempts a LEFT JOIN t3_purpose_capabilities c USING(provider_session_id) "
             "WHERE a.run_id=? ORDER BY a.attempt_id", (run_id,))]
+        unsupported_table = _has_table(con, "t3_purpose_unsupported_turns")
         for a in attempts:
             a["turns"] = [dict(r) for r in con.execute(
                 "SELECT * FROM t3_purpose_turns WHERE attempt_id=? ORDER BY provider_turn_id", (a["attempt_id"],))]
+            # A turn on a driver Observer cannot read has no usage closure and joins no response.
+            a["unsupported_turns"] = [dict(r) for r in con.execute(
+                "SELECT * FROM t3_purpose_unsupported_turns WHERE attempt_id=? ORDER BY provider_turn_id",
+                (a["attempt_id"],))] if unsupported_table else []
         # Only the refresh, which reads the raw projection before validation,
         # can prove a run never ran; absence in the mirror proves nothing.
-        run["never_ran"] = run.get("never_ran") == "proven" and not any(a["turns"] for a in attempts)
+        run["never_ran"] = run.get("never_ran") == "proven" and not any(
+            a["turns"] or a["unsupported_turns"] for a in attempts)
         if run["status"] not in TERMINAL:
             gaps.add("run_not_terminal", "runs", run_id)
         if not run["never_ran"] and run["active_attempt_id"] not in {a["attempt_id"] for a in attempts}:
@@ -695,11 +722,14 @@ def check_inventory(con, native, rows):
             main_gaps.add("expected_attempt_missing")
         for a in attempts:
             turns = a.pop("turns")
-            if not run["never_ran"] and (not turns or (
-                    a["provider_turn_id"] is not None
-                    and a["provider_turn_id"] not in {t["provider_turn_id"] for t in turns})):
+            seen = {t["provider_turn_id"] for t in turns + a["unsupported_turns"]}
+            if not run["never_ran"] and (not seen or (
+                    a["provider_turn_id"] is not None and a["provider_turn_id"] not in seen)):
                 gaps.add("expected_provider_turn_missing", "attempts", a["attempt_id"])
                 main_gaps.add("expected_provider_turn_missing")
+            for turn in a["unsupported_turns"]:
+                gaps.add("provider_unsupported", "turns", turn["provider_turn_id"])
+                main_gaps.add("provider_unsupported")
             for turn in turns:
                 closure = _closure(turn)
                 closed = closure is not None and closure["state"] == "main_agent_only"

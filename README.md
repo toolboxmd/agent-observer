@@ -551,7 +551,13 @@ Observer remembers every run it has synced, including the purpose runs a
 1.7.0 ledger already held. Two kinds of run cannot be known: one created and
 deleted before any sync saw it, and a pre-purpose run deleted before the
 first sync with 1.8.0 (earlier versions did not record those). Their
-leftover rows keep every Chromeria task of that source unknown. A delegated child
+leftover rows keep every Chromeria task of that source unknown. A 1.7.0
+ledger also kept no task reference for runs it could not parse: such a run
+keeps every task of its source unknown until a sync sees it valid in its
+source, or for good once it is deleted. A run that a newer Chromeria wrote
+in a shape Observer did not yet read heals the same way once Observer
+reads it. A turn on a provider Observer cannot read (such as `devReplay`)
+is a `provider_unsupported` gap. A delegated child
 that declared another task, or was deliberately unscoped, is another task's
 cost; `not counted` says how many there were. Native child agents, children
 without a declared purpose, active or remote children, and unpriced models

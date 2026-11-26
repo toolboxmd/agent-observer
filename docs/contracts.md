@@ -548,8 +548,10 @@ re-read every sync; workload bindings are durable ledger rows.
   rejected. Copies that disagree on a row's identity, a missing table, and a
   reference to a row that does not exist are rejects too.
 - Run classes: `t3_seen_runs` records every raw run row with a readable id
-  once, per source, with exactly one class; a refresh only inserts into it
-  and read commands never write it. Before a refresh replaces its source's
+  once, per source, with exactly one class, and `t3_source_classes` holds the
+  class each run has in its source now. A refresh inserts a run's recorded
+  class once and changes it only to heal an `invalid` record (below); read
+  commands never write it. Before a refresh replaces its source's
   rows, the runs the ledger already mirrors are recorded too, so a ledger
   written by 1.7.0 keeps the purpose runs it knew (it never mirrored
   pre-purpose runs, so those are recorded from the first 1.8.0 sync on). The class decides, for a run that
@@ -568,12 +570,24 @@ re-read every sync; workload bindings are durable ledger rows.
 
   A rejected row reaches a task by its own task reference or through the
   class of the run, or the runs on the thread, it names
-  (`native_rows_rejected`); a rejected run row is represented by its class.
-  A recorded run whose source now holds it under another task or class is a
-  conflict for both tasks (`conflicting_native_run_records`), on the
-  assumption that a Chromeria run's purpose is fixed when the run is
-  created. A deleted run's responses lose their purpose witness and leave
+  (`native_rows_rejected`); a rejected run row is represented by its class,
+  and a run or attempt row whose run id cannot be read names a run in no
+  class. Chromeria refuses to change a run's purpose once it exists, so for
+  a run present in its source now:
+  - A recorded `invalid` run that now parses as valid heals to its current
+    class when it has no stored task reference, or when its reference names
+    the task it now parses under. Only the parser can have changed.
+  - Any other difference between the recorded and current class or task,
+    including an `invalid` run whose reference names another task than it
+    now parses under and a `legacy` run that gains a purpose, is a conflict
+    for both tasks (`conflicting_native_run_records`).
+  A run absent from its source keeps its recorded class. A deleted run's responses lose their purpose witness and leave
   the task's subtotal; the gap says that run's usage is missing.
+- Unsupported providers: a provider thread whose driver is a well-formed
+  name Observer cannot read (for example `devReplay`, `acpRegistry`,
+  `cursor`) is mirrored. Its runs' attempts and provider turns are kept as
+  `t3_purpose_unsupported_turns`, which join no response and count as
+  `provider_unsupported` turns; their native operations are rejected.
 - Never ran: the refresh decides from raw rows before validation whether a
   run never ran: terminal, an explicit null `startedAt`, an active attempt
   that is null or one of its attempts, and every attempt with a null
