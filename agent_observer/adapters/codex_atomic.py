@@ -69,8 +69,11 @@ def relocated_source(src):
 def _moved_before_atoms(src, path):
     # Before context version 8 an import recorded no atomic observation, so
     # its responses keep that source until it is replayed. Once Codex moved
-    # the file, only this rollout can replay it. The recorded inode and the
-    # bytes before the read offset identify the move, never the name alone.
+    # the file, only this rollout can replay it. Identity rests on the
+    # recorded inode, name and size and on the hash of the 4 KiB before the
+    # read offset: older rows record nothing covering the whole file. A
+    # handed-off row has no context offset and never qualifies again, even
+    # when one of its responses stays conflicting.
     con = src.con
     if db._has_table(con, "codex_atomic_observations") and (src.row["codex_context_version"] or 0) >= 8:
         pending = ("EXISTS (SELECT 1 FROM codex_atomic_observations o WHERE o.source_id=? "
@@ -80,7 +83,7 @@ def _moved_before_atoms(src, path):
     matches = []
     for row in con.execute(f"""SELECT s.*,'codex:'||COALESCE(s.thread_id,s.session_id) AS session_key
             FROM sources s WHERE s.harness='codex' AND s.ino=? AND s.id!=? AND s.read_offset>0
-            AND s.tail_sha256 IS NOT NULL AND COALESCE(s.codex_context_version,0)<8
+            AND s.tail_sha256 IS NOT NULL AND s.codex_context_version<8 AND s.codex_context_offset IS NOT NULL
             AND EXISTS (SELECT 1 FROM responses r WHERE r.source_id=s.id AND {pending[0]})""",
                            (src.ino, src.source_id, *pending[1])):
         if os.path.basename(row["path"]) != os.path.basename(path):
@@ -141,7 +144,6 @@ def observe(r, obj, counters):
 def finish(r, predecessor):
     con, src = r.con, r.src
     incomplete = r.unreadable_atomic or src.incomplete_record or src.end_offset < src.size
-    refreshing = {src.source_id}
     if incomplete:
         legacy = (src.row["codex_context_version"] == 7 and con.execute(
             "SELECT 1 FROM import_errors WHERE harness='codex' AND source_path=? AND error='usage_conflict' LIMIT 1",
@@ -160,7 +162,6 @@ def finish(r, predecessor):
             # The archive was read from the start. Its source now owns the current
             # observations, including withdrawals. Keep the old raw ledger locators.
             old = predecessor["id"]
-            refreshing.add(old)
             r.atomic_ids.update(rid for rid, in con.execute(
                 "SELECT DISTINCT response_id FROM codex_atomic_observations WHERE source_id=?", (old,)))
             con.execute("DELETE FROM codex_atomic_observations WHERE source_id=?", (old,))
@@ -179,7 +180,7 @@ def finish(r, predecessor):
             con.execute("INSERT OR IGNORE INTO codex_atomic_observations SELECT * FROM prior_codex_atoms")
         con.execute("DROP TABLE temp.prior_codex_atoms")
     for rid in r.atomic_ids:
-        _reconcile(con, rid, refreshing)
+        _reconcile(con, rid, src.source_id)
 
 
 def _historical_atoms_survive(con, original, archive):
@@ -200,12 +201,16 @@ def _reconcile(con, rid, refreshing):
     if len(signatures) != 1 or not copies[0]["measurement"] or any(o["incomplete"] for o in copies):
         return
     first = copies[0]
-    row = con.execute("SELECT r.*,s.codex_context_version AS version FROM responses r JOIN sources s "
+    row = con.execute("SELECT r.*,s.codex_context_version AS version,s.codex_context_offset AS context_offset "
+                      "FROM responses r JOIN sources s "
                       "ON s.id=r.source_id WHERE r.response_id=?", (rid,)).fetchone()
     if row is None or row["session_key"] != first["session_key"]:
         return
     source = next((o for o in copies if o["source_id"] == row["source_id"]), first)
-    if source["source_id"] != row["source_id"] and row["source_id"] not in refreshing and (row["version"] or 0) < 8:
+    # A pre-upgrade source whose context offset was cleared was replayed as its verified move.
+    replayed = row["version"] is not None and row["context_offset"] is None
+    if (source["source_id"] != row["source_id"] and row["source_id"] != refreshing
+            and (row["version"] or 0) < 8 and not replayed):
         return  # The original pre-upgrade source has not been replayed.
     measured = json.loads(source["measurement"])
     same_source = source["source_id"] == row["source_id"]

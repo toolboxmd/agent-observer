@@ -96,8 +96,10 @@ class PreAtomicArchiveTest(LedgerCase):
     def assert_second_sync_is_a_no_op(self):
         tables = ("responses", "codex_atomic_observations", "native_response_inputs")
         before = {t: self.con.execute(f"SELECT * FROM {t} ORDER BY 1,2,3").fetchall() for t in tables}
+        changes = self.con.total_changes
         totals = codex.sync(self.con)
         self.assertEqual(totals["unchanged"], totals["sources"])
+        self.assertEqual(self.con.total_changes, changes)
         self.assertEqual({t: self.con.execute(f"SELECT * FROM {t} ORDER BY 1,2,3").fetchall()
                           for t in tables}, before)
         changes = self.con.total_changes
@@ -124,7 +126,27 @@ class PreAtomicArchiveTest(LedgerCase):
         self.assert_attributed()
         self.assert_second_sync_is_a_no_op()
 
+    def test_leftover_conflict_stays_conflicting_and_the_handoff_is_not_repeated(self):
+        # Two copies of one response in the moved file disagree. The other
+        # responses still move, and later syncs do not reread the rollout.
+        atom = next(json.loads(line) for line in self.original.read_text().splitlines()
+                    if '"resp-mini-003"' in line and '"token_usage_record"' in line)
+        atom["payload"]["usage"]["output_tokens"] += 7
+        with self.original.open("a") as stream:
+            stream.write(json.dumps(atom) + "\n")
+        codex.sync(self.con)
+        self.downgrade(self.original)
+        self.original.rename(self.archived)
+        codex.sync(self.con)
+        self.assertEqual(self.native(), (TURN_RESPONSES, ["codex:resp-mini-003"], ["reconciled"]))
+        owners = self.owners()
+        self.assertEqual(owners.pop("codex:resp-mini-003"), str(self.original))
+        self.assertEqual(set(owners.values()), {str(self.archived)})
+        self.assert_second_sync_is_a_no_op()
+        self.assertEqual(self.native(), (TURN_RESPONSES, ["codex:resp-mini-003"], ["reconciled"]))
+
     def test_different_file_with_the_same_name_stays_conflicting(self):
+        # The inode filter rejects this copy before any bytes are compared.
         self.downgrade(self.original)
         moved = self.original.read_bytes()
         self.archived.write_bytes(moved.replace(b'"redacted body"', b'"another body"'))
@@ -133,6 +155,8 @@ class PreAtomicArchiveTest(LedgerCase):
         self.assert_conflicting()
 
     def test_moved_inode_with_rewritten_bytes_stays_conflicting(self):
+        # Older imports hashed only the 4 KiB before their read offset, so the
+        # rewrite sits inside that window. An earlier rewrite would pass.
         self.downgrade(self.original)
         self.original.rename(self.archived)
         with self.archived.open("r+b") as stream:
