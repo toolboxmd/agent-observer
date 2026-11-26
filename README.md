@@ -206,8 +206,9 @@ with an unavailable or zero denominator display as unknown (`null` in JSON).
 When Grok or a Codex fallback snapshot records a counter conflict without
 identifying the affected response, input measurements under those counter
 semantics stay unknown for the session.
-Run `sync` after upgrading to recover the counter family of old Codex
-quarantine records when the rollout is still available.
+Run `sync` after upgrading to recover counter families for old Codex
+quarantine records and source locations for unmeasured Claude Code finals
+when the native files are still available.
 
 Comparisons are observational: groups differ in period, projects and task
 mix, so differences are leads to inspect, not causal effects. Detector

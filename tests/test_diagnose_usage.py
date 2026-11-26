@@ -369,7 +369,7 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertEqual([p["response_id"] for p in timeline], ["claude:final-1", "claude:final-2"])
         self.assertEqual([p["input_tokens"] for p in timeline], [100, None])
         self.assertIsNotNone(timeline[1]["source_id"])
-        self.assertIsNone(timeline[1]["ordinal_num"])
+        self.assertEqual(timeline[1]["ordinal_num"], 1)
         cache, = result["cache_observations"]
         self.assertEqual(cache["responses"], 2)
         self.assertIsNone(cache["cached_input_share"])
@@ -378,6 +378,17 @@ class DiagnoseUsageTest(LedgerCase):
                                     "--until", "2026-10-01T12:00:03Z")
         self.assertEqual(bounded["context_growth"], result["context_growth"])
         self.assertEqual(bounded["cache_observations"], [cache])
+        early = self.run_diagnose("--session", f"claude:{session}",
+                                  "--until", "2026-10-01T12:00:01.500Z")
+        self.assertEqual([p["response_id"] for p in early["context_growth"][0]["timeline"]],
+                         ["claude:final-1"])
+        self.assertEqual(early["cache_observations"][0]["cached_input_share"], 0.8)
+
+        self.con.execute("DELETE FROM claude_final_blocks WHERE response_id='claude:final-2'")
+        self.con.execute("UPDATE sources SET claude_usage_version=18 WHERE path=?", (str(log),))
+        self.assertGreater(claude.import_claude_file(self.con, str(log))["lines"], 0)
+        self.assertEqual(claude.import_claude_file(self.con, str(log))["lines"], 0)
+        self.assertEqual(self.run_diagnose("--session", f"claude:{session}"), result)
 
     def test_opencode_import_surfaces_completed_response_without_counters(self):
         path = str(Path(self.tmp.name) / "opencode.db")
