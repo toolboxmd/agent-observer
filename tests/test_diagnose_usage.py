@@ -456,6 +456,27 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertIsNone(cache["cached_input_share"])
         self.assertEqual(cache["unlocated_usage_sessions"], 1)
 
+    def test_opencode_quarantine_on_session_move_qualifies_destination_cache(self):
+        source = str(Path(self.tmp.name) / "opencode-move.db")
+        build_native(source)
+        with contextlib.closing(sqlite3.connect(source)) as native:
+            # Keep the destination in the top-level diagnosis scope.
+            native.execute("UPDATE session SET parent_id=NULL WHERE id='ses_child'")
+            native.commit()
+        opencode.sync(self.con, source=source)
+        initial = self.run_diagnose("--session", "opencode:ses_child")
+        self.assertIsNotNone(initial["cache_observations"][0]["cached_input_share"])
+        with contextlib.closing(sqlite3.connect(source)) as native:
+            native.execute("UPDATE message SET session_id='ses_child' WHERE id='msg_a1'")
+            native.execute("UPDATE session SET time_updated=? WHERE id IN ('ses_parent','ses_child')",
+                           (T0 + 500,))
+            native.commit()
+        opencode.sync(self.con, source=source)
+        result = self.run_diagnose("--session", "opencode:ses_child")
+        group, = result["cache_observations"]
+        self.assertEqual(group["unlocated_usage_sessions"], 1)
+        self.assertIsNone(group["cached_input_share"])
+
     def test_grok_quarantined_usage_qualifies_cache_without_removing_measurement(self):
         cases = (("malformed", "400", 400), (None, 400, 400), ("measured", 500, None))
         for index, (prompt, tokens, expected) in enumerate(cases, 1):

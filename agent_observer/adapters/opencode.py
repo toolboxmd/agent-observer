@@ -411,13 +411,14 @@ def unavailable_usage_locations(con, session_key):
 
 
 def has_unlocated_usage_error(con, session_key):
-    # Older adapters quarantined a malformed usage record by ordinal only.
-    # Keep the session's cost open without guessing which message failed.
+    # Cross-session response collisions and older malformed usage receipts
+    # identify the source and ordinal without identifying a response.
     return con.execute(
         "SELECT 1 FROM sources s WHERE s.harness=? AND s.session_id=? AND "
-        "(s.sha256 GLOB 'oc[4-8]:unlocated' OR (s.sha256 NOT GLOB 'oc[4-8]:*' AND EXISTS (SELECT 1 FROM import_errors e "
-        "WHERE e.harness=s.harness AND e.source_path=s.path AND e.error='malformed_usage' "
-        "AND instr(','||e.line_excerpt||',', ',tokens,')>0))) LIMIT 1",
+        "(s.sha256 GLOB 'oc[4-8]:unlocated' OR EXISTS (SELECT 1 FROM import_errors e "
+        "WHERE e.harness=s.harness AND e.source_path=s.path AND (e.error='usage_conflict' OR "
+        "(s.sha256 NOT GLOB 'oc[4-8]:*' AND e.error='malformed_usage' "
+        "AND instr(','||e.line_excerpt||',', ',tokens,')>0)))) LIMIT 1",
         (HARNESS, session_key.partition(":")[2])).fetchone() is not None
 
 
