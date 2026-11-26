@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.9.1] - 2026-11-26
+
+### Changed
+
+- Sanitize price sources and basis labels in published summaries
+
 ## [1.9.0] - 2026-11-26
 
 ### Added

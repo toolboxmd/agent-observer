@@ -14,6 +14,7 @@ import re
 import shlex
 import subprocess
 from datetime import datetime, timezone
+from urllib.parse import urlsplit, urlunsplit
 
 from . import analysis, report
 from .outcome import purpose_evidence
@@ -27,6 +28,17 @@ _SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
 _GITHUB_URL_RE = re.compile(
     r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
     r"(/((issues|pull|commit)/[A-Za-z0-9_.-]+))?/?$")
+_DEFAULT_PRICE_BASIS = "Standard API list-price equivalent, not subscription spend."
+_PUBLIC_PRICE_BASES = (
+    _DEFAULT_PRICE_BASIS,
+    "API list-price equivalent; not subscription spend",
+    "Standard API list-price equivalent, not subscription spend or an invoice. "
+    "Service-tier discounts and premiums excluded.",
+    "T3 LiteLLM rate table when present; bundled schedule covers the rest.",
+)
+_INVALID_URL_CHARACTER = re.compile(r"[\s\x00-\x1f\x7f\\]")
+_PRICE_URL_AUTHORITY = re.compile(r"(?:[A-Za-z0-9._~-]+|\[[A-Fa-f0-9:.]+\])(?::[0-9]+)?")
+_PRICE_URL_PATH = re.compile(r"(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-Fa-f]{2})*")
 
 
 def validate_target(repo: str, pr: int | None = None,
@@ -68,9 +80,9 @@ def _safe_field(value) -> str:
 def _safe_source(value) -> str:
     """A publishable price-source label; local paths never leave the machine.
 
-    Public http(s) schedule and model sources render unchanged
-    (Markdown-escaped). Every other value, a file:// URI or a raw path such
-    as the bundled fallback, renders as a stable label naming the kind with
+    HTTP(S) sources retain only the scheme, host, port and path.
+    Other sources, including a file:// URI or a raw path such
+    as the bundled fallback, render as a stable label naming the kind with
     the path withheld, so a requested publish cannot expose a
     home-directory path. The T3 table is recognized by its fixed filename;
     every other local source stays a generic local schedule.
@@ -78,7 +90,19 @@ def _safe_source(value) -> str:
     if value is None or value == "":
         return "unknown"
     if isinstance(value, str) and value.startswith(("https://", "http://")):
-        return _safe_field(value)
+        # urlsplit silently removes some controls before returning components.
+        if _INVALID_URL_CHARACTER.search(value):
+            return "price source (URL withheld)"
+        try:
+            url = urlsplit(value)
+            authority = url.netloc.rsplit("@", 1)[-1]
+            if (_PRICE_URL_AUTHORITY.fullmatch(authority)
+                    and _PRICE_URL_PATH.fullmatch(url.path)
+                    and (url.port or 0) <= 65535):
+                return _safe_field(urlunsplit((url.scheme, authority, url.path, "", "")))
+        except ValueError:
+            pass
+        return "price source (URL withheld)"
     if isinstance(value, str) and value.endswith("usage-model-rates.json"):
         return "T3 local rate table (path withheld)"
     return "local schedule (path withheld)"
@@ -529,10 +553,11 @@ def render(summary: dict, target: str | None = None) -> str:
                          f"{_safe_field(est.get('schedule_as_of'))}, schedule "
                          f"`{_safe_field(summary.get('price_schedule_id'))}`. "
                          f"Unknown prices stay unknown, never zero.")
-            # Only the schedule-level basis is published; per-model basis
-            # text from a caller's schedule never is (see #30).
             by_model = (total.get("estimate") or {}).get("by_model", [])
-            lines.append(f"  - {_safe_field(est.get('basis') or 'Standard API list-price equivalent, not subscription spend.')}")
+            basis = est.get("basis") or _DEFAULT_PRICE_BASIS
+            if basis not in _PUBLIC_PRICE_BASES:
+                basis = "custom schedule basis (withheld)"
+            lines.append(f"  - {basis}")
             sources = {_safe_source(m.get("source_url")) for m in by_model}
             if sources:
                 lines.append(f"  - Model price sources: {', '.join(sorted(sources))}.")

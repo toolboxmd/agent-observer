@@ -289,6 +289,66 @@ class PublishTest(LedgerCase):
         body = publish.render(summary)
         self.assertIn("https://example.com/pricing", body)
 
+    def test_custom_price_sources_are_sanitized(self):
+        summary = publish.summarize(self.con, {"claude:s1"}, "task T")
+        summary["scope_kind"] = "task"
+        for unsafe_source, safe_source, withheld in (
+            ("https://example-user:fixture-password@pricing.example.test/rates",
+             "https://pricing.example.test/rates", "fixture-password"),
+            ("http://pricing.example.test:8080/rates?token=fixture-token",
+             "http://pricing.example.test:8080/rates", "fixture-token"),
+            ("https://pricing.example.test/rates#fixture-fragment",
+             "https://pricing.example.test/rates", "fixture-fragment"),
+            ("https://[fixture-malformed/rates",
+             "price source (URL withheld)", "fixture-malformed"),
+            ("https://pricing.example.test%ZZ/rates",
+             "price source (URL withheld)", "%ZZ"),
+            ("https://pricing.example.test/fixture\tprivate",
+             "price source (URL withheld)", "fixtureprivate"),
+            ("https://pricing.example.test/rates/[fixture-private](https://other.test/)",
+             "price source (URL withheld)", "fixture-private"),
+            ("https://[2001:db8::1]fixture-malformed/rates",
+             "price source (URL withheld)", "fixture-malformed"),
+            ("https://[2001:db8::1]:8443/rates?token=fixture-token",
+             "https://[2001:db8::1]:8443/rates", "fixture-token"),
+            ("https://pricing.example.test/rate%20card?token=fixture-token",
+             "https://pricing.example.test/rate%20card", "fixture-token"),
+        ):
+            with self.subTest(withheld=withheld):
+                estimate = {
+                    "schedule_source": unsafe_source,
+                    "by_model": [{"source_url": unsafe_source,
+                                  "basis": "fixture-model-notes"}],
+                }
+                summary["estimated_cost"] = estimate
+                summary["total_cost"] = {"text": "$0.00", "estimate": estimate}
+                body = publish.render(summary)
+                self.assertNotIn(withheld, body)
+                self.assertNotIn("fixture-model-notes", body)
+                self.assertIn(f"estimate from {safe_source} as of", body)
+                self.assertIn(f"Model price sources: {safe_source}.", body)
+
+    def test_only_known_price_basis_labels_render(self):
+        summary = publish.summarize(self.con, {"claude:s1"}, "task T")
+        summary["scope_kind"] = "task"
+        for basis, expected in (
+            ("Private notes at /example-home/fixture-notes.txt",
+             "custom schedule basis (withheld)"),
+            ("Standard API list-price equivalent, not subscription spend or an "
+             "invoice. Service-tier discounts and premiums excluded.", None),
+            ("T3 LiteLLM rate table when present; bundled schedule covers the rest.",
+             None),
+        ):
+            with self.subTest(basis=basis):
+                summary["estimated_cost"] = {
+                    "schedule_source": "https://pricing.example.test/rates",
+                    "basis": basis,
+                }
+                body = publish.render(summary)
+                self.assertIn(f"  - {expected or basis}", body)
+                if expected:
+                    self.assertNotIn(basis, body)
+
     def test_raw_fallback_schedule_path_is_withheld(self):
         # Bundled schedule unusable and no T3 rate table: default_schedule
         # falls back to the raw bundled path, which must not be published.
