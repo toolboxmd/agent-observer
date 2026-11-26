@@ -522,6 +522,26 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertEqual(group["unlocated_usage_sessions"], 1)
         self.assertIsNone(group["cached_input_share"])
 
+    def test_opencode_in_window_copy_keeps_projected_counter_conflict_visible(self):
+        session = "scoped-open-conflict"
+        for name, completed, reads in (("a-first.db", 20, 60), ("z-later.db", 40, 40)):
+            source = str(Path(self.tmp.name) / name)
+            build_native(source)
+            with contextlib.closing(sqlite3.connect(source)) as native:
+                native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                               (session, None, "/fixture", "Scoped", "1", None,
+                                "build", T0, T0 + 1000, None))
+                usage = _msg("assistant", T0 + 10, T0 + completed, _tokens(20, 1, 0, reads, 0))
+                native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                               ("scoped-response", session, T0 + 10, T0 + completed, usage))
+                native.commit()
+            opencode.sync(self.con, source=source)
+        result = self.run_diagnose("--session", f"opencode:{session}", "--since", str((T0 + 30) / 1000))
+        point, = result["context_growth"][0]["timeline"]
+        self.assertEqual(point["ts"], (T0 + 40) / 1000)
+        self.assertIsNone(point["input_tokens"])
+        self.assertIsNone(result["cache_observations"][0]["cached_input_share"])
+
     def test_grok_quarantined_usage_qualifies_cache_without_removing_measurement(self):
         cases = (("malformed", "400", 400), (None, 400, 400), ("measured", 500, None))
         for index, (prompt, tokens, expected) in enumerate(cases, 1):

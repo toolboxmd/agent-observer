@@ -584,7 +584,8 @@ def _sort_context(con, key, harness, timeline):
 
 def _opencode_context_rows(con, key, measured, since, until):
     witnesses, conflicts, unavailable = opencode.response_witnesses(con, key)
-    gaps = _group_usage_locations(opencode.unavailable_usage_locations(con, key))
+    copies_by_response = _group_usage_locations(opencode.usage_locations(
+        con, key, include_measured=bool(conflicts and (since is not None or until is not None))))
 
     def turn_id(rid, parents):
         if rid not in conflicts and len(parents) == 1:
@@ -598,14 +599,22 @@ def _opencode_context_rows(con, key, measured, since, until):
 
     for row in measured:
         rid = row["response_id"]
-        gap = gaps.pop(rid, None)
+        copies = copies_by_response.pop(rid, [])
+        gap = next((copy for copy in copies if not copy["measured"]), None)
         if gap is not None:
-            place = _select_usage_location([row, *gap], since, until)
+            place = _select_usage_location([row, *copies], since, until)
             if place is not None:
-                yield dict(unknown_row(place), usage_gap=dict(gap[0]))
+                yield dict(unknown_row(place), usage_gap={field: gap[field] for field in
+                                                          ("source_id", "ordinal_num", "ts")})
         else:
-            yield dict(row, turn_id=row["turn_id"] or turn_id(rid, witnesses.get(rid, ())))
-    for copies in gaps.values():
+            resolved_turn = row["turn_id"] or turn_id(rid, witnesses.get(rid, ()))
+            if rid in conflicts and not _in_usage_window(row["ts"], since, until):
+                place = _select_usage_location([row, *copies], since, until)
+                if place is not None:
+                    yield dict(row, **(place | {"turn_id": resolved_turn}))
+            else:
+                yield dict(row, turn_id=resolved_turn)
+    for copies in copies_by_response.values():
         place = _select_usage_location(copies, since, until)
         if place is not None:
             yield unknown_row(place)
