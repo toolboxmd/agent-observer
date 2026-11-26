@@ -224,3 +224,32 @@ class DiagnoseUsageTest(LedgerCase):
         cache, = result["cache_observations"]
         self.assertEqual(cache["responses"], 1)
         self.assertIsNone(cache["cached_input_share"])
+
+    def test_opencode_role_conflict_qualifies_usage_in_both_import_orders(self):
+        for index, roles in enumerate((("assistant", "user"), ("user", "assistant"))):
+            with self.subTest(roles=roles):
+                session = f"role-conflict-{index}"
+                paths = {}
+                for role in roles:
+                    path = str(Path(self.tmp.name) / f"{session}-{role}.db")
+                    paths[role] = path
+                    build_native(path)
+                    with contextlib.closing(sqlite3.connect(path)) as native:
+                        native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                                       (session, None, "/fixture", "Role", "1", None,
+                                        "build", T0, T0 + 1000, None))
+                        data = _msg(role, T0 + 20, T0 + 30, _tokens(0, 1, 0, 40, 0))
+                        native.execute("INSERT INTO message VALUES(?,?,?,?,?)",
+                                       (session, session, T0 + 20, T0 + 30, data))
+                        native.commit()
+                    opencode.sync(self.con, source=path)
+                result = self.run_diagnose("--session", f"opencode:{session}")
+                point, = result["context_growth"][0]["timeline"]
+                self.assertIsNone(point["input_tokens"])
+                gap_source = self.con.execute("SELECT id FROM sources WHERE path=?",
+                                              (f"{paths['user']}#{session}",)).fetchone()[0]
+                self.assertEqual(point["usage_gap"]["source_id"], gap_source)
+                cache, = result["cache_observations"]
+                self.assertEqual(cache["responses"], 1)
+                self.assertIsNone(cache["cached_input_tokens"])
+                self.assertIsNone(cache["cached_input_share"])
