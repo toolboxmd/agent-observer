@@ -27,6 +27,12 @@ def active(con, task_id):
     ).fetchone() is not None
 
 
+def purpose_evidence(native):
+    """Whether Chromeria purpose evidence decides this task: runs, deliveries or rejects."""
+    return bool(native and (native["runs"] or native["deliveries"] or native["conflicting_source_runs"]
+                            or native.get("rejected_rows")))
+
+
 def legacy_link(evidence):
     return evidence == "t3" or (evidence or "").startswith("t3:")
 
@@ -107,8 +113,12 @@ def evidence(con, task_id, scope):
             continue
         _session_ownership(con, key, task_id, by_run, reference_conflict, result, members)
 
-    if runs or deliveries or session_runs or disputed_runs:
+    # A rejected Chromeria row tied to this task is Chromeria evidence for it
+    # even when no valid purpose run exists, so it is read here, before any gate.
+    rejected = _rejected(con, {"runs": runs, "conflicting_source_runs": disputed_runs, "task_id": task_id})
+    if runs or deliveries or session_runs or disputed_runs or rejected:
         result.native = {"version": 1, "task_id": task_id, "runs": runs, "deliveries": deliveries,
+                         "rejected_rows": rejected,
                          "membership": members, "sessions": session_runs,
                          "unavailable_response_usage": sorted(result.unavailable_usage),
                          "unlocated_usage_sessions": sorted(result.unlocated_usage_sessions),
@@ -646,8 +656,7 @@ def check_inventory(con, native, rows):
         run["participants"] = [dict(r) for r in con.execute(
             "SELECT * FROM t3_purpose_participants WHERE run_id=? ORDER BY kind,participant_id", (run_id,))]
         _children(con, native["task_id"], run, gaps, not_counted)
-    native["rejected_rows"] = _rejected(con, native)
-    for item in native["rejected_rows"]:
+    for item in native.get("rejected_rows") or []:
         gaps.add("native_rows_rejected", "rows", tuple(item.values()))
     if native["conflicting_reference_kinds"]:
         for run in native["runs"]:

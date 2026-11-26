@@ -538,15 +538,17 @@ re-read every sync; workload bindings are durable ledger rows.
 - Rejected rows: every row of a projection table that decides completeness
   (`runs`, `run_attempts`, `provider_turns`, `provider_threads` with their
   native operations and pending background tasks, `subagents`, subagent
-  `turn_items`, native segments) is either mirrored, out of scope by a named
-  rule (a readable run without `purpose` and the rows that belong to it,
-  provider turns of native child threads), or recorded in
+  `turn_items` selected by row or payload type, native segments) is either
+  mirrored, out of scope by a named rule (a readable run without `purpose`
+  and the rows that belong to it, provider turns without an attempt on a
+  provider-native child's provider thread), or recorded in
   `t3_purpose_rejects` with the run, thread and task references it still
   carries. A run whose purpose fails validation is mirrored and also
   rejected. Copies that disagree on a row's identity, a missing table, and a
   reference to a row that does not exist are rejects too. A report keeps
-  unknown every task a reject is tied to by task, run or thread, and every
-  task of the source when it is tied to nothing (`native_rows_rejected`).
+  unknown every task a reject is tied to by task, run or thread, including a
+  task with no valid purpose run, and every task of the source when it is
+  tied to nothing (`native_rows_rejected`).
 - Never ran: the refresh decides from raw rows before validation whether a
   run never ran: terminal, an explicit null `startedAt`, an active attempt
   that is null or one of its attempts, and every attempt with a null

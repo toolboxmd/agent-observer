@@ -542,7 +542,10 @@ def _subagents(snapshot, native, tables, runs, legacy, segments):
 def _expected_children(snapshot, native, tables, runs, legacy):
     # A subagent turn item names the expected child even if its own projection
     # or the remote ledger is missing. Avoid reading unrelated text/tool items.
-    for row, p in _rows(native, tables, "turn_items", " WHERE type='subagent'"):
+    # Select on the row type or the payload type, then validate, so a row
+    # whose two types disagree is rejected rather than skipped.
+    for row, p in _rows(native, tables, "turn_items", " WHERE type='subagent' OR (json_valid(payload_json)"
+                        " AND json_extract(payload_json,'$.type')='subagent')"):
         run = _id(row.get("run_id"))
         if (run not in runs or runs[run][0] != row.get("thread_id")
                 or not _matches(row, p, ("run_id", "runId"), ("thread_id", "threadId"),
@@ -607,12 +610,17 @@ def _grok_call_refs(snapshot, native, tables, owner, columns):
             snapshot.insert("grok_calls", key, call, turn, row["turn_item_id"])
 
 
-def _turns(snapshot, native, tables, attempts, owners, legacy):
+def _turns(snapshot, native, tables, attempts, owners, legacy, children):
     item_columns = {r[1] for r in native.execute("PRAGMA table_info(orchestration_v2_projection_turn_items)")}
+    child_threads = {pt for _, pt in children.values() if pt}
     for row, p in _rows(native, tables, "provider_turns"):
         raw_attempt = row.get("run_attempt_id") or p.get("runAttemptId")
         if raw_attempt is None:
-            continue  # Out of scope here: a native child thread's turn (see _child_turns).
+            if row.get("provider_thread_id") in child_threads:
+                continue  # Out of scope here: a native child thread's turn (see _child_turns).
+            snapshot.reject("provider_turns", "attempt_missing", row.get("provider_turn_id"),
+                            thread=row.get("thread_id") or p.get("threadId"))
+            continue
         owner = owners.get(raw_attempt)
         if owner in legacy:
             continue  # Out of scope: a turn of a legacy run.
@@ -973,8 +981,8 @@ def refresh(con, native, tables):
         segments = []
         providers = _providers(snapshot, native, tables, runs, legacy, segments)
         attempts, owners = _attempts(snapshot, native, tables, runs, legacy, providers)
-        _turns(snapshot, native, tables, attempts, owners, legacy)
         children = _subagents(snapshot, native, tables, runs, legacy, segments)
+        _turns(snapshot, native, tables, attempts, owners, legacy, children)
         _expected_children(snapshot, native, tables, runs, legacy)
         boundaries = _segments(snapshot, segments, runs, children)
         _child_turns(snapshot, native, tables, boundaries, providers)

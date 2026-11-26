@@ -13,6 +13,7 @@ from . import CAPTURE_CONTRACT_VERSION, EVENT_CONTRACT_VERSION, SCHEMA_VERSION
 from . import adapters as _adapters
 from .adapters import bare as _bare
 from . import analysis as _analysis
+from . import outcome as _outcome
 from . import db as _db
 from . import health as _health
 from . import identity as _identity
@@ -175,7 +176,7 @@ def _text(payload) -> str:
             f"({r.get('time', {}).get('session_span_label')})",
         ]
         native = r.get("native_purpose") or {}
-        if native.get("runs") or native.get("deliveries") or native.get("conflicting_source_runs"):
+        if _outcome.purpose_evidence(native):
             lines.append(f"  native purpose: {len(native['runs'])} runs, "
                          f"{len(native['membership'])} joined responses")
             if native.get("coverage_gaps"):

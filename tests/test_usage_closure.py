@@ -597,6 +597,59 @@ class UsageClosureTest(LedgerCase):
         self.assertEqual(self.gaps(rep), {"native_rows_rejected": (1, "rows")})
         self.assertIn("unknown (observed priced subtotal", rep["total_cost"]["text"])
 
+    def assigned_outside_chromeria(self):
+        """A task whose only measured work is a Claude session assigned to it whole."""
+        self.claude_transcript([claude_user("u-a", None, "a"), assistant("r1", "u-a", "msg-1")])
+        self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES(?,0)", (TASK,))
+        self.con.execute("INSERT INTO session_assignments VALUES('claude:s',?,'capture',1)", (TASK,))
+        # The source has a valid run for another task, so the mirror is refreshed.
+        self.run_turn("other", "claudeAgent", "s2", inputs=[], usage=claude_usage(1, 1), purpose=OTHER)
+
+    def test_a_rejected_run_naming_a_task_with_no_valid_run_keeps_it_unknown(self):
+        self.assigned_outside_chromeria()
+        rep = self.native_report()
+        self.assertEqual(rep["total_cost"]["status"], "complete")
+        for name, run, payload in (
+                ("unknown provenance", "rejected", dict(PURPOSE, provenance=dict(type="future_kind"))),
+                ("unparseable run id", "not a valid id", PURPOSE)):
+            with self.subTest(name):
+                self.native.execute(f"DELETE FROM {PREFIX}runs WHERE run_id NOT IN ('other')")
+                self.row("runs", [run, "t", "completed"], dict(id=run, threadId="t", purpose=payload,
+                                                               status="completed", startedAt=TIME))
+                rep = self.native_report()
+                self.assertNotEqual(rep["total_cost"]["status"], "complete")
+                self.assertEqual(self.gaps(rep)["native_rows_rejected"], (1, "rows"))
+                self.assertIn("native coverage: ", self.cli())
+
+    def test_a_rejected_segment_naming_a_task_with_no_valid_run_keeps_it_unknown(self):
+        self.assigned_outside_chromeria()
+        segment = dict(self.segment("background", source_run="other", child="shell"),
+                       purpose=dict(PURPOSE, provenance=dict(type="future_kind")))
+        self.native.execute(f"UPDATE {PREFIX}provider_threads SET payload_json=json_set(payload_json,"
+                            "'$.nativeOperations',json(?)) WHERE provider_thread_id='pt-claudeAgent'",
+                            (json.dumps([segment]),))
+        rep = self.native_report()
+        self.assertNotEqual(rep["total_cost"]["status"], "complete")
+        self.assertEqual(self.gaps(rep)["native_rows_rejected"], (1, "rows"))
+        self.assertEqual(rep["native_purpose"]["rejected_rows"][0]["table_name"], "segments")
+
+    def test_a_turn_without_an_attempt_off_any_child_thread_is_a_rejected_row(self):
+        self.closed_turn()
+        self.row("provider_turns", ["turn-loose", "t", "pt-claudeAgent", None, "node-loose"], dict(
+            id="turn-loose", nodeId="node-loose", providerThreadId="pt-claudeAgent", runAttemptId=None,
+            status="completed", nativeInputs=[], turnTokenUsage=claude_usage(500, 50)))
+        rep = self.native_report()
+        self.assertEqual(self.gaps(rep), {"native_rows_rejected": (1, "rows")})
+        self.assertEqual(rep["native_purpose"]["rejected_rows"][0]["reason"], "attempt_missing")
+
+    def test_a_subagent_item_whose_row_and_payload_types_disagree_is_a_rejected_row(self):
+        self.closed_turn()
+        self.row("turn_items", ["item-1", "t", "c1", "pt-claudeAgent", "turn-c1", "text"], dict(
+            id="item-1", threadId="t", runId="c1", type="subagent", subagentId="job"))
+        rep = self.native_report()
+        self.assertEqual(self.gaps(rep), {"native_rows_rejected": (1, "rows")})
+        self.assertEqual(rep["native_purpose"]["rejected_rows"][0]["table_name"], "turn_items")
+
     def test_a_missing_projection_table_keeps_every_task_of_its_source_unknown(self):
         self.closed_turn()
         self.native.execute(f"DROP TABLE {PREFIX}subagents")
