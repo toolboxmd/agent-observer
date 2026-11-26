@@ -147,6 +147,22 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertIsNone(native["cached_input_share"])
         self.assertIsNone(native["cached_input_tokens"])
 
+    def test_codex_unindexed_atom_keeps_same_source_compaction_order(self):
+        lines = [json.loads(line) for line in Path(fixture("codex-mini.jsonl")).read_text().splitlines()]
+        valid = next(row for row in lines if row["type"] == "token_usage_record")
+        boundary = next(row for row in lines if row["type"] == "compacted")
+        boundary.pop("timestamp")
+        malformed = json.loads(json.dumps(valid))
+        malformed["payload"]["response_id"] = "unindexed"
+        malformed["payload"]["usage"] = {"input_tokens": -1}
+        log = Path(self.tmp.name) / "rollout.jsonl"
+        log.write_text("\n".join(map(json.dumps, (lines[0], valid, boundary, malformed))) + "\n")
+        codex.import_codex_file(self.con, str(log))
+        session, = self.run_diagnose("--harness", "codex")["context_growth"]
+        self.assertEqual([p["kind"] for p in session["timeline"]], ["input", "compaction", "input"])
+        self.assertEqual(session["timeline"][-1]["response_id"], "codex:unindexed")
+        self.assertEqual(session["order"], "native")
+
     def test_claude_disputed_cache_reads_stay_unknown_in_both_import_orders(self):
         for index, reads in enumerate(((20, 80), (80, 20))):
             with self.subTest(reads=reads):

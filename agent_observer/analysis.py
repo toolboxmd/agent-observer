@@ -555,16 +555,25 @@ def _sort_context(con, key, harness, timeline):
         by_identity = {
             ("response", point["response_id"]) if point["kind"] == "input"
             else ("event", str(point["event_id"])): point for point in timeline}
-        state, groups, _ = codex_order.resolve(con, key, set(by_identity))
+        state, groups, sequences = codex_order.resolve(con, key, set(by_identity))
         if state == "known":
             timeline[:] = [by_identity[identity] for group in groups for identity in sorted(group)]
             return "native"
-        if state == "absent" and len({point["source_id"] for point in timeline}) == 1 and all(
-                point["source_id"] is not None and point["ordinal_num"] is not None
-                for point in timeline):
-            timeline.sort(key=lambda point: (
-                point["ordinal_num"], point["kind"], point.get("response_id", point.get("event_id"))))
-            return "native"
+        if state in {"absent", "partial"}:
+            sources = {point["source_id"] for point in timeline}
+            positions = {identity: point["ordinal_num"] for identity, point in by_identity.items()}
+            # A malformed atom can have a physical locator but no indexed
+            # occurrence. Use a common source if indexed copies agree with it.
+            if len(sources) == 1 and None not in sources and None not in positions.values():
+                for sequence in sequences:
+                    projected = [pos for group in sequence
+                                 for pos in sorted(positions[identity] for identity in group)]
+                    if projected != sorted(projected):
+                        break
+                else:
+                    timeline[:] = [by_identity[identity] for identity in
+                                   sorted(by_identity, key=lambda item: (positions[item], item))]
+                    return "native"
     timeline.sort(key=lambda point: (
         point["ts"] is None, point["ts"] or 0,
         point["source_id"] or 0, point["ordinal_num"] or 0,
