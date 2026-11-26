@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import sqlite3
 from collections import defaultdict
 
 from .. import db, lookup, native_response
@@ -59,6 +60,108 @@ def relocated_source(src):
             continue
         matches.append(row)
     return matches[0] if len(matches) == 1 else None
+
+
+def source_columns(con, table):
+    """Columns of ``table`` that name a ``sources`` row."""
+    refs = {fk[3] for fk in con.execute(f'PRAGMA foreign_key_list("{table}")') if fk[2] == "sources"}
+    return refs | {c[1] for c in con.execute(f'PRAGMA table_info("{table}")') if c[1] == "source_id"}
+
+
+class UnclassifiedTable(sqlite3.DatabaseError):
+    """A table names a source but has no key that says how to fold its rows."""
+
+
+def _fold_action(con, table, column):
+    """How a folded source's rows in ``table`` are handed to the adopted row.
+
+    A row whose primary or unique key includes the source column belongs to
+    that source's import and is deleted: the replay writes it again. A row
+    with a key of its own is re-pointed. A table with no primary or unique key
+    cannot be classified, so the fold stops instead of guessing: deleting
+    could lose rows the replay never writes again, and re-pointing could
+    duplicate rows it does.
+    """
+    keys = [[c[1] for c in sorted(con.execute(f'PRAGMA table_info("{table}")'), key=lambda c: c[5]) if c[5]]]
+    for index in con.execute(f'PRAGMA index_list("{table}")'):
+        if index[2]:
+            keys.append([c[2] for c in con.execute(f'PRAGMA index_info("{index[1]}")')])
+    keys = [k for k in keys if k]
+    if not keys:
+        raise UnclassifiedTable(f"cannot fold {table}.{column}: the table has no primary or unique key")
+    return "delete" if any(column in k for k in keys) else "repoint"
+
+
+def adopt_moved_source(con, path):
+    """Make the moved file's older source row the one that stands for ``path``.
+
+    Before context version 8 an import recorded no atomic observation, so its
+    responses keep that source until the file is replayed. Codex later moves a
+    finished rollout to ``archived_sessions`` with the same inode and bytes.
+    When exactly one such row's recorded inode, name, size and the hash of the
+    4 KiB before its read offset identify this file at its new path, that row
+    takes the new path, as if the file had never moved. The import that
+    follows then replays the row in place, so every version-, path- and
+    thread-dependent rule applies to it unchanged. A row from before context
+    versions is not adopted.
+
+    A released version may already have imported the new path as its own
+    source. That source is folded into the adopted row by the schema (see
+    ``_fold_action``) and removed, and its Codex import errors at the new path
+    are dropped for the replay to record again. Four things cannot return to
+    the in-place state, so they stay as the separate import left them:
+
+    - Its AUTOINCREMENT event and import-error ids are never reused, so
+      ``event show`` and trace ids stay stable.
+    - Rows only it added stay with the adopted row, since assignments,
+      delegations and intervention evidence reference user messages.
+    - Session-keyed rows without a source column stay, since nothing names
+      their writer.
+    - Checkout diagnostics it captured for events the older import lacked
+      stay. The replay cannot capture them again, because the records are
+      not new, and checkout diagnostics cannot grant ownership
+      (``placement.read_placements``).
+    """
+    full = os.path.abspath(path)
+    if not any(part in full for part in ("/sessions/", "/archived_sessions/")):
+        return None
+    try:
+        ino = os.stat(path).st_ino
+    except OSError:
+        return None
+    matches = []
+    for row in _moved_before_atoms(con, path, ino):
+        if os.path.basename(row["path"]) != os.path.basename(full):
+            continue
+        resolved = lookup.resolve_source(row)
+        if resolved["reason"] == "relocated" and os.path.abspath(resolved["path"]) == full:
+            matches.append(row)
+    if len(matches) != 1:
+        return None
+    kept, old_path = matches[0]["id"], matches[0]["path"]
+    current = con.execute("SELECT id FROM sources WHERE harness='codex' AND path=?", (path,)).fetchone()
+    if current is not None:
+        gone = current[0]
+        tables = [t for t, in con.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                                          "AND name!='sources' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        # Classify every table before the first write.
+        plan = [(table, column, _fold_action(con, table, column))
+                for table in tables for column in sorted(source_columns(con, table))]
+        for table, column, action in plan:
+            if action == "delete":
+                con.execute(f'DELETE FROM "{table}" WHERE "{column}"=?', (gone,))
+            else:
+                con.execute(f'UPDATE "{table}" SET "{column}"=? WHERE "{column}"=?', (kept, gone))
+        con.execute("DELETE FROM import_errors WHERE harness='codex' AND source_path=?", (path,))
+        con.execute("DELETE FROM sources WHERE id=?", (gone,))
+    con.execute("UPDATE import_errors SET source_path=? WHERE harness='codex' AND source_path=?", (path, old_path))
+    con.execute("UPDATE sources SET path=? WHERE id=?", (path, kept))
+    return kept
+
+
+def _moved_before_atoms(con, path, ino):
+    return con.execute("""SELECT * FROM sources WHERE harness='codex' AND ino=? AND path!=? AND read_offset>0
+        AND tail_sha256 IS NOT NULL AND codex_context_version<8""", (ino, path)).fetchall()
 
 
 def prepare(r):
