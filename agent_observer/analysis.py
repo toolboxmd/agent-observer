@@ -565,7 +565,8 @@ def _sort_context(con, key, harness, timeline):
             # A malformed atom can have a physical locator but no indexed
             # occurrence. Check the indexed subset for conflicts before using
             # common-source locations to place the unindexed samples.
-            if len(sources) == 1 and None not in sources and None not in positions.values():
+            if (len(sources) == 1 and None not in sources and None not in positions.values()
+                    and not any(point.get("alternate_locations") for point in timeline)):
                 covered = {item for sequence in sequences for group in sequence for item in group}
                 state, groups, _ = codex_order.resolve(con, key, covered) if covered else ("absent", [], [])
                 indexed = [pos for group in groups or ()
@@ -607,14 +608,20 @@ def _opencode_context_rows(con, key, measured):
 
 
 def _unmeasured_rows(locations, harness, semantics):
-    identities = set()
+    rows = {}
     for row in locations:
         rid = row["response_id"]
-        if rid in identities:
-            continue
-        identities.add(rid)
-        yield dict(row, harness=harness, semantics=semantics, input_tokens=None,
-                   cached_input_tokens=None, cache_write_input_tokens=None)
+        if rid in rows:
+            first = rows[rid]
+            location = {"source_id": row["source_id"], "ordinal_num": row["ordinal_num"]}
+            if location != {field: first[field] for field in location}:
+                alternatives = first.setdefault("alternate_locations", [])
+                if location not in alternatives:
+                    alternatives.append(location)
+        else:
+            rows[rid] = dict(row, harness=harness, semantics=semantics, input_tokens=None,
+                             cached_input_tokens=None, cache_write_input_tokens=None)
+    yield from rows.values()
 
 
 def _diagnose_usage(con, sessions, since, until):
@@ -658,8 +665,9 @@ def _diagnose_usage(con, sessions, since, until):
             cache[row["harness"], row["semantics"]].append(row)
             point = {field: row[field] for field in (
                 "response_id", "source_id", "ordinal_num", "ts", "turn_id", "semantics")}
-            if isinstance(row, dict) and "usage_gap" in row:
-                point["usage_gap"] = row["usage_gap"]
+            for field in ("usage_gap", "alternate_locations"):
+                if field in row.keys():
+                    point[field] = row[field]
             timeline.append(dict(point, kind="input", input_tokens=_context_input(row)))
         for row in con.execute(
                 "SELECT id AS event_id, source_id, ordinal_num, ts, turn_id"
