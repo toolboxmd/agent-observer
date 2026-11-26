@@ -1679,6 +1679,7 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
             " FROM responses WHERE response_id=?", (rid,)).fetchone()
         seen = dict(existing) if existing is not None else {}
         if seen != want:
+            _note_occurrence(r, "atomic_usage_error", r.record_position, obj)
             raise _UsageConflict("usage conflict")
         _migrate_response_position(r, rid, r.record_position)
         _repair_usage_context(r, rid, obj, r.model, r.effort, r.record_position)
