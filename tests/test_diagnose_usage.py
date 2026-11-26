@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -130,11 +131,12 @@ class DiagnoseUsageTest(LedgerCase):
                             "build", T0, T0 + 1000, None))
             prompt = _msg("user", T0 + 10)
             measured = _msg("assistant", T0 + 20, T0 + 30, _tokens(0, 1, 0, 40, 0))
-            missing = _msg("assistant", T0 + 50, T0 + 60)
+            missing = json.loads(_msg("assistant", T0 + 50, T0 + 60))
+            missing["parentID"] = "cache_user"
             native.executemany("INSERT INTO message VALUES(?,'cache_gap',?,?,?)", [
                 ("cache_user", T0 + 10, T0 + 10, prompt),
                 ("cache_measured", T0 + 20, T0 + 30, measured),
-                ("cache_missing", T0 + 50, T0 + 60, missing),
+                ("cache_missing", T0 + 50, T0 + 60, json.dumps(missing)),
             ])
             native.commit()
         opencode.sync(self.con, source=path)
@@ -143,7 +145,24 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertEqual([p["response_id"] for p in timeline],
                          ["opencode:cache_measured", "opencode:cache_missing"])
         self.assertEqual([p["input_tokens"] for p in timeline], [40, None])
+        self.assertEqual(timeline[1]["turn_id"], "opencode:cache_user")
         cache, = result["cache_observations"]
         self.assertEqual(cache["responses"], 2)
         self.assertIsNone(cache["cached_input_share"])
         self.assertIsNone(cache["cached_input_tokens"])
+
+        copied = str(Path(self.tmp.name) / "opencode-copy.db")
+        shutil.copyfile(path, copied)
+        with contextlib.closing(sqlite3.connect(copied)) as native:
+            missing_copy = _msg("assistant", T0 + 20, T0 + 30)
+            native.execute("UPDATE message SET data=? WHERE id='cache_measured'", (missing_copy,))
+            native.commit()
+        opencode.sync(self.con, source=copied)
+        result = self.run_diagnose("--session", "opencode:cache_gap",
+                                   "--until", str((T0 + 40) / 1000))
+        timeline = result["context_growth"][0]["timeline"]
+        self.assertEqual([p["response_id"] for p in timeline], ["opencode:cache_measured"])
+        self.assertIsNone(timeline[0]["input_tokens"])
+        cache, = result["cache_observations"]
+        self.assertEqual(cache["responses"], 1)
+        self.assertIsNone(cache["cached_input_share"])

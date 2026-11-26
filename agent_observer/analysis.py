@@ -15,9 +15,8 @@ import re
 import sqlite3
 import statistics
 from collections import defaultdict
-from itertools import chain
 
-from . import codex_order, native_response
+from . import codex_order
 from .adapters import opencode
 
 TEST_COMMAND_RE = re.compile(
@@ -572,6 +571,31 @@ def _sort_context(con, key, harness, timeline):
     return "timestamp"
 
 
+def _opencode_context_rows(con, key, measured):
+    witnesses, conflicts, unavailable = opencode.response_witnesses(con, key)
+    gaps = opencode.unavailable_usage_locations(con, key)
+
+    def turn_id(rid, parents):
+        if rid not in conflicts and len(parents) == 1:
+            return f"opencode:{next(iter(parents))}"
+        return None
+
+    def unknown_row(row):
+        return dict(row, harness="opencode", semantics=opencode.SEMANTICS,
+                    turn_id=turn_id(row["response_id"], unavailable.get(row["response_id"], ())),
+                    input_tokens=None, cached_input_tokens=None, cache_write_input_tokens=None)
+
+    for row in measured:
+        rid = row["response_id"]
+        gap = gaps.pop(rid, None)
+        if gap is not None:
+            yield unknown_row(gap)
+        else:
+            yield dict(row, turn_id=row["turn_id"] or turn_id(rid, witnesses.get(rid, ())))
+    for row in gaps.values():
+        yield unknown_row(row)
+
+
 def _diagnose_usage(con, sessions, since, until):
     window = ""
     bounds = []
@@ -590,26 +614,17 @@ def _diagnose_usage(con, sessions, since, until):
         responses = con.execute(
             "SELECT response_id, source_id, ordinal_num, ts, turn_id, harness, semantics,"
             " input_tokens, cached_input_tokens, cache_write_input_tokens"
-            " FROM responses WHERE session_key=? AND is_overlap=0" + window, args)
-        inputs = {}
-        missing = []
+            " FROM responses WHERE session_key=? AND is_overlap=0", (key,))
         if harness == "opencode":
-            inputs = native_response.inputs(con, key)
-            for row in opencode.unprojected_usage(con, key):
-                ts = row["ts"]
-                if (since is not None and (ts is None or ts < since)
-                        or until is not None and (ts is None or ts >= until)):
-                    continue
-                missing.append(dict(row, harness=harness, semantics=opencode.SEMANTICS, turn_id=None,
-                                    input_tokens=None, cached_input_tokens=None,
-                                    cache_write_input_tokens=None))
-        for row in chain(responses, missing):
+            responses = _opencode_context_rows(con, key, responses)
+        for row in responses:
+            ts = row["ts"]
+            if (since is not None and (ts is None or ts < since)
+                    or until is not None and (ts is None or ts >= until)):
+                continue
             cache[row["harness"], row["semantics"]].append(row)
             point = {field: row[field] for field in (
                 "response_id", "source_id", "ordinal_num", "ts", "turn_id", "semantics")}
-            parents = inputs.get(row["response_id"], ())
-            if point["turn_id"] is None and len(parents) == 1:
-                point["turn_id"] = f"opencode:{next(iter(parents))}"
             timeline.append(dict(point, kind="input", input_tokens=_context_input(row)))
         for row in con.execute(
                 "SELECT id AS event_id, source_id, ordinal_num, ts, turn_id"
