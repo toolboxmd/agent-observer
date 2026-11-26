@@ -36,17 +36,12 @@ def _prefix_digest(path, size):
 
 
 def relocated_source(src):
-    """Find an earlier ledger source whose verified move is this rollout.
-
-    It is either an incomplete source or one an older parser imported before
-    atomic observations that no rollout has replayed as its move yet.
-    """
+    """Find an incomplete ledger source whose verified archive is this rollout."""
     path = os.path.abspath(src.path)
-    if not any(part in path for part in ("/sessions/", "/archived_sessions/")):
+    if (not any(part in path for part in ("/sessions/", "/archived_sessions/"))
+            or not db._has_table(src.con, "codex_incomplete_sources")):
         return None
-    matches = _moved_before_atoms(src, path)
-    if not db._has_table(src.con, "codex_incomplete_sources"):
-        return matches[0] if len(matches) == 1 else None
+    matches = []
     for row in src.con.execute("""SELECT s.*,i.* FROM codex_incomplete_sources i
             JOIN sources s ON s.id=i.source_id WHERE s.id!=? AND s.read_offset>0""", (src.source_id,)):
         if os.path.basename(row["path"]) != os.path.basename(path) or not row["tail_sha256"]:
@@ -66,43 +61,87 @@ def relocated_source(src):
     return matches[0] if len(matches) == 1 else None
 
 
-def _moved_before_atoms(src, path):
-    # Before context version 8 an import recorded no atomic observation, so
-    # its responses keep that source until it is replayed. Once Codex moved
-    # the file, only this rollout can replay it. Identity rests on the
-    # recorded inode, name and size and on the hash of the 4 KiB before the
-    # read offset: older rows record nothing covering the whole file. A
-    # source replayed once as its move is recorded in codex_relocations and
-    # never qualifies again, whatever that replay found.
-    con = src.con
-    recorded = ("AND NOT EXISTS (SELECT 1 FROM codex_relocations m WHERE m.source_id=s.id)"
-                if db._has_table(con, "codex_relocations") else "")
+def source_columns(con, table):
+    """Columns of ``table`` that name a ``sources`` row."""
+    refs = {fk[3] for fk in con.execute(f'PRAGMA foreign_key_list("{table}")') if fk[2] == "sources"}
+    return refs | {c[1] for c in con.execute(f'PRAGMA table_info("{table}")') if c[1] == "source_id"}
+
+
+def _source_keyed(con, table, column):
+    """Whether a row's identity includes its source, so a replay rewrites it."""
+    keys = [[c[1] for c in sorted(con.execute(f'PRAGMA table_info("{table}")'), key=lambda c: c[5]) if c[5]]]
+    for index in con.execute(f'PRAGMA index_list("{table}")'):
+        if index[2]:
+            keys.append([c[2] for c in con.execute(f'PRAGMA index_info("{index[1]}")')])
+    keys = [k for k in keys if k]
+    return not keys or any(column in k for k in keys)
+
+
+def adopt_moved_source(con, path):
+    """Make the moved file's older source row the one that stands for ``path``.
+
+    Before context version 8 an import recorded no atomic observation, so its
+    responses keep that source until the file is replayed. Codex later moves a
+    finished rollout to ``archived_sessions`` with the same inode and bytes.
+    When exactly one such row's recorded inode, name, size and the hash of the
+    4 KiB before its read offset identify this file at its new path, that row
+    takes the new path, as if the file had never moved. The import that
+    follows then replays the row in place, so every version-, path- and
+    thread-dependent rule applies to it unchanged. A row from before context
+    versions is not adopted.
+
+    A released version may already have imported the new path as its own
+    source. That source is removed: rows whose key includes it are deleted
+    because the replay rewrites them, and other rows are handed to the adopted
+    row, keyed by the schema so a later table is covered too. Three things
+    cannot return to the in-place state. Its AUTOINCREMENT event and
+    import-error ids are never reused, so ``event show`` and trace ids stay
+    stable. Rows only it added stay with the adopted row, since assignments,
+    delegations and intervention evidence may reference them. Session-keyed
+    rows without a source column stay, since nothing names their writer.
+    """
+    full = os.path.abspath(path)
+    if not any(part in full for part in ("/sessions/", "/archived_sessions/")):
+        return None
+    try:
+        ino = os.stat(path).st_ino
+    except OSError:
+        return None
     matches = []
-    for row in con.execute(f"""SELECT s.* FROM sources s WHERE s.harness='codex' AND s.ino=? AND s.id!=?
-            AND s.read_offset>0 AND s.tail_sha256 IS NOT NULL AND s.codex_context_version<8 {recorded}""",
-                           (src.ino, src.source_id)):
-        if os.path.basename(row["path"]) != os.path.basename(path):
+    for row in _moved_before_atoms(con, path, ino):
+        if os.path.basename(row["path"]) != os.path.basename(full):
             continue
         resolved = lookup.resolve_source(row)
-        if resolved["reason"] == "relocated" and os.path.abspath(resolved["path"]) == path:
-            matches.append(dict(row, before_atoms=True))
-    return matches
+        if resolved["reason"] == "relocated" and os.path.abspath(resolved["path"]) == full:
+            matches.append(row)
+    if len(matches) != 1:
+        return None
+    kept, old_path = matches[0]["id"], matches[0]["path"]
+    current = con.execute("SELECT id FROM sources WHERE harness='codex' AND path=?", (path,)).fetchone()
+    tables = [t for t, in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name!='sources' "
+                                      "AND name NOT LIKE 'sqlite_%'")]
+    if current is not None:
+        gone = current[0]
+        for table in tables:
+            for column in source_columns(con, table):
+                if _source_keyed(con, table, column):
+                    con.execute(f'DELETE FROM "{table}" WHERE "{column}"=?', (gone,))
+                else:
+                    con.execute(f'UPDATE "{table}" SET "{column}"=? WHERE "{column}"=?', (kept, gone))
+        for table in tables:
+            if "source_path" in {c[1] for c in con.execute(f'PRAGMA table_info("{table}")')}:
+                con.execute(f'DELETE FROM "{table}" WHERE source_path=?', (path,))
+        con.execute("DELETE FROM sources WHERE id=?", (gone,))
+    for table in tables:
+        if "source_path" in {c[1] for c in con.execute(f'PRAGMA table_info("{table}")')}:
+            con.execute(f'UPDATE "{table}" SET source_path=? WHERE source_path=?', (path, old_path))
+    con.execute("UPDATE sources SET path=? WHERE id=?", (path, kept))
+    return kept
 
 
-def relocate(con, predecessor, successor):
-    """Let this rollout stand for the moved file before it replays it.
-
-    The rollout adopts the predecessor's responses and drops the inputs an
-    older parser derived, so the replay from the start treats them exactly as
-    an in-place replay treats its own rows. The record keeps the predecessor
-    from qualifying again and out of rules that read its stale version.
-    """
-    con.execute("""CREATE TABLE IF NOT EXISTS codex_relocations (
-        source_id INTEGER PRIMARY KEY REFERENCES sources(id), successor_id INTEGER NOT NULL REFERENCES sources(id))""")
-    con.execute("INSERT OR REPLACE INTO codex_relocations VALUES(?,?)", (predecessor["id"], successor))
-    con.execute("UPDATE responses SET source_id=? WHERE source_id=?", (successor, predecessor["id"]))
-    if db._has_table(con, "native_response_inputs"):
-        con.execute("DELETE FROM native_response_inputs WHERE source_id=?", (predecessor["id"],))
+def _moved_before_atoms(con, path, ino):
+    return con.execute("""SELECT * FROM sources WHERE harness='codex' AND ino=? AND path!=? AND read_offset>0
+        AND tail_sha256 IS NOT NULL AND codex_context_version<8""", (ino, path)).fetchall()
 
 
 def prepare(r):
@@ -154,8 +193,6 @@ def observe(r, obj, counters):
 
 def finish(r, predecessor):
     con, src = r.con, r.src
-    if predecessor is not None and predecessor.get("before_atoms"):
-        predecessor = None  # relocate() already handed its responses to this rollout.
     incomplete = r.unreadable_atomic or src.incomplete_record or src.end_offset < src.size
     if incomplete:
         legacy = (src.row["codex_context_version"] == 7 and con.execute(
@@ -245,11 +282,9 @@ def disputes(con, session_key, semantics):
     """Only current agreeing source measurements can support positive ownership."""
     if "codex_context_version" not in {c[1] for c in con.execute("PRAGMA table_info(sources)")}:
         return {}, False, {}
-    replayed = ("AND NOT EXISTS (SELECT 1 FROM codex_relocations m WHERE m.source_id=s.id)"
-                if db._has_table(con, "codex_relocations") else "")
-    legacy = con.execute(f"""SELECT 1 FROM sources s JOIN import_errors e ON e.source_path=s.path
+    legacy = con.execute("""SELECT 1 FROM sources s JOIN import_errors e ON e.source_path=s.path
         WHERE s.harness='codex' AND e.harness='codex' AND e.error='usage_conflict' AND s.codex_context_version=7
-        AND 'codex:'||COALESCE(s.thread_id,s.session_id)=? {replayed} LIMIT 1""", (session_key,)).fetchone() is not None
+        AND 'codex:'||COALESCE(s.thread_id,s.session_id)=? LIMIT 1""", (session_key,)).fetchone() is not None
     historical = {}
     if legacy:
         historical = {rid: set() for rid, in con.execute("SELECT response_id FROM responses WHERE session_key=? "

@@ -4,7 +4,7 @@
 
 ### Changed
 
-- Archived Codex rollouts an older version imported reconcile their responses after one ordinary sync (#152). A row imported before context versions existed is not handed off and stays conflicting.
+- Archived Codex rollouts an older version imported reconcile their responses after one ordinary sync (#152). The older source row takes the archive path and is replayed in place. Known limits: a row imported before context versions existed is not adopted and stays conflicting. If a released version already imported the archive separately, its event and import-error ids are kept rather than reused, so `event show` and trace ids stay stable; rows it added stay, owned by the adopted row, because user assignments, delegations and intervention evidence may reference them; and session-keyed rows without a source column are kept.
 
 ## [1.7.0] - 2026-11-25
 
