@@ -664,6 +664,93 @@ class UsageClosureTest(LedgerCase):
         self.assertEqual(self.gaps(rep), {"native_rows_rejected": (1, "rows")})
         self.assertEqual(rep["native_purpose"]["rejected_rows"][0]["reason"], "table_missing")
 
+    # Deleted threads -------------------------------------------------------
+
+    def two_thread_task(self):
+        """A task with a closed Claude run on thread t and a closed Codex run on thread t-cx."""
+        self.closed_turn()
+        self.provider_thread("pt-cx", "t-cx", "codex")
+        path = os.path.join(self.tmp.name, "rollout-2026-11-26T10-00-00-cx-s.jsonl")
+        codex_rollout(path, "cx-s", [("cx-t1", [("resp-1", 100, 10)], [])])
+        codex.import_codex_file(self.con, path)
+        self.run_turn("x1", "codex", "cx-s", inputs=["cx-t1"], closure=CLOSED_CODEX, thread="t-cx", pt="pt-cx",
+                      usage=dict(usageScope="main_agent", usageStatus="complete", hasSubagents=False,
+                                 inputTokens=100, outputTokens=10))
+
+    def delete_thread(self, thread):
+        # Chromeria's thread deletion: runs, subagents and turn items go; attempts and turns stay.
+        for table in ("runs", "subagents", "turn_items", "threads"):
+            self.native.execute(f"DELETE FROM {PREFIX}{table} WHERE thread_id=?", (thread,))
+
+    def test_a_deleted_thread_keeps_its_task_unknown_on_every_later_sync(self):
+        self.two_thread_task()
+        rep = self.native_report()
+        self.assertEqual(rep["total_cost"]["status"], "complete")
+        self.assertEqual(rep["total_cost"]["responses"], 2)
+        self.delete_thread("t-cx")
+        for _ in range(2):
+            rep = self.native_report()
+            self.assertNotEqual(rep["total_cost"]["status"], "complete")
+            gaps = self.gaps(rep)
+            self.assertEqual(gaps["native_run_deleted"], (1, "runs"))
+            self.assertEqual(gaps["native_rows_rejected"], (2, "rows"))
+            self.assertEqual(rep["native_purpose"]["deleted_runs"], ["x1"])
+            self.assertIn("native_run_deleted (1 run)", self.cli())
+
+    def test_a_deleted_thread_leaves_tasks_on_other_threads_complete(self):
+        self.two_thread_task()
+        self.claude_transcript([claude_user("o-a", None, "other"), assistant("o1", "o-a", "msg-o1")],
+                               session="other-s")
+        self.provider_thread("pt-o", "t-o")
+        self.run_turn("o1", "claudeAgent", "other-s", inputs=["o-a"], usage=claude_usage(10, 5),
+                      closure=CLOSED_CLAUDE, response_ids=["msg-o1"], thread="t-o", pt="pt-o", purpose=OTHER)
+        self.native_report()
+        self.delete_thread("t-cx")
+        self.native_report()
+        other = report.task_report(self.con, "example/project#8")
+        self.assertEqual(other["native_purpose"]["coverage_gaps"], [])
+        self.assertEqual(other["total_cost"]["status"], "complete")
+
+    def test_a_deleted_same_task_child_thread_is_a_missing_child_and_a_deleted_run(self):
+        self.test_same_task_child_that_ran_is_counted_through_its_own_turn()
+        self.native.execute(f"UPDATE {PREFIX}provider_turns SET payload_json=json_set(payload_json,"
+                            "'$.turnTokenUsage',json(?)) WHERE provider_turn_id='turn-kid-run'",
+                            (json.dumps(claude_usage(30, 7)),))
+        self.assertEqual(self.native_report()["total_cost"]["status"], "complete")
+        self.delete_thread("child-kid")
+        rep = self.native_report()
+        gaps = self.gaps(rep)
+        self.assertEqual(gaps["child_runs_missing"], (1, "children"))
+        self.assertEqual(gaps["native_run_deleted"], (1, "runs"))
+        self.assertNotEqual(rep["total_cost"]["status"], "complete")
+
+    def test_surviving_rows_of_a_run_never_seen_keep_every_task_of_the_source_unknown(self):
+        self.closed_turn()
+        # Deleted before this ledger ever synced: only its attempt and turn remain.
+        self.row("run_attempts", ["attempt-gone", "gone", "t-gone", "pt-claudeAgent", "turn-gone", "node-g"], dict(
+            id="attempt-gone", runId="gone", providerThreadId="pt-claudeAgent", rootNodeId="node-g",
+            providerInstanceId="claudeAgent-custom", providerTurnId="turn-gone", status="completed",
+            startedAt=TIME))
+        self.row("provider_turns", ["turn-gone", "t-gone", "pt-claudeAgent", "attempt-gone", "node-g"], dict(
+            id="turn-gone", nodeId="node-g", providerThreadId="pt-claudeAgent", runAttemptId="attempt-gone",
+            status="completed", nativeInputs=[], turnTokenUsage=claude_usage(500, 50)))
+        rep = self.native_report()
+        self.assertEqual(self.gaps(rep), {"native_rows_rejected": (2, "rows")})
+        self.assertNotEqual(rep["total_cost"]["status"], "complete")
+
+    def test_a_ledger_without_the_run_record_cannot_tell_a_thread_deleted_before_it(self):
+        self.two_thread_task()
+        self.native_report()
+        # An upgraded ledger: the record did not exist, and the thread was deleted before this sync.
+        self.con.execute("DROP TABLE IF EXISTS t3_seen_runs")
+        self.con.commit()
+        self.delete_thread("t-cx")
+        rep = self.native_report()
+        # The surviving rows name a run the ledger never recorded: every task of the source is unknown.
+        self.assertNotEqual(rep["total_cost"]["status"], "complete")
+        self.assertNotIn("native_run_deleted", self.gaps(rep))
+        self.assertEqual(self.gaps(rep)["native_rows_rejected"], (2, "rows"))
+
     # Upgrade ----------------------------------------------------------------
 
     def test_ledger_from_1_7_0_upgrades_on_sync_and_reads_stay_read_only(self):

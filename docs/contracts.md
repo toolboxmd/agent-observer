@@ -547,9 +547,24 @@ re-read every sync; workload bindings are durable ledger rows.
   carries. A run whose purpose fails validation is mirrored and also
   rejected. Copies that disagree on a row's identity, a missing table, and a
   reference to a row that does not exist are rejects too. A report keeps
-  unknown every task a reject is tied to by task, run or thread, including a
-  task with no valid purpose run, and every task of the source when it is
-  tied to nothing (`native_rows_rejected`).
+  unknown every task a reject is tied to by task reference, or by a run or
+  thread the task has now or had when the ledger recorded it, including a
+  task with no valid purpose run (`native_rows_rejected`). A reject whose
+  references match no run or thread the ledger has ever recorded for its
+  source belongs to a run it never saw and keeps every task of that source
+  unknown.
+- Deleted runs: `t3_seen_runs` records, per source, every run the ledger has
+  mirrored with its thread and task. A refresh only adds rows to it; read
+  commands never write it. Chromeria's thread deletion removes a thread's
+  runs, subagents and turn items and keeps its attempts and provider turns;
+  a recorded run that is no longer in its source keeps its task unknown on
+  every later sync (`native_run_deleted`), and the deleted run's surviving
+  rows stay tied to that task. Its responses lose their purpose witness, so
+  they leave the task's subtotal; the gap says that run's usage is missing.
+  A recorded run now held under another task is a conflict
+  (`conflicting_native_run_records`). A ledger only knows runs mirrored since
+  it first synced with this record, so surviving rows of a run deleted
+  before then belong to a run it never saw.
 - Never ran: the refresh decides from raw rows before validation whether a
   run never ran: terminal, an explicit null `startedAt`, an active attempt
   that is null or one of its attempts, and every attempt with a null

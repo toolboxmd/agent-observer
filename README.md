@@ -544,7 +544,11 @@ priced subtotal is shown, and `native coverage` names each reason with the
 number of turns, attempts, runs, segments, children, responses or sessions it
 affects. A run that the Chromeria records prove never ran adds nothing. A Chromeria
 row that Observer cannot validate is a `native_rows_rejected` gap for every
-task it can be tied to, never an absence. A delegated child
+task it can be tied to, never an absence. When a Chromeria thread is
+deleted, a task that had a run there stays unknown (`native_run_deleted`) on
+every later sync. Observer remembers runs from the first sync with version
+1.8.0 on: rows left over from a thread deleted before that belong to a run it
+never saw, and they keep every Chromeria task of that source unknown. A delegated child
 that declared another task, or was deliberately unscoped, is another task's
 cost; `not counted` says how many there were. Native child agents, children
 without a declared purpose, active or remote children, and unpriced models

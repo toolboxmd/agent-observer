@@ -880,6 +880,10 @@ def _upgrade_retained_run_keys(con):
                 SELECT 1 FROM t3_source_runs r WHERE r.source_path=s.source_path
                 AND r.run_id=s.run_id AND r.task_id=s.task_id AND r.kind=?)""", args)
         con.execute("UPDATE t3_source_runs SET task_id=? WHERE task_id=? AND kind=?", args)
+        # The same key migration, not a change of purpose.
+        con.execute("""UPDATE t3_seen_runs AS s SET task_id=? WHERE task_id=? AND EXISTS (
+            SELECT 1 FROM t3_source_runs r WHERE r.source_path=s.source_path AND r.run_id=s.run_id
+            AND r.kind=?)""", args)
 
 
 def _materialize(con, table):
@@ -970,9 +974,15 @@ def refresh(con, native, tables):
     con.execute("CREATE INDEX IF NOT EXISTS t3_purpose_inputs_native"
                 " ON t3_purpose_inputs(session_key,native_id)")
     con.execute("CREATE INDEX IF NOT EXISTS t3_purpose_inputs_run ON t3_purpose_inputs(run_id)")
+    # Every run this ledger has mirrored, kept across refreshes and never
+    # rewritten, so a run its source later deletes still names its task.
+    con.execute("CREATE TABLE IF NOT EXISTS t3_seen_runs(source_path TEXT NOT NULL, run_id TEXT NOT NULL,"
+                " thread_id TEXT NOT NULL, task_id TEXT, PRIMARY KEY(source_path,run_id))")
     _upgrade_retained_run_keys(con)
     aware = _deliveries(snapshot, native, tables)
     runs, legacy = _runs(snapshot, native, tables)
+    con.execute("INSERT OR IGNORE INTO t3_seen_runs SELECT source_path,run_id,thread_id,task_id"
+                " FROM t3_source_runs WHERE source_path=?", (path,))
     if runs:
         for table in COMPLETENESS_TABLES:
             if PROJECTION + table not in tables:
