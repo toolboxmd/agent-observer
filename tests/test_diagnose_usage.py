@@ -223,6 +223,11 @@ class DiagnoseUsageTest(LedgerCase):
         cache, = result["cache_observations"]
         self.assertEqual(cache["responses"], 2)
         self.assertIsNone(cache["cached_input_share"])
+        bounded = self.run_diagnose("--session", f"claude:{session}",
+                                    "--since", "2026-10-01T12:00:00Z",
+                                    "--until", "2026-10-01T12:00:03Z")
+        self.assertEqual(bounded["context_growth"], result["context_growth"])
+        self.assertEqual(bounded["cache_observations"], [cache])
 
     def test_opencode_import_surfaces_completed_response_without_counters(self):
         path = str(Path(self.tmp.name) / "opencode.db")

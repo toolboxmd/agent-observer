@@ -1313,6 +1313,7 @@ def _print_diagnose_usage(payload):
 
     print("Context growth by session (input samples labeled with their recorded turns).")
     print("Timestamps are Unix seconds. In timestamp order, ties and missing times leave order uncertain.")
+    print("Date filters retain untimed observations with unknown cache contribution.")
     for session in payload["context_growth"]:
         print(f"- {session['session']} ({session['order']} order)")
         if not session["timeline"]:

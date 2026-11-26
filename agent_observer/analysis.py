@@ -628,10 +628,10 @@ def _diagnose_usage(con, sessions, since, until):
     window = ""
     bounds = []
     if since is not None:
-        window += " AND ts>=?"
+        window += " AND (ts IS NULL OR ts>=?)"
         bounds.append(since)
     if until is not None:
-        window += " AND ts<?"
+        window += " AND (ts IS NULL OR ts<?)"
         bounds.append(until)
     context = []
     cache = defaultdict(list)
@@ -656,13 +656,17 @@ def _diagnose_usage(con, sessions, since, until):
             responses = _opencode_context_rows(con, key, responses)
         for row in chain(responses, gaps):
             ts = row["ts"]
-            if (since is not None and (ts is None or ts < since)
-                    or until is not None and (ts is None or ts >= until)):
+            if ts is not None and (since is not None and ts < since
+                                   or until is not None and ts >= until):
                 continue
             if row["response_id"] in disputes:
                 row = dict(row, turn_id=None, input_tokens=None, cached_input_tokens=None,
                            cache_write_input_tokens=None)
-            cache[row["harness"], row["semantics"]].append(row)
+            cache_row = row
+            if ts is None and bounds:
+                cache_row = dict(row, input_tokens=None, cached_input_tokens=None,
+                                 cache_write_input_tokens=None)
+            cache[row["harness"], row["semantics"]].append(cache_row)
             point = {field: row[field] for field in (
                 "response_id", "source_id", "ordinal_num", "ts", "turn_id", "semantics")}
             for field in ("usage_gap", "alternate_locations"):
