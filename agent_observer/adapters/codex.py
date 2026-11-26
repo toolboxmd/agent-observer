@@ -1412,10 +1412,8 @@ def has_unlocated_fallback_usage(con, session_key):
         "SELECT 1 FROM sources s JOIN import_errors e"
         " ON e.harness=s.harness AND e.source_path=s.path"
         " WHERE s.harness='codex' AND 'codex:'||COALESCE(s.thread_id,s.session_id)=?"
-        " AND e.error IN ('malformed_usage','usage_conflict')" + atoms +
-        " AND EXISTS (SELECT 1 FROM responses r WHERE r.session_key=?"
-        " AND r.semantics=? AND r.is_overlap=0) LIMIT 1",
-        (session_key, session_key, TOKEN_COUNT_SEMANTICS)).fetchone() is not None
+        " AND e.error IN ('malformed_usage','usage_conflict')" + atoms + " LIMIT 1",
+        (session_key,)).fetchone() is not None
 
 
 def _flush_token_counts(r: _Reader) -> None:

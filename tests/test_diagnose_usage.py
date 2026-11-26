@@ -178,6 +178,24 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertEqual(groups[codex.TOKEN_COUNT_SEMANTICS]["cached_input_share"], 200 / 1300)
         self.assertIsNone(groups[codex.SEMANTICS]["cached_input_share"])
 
+    def test_codex_all_quarantined_fallback_session_qualifies_harness_share(self):
+        lines = [json.loads(line) for line in
+                 Path(fixture("codex-precompaction-conflict.jsonl")).read_text().splitlines()]
+        valid = Path(self.tmp.name) / "rollout-fallback-valid.jsonl"
+        valid.write_text("\n".join(map(json.dumps, (lines[0], lines[5]))) + "\n")
+        codex.import_codex_file(self.con, str(valid))
+        lines[0]["payload"]["session_id"] = "sess-fixture-all-quarantined"
+        lines[5]["payload"]["info"]["last_token_usage"]["input_tokens"] = "900"
+        rejected = Path(self.tmp.name) / "rollout-fallback-rejected.jsonl"
+        rejected.write_text("\n".join(map(json.dumps, (lines[0], lines[5]))) + "\n")
+        codex.import_codex_file(self.con, str(rejected))
+        result = self.run_diagnose("--harness", "codex")
+        group, = result["cache_observations"]
+        self.assertEqual(group["semantics"], codex.TOKEN_COUNT_SEMANTICS)
+        self.assertEqual(group["responses"], 1)
+        self.assertEqual(group["unlocated_usage_sessions"], 1)
+        self.assertIsNone(group["cached_input_share"])
+
     def test_codex_unindexed_atom_keeps_same_source_compaction_order(self):
         lines = [json.loads(line) for line in Path(fixture("codex-mini.jsonl")).read_text().splitlines()]
         valid = next(row for row in lines if row["type"] == "token_usage_record")
