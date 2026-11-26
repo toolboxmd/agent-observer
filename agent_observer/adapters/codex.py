@@ -1404,6 +1404,10 @@ def has_unlocated_fallback_usage(con, session_key):
     if db._has_table(con, "codex_atomic_observations"):
         atoms = (" AND NOT EXISTS (SELECT 1 FROM codex_atomic_observations a"
                  " WHERE a.source_id=s.id AND a.position=e.ordinal_num)")
+    if db._has_table(con, "codex_occurrences"):
+        atoms += (" AND NOT EXISTS (SELECT 1 FROM codex_occurrences o"
+                  " WHERE o.source_id=s.id AND o.row_kind='atomic_usage_error'"
+                  " AND o.row_key=CAST(e.ordinal_num AS TEXT))")
     return con.execute(
         "SELECT 1 FROM sources s JOIN import_errors e"
         " ON e.harness=s.harness AND e.source_path=s.path"
@@ -1640,6 +1644,9 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
                 raise _MalformedUsage("invalid atomic counter")
     except _MalformedUsage:
         codex_atomic.observe(r, obj, None)
+        # If the atom lacks a response ID, its occurrence still identifies
+        # which counter family its quarantined source position belongs to.
+        _note_occurrence(r, "atomic_usage_error", r.record_position, obj)
         raise
     u = u_raw if isinstance(u_raw, dict) else {}
     tt = tt_raw if isinstance(tt_raw, dict) else {}

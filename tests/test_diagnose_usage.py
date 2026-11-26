@@ -159,6 +159,25 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertIsNone(cache["cached_input_share"])
         self.assertEqual(cache["unlocated_usage_sessions"], 1)
 
+    def test_codex_unidentified_atomic_error_preserves_clean_fallback_counters(self):
+        lines = [json.loads(line) for line in
+                 Path(fixture("codex-precompaction-conflict.jsonl")).read_text().splitlines()]
+        sid = lines[0]["payload"]["session_id"]
+        records = [line for line in lines if line["ordinal"] != 3]
+        records.append({"type": "token_usage_record", "ordinal": 6,
+                        "timestamp": "2026-09-14T10:00:06Z",
+                        "payload": {"response_id": "", "thread_id": sid,
+                                    "usage": {"input_tokens": -1}}})
+        log = Path(self.tmp.name) / "rollout-mixed.jsonl"
+        log.write_text("\n".join(map(json.dumps, records)) + "\n")
+        codex.import_codex_file(self.con, str(log))
+        result = self.run_diagnose("--harness", "codex")
+        timeline = result["context_growth"][0]["timeline"]
+        self.assertEqual([p["input_tokens"] for p in timeline if p["kind"] == "input"], [400, 900])
+        groups = {group["semantics"]: group for group in result["cache_observations"]}
+        self.assertEqual(groups[codex.TOKEN_COUNT_SEMANTICS]["cached_input_share"], 200 / 1300)
+        self.assertIsNone(groups[codex.SEMANTICS]["cached_input_share"])
+
     def test_codex_unindexed_atom_keeps_same_source_compaction_order(self):
         lines = [json.loads(line) for line in Path(fixture("codex-mini.jsonl")).read_text().splitlines()]
         valid = next(row for row in lines if row["type"] == "token_usage_record")
