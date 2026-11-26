@@ -145,6 +145,74 @@ class PreAtomicArchiveTest(LedgerCase):
         self.assert_second_sync_is_a_no_op()
         self.assertEqual(self.native(), (TURN_RESPONSES, ["codex:resp-mini-003"], ["reconciled"]))
 
+    def sync_imports(self):
+        """Run an ordinary sync and return each source's import stats."""
+        seen = []
+        real = codex.import_codex_file
+
+        def record(*args, **kwargs):
+            seen.append(real(*args, **kwargs))
+            return seen[-1]
+
+        with patch.object(codex, "import_codex_file", side_effect=record):
+            codex.sync(self.con)
+        return seen
+
+    def atom(self, response_id):
+        return next(json.loads(line) for line in self.original.read_text().splitlines()
+                    if f'"{response_id}"' in line and '"token_usage_record"' in line)
+
+    def test_unreadable_usage_record_keeps_conflicts_without_repeating_the_replay(self):
+        self.downgrade(self.original)
+        atom = self.atom("resp-mini-003")
+        del atom["payload"]["response_id"]
+        self.original.rename(self.archived)
+        with self.archived.open("a") as stream:
+            stream.write(json.dumps(atom) + "\n")
+        codex.sync(self.con)
+        self.assert_conflicting()
+        self.assert_second_sync_is_a_no_op()
+        self.assert_conflicting()
+
+    def test_torn_archive_reads_only_its_tail_until_the_line_completes(self):
+        self.downgrade(self.original)
+        self.original.rename(self.archived)
+        line = next(row for row in self.archived.read_text().splitlines() if '"turn_context"' in row) + "\n"
+        with self.archived.open("a") as stream:
+            stream.write(line[:20])
+        codex.sync(self.con)
+        self.assert_conflicting()
+        imports = self.sync_imports()
+        self.assertTrue(imports)
+        self.assertTrue(all(stats["unchanged"] or stats["incremental"] for stats in imports), imports)
+        self.assert_conflicting()
+        with self.archived.open("a") as stream:
+            stream.write(line[20:])
+        codex.sync(self.con)
+        self.assert_attributed()
+        self.assert_second_sync_is_a_no_op()
+
+    def test_source_identity_that_differs_from_the_archive_is_handed_off_once(self):
+        # Before #69 an import could store a copied parent thread on the row.
+        source = self.downgrade(self.original)
+        self.con.execute("UPDATE sources SET thread_id='thread-copied-parent' WHERE id=?", (source,))
+        self.con.commit()
+        self.original.rename(self.archived)
+        codex.sync(self.con)
+        self.assert_second_sync_is_a_no_op()
+        self.assert_attributed()
+
+    def test_row_from_before_context_versions_stays_conflicting(self):
+        source = self.downgrade(self.original)
+        self.con.execute("UPDATE sources SET codex_context_version=NULL,codex_context_offset=NULL WHERE id=?",
+                         (source,))
+        self.con.commit()
+        self.original.rename(self.archived)
+        codex.sync(self.con)
+        self.assert_conflicting()
+        self.assert_second_sync_is_a_no_op()
+        self.assert_conflicting()
+
     def test_different_file_with_the_same_name_stays_conflicting(self):
         # The inode filter rejects this copy before any bytes are compared.
         self.downgrade(self.original)

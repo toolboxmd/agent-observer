@@ -39,7 +39,7 @@ def relocated_source(src):
     """Find an earlier ledger source whose verified move is this rollout.
 
     It is either an incomplete source or one an older parser imported before
-    atomic observations, which still owns responses this rollout must replay.
+    atomic observations that no rollout has replayed as its move yet.
     """
     path = os.path.abspath(src.path)
     if not any(part in path for part in ("/sessions/", "/archived_sessions/")):
@@ -72,20 +72,15 @@ def _moved_before_atoms(src, path):
     # the file, only this rollout can replay it. Identity rests on the
     # recorded inode, name and size and on the hash of the 4 KiB before the
     # read offset: older rows record nothing covering the whole file. A
-    # handed-off row has no context offset and never qualifies again, even
-    # when one of its responses stays conflicting.
+    # source replayed once as its move is recorded in codex_relocations and
+    # never qualifies again, whatever that replay found.
     con = src.con
-    if db._has_table(con, "codex_atomic_observations") and (src.row["codex_context_version"] or 0) >= 8:
-        pending = ("EXISTS (SELECT 1 FROM codex_atomic_observations o WHERE o.source_id=? "
-                   "AND o.response_id=r.response_id AND o.session_key=r.session_key)", (src.source_id,))
-    else:
-        pending = ("1", ())  # This rollout has not recorded which responses it holds.
+    recorded = ("AND NOT EXISTS (SELECT 1 FROM codex_relocations m WHERE m.source_id=s.id)"
+                if db._has_table(con, "codex_relocations") else "")
     matches = []
-    for row in con.execute(f"""SELECT s.*,'codex:'||COALESCE(s.thread_id,s.session_id) AS session_key
-            FROM sources s WHERE s.harness='codex' AND s.ino=? AND s.id!=? AND s.read_offset>0
-            AND s.tail_sha256 IS NOT NULL AND s.codex_context_version<8 AND s.codex_context_offset IS NOT NULL
-            AND EXISTS (SELECT 1 FROM responses r WHERE r.source_id=s.id AND {pending[0]})""",
-                           (src.ino, src.source_id, *pending[1])):
+    for row in con.execute(f"""SELECT s.* FROM sources s WHERE s.harness='codex' AND s.ino=? AND s.id!=?
+            AND s.read_offset>0 AND s.tail_sha256 IS NOT NULL AND s.codex_context_version<8 {recorded}""",
+                           (src.ino, src.source_id)):
         if os.path.basename(row["path"]) != os.path.basename(path):
             continue
         resolved = lookup.resolve_source(row)
@@ -106,6 +101,9 @@ def prepare(r):
     con.execute("""CREATE TABLE IF NOT EXISTS codex_incomplete_sources (
         source_id INTEGER PRIMARY KEY REFERENCES sources(id),session_key TEXT NOT NULL,legacy_dispute INTEGER NOT NULL,
         replay INTEGER NOT NULL DEFAULT 1, prefix_bytes INTEGER, prefix_digest TEXT)""")
+    # A pre-atomic source and the rollout that replayed it after Codex moved the file.
+    con.execute("""CREATE TABLE IF NOT EXISTS codex_relocations (
+        source_id INTEGER PRIMARY KEY REFERENCES sources(id), successor_id INTEGER NOT NULL REFERENCES sources(id))""")
     columns = {c[1] for c in con.execute("PRAGMA table_info(codex_incomplete_sources)")}
     for key, declaration in (("replay", "INTEGER NOT NULL DEFAULT 1"), ("prefix_bytes", "INTEGER"), ("prefix_digest", "TEXT")):
         if key not in columns:
@@ -143,6 +141,9 @@ def observe(r, obj, counters):
 
 def finish(r, predecessor):
     con, src = r.con, r.src
+    moved = None
+    if predecessor is not None and predecessor.get("before_atoms"):
+        moved, predecessor = predecessor, None
     incomplete = r.unreadable_atomic or src.incomplete_record or src.end_offset < src.size
     if incomplete:
         legacy = (src.row["codex_context_version"] == 7 and con.execute(
@@ -157,8 +158,7 @@ def finish(r, predecessor):
                     (src.source_id, r.session_key, legacy, replay, src.size, _prefix_digest(src.path, src.size)))
     else:
         if predecessor is not None and predecessor["session_key"] == r.session_key and (
-                predecessor.get("before_atoms") or predecessor.get("prefix_digest")
-                or _historical_atoms_survive(con, predecessor["id"], src.source_id)):
+                predecessor.get("prefix_digest") or _historical_atoms_survive(con, predecessor["id"], src.source_id)):
             # The archive was read from the start. Its source now owns the current
             # observations, including withdrawals. Keep the old raw ledger locators.
             old = predecessor["id"]
@@ -174,6 +174,9 @@ def finish(r, predecessor):
             # tail was unfinished. Revisit its stored atoms without rereading the file.
             r.atomic_ids.update(rid for rid, in con.execute(
                 "SELECT DISTINCT response_id FROM codex_atomic_observations WHERE source_id=?", (src.source_id,)))
+    if moved is not None and not src.incremental:
+        # This replay from the start stands in for the moved source, complete or not.
+        con.execute("INSERT OR REPLACE INTO codex_relocations VALUES(?,?)", (moved["id"], src.source_id))
     if not src.incremental:
         r.atomic_ids.update(rid for rid, in con.execute("SELECT DISTINCT response_id FROM prior_codex_atoms"))
         if incomplete:
@@ -201,16 +204,14 @@ def _reconcile(con, rid, refreshing):
     if len(signatures) != 1 or not copies[0]["measurement"] or any(o["incomplete"] for o in copies):
         return
     first = copies[0]
-    row = con.execute("SELECT r.*,s.codex_context_version AS version,s.codex_context_offset AS context_offset "
-                      "FROM responses r JOIN sources s "
-                      "ON s.id=r.source_id WHERE r.response_id=?", (rid,)).fetchone()
+    row = con.execute("SELECT r.*,s.codex_context_version AS version,m.successor_id FROM responses r "
+                      "JOIN sources s ON s.id=r.source_id LEFT JOIN codex_relocations m ON m.source_id=s.id "
+                      "WHERE r.response_id=?", (rid,)).fetchone()
     if row is None or row["session_key"] != first["session_key"]:
         return
     source = next((o for o in copies if o["source_id"] == row["source_id"]), first)
-    # A pre-upgrade source whose context offset was cleared was replayed as its verified move.
-    replayed = row["version"] is not None and row["context_offset"] is None
     if (source["source_id"] != row["source_id"] and row["source_id"] != refreshing
-            and (row["version"] or 0) < 8 and not replayed):
+            and (row["version"] or 0) < 8 and row["successor_id"] is None):
         return  # The original pre-upgrade source has not been replayed.
     measured = json.loads(source["measurement"])
     same_source = source["source_id"] == row["source_id"]
