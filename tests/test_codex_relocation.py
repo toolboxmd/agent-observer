@@ -63,12 +63,14 @@ class PreAtomicArchiveTest(LedgerCase):
                                           inputTokens=3000, outputTokens=350, hasSubagents=False)),))
         self.con.commit()
 
-    def downgrade(self, path):
-        """Leave the durable state of a context-version 5 import of ``path``."""
+    def downgrade(self, path, version=5):
+        """Leave the durable state of an older context-version import of ``path``."""
         source, = self.con.execute("SELECT id FROM sources WHERE path=?", (str(path),)).fetchone()
         self.con.execute("DELETE FROM codex_atomic_observations WHERE source_id=?", (source,))
-        self.con.execute("DELETE FROM native_response_inputs WHERE source_id=?", (source,))
-        self.con.execute("UPDATE sources SET codex_context_version=5 WHERE id=?", (source,))
+        if version < 7:
+            # Version 7 recorded literal turn inputs; earlier versions did not.
+            self.con.execute("DELETE FROM native_response_inputs WHERE source_id=?", (source,))
+        self.con.execute("UPDATE sources SET codex_context_version=? WHERE id=?", (version, source))
         self.con.commit()
         return source
 
@@ -126,25 +128,6 @@ class PreAtomicArchiveTest(LedgerCase):
         self.assert_attributed()
         self.assert_second_sync_is_a_no_op()
 
-    def test_leftover_conflict_stays_conflicting_and_the_handoff_is_not_repeated(self):
-        # Two copies of one response in the moved file disagree. The other
-        # responses still move, and later syncs do not reread the rollout.
-        atom = next(json.loads(line) for line in self.original.read_text().splitlines()
-                    if '"resp-mini-003"' in line and '"token_usage_record"' in line)
-        atom["payload"]["usage"]["output_tokens"] += 7
-        with self.original.open("a") as stream:
-            stream.write(json.dumps(atom) + "\n")
-        codex.sync(self.con)
-        self.downgrade(self.original)
-        self.original.rename(self.archived)
-        codex.sync(self.con)
-        self.assertEqual(self.native(), (TURN_RESPONSES, ["codex:resp-mini-003"], ["reconciled"]))
-        owners = self.owners()
-        self.assertEqual(owners.pop("codex:resp-mini-003"), str(self.original))
-        self.assertEqual(set(owners.values()), {str(self.archived)})
-        self.assert_second_sync_is_a_no_op()
-        self.assertEqual(self.native(), (TURN_RESPONSES, ["codex:resp-mini-003"], ["reconciled"]))
-
     def sync_imports(self):
         """Run an ordinary sync and return each source's import stats."""
         seen = []
@@ -161,36 +144,6 @@ class PreAtomicArchiveTest(LedgerCase):
     def atom(self, response_id):
         return next(json.loads(line) for line in self.original.read_text().splitlines()
                     if f'"{response_id}"' in line and '"token_usage_record"' in line)
-
-    def test_unreadable_usage_record_keeps_conflicts_without_repeating_the_replay(self):
-        self.downgrade(self.original)
-        atom = self.atom("resp-mini-003")
-        del atom["payload"]["response_id"]
-        self.original.rename(self.archived)
-        with self.archived.open("a") as stream:
-            stream.write(json.dumps(atom) + "\n")
-        codex.sync(self.con)
-        self.assert_conflicting()
-        self.assert_second_sync_is_a_no_op()
-        self.assert_conflicting()
-
-    def test_torn_archive_reads_only_its_tail_until_the_line_completes(self):
-        self.downgrade(self.original)
-        self.original.rename(self.archived)
-        line = next(row for row in self.archived.read_text().splitlines() if '"turn_context"' in row) + "\n"
-        with self.archived.open("a") as stream:
-            stream.write(line[:20])
-        codex.sync(self.con)
-        self.assert_conflicting()
-        imports = self.sync_imports()
-        self.assertTrue(imports)
-        self.assertTrue(all(stats["unchanged"] or stats["incremental"] for stats in imports), imports)
-        self.assert_conflicting()
-        with self.archived.open("a") as stream:
-            stream.write(line[20:])
-        codex.sync(self.con)
-        self.assert_attributed()
-        self.assert_second_sync_is_a_no_op()
 
     def test_source_identity_that_differs_from_the_archive_is_handed_off_once(self):
         # Before #69 an import could store a copied parent thread on the row.
@@ -234,53 +187,187 @@ class PreAtomicArchiveTest(LedgerCase):
         codex.sync(self.con)
         self.assert_conflicting()
 
-    # A verified move gives exactly the verdict an in-place replay gives.
-    def stored_counters(self):
-        names = ",".join(("response_id", "turn_id") + codex_atomic.COUNTERS)
-        return self.con.execute(f"SELECT {names} FROM responses ORDER BY response_id").fetchall()
 
-    def replay(self, move, third=False):
-        # An older parser stored a counter the native bytes do not hold.
-        self.downgrade(self.original)
-        self.con.execute("UPDATE responses SET output_tokens=output_tokens+9 WHERE response_id='codex:resp-mini-001'")
-        self.con.commit()
-        if third:
-            # Another rollout observes the same atom with the native counters.
-            # Its name sorts before the archived rollout.
-            other = self.archive / "rollout-2026-09-09T10-00-00-copy.jsonl"
-            meta = self.original.read_text().splitlines()[0]
-            other.write_text(meta + "\n" + json.dumps(self.atom("resp-mini-001")) + "\n")
-        if move:
-            self.original.rename(self.archived)
-        codex.sync(self.con)
-        owner = self.owners()["codex:resp-mini-001"]
-        return self.native(), [tuple(r) for r in self.stored_counters()], owner
+IGNORED = ("source_availability", "snapshot_id", "source_cutoff")
 
-    def in_place(self, third=False):
-        other = PreAtomicArchiveTest("test_differing_stored_counter_keeps_its_conflict")
-        other.setUp()
+
+class MoveEqualsInPlaceReplayTest(LedgerCase):
+    """For the same bytes and older-parser state, a verified move followed by an
+    ordinary sync leaves exactly what an in-place replay leaves: the task report
+    (apart from source availability), every responses column and every native
+    response input. A row from before context versions is the one exception."""
+
+    def replay(self, arrange, move, later, settled):
+        """Every view one ledger passes through. Each ledger runs to the end
+        before the next starts, because the Codex roots are patched globally."""
+        case = PreAtomicArchiveTest("test_older_import_reconciles_after_its_rollout_is_archived")
+        case.setUp()
         try:
-            verdict = other.replay(False, third)
-            other.assert_second_sync_is_a_no_op()
-            return verdict, str(other.original)
+            arrange(case)
+            case.con.commit()
+            if move:
+                case.original.rename(case.archived)
+            codex.sync(case.con)
+            views = [self.view(case)]
+            if later is not None:
+                # Only the unfinished tail is read until the line completes.
+                imports = case.sync_imports()
+                self.assertTrue(all(stats["unchanged"] or stats["incremental"] for stats in imports), imports)
+                views.append(self.view(case))
+                later(case, case.archived if move else case.original)
+                codex.sync(case.con)
+                views.append(self.view(case))
+            if settled:
+                case.assert_second_sync_is_a_no_op()
+                views.append(self.view(case))
+            return views
         finally:
-            other.tearDown()
-            other.doCleanups()
+            case.tearDown()
+            case.doCleanups()
 
-    def test_differing_stored_counter_keeps_its_conflict(self):
-        (expected, counters, owner), original = self.in_place()
-        self.assertEqual(expected, (["codex:resp-mini-002"], ["codex:resp-mini-001"], ["counter_mismatch"]))
-        self.assertEqual(owner, original)
-        moved, moved_counters, moved_owner = self.replay(True)
-        self.assertEqual((moved, moved_counters), (expected, counters))
-        self.assertEqual(moved_owner, str(self.original))
-        self.assert_second_sync_is_a_no_op()
-        self.assertEqual((self.native(), [tuple(r) for r in self.stored_counters()]), (expected, counters))
+    def view(self, case):
+        paths = {str(case.original): "<file>", str(case.archived): "<file>", case.tmp.name: "<root>"}
 
-    def test_agreeing_copy_elsewhere_does_not_take_the_moved_files_response(self):
-        (expected, counters, owner), original = self.in_place(third=True)
-        self.assertEqual(owner, original)
-        moved, moved_counters, moved_owner = self.replay(True, third=True)
-        self.assertEqual((moved, moved_counters), (expected, counters))
-        self.assertEqual(moved_owner, str(self.archived))
-        self.assert_second_sync_is_a_no_op()
+        def plain(value):
+            text = json.dumps(value, sort_keys=True, default=str)
+            for path, name in paths.items():
+                text = text.replace(path, name)
+            return json.loads(text)
+
+        def kept(value):
+            if isinstance(value, dict):
+                return {k: kept(v) for k, v in value.items() if k not in IGNORED}
+            return [kept(v) for v in value] if isinstance(value, list) else value
+
+        rep = kept(report.task_report(case.con, case.task))
+        tables = {}
+        for table, order in (("responses", "response_id"), ("native_response_inputs", "response_id,input_id")):
+            rows = case.con.execute(f"SELECT t.*,s.path AS source_path FROM {table} t JOIN sources s "
+                                    f"ON s.id=t.source_id ORDER BY s.path!=?,{order}", (str(case.archived),))
+            tables[table] = sorted((sorted((k, row[k]) for k in row.keys() if k != "source_id") for row in rows),
+                                   key=json.dumps)
+        return plain({"report": rep, **tables})
+
+    def assert_pair(self, arrange, later=None, settled=True):
+        in_place, moved = (self.replay(arrange, move, later, settled) for move in (False, True))
+        for step, (expected, actual) in enumerate(zip(in_place, moved)):
+            with self.subTest(step=step):
+                self.assertEqual(actual, expected)
+        return moved[-1]
+
+    @staticmethod
+    def stored(case, rid, **values):
+        case.con.execute("UPDATE responses SET " + ",".join(f"{k}=?" for k in values) + " WHERE response_id=?",
+                         (*values.values(), rid))
+
+    @staticmethod
+    def append(path, *lines):
+        with path.open("a") as stream:
+            stream.write("".join(lines))
+
+    def copy_elsewhere(self, case, extra=0):
+        atom = case.atom("resp-mini-001")
+        atom["payload"]["usage"]["output_tokens"] += extra
+        other = case.live / "2026" / "09" / "11" / "rollout-2026-09-11T10-00-00-copy.jsonl"
+        other.parent.mkdir(parents=True)
+        other.write_text(case.original.read_text().splitlines()[0] + "\n" + json.dumps(atom) + "\n")
+
+    def test_all_counters_agree(self):
+        view = self.assert_pair(lambda c: c.downgrade(c.original))
+        self.assertEqual(view["report"]["native_purpose"]["conflicting_responses"], [])
+
+    def test_one_stored_counter_differs(self):
+        def arrange(c):
+            c.downgrade(c.original)
+            self.stored(c, "codex:resp-mini-001", output_tokens=109)
+        self.assert_pair(arrange)
+
+    def test_stored_model_differs(self):
+        def arrange(c):
+            c.downgrade(c.original)
+            self.stored(c, "codex:resp-mini-001", model="other-model")
+        self.assert_pair(arrange)
+
+    def test_stored_effort_differs(self):
+        def arrange(c):
+            c.downgrade(c.original)
+            self.stored(c, "codex:resp-mini-001", effort="low")
+        self.assert_pair(arrange)
+
+    def test_stored_turn_differs(self):
+        def arrange(c):
+            c.downgrade(c.original)
+            self.stored(c, "codex:resp-mini-001", turn_id="codex:turn-other")
+        self.assert_pair(arrange)
+
+    def test_response_the_file_no_longer_contains(self):
+        def arrange(c):
+            c.downgrade(c.original)
+            columns = [r[1] for r in c.con.execute("PRAGMA table_info(responses)")]
+            values = ",".join("'codex:resp-mini-gone'" if k == "response_id" else k for k in columns)
+            c.con.execute(f"INSERT INTO responses({','.join(columns)}) SELECT {values} FROM responses "
+                          "WHERE response_id='codex:resp-mini-001'")
+        self.assert_pair(arrange)
+
+    def test_extra_response_only_the_file_contains(self):
+        def arrange(c):
+            c.downgrade(c.original)
+            c.con.execute("DELETE FROM responses WHERE response_id='codex:resp-mini-002'")
+        self.assert_pair(arrange)
+
+    def test_conflicting_copy_in_a_second_rollout(self):
+        def arrange(c):
+            c.downgrade(c.original)
+            self.copy_elsewhere(c, extra=7)
+        self.assert_pair(arrange)
+
+    def test_agreeing_copy_in_a_second_rollout(self):
+        def arrange(c):
+            c.downgrade(c.original)
+            self.copy_elsewhere(c)
+        self.assert_pair(arrange)
+
+    def test_agreeing_copy_in_a_second_rollout_and_a_differing_stored_counter(self):
+        def arrange(c):
+            c.downgrade(c.original)
+            self.copy_elsewhere(c)
+            self.stored(c, "codex:resp-mini-001", output_tokens=109)
+        self.assert_pair(arrange)
+
+    def test_version_7_predecessor(self):
+        self.assert_pair(lambda c: c.downgrade(c.original, 7))
+
+    def test_version_7_predecessor_with_usage_conflict_history(self):
+        def arrange(c):
+            c.downgrade(c.original, 7)
+            c.con.execute("INSERT INTO import_errors(harness,source_path,ordinal_num,error,line_excerpt,created_at) "
+                          "VALUES('codex',?,30,'usage_conflict','',0)", (str(c.original),))
+        self.assert_pair(arrange)
+
+    def test_conflicting_copies_inside_the_file(self):
+        def arrange(c):
+            atom = c.atom("resp-mini-003")
+            atom["payload"]["usage"]["output_tokens"] += 7
+            self.append(c.original, json.dumps(atom) + "\n")
+            codex.sync(c.con)
+            c.downgrade(c.original)
+        view = self.assert_pair(arrange)
+        self.assertEqual(view["report"]["native_purpose"]["conflicting_responses"], ["codex:resp-mini-003"])
+
+    def test_torn_last_line_before_and_after_it_completes(self):
+        line = []
+
+        def arrange(c):
+            c.downgrade(c.original)
+            line.append(next(r for r in c.original.read_text().splitlines() if '"turn_context"' in r) + "\n")
+            self.append(c.original, line[0][:20])
+        self.assert_pair(arrange, later=lambda c, path: self.append(path, line[0][20:]))
+
+    def test_unreadable_usage_record(self):
+        def arrange(c):
+            c.downgrade(c.original)
+            atom = c.atom("resp-mini-003")
+            del atom["payload"]["response_id"]
+            self.append(c.original, json.dumps(atom) + "\n")
+        self.assert_pair(arrange)
+

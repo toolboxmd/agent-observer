@@ -769,6 +769,8 @@ def import_codex_file(con: sqlite3.Connection, path: str,
     }
     src = JsonlSource(con, HARNESS, path, full=full)
     predecessor = codex_atomic.relocated_source(src)
+    if predecessor is not None and predecessor.get("before_atoms"):
+        codex_atomic.relocate(con, predecessor, src.source_id)
     if (predecessor is not None or src.row["codex_context_version"] != _CONTEXT_VERSION
             or src.row["codex_context_offset"] != src.row["read_offset"]):
         # Replay older indexes once to recover literal turn witnesses from copies.

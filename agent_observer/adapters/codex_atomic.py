@@ -89,6 +89,22 @@ def _moved_before_atoms(src, path):
     return matches
 
 
+def relocate(con, predecessor, successor):
+    """Let this rollout stand for the moved file before it replays it.
+
+    The rollout adopts the predecessor's responses and drops the inputs an
+    older parser derived, so the replay from the start treats them exactly as
+    an in-place replay treats its own rows. The record keeps the predecessor
+    from qualifying again and out of rules that read its stale version.
+    """
+    con.execute("""CREATE TABLE IF NOT EXISTS codex_relocations (
+        source_id INTEGER PRIMARY KEY REFERENCES sources(id), successor_id INTEGER NOT NULL REFERENCES sources(id))""")
+    con.execute("INSERT OR REPLACE INTO codex_relocations VALUES(?,?)", (predecessor["id"], successor))
+    con.execute("UPDATE responses SET source_id=? WHERE source_id=?", (successor, predecessor["id"]))
+    if db._has_table(con, "native_response_inputs"):
+        con.execute("DELETE FROM native_response_inputs WHERE source_id=?", (predecessor["id"],))
+
+
 def prepare(r):
     con = r.con
     con.execute("""CREATE TABLE IF NOT EXISTS codex_atomic_observations (
@@ -101,9 +117,6 @@ def prepare(r):
     con.execute("""CREATE TABLE IF NOT EXISTS codex_incomplete_sources (
         source_id INTEGER PRIMARY KEY REFERENCES sources(id),session_key TEXT NOT NULL,legacy_dispute INTEGER NOT NULL,
         replay INTEGER NOT NULL DEFAULT 1, prefix_bytes INTEGER, prefix_digest TEXT)""")
-    # A pre-atomic source and the rollout that replayed it after Codex moved the file.
-    con.execute("""CREATE TABLE IF NOT EXISTS codex_relocations (
-        source_id INTEGER PRIMARY KEY REFERENCES sources(id), successor_id INTEGER NOT NULL REFERENCES sources(id))""")
     columns = {c[1] for c in con.execute("PRAGMA table_info(codex_incomplete_sources)")}
     for key, declaration in (("replay", "INTEGER NOT NULL DEFAULT 1"), ("prefix_bytes", "INTEGER"), ("prefix_digest", "TEXT")):
         if key not in columns:
@@ -141,9 +154,8 @@ def observe(r, obj, counters):
 
 def finish(r, predecessor):
     con, src = r.con, r.src
-    moved = None
     if predecessor is not None and predecessor.get("before_atoms"):
-        moved, predecessor = predecessor, None
+        predecessor = None  # relocate() already handed its responses to this rollout.
     incomplete = r.unreadable_atomic or src.incomplete_record or src.end_offset < src.size
     if incomplete:
         legacy = (src.row["codex_context_version"] == 7 and con.execute(
@@ -174,9 +186,6 @@ def finish(r, predecessor):
             # tail was unfinished. Revisit its stored atoms without rereading the file.
             r.atomic_ids.update(rid for rid, in con.execute(
                 "SELECT DISTINCT response_id FROM codex_atomic_observations WHERE source_id=?", (src.source_id,)))
-    if moved is not None and not src.incremental:
-        # This replay from the start stands in for the moved source, complete or not.
-        con.execute("INSERT OR REPLACE INTO codex_relocations VALUES(?,?)", (moved["id"], src.source_id))
     if not src.incremental:
         r.atomic_ids.update(rid for rid, in con.execute("SELECT DISTINCT response_id FROM prior_codex_atoms"))
         if incomplete:
@@ -204,29 +213,22 @@ def _reconcile(con, rid, refreshing):
     if len(signatures) != 1 or not copies[0]["measurement"] or any(o["incomplete"] for o in copies):
         return
     first = copies[0]
-    row = con.execute("SELECT r.*,s.codex_context_version AS version,m.successor_id FROM responses r "
-                      "JOIN sources s ON s.id=r.source_id LEFT JOIN codex_relocations m ON m.source_id=s.id "
-                      "WHERE r.response_id=?", (rid,)).fetchone()
+    row = con.execute("SELECT r.*,s.codex_context_version AS version FROM responses r JOIN sources s "
+                      "ON s.id=r.source_id WHERE r.response_id=?", (rid,)).fetchone()
     if row is None or row["session_key"] != first["session_key"]:
         return
-    # A recorded relocation's successor is the same file as its predecessor.
-    # Every rule below treats it so, which gives a verified move exactly the
-    # verdict an in-place replay of that file would give.
-    same_file = {row["source_id"], row["successor_id"]} - {None}
-    source = next((o for o in copies if o["source_id"] in same_file), first)
-    same_source = source["source_id"] in same_file
-    if (not same_source and row["source_id"] != refreshing
-            and (row["version"] or 0) < 8 and row["successor_id"] is None):
+    source = next((o for o in copies if o["source_id"] == row["source_id"]), first)
+    if source["source_id"] != row["source_id"] and row["source_id"] != refreshing and (row["version"] or 0) < 8:
         return  # The original pre-upgrade source has not been replayed.
     measured = json.loads(source["measurement"])
-    if (same_source and {o["source_id"] for o in copies} <= same_file
+    same_source = source["source_id"] == row["source_id"]
+    if (same_source and len({o["source_id"] for o in copies}) == 1
             and any(row[k] is not None and row[k] != measured[k] for k in COUNTERS)):
         # One rewritten native atom cannot independently revise immutable
         # counters. The task view withholds it while the raw ledger keeps it.
         return
     turn = "codex:" + source["input_id"] if source["input_id"] else None
-    if (source["source_id"] != row["source_id"] or row["turn_id"] != turn
-            or any(row[k] != measured[k] for k in COUNTERS)):
+    if not same_source or row["turn_id"] != turn or any(row[k] != measured[k] for k in COUNTERS):
         con.execute("UPDATE responses SET " + ",".join(f"{k}=?" for k in COUNTERS) +
                     ",source_id=?,turn_id=?,ordinal_num=?,ts=?,model=?,effort=?,thread_id=?,root_turn_id=?,session_id=? "
                     "WHERE response_id=?",
@@ -243,9 +245,11 @@ def disputes(con, session_key, semantics):
     """Only current agreeing source measurements can support positive ownership."""
     if "codex_context_version" not in {c[1] for c in con.execute("PRAGMA table_info(sources)")}:
         return {}, False, {}
-    legacy = con.execute("""SELECT 1 FROM sources s JOIN import_errors e ON e.source_path=s.path
+    replayed = ("AND NOT EXISTS (SELECT 1 FROM codex_relocations m WHERE m.source_id=s.id)"
+                if db._has_table(con, "codex_relocations") else "")
+    legacy = con.execute(f"""SELECT 1 FROM sources s JOIN import_errors e ON e.source_path=s.path
         WHERE s.harness='codex' AND e.harness='codex' AND e.error='usage_conflict' AND s.codex_context_version=7
-        AND 'codex:'||COALESCE(s.thread_id,s.session_id)=? LIMIT 1""", (session_key,)).fetchone() is not None
+        AND 'codex:'||COALESCE(s.thread_id,s.session_id)=? {replayed} LIMIT 1""", (session_key,)).fetchone() is not None
     historical = {}
     if legacy:
         historical = {rid: set() for rid, in con.execute("SELECT response_id FROM responses WHERE session_key=? "
