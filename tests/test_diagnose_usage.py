@@ -128,6 +128,7 @@ class DiagnoseUsageTest(LedgerCase):
                     '"resp-mini-001"' in line and '"token_usage_record"' in line)
         self.sync("codex-mini.jsonl")
         atom["payload"]["usage"]["input_tokens"] += 7
+        atom["timestamp"] = "2026-09-10T10:00:09Z"
         copy = Path(self.tmp.name) / "rollout-copy.jsonl"
         missing = json.loads(json.dumps(atom))
         missing["payload"]["response_id"] = "missing-usage"
@@ -146,6 +147,10 @@ class DiagnoseUsageTest(LedgerCase):
                       group["semantics"] == codex.SEMANTICS)
         self.assertIsNone(native["cached_input_share"])
         self.assertIsNone(native["cached_input_tokens"])
+        bounded = self.run_diagnose("--harness", "codex", "--since", "2026-09-10T10:00:07.500Z")
+        points = bounded["context_growth"][0]["timeline"]
+        self.assertTrue(any(p.get("response_id") == "codex:resp-mini-001" and p["input_tokens"] is None
+                            for p in points))
 
     def test_codex_fallback_quarantine_keeps_timeline_input_and_share_unknown(self):
         self.sync("codex-precompaction-conflict.jsonl")
@@ -403,13 +408,24 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertIsNone(cache["cached_input_share"])
         self.assertIsNone(cache["cached_input_tokens"])
 
-        copied = str(Path(self.tmp.name) / "opencode-copy.db")
+        copied = str(Path(self.tmp.name) / "z-opencode-copy.db")
         shutil.copyfile(path, copied)
+        with contextlib.closing(sqlite3.connect(copied)) as native:
+            moved = _msg("assistant", T0 + 31, T0 + 35)
+            native.execute("UPDATE message SET data=? WHERE id='cache_missing'", (moved,))
+            native.commit()
+        opencode.sync(self.con, source=copied)
+        bounded = self.run_diagnose("--session", "opencode:cache_gap",
+                                    "--until", str((T0 + 40) / 1000))
+        self.assertEqual([p["response_id"] for p in bounded["context_growth"][0]["timeline"]],
+                         ["opencode:cache_measured", "opencode:cache_missing"])
+        self.assertIsNone(bounded["cache_observations"][0]["cached_input_share"])
         with contextlib.closing(sqlite3.connect(copied)) as native:
             missing_copy = _msg("assistant", T0 + 20, T0 + 30)
             native.execute("UPDATE message SET data=? WHERE id='cache_measured'", (missing_copy,))
+            native.execute("UPDATE message SET data=? WHERE id='cache_missing'", (json.dumps(missing),))
             native.commit()
-        opencode.sync(self.con, source=copied)
+        opencode.sync(self.con, source=copied, full=True)
         result = self.run_diagnose("--session", "opencode:cache_gap",
                                    "--until", str((T0 + 40) / 1000))
         timeline = result["context_growth"][0]["timeline"]

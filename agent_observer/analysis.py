@@ -15,7 +15,6 @@ import re
 import sqlite3
 import statistics
 from collections import defaultdict
-from itertools import chain
 
 from . import codex_order, db
 from .adapters import claude, codex, codex_atomic, grok, opencode
@@ -583,9 +582,9 @@ def _sort_context(con, key, harness, timeline):
     return "timestamp"
 
 
-def _opencode_context_rows(con, key, measured):
+def _opencode_context_rows(con, key, measured, since, until):
     witnesses, conflicts, unavailable = opencode.response_witnesses(con, key)
-    gaps = opencode.unavailable_usage_locations(con, key)
+    gaps = _group_usage_locations(opencode.unavailable_usage_locations(con, key))
 
     def turn_id(rid, parents):
         if rid not in conflicts and len(parents) == 1:
@@ -601,34 +600,58 @@ def _opencode_context_rows(con, key, measured):
         rid = row["response_id"]
         gap = gaps.pop(rid, None)
         if gap is not None:
-            yield dict(unknown_row(row), usage_gap=dict(gap))
+            place = _select_usage_location([row, *gap], since, until)
+            if place is not None:
+                yield dict(unknown_row(place), usage_gap=dict(gap[0]))
         else:
             yield dict(row, turn_id=row["turn_id"] or turn_id(rid, witnesses.get(rid, ())))
-    for row in gaps.values():
-        yield unknown_row(row)
+    for copies in gaps.values():
+        place = _select_usage_location(copies, since, until)
+        if place is not None:
+            yield unknown_row(place)
 
 
 def _in_usage_window(ts, since, until):
     return ts is None or ((since is None or ts >= since) and (until is None or ts < until))
 
 
-def _unmeasured_rows(locations, harness, semantics, since, until):
+def _group_usage_locations(locations):
     rows = defaultdict(list)
     for row in locations:
         rows[row["response_id"]].append(row)
-    for copies in rows.values():
-        first = next((row for row in copies if _in_usage_window(row["ts"], since, until)), None)
-        if first is None:
-            continue
-        result = dict(first, harness=harness, semantics=semantics, input_tokens=None,
-                      cached_input_tokens=None, cache_write_input_tokens=None)
-        fields = ("source_id", "ordinal_num", "ts")
-        selected = tuple(first[field] for field in fields)
-        locations = dict.fromkeys(tuple(row[field] for field in fields) for row in copies)
-        if len(locations) > 1:
-            result["alternate_locations"] = [dict(zip(fields, locator))
-                                             for locator in locations if locator != selected]
-        yield result
+    return rows
+
+
+def _select_usage_location(copies, since, until):
+    first = next((row for row in copies if _in_usage_window(row["ts"], since, until)), None)
+    if first is None:
+        return None
+    result = dict(first)
+    fields = ("source_id", "ordinal_num", "ts")
+    selected = tuple(first[field] for field in fields)
+    locations = dict.fromkeys(tuple(row[field] for field in fields) for row in copies)
+    if len(locations) > 1:
+        result["alternate_locations"] = [dict(zip(fields, locator))
+                                         for locator in locations if locator != selected]
+    return result
+
+
+def _native_context_rows(measured, locations, disputes, harness, semantics, since, until):
+    copies = _group_usage_locations(locations)
+    for row in measured:
+        rid = row["response_id"]
+        others = copies.pop(rid, [])
+        if rid in disputes and not _in_usage_window(row["ts"], since, until):
+            place = _select_usage_location([row, *others], since, until)
+            if place is not None:
+                yield dict(row, **place)
+        else:
+            yield row
+    for others in copies.values():
+        place = _select_usage_location(others, since, until)
+        if place is not None:
+            yield dict(place, harness=harness, semantics=semantics, input_tokens=None,
+                       cached_input_tokens=None, cache_write_input_tokens=None)
 
 
 def _diagnose_usage(con, sessions, since, until):
@@ -653,7 +676,6 @@ def _diagnose_usage(con, sessions, since, until):
             " FROM responses WHERE session_key=? AND is_overlap=0", (key,))
         disputes = set()
         agreed_turns = {}
-        gaps = ()
         incomplete_semantics = set()
         disputed_semantics = set()
         if harness == "codex":
@@ -661,8 +683,9 @@ def _diagnose_usage(con, sessions, since, until):
             disputes.update(conflicts)
             if disputes:
                 agreed_turns = codex_atomic.agreed_turn_ids(con, key)
-            gaps = _unmeasured_rows(codex_atomic.unmeasured_locations(con, key),
-                                    harness, codex.SEMANTICS, since, until)
+            locations = codex_atomic.usage_locations(con, key, unprojected_only=not (disputes and bounds))
+            responses = _native_context_rows(responses, locations, disputes, harness,
+                                            codex.SEMANTICS, since, until)
             if incomplete:
                 incomplete_semantics.add(codex.SEMANTICS)
             if codex.has_unlocated_fallback_usage(con, key):
@@ -670,13 +693,14 @@ def _diagnose_usage(con, sessions, since, until):
                 disputed_semantics.add(codex.TOKEN_COUNT_SEMANTICS)
         elif harness == "claude":
             disputes = claude.conflicting_final_measurements(con, key)
-            gaps = _unmeasured_rows(claude.unmeasured_final_locations(con, key),
-                                    harness, claude.SEMANTICS, since, until)
+            locations = claude.final_locations(con, key, unprojected_only=not (disputes and bounds))
+            responses = _native_context_rows(responses, locations, disputes, harness,
+                                            claude.SEMANTICS, since, until)
             if db._has_table(con, "claude_unreadable_sources") and con.execute(
                     "SELECT 1 FROM claude_unreadable_sources WHERE session_key=? LIMIT 1", (key,)).fetchone():
                 incomplete_semantics.add(claude.SEMANTICS)
         elif harness == "opencode":
-            responses = _opencode_context_rows(con, key, responses)
+            responses = _opencode_context_rows(con, key, responses, since, until)
             if opencode.has_unlocated_usage_error(con, key):
                 incomplete_semantics.add(opencode.SEMANTICS)
         elif harness == "grok":
@@ -689,7 +713,7 @@ def _diagnose_usage(con, sessions, since, until):
             group = (harness, semantics)
             unlocated[group] += 1
             cache.setdefault(group, [])
-        for row in chain(responses, gaps):
+        for row in responses:
             ts = row["ts"]
             if not _in_usage_window(ts, since, until):
                 continue

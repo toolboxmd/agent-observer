@@ -392,11 +392,10 @@ def response_witnesses(con, session_key):
 
 
 def unavailable_usage_locations(con, session_key):
-    """One source locator per response with missing or unusable counters."""
+    """Source locators for responses with missing or unusable counters."""
     if not db._has_table(con, "opencode_response_observations"):
-        return {}
-    found = {}
-    for row in con.execute(
+        return
+    yield from con.execute(
             "SELECT o.response_id,o.source_id,o.ordinal_num,o.ts"
             " FROM opencode_response_observations o JOIN sources s ON s.id=o.source_id"
             " WHERE o.session_key=? AND json_type(o.measurement)<>'object'"
@@ -405,9 +404,7 @@ def unavailable_usage_locations(con, session_key):
             " AND (o.measurement IN (?,?) OR EXISTS (SELECT 1 FROM responses r"
             " WHERE r.session_key=o.session_key AND r.response_id=o.response_id AND r.is_overlap=0))"
             " ORDER BY o.response_id,s.path",
-            (session_key, json.dumps("unmeasured"), json.dumps(_MALFORMED_USAGE))):
-        found.setdefault(row["response_id"], row)
-    return found
+            (session_key, json.dumps("unmeasured"), json.dumps(_MALFORMED_USAGE)))
 
 
 def has_unlocated_usage_error(con, session_key):
