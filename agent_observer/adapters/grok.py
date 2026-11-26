@@ -3148,17 +3148,6 @@ def _record_prompt_bridges(r, src, records):
                       ((r.session_key, pid, ref, src.source_id) for pid, ref in witnesses))
 
 
-def usage_quarantine(con, native_session_id):
-    """Source-level issues that can affect usage without identifying a prompt."""
-    return {error for error, in con.execute(
-        "SELECT DISTINCT e.error FROM sources s JOIN import_errors e"
-        " ON e.harness=s.harness AND e.source_path=s.path"
-        " WHERE s.harness=? AND s.session_id=?"
-        " AND (e.error IN ('malformed_usage','usage_conflict')"
-        " OR (e.error='missing_id' AND s.path LIKE '%/updates.jsonl'))",
-        (HARNESS, native_session_id))}
-
-
 def response_witnesses(con, session_key):
     if not db._has_table(con, "grok_prompt_bridges"):
         return {}, set(), set()

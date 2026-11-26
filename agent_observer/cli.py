@@ -1313,7 +1313,6 @@ def _print_diagnose_usage(payload):
 
     print("Context growth by session (input samples labeled with their recorded turns).")
     print("Timestamps are Unix seconds. In timestamp order, ties and missing times leave order uncertain.")
-    print("Date filters retain untimed observations with unknown cache contribution.")
     for session in payload["context_growth"]:
         print(f"- {session['session']} ({session['order']} order)")
         if not session["timeline"]:
@@ -1325,12 +1324,6 @@ def _print_diagnose_usage(payload):
             else:
                 observation = (f"{known(point['input_tokens'])} input tokens "
                                f"(response {point['response_id']}, {location})")
-                if gap := point.get("usage_gap"):
-                    observation += (f" (usage gap at source {gap['source_id']}, "
-                                    f"ordinal {known(gap['ordinal_num'])})")
-                for alternate in point.get("alternate_locations", ()):
-                    observation += (f" (also source {alternate['source_id']}, "
-                                    f"ordinal {known(alternate['ordinal_num'])})")
             print(f"  {known(point['ts'])} turn {known(point['turn_id'])}: {observation}")
     print("Cache observations by harness and counter semantics")
     for item in payload["cache_observations"]:
@@ -1340,8 +1333,6 @@ def _print_diagnose_usage(payload):
               f"cached input share {percent}, "
               f"creation {known(item['cache_write_input_tokens'])} vs "
               f"reads {known(item['cached_input_tokens'])} tokens")
-        if item["unlocated_usage_sessions"]:
-            print(f"  Usage could not be located in {item['unlocated_usage_sessions']} sessions.")
 
 
 def _publish(con, ns) -> int:

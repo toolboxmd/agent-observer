@@ -62,7 +62,7 @@ def _occurrences_ready(row) -> bool:
 
 
 HARNESS = "codex"
-_CONTEXT_VERSION = 11  # Preserve the counter family of each quarantined usage record.
+_CONTEXT_VERSION = 10  # Recover atoms deferred while a formerly incomplete source was growing.
 SEMANTICS = "codex:input_includes_cached,output_includes_reasoning"
 # Older rollouts carry usage only in token_count events: last_token_usage per
 # response and a cumulative total that repeats when nothing new happened.
@@ -770,14 +770,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
     codex_atomic.adopt_moved_source(con, path)
     src = JsonlSource(con, HARNESS, path, full=full)
     predecessor = codex_atomic.relocated_source(src)
-    prior_context = src.row["codex_context_version"]
-    # Version 10 already has native turn witnesses. Only sources with usage
-    # quarantine need replay to recover their counter family at each offset.
-    replay_quarantine = prior_context == 10 and con.execute(
-        "SELECT 1 FROM import_errors WHERE harness=? AND source_path=?"
-        " AND error IN ('malformed_usage','usage_conflict') LIMIT 1",
-        (HARNESS, src.path)).fetchone()
-    if (predecessor is not None or prior_context not in (10, _CONTEXT_VERSION) or replay_quarantine
+    if (predecessor is not None or src.row["codex_context_version"] != _CONTEXT_VERSION
             or src.row["codex_context_offset"] != src.row["read_offset"]):
         # Replay older indexes once to recover literal turn witnesses from copies.
         src.start_offset = 0
@@ -1405,31 +1398,6 @@ def _repair_usage_context(r: _Reader, rid: str, obj: dict, model, effort,
              iso_ts(obj.get("timestamp"))))
 
 
-def has_unlocated_fallback_usage(con, session_key):
-    """Fallback quarantine does not retain the cumulative response identity."""
-    native = "COALESCE(NULLIF(s.thread_id,''),NULLIF(s.session_id,''))"
-    identity = f"'codex:'||{native}=?"
-    params = [session_key]
-    if session_key.startswith("codex:file:"):
-        suffix = "/" + session_key.removeprefix("codex:file:")
-        identity += f" OR ({native} IS NULL AND substr(s.path,?)=?)"
-        params.extend((-len(suffix), suffix))
-    atoms = ""
-    if db._has_table(con, "codex_atomic_observations"):
-        atoms = (" AND NOT EXISTS (SELECT 1 FROM codex_atomic_observations a"
-                 " WHERE a.source_id=s.id AND a.position=e.ordinal_num)")
-    if db._has_table(con, "codex_occurrences"):
-        atoms += (" AND NOT EXISTS (SELECT 1 FROM codex_occurrences o"
-                  " WHERE o.source_id=s.id AND o.row_kind='atomic_usage_error'"
-                  " AND o.row_key=CAST(e.ordinal_num AS TEXT))")
-    return con.execute(
-        "SELECT 1 FROM sources s JOIN import_errors e"
-        " ON e.harness=s.harness AND e.source_path=s.path"
-        f" WHERE s.harness='codex' AND ({identity})"
-        " AND e.error IN ('malformed_usage','usage_conflict')" + atoms + " LIMIT 1",
-        params).fetchone() is not None
-
-
 def _flush_token_counts(r: _Reader) -> None:
     """Count token_count usage snapshots for rollouts without full usage cover.
 
@@ -1656,9 +1624,6 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
                 raise _MalformedUsage("invalid atomic counter")
     except _MalformedUsage:
         codex_atomic.observe(r, obj, None)
-        # If the atom lacks a response ID, its occurrence still identifies
-        # which counter family its quarantined source position belongs to.
-        _note_occurrence(r, "atomic_usage_error", r.record_position, obj)
         raise
     u = u_raw if isinstance(u_raw, dict) else {}
     tt = tt_raw if isinstance(tt_raw, dict) else {}
@@ -1693,7 +1658,6 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
             " FROM responses WHERE response_id=?", (rid,)).fetchone()
         seen = dict(existing) if existing is not None else {}
         if seen != want:
-            _note_occurrence(r, "atomic_usage_error", r.record_position, obj)
             raise _UsageConflict("usage conflict")
         _migrate_response_position(r, rid, r.record_position)
         _repair_usage_context(r, rid, obj, r.model, r.effort, r.record_position)

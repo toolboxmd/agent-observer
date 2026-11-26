@@ -16,8 +16,8 @@ import sqlite3
 import statistics
 from collections import defaultdict
 
-from . import codex_order, db
-from .adapters import claude, codex, codex_atomic, grok, opencode
+from . import codex_order
+from .adapters import claude, codex, codex_atomic, opencode
 
 TEST_COMMAND_RE = re.compile(
     r"(\bpytest\b|\bunittest\b|scripts/test\.py|\bnpm (run )?test\b|\bpnpm (run )?test\b"
@@ -531,10 +531,43 @@ def _context_input(response):
     return None
 
 
-def _cache_observation(harness, semantics, rows, unlocated_sessions):
+def _sort_usage_timeline(con, session, timeline):
+    if session["harness"] == "codex" and timeline:
+        by_identity = {
+            ("response", point["response_id"]) if point["kind"] == "input"
+            else ("event", str(point["event_id"])): point for point in timeline}
+        state, order, _ = codex_order.resolve(con, session["session_key"], set(by_identity))
+        if state == "known":
+            timeline[:] = [by_identity[ident] for group in order for ident in sorted(group)]
+            return "native"
+        if state == "absent" and len({p["source_id"] for p in timeline}) == 1 and all(
+                p["source_id"] is not None and p["ordinal_num"] is not None for p in timeline):
+            timeline[:] = [by_identity[ident] for ident in sorted(
+                by_identity, key=lambda ident: (by_identity[ident]["ordinal_num"], ident))]
+            return "native"
+    timeline.sort(key=lambda point: (
+        point["ts"] is None, point["ts"] or 0, point["source_id"] or 0,
+        point["ordinal_num"] or 0, point["kind"], point.get("response_id", point.get("event_id"))))
+    return "timestamp"
+
+
+def _usage_evidence(con, session):
+    key = session["session_key"]
+    if session["harness"] == "codex":
+        conflicts, _, _ = codex_atomic.disputes(con, key, codex.SEMANTICS)
+        return set(conflicts), {}
+    if session["harness"] == "claude":
+        return claude.conflicting_final_measurements(con, key), {}
+    if session["harness"] == "opencode":
+        inputs, conflicts, _ = opencode.response_witnesses(con, key)
+        return conflicts, inputs
+    return set(), {}
+
+
+def _cache_observation(harness, semantics, rows):
     def total(counter):
         values = [row[counter] for row in rows]
-        return sum(values) if values and not unlocated_sessions and None not in values else None
+        return sum(values) if values and None not in values else None
 
     reads = total("cached_input_tokens")
     writes = total("cache_write_input_tokens")
@@ -545,130 +578,8 @@ def _cache_observation(harness, semantics, rows, unlocated_sessions):
         for row, size in zip(rows, inputs))
     input_total = sum(inputs) if valid else None
     return {"harness": harness, "semantics": semantics, "responses": len(rows),
-            "unlocated_usage_sessions": unlocated_sessions,
             "cached_input_tokens": reads, "cache_write_input_tokens": writes,
             "cached_input_share": reads / input_total if input_total else None}
-
-
-def _sort_context(con, key, harness, timeline):
-    if timeline and harness == "codex":
-        by_identity = {
-            ("response", point["response_id"]) if point["kind"] == "input"
-            else ("event", str(point["event_id"])): point for point in timeline}
-        state, groups, sequences = codex_order.resolve(con, key, set(by_identity))
-        if state == "known":
-            timeline[:] = [by_identity[identity] for group in groups for identity in sorted(group)]
-            return "native"
-        if state in {"absent", "partial"}:
-            sources = {point["source_id"] for point in timeline}
-            positions = {identity: point["ordinal_num"] for identity, point in by_identity.items()}
-            # A malformed atom can have a physical locator but no indexed
-            # occurrence. Check the indexed subset for conflicts before using
-            # common-source locations to place the unindexed samples.
-            if (len(sources) == 1 and None not in sources and None not in positions.values()
-                    and not any(point.get("alternate_locations") for point in timeline)):
-                covered = {item for sequence in sequences for group in sequence for item in group}
-                state, groups, _ = codex_order.resolve(con, key, covered) if covered else ("absent", [], [])
-                indexed = [pos for group in groups or ()
-                           for pos in sorted(positions[item] for item in group)]
-                if state in {"absent", "known"} and indexed == sorted(indexed):
-                    timeline[:] = [by_identity[identity] for identity in
-                                   sorted(by_identity, key=lambda item: (positions[item], item))]
-                    return "native"
-    timeline.sort(key=lambda point: (
-        point["ts"] is None, point["ts"] or 0,
-        point["source_id"] or 0, point["ordinal_num"] or 0,
-        point["kind"], point.get("response_id", point.get("event_id"))))
-    return "timestamp"
-
-
-def _opencode_context_rows(con, key, measured, since, until):
-    witnesses, conflicts, unavailable = opencode.response_witnesses(con, key)
-    copies_by_response = _group_usage_locations(opencode.usage_locations(
-        con, key, include_measured=bool(conflicts and (since is not None or until is not None))))
-
-    def turn_id(rid, parents):
-        if rid not in conflicts and len(parents) == 1:
-            return f"opencode:{next(iter(parents))}"
-        return None
-
-    def unknown_row(row):
-        return dict(row, harness="opencode", semantics=opencode.SEMANTICS,
-                    turn_id=turn_id(row["response_id"], unavailable.get(row["response_id"], ())),
-                    input_tokens=None, cached_input_tokens=None, cache_write_input_tokens=None)
-
-    for row in measured:
-        rid = row["response_id"]
-        copies = copies_by_response.pop(rid, [])
-        gap = next((copy for copy in copies if not copy["measured"]), None)
-        if gap is not None:
-            place = _select_usage_location([row, *copies], since, until)
-            if place is not None:
-                yield dict(unknown_row(place), usage_gap={field: gap[field] for field in
-                                                          ("source_id", "ordinal_num", "ts")})
-        else:
-            resolved_turn = row["turn_id"] or turn_id(rid, witnesses.get(rid, ()))
-            if rid in conflicts and not _in_usage_window(row["ts"], since, until):
-                place = _select_usage_location([row, *copies], since, until)
-                if place is not None:
-                    yield dict(row, **(place | {"turn_id": resolved_turn}))
-            else:
-                yield dict(row, turn_id=resolved_turn)
-    for copies in copies_by_response.values():
-        place = _select_usage_location(copies, since, until)
-        if place is not None:
-            yield unknown_row(place)
-
-
-def _in_usage_window(ts, since, until):
-    return ts is None or ((since is None or ts >= since) and (until is None or ts < until))
-
-
-def _group_usage_locations(locations):
-    rows = defaultdict(list)
-    for row in locations:
-        rows[row["response_id"]].append(row)
-    return rows
-
-
-def _select_usage_location(copies, since, until):
-    first = next((row for row in copies if _in_usage_window(row["ts"], since, until)), None)
-    if first is None:
-        return None
-    result = dict(first)
-    fields = ("source_id", "ordinal_num", "ts")
-    selected = tuple(first[field] for field in fields)
-    locations = dict.fromkeys(tuple(row[field] for field in fields) for row in copies)
-    if len(locations) > 1:
-        result["alternate_locations"] = [dict(zip(fields, locator))
-                                         for locator in locations if locator != selected]
-    return result
-
-
-def _native_context_rows(measured, locations, disputes, harness, semantics, since, until):
-    copies = _group_usage_locations(locations)
-    for row in measured:
-        rid = row["response_id"]
-        others = copies.pop(rid, [])
-        if harness == "claude":
-            # A final block in another copy can update the projected time
-            # and ordinal while the response retains its provisional source.
-            matches = [copy for copy in others if copy["measured"]
-                       and (copy["ts"], copy["ordinal_num"]) == (row["ts"], row["ordinal_num"])]
-            matches.sort(key=lambda copy: copy["source_id"] != row["source_id"])
-            if matches:
-                row = dict(row, **_select_usage_location(matches, None, None))
-        if rid in disputes and not _in_usage_window(row["ts"], since, until):
-            place = _select_usage_location([row, *others], since, until)
-            if place is not None:
-                yield dict(row, **place)
-        else:
-            yield row
-    for others in copies.values():
-        place = _select_usage_location(others, since, until)
-        if place is not None:
-            yield dict(place, harness=harness, semantics=semantics, input_tokens=None,
-                       cached_input_tokens=None, cache_write_input_tokens=None)
 
 
 def _diagnose_usage(con, sessions, since, until):
@@ -682,7 +593,6 @@ def _diagnose_usage(con, sessions, since, until):
         bounds.append(until)
     context = []
     cache = defaultdict(list)
-    unlocated = defaultdict(int)
     for session in sorted(sessions, key=lambda row: row["session_key"]):
         key, harness = session["session_key"], session["harness"]
         args = (key, *bounds)
@@ -690,79 +600,30 @@ def _diagnose_usage(con, sessions, since, until):
         responses = con.execute(
             "SELECT response_id, source_id, ordinal_num, ts, turn_id, harness, semantics,"
             " input_tokens, cached_input_tokens, cache_write_input_tokens"
-            " FROM responses WHERE session_key=? AND is_overlap=0", (key,))
-        disputes = set()
-        agreed_turns = {}
-        incomplete_semantics = set()
-        disputed_semantics = set()
-        if harness == "codex":
-            conflicts, incomplete, _ = codex_atomic.disputes(con, key, codex.SEMANTICS)
-            disputes.update(conflicts)
-            if disputes:
-                agreed_turns = codex_atomic.agreed_turn_ids(con, key)
-            locations = codex_atomic.usage_locations(con, key, unprojected_only=not (disputes and bounds))
-            responses = _native_context_rows(responses, locations, disputes, harness,
-                                            codex.SEMANTICS, since, until)
-            if incomplete:
-                incomplete_semantics.add(codex.SEMANTICS)
-            if codex.has_unlocated_fallback_usage(con, key):
-                incomplete_semantics.add(codex.TOKEN_COUNT_SEMANTICS)
-                disputed_semantics.add(codex.TOKEN_COUNT_SEMANTICS)
-        elif harness == "claude":
-            disputes = claude.conflicting_final_measurements(con, key)
-            locations = claude.final_locations(con, key)
-            responses = _native_context_rows(responses, locations, disputes, harness,
-                                            claude.SEMANTICS, since, until)
-            if db._has_table(con, "claude_unreadable_sources") and con.execute(
-                    "SELECT 1 FROM claude_unreadable_sources WHERE session_key=? LIMIT 1", (key,)).fetchone():
-                incomplete_semantics.add(claude.SEMANTICS)
-        elif harness == "opencode":
-            responses = _opencode_context_rows(con, key, responses, since, until)
-            if opencode.has_unlocated_usage_error(con, key):
-                incomplete_semantics.add(opencode.SEMANTICS)
-        elif harness == "grok":
-            quarantine = grok.usage_quarantine(con, session["native_id"])
-            if quarantine:
-                incomplete_semantics.add(grok.SEMANTICS)
-                if "usage_conflict" in quarantine:
-                    disputed_semantics.add(grok.SEMANTICS)
-        for semantics in incomplete_semantics:
-            group = (harness, semantics)
-            unlocated[group] += 1
-            cache.setdefault(group, [])
+            " FROM responses WHERE session_key=? AND is_overlap=0" + window, args)
+        disputed, inputs = _usage_evidence(con, session)
         for row in responses:
-            ts = row["ts"]
-            if not _in_usage_window(ts, since, until):
-                continue
-            if row["response_id"] in disputes:
-                turn = agreed_turns.get(row["response_id"]) if harness == "codex" else row["turn_id"]
-                row = dict(row, turn_id=turn, input_tokens=None, cached_input_tokens=None,
-                           cache_write_input_tokens=None)
-            elif row["semantics"] in disputed_semantics:
-                row = dict(row, input_tokens=None, cached_input_tokens=None,
-                           cache_write_input_tokens=None)
-            cache_row = row
-            if ts is None and bounds:
-                cache_row = dict(row, input_tokens=None, cached_input_tokens=None,
-                                 cache_write_input_tokens=None)
-            cache[row["harness"], row["semantics"]].append(cache_row)
             point = {field: row[field] for field in (
                 "response_id", "source_id", "ordinal_num", "ts", "turn_id", "semantics")}
-            for field in ("usage_gap", "alternate_locations"):
-                if field in row.keys():
-                    point[field] = row[field]
-            timeline.append(dict(point, kind="input", input_tokens=_context_input(row)))
+            parents = inputs.get(row["response_id"], ())
+            if point["turn_id"] is None and len(parents) == 1 and row["response_id"] not in disputed:
+                point["turn_id"] = f"opencode:{next(iter(parents))}"
+            known = row["response_id"] not in disputed
+            timeline.append(dict(point, kind="input", input_tokens=_context_input(row) if known else None))
+            if not known or (bounds and row["ts"] is None):
+                row = dict(row, input_tokens=None, cached_input_tokens=None, cache_write_input_tokens=None)
+            cache[row["harness"], row["semantics"]].append(row)
         for row in con.execute(
                 "SELECT id AS event_id, source_id, ordinal_num, ts, turn_id"
                 " FROM events WHERE session_key=? AND family='compaction'" + window, args):
             timeline.append(dict(row, kind="compaction"))
-        order = _sort_context(con, key, harness, timeline)
+        order = _sort_usage_timeline(con, session, timeline)
         context.append({"session": key, "harness": harness, "order": order, "timeline": timeline})
 
     measured = {harness for harness, _ in cache}
     for harness in {row["harness"] for row in sessions} - measured:
         cache[harness, None] = []
-    observations = [_cache_observation(harness, semantics, cache[harness, semantics], unlocated[harness, semantics])
+    observations = [_cache_observation(harness, semantics, cache[harness, semantics])
                     for harness, semantics in sorted(cache, key=lambda group: (group[0], group[1] or ""))]
     return context, observations
 

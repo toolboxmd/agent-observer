@@ -391,31 +391,14 @@ def response_witnesses(con, session_key):
     return witnesses, conflicts, unavailable
 
 
-def usage_locations(con, session_key, *, include_measured=False):
-    """Source locators for unmeasured or conflicting observations."""
-    if not db._has_table(con, "opencode_response_observations"):
-        return
-    yield from con.execute(
-            "SELECT o.response_id,o.source_id,o.ordinal_num,o.ts,json_type(o.measurement)='object' AS measured"
-            " FROM opencode_response_observations o JOIN sources s ON s.id=o.source_id"
-            " WHERE o.session_key=? AND (? OR json_type(o.measurement)<>'object')"
-            # A standalone observation needs evidence of an assistant usage
-            # record. An unusable copy can still qualify an existing projection.
-            " AND (o.measurement IN (?,?) OR EXISTS (SELECT 1 FROM responses r"
-            " WHERE r.session_key=o.session_key AND r.response_id=o.response_id AND r.is_overlap=0))"
-            " ORDER BY o.response_id,s.path",
-            (session_key, include_measured, json.dumps("unmeasured"), json.dumps(_MALFORMED_USAGE)))
-
-
 def has_unlocated_usage_error(con, session_key):
-    # Cross-session response collisions and older malformed usage receipts
-    # identify the source and ordinal without identifying a response.
+    # Older adapters quarantined a malformed usage record by ordinal only.
+    # Keep the session's cost open without guessing which message failed.
     return con.execute(
         "SELECT 1 FROM sources s WHERE s.harness=? AND s.session_id=? AND "
-        "(s.sha256 GLOB 'oc[4-8]:unlocated' OR EXISTS (SELECT 1 FROM import_errors e "
-        "WHERE e.harness=s.harness AND e.source_path=s.path AND (e.error='usage_conflict' OR "
-        "(s.sha256 NOT GLOB 'oc[4-8]:*' AND e.error='malformed_usage' "
-        "AND instr(','||e.line_excerpt||',', ',tokens,')>0)))) LIMIT 1",
+        "(s.sha256 GLOB 'oc[4-8]:unlocated' OR (s.sha256 NOT GLOB 'oc[4-8]:*' AND EXISTS (SELECT 1 FROM import_errors e "
+        "WHERE e.harness=s.harness AND e.source_path=s.path AND e.error='malformed_usage' "
+        "AND instr(','||e.line_excerpt||',', ',tokens,')>0))) LIMIT 1",
         (HARNESS, session_key.partition(":")[2])).fetchone() is not None
 
 

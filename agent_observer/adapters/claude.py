@@ -106,8 +106,7 @@ def _valid_counter(value) -> bool:
 
 _FINALITY_TABLE = "claude_response_finality"
 _NATIVE_KINDS_TABLE = "claude_native_kinds"
-_IMPORT_VERSION = 20  # Recover locators for copied provisional measurements.
-_UNMEASURED_FINAL = "unmeasured_final"
+_IMPORT_VERSION = 18  # Resume historical capture at the last prompt in this source.
 _FINAL_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens",
                  "reasoning_output_tokens", "total_tokens", "cache_write_5m_tokens", "cache_write_1h_tokens", "model")
 
@@ -354,24 +353,7 @@ def import_claude_file(con: sqlite3.Connection, path: str,
              "user_messages_inserted": 0, "events_inserted": 0,
              "events_duplicate": 0, "compactions": 0, "malformed": 0}
     src = JsonlSource(con, HARNESS, path, full=full)
-    prior_usage = src.row["claude_usage_version"]
-    streaming_locations = set()
-    # An appended source still has a trustworthy historical prefix.
-    if (prior_usage in (18, 19) and (src.unchanged or src.incremental)
-            and db._has_table(con, "claude_response_ancestry")):
-        streaming_locations = {rid for rid, in con.execute(
-            "SELECT DISTINCT a.response_id FROM claude_response_ancestry a"
-            " JOIN responses r USING(session_key,response_id)"
-            f" WHERE a.source_id=? AND NOT EXISTS (SELECT 1 FROM {_FINALITY_TABLE} f"
-            " WHERE f.response_id=a.response_id) AND EXISTS (SELECT 1 FROM claude_response_ancestry b"
-            " WHERE b.session_key=a.session_key AND b.response_id=a.response_id AND b.source_id<>a.source_id)",
-            (src.source_id,))}
-    replay_unmeasured = (prior_usage == 18 and db._has_table(con, "claude_rejected_measurements")
-                         and con.execute(
-                             "SELECT 1 FROM claude_rejected_measurements WHERE source_id=?"
-                             " AND reason IN ('missing_final_usage','malformed_final_usage') LIMIT 1",
-                             (src.source_id,)).fetchone())
-    if (prior_usage not in (18, 19, _IMPORT_VERSION) or replay_unmeasured or streaming_locations
+    if (src.row["claude_usage_version"] != _IMPORT_VERSION
             or src.row["claude_usage_offset"] != src.row["read_offset"]):
         src.start_offset = src.end_offset = 0
         src.unchanged = False
@@ -416,7 +398,6 @@ def import_claude_file(con: sqlite3.Connection, path: str,
         # together, including when the writer merely finishes its last line.
         src.start_offset = src.end_offset = 0
     r = _Reader(con, src, stats)
-    r.recover_streaming_locations = streaming_locations
     _ensure_finality_table(con)
     _ensure_native_kinds(con)
     _seed_queue_identity(r)
@@ -703,9 +684,8 @@ def _reproject_withdrawn_finals(r):
                              "LEFT JOIN claude_unreadable_sources u USING(session_key,source_id) "
                              "WHERE o.session_key=? AND o.response_id=?", (key, rid)).fetchall()
         blocks = con.execute("SELECT b.* FROM claude_final_blocks b JOIN sources s ON s.id=b.source_id "
-                             "WHERE b.session_key=? AND b.response_id=? AND b.link_status<>?"
-                             " ORDER BY s.path,b.ordinal_num",
-                             (key, rid, _UNMEASURED_FINAL)).fetchall()
+                             "WHERE b.session_key=? AND b.response_id=? ORDER BY s.path,b.ordinal_num",
+                             (key, rid)).fetchall()
         if (not copies or any(c["unreadable"] for c in copies)
                 or {c["source_id"] for c in copies} != {b["source_id"] for b in blocks}):
             continue
@@ -746,17 +726,6 @@ def _unsupported_projections(con, scope, args):
     return con.execute("SELECT r.session_key,r.response_id FROM responses r WHERE r.harness='claude' AND " + scope +
                        " AND EXISTS (SELECT 1 FROM claude_final_observations o WHERE o.session_key=r.session_key "
                        "AND o.response_id=r.response_id) AND (" + " OR ".join(gaps) + ")", args)
-
-
-def final_locations(con, session_key):
-    """Expected final locations, including source-only evidence."""
-    if db._has_table(con, "claude_expected_finals") and db._has_table(con, "claude_final_blocks"):
-        yield from con.execute(
-            "SELECT e.response_id,e.source_id,b.ordinal_num,b.ts,b.turn_id,b.link_status<>? AS measured"
-            " FROM claude_expected_finals e JOIN sources s ON s.id=e.source_id"
-            " LEFT JOIN claude_final_blocks b USING(session_key,response_id,source_id)"
-            " WHERE e.session_key=?"
-            " ORDER BY b.ordinal_num IS NULL,s.path,b.ordinal_num", (_UNMEASURED_FINAL, session_key))
 
 
 def conflicting_final_measurements(con, session_key):
@@ -831,16 +800,8 @@ def _ingest_usage_row(r: _Reader, obj: dict, ordinal: int, ts, mid: str,
     disagreements between measured counters are quarantined. A
     malformed final block never reaches here, so it never finalizes."""
     rid = f"{HARNESS}:{mid}"
-    if (not final and rid in r.recover_streaming_locations
-            and ordinal <= r.src.row["ordinal_max"]):
-        # Upgrade replays keep the previous streaming measurement. Only
-        # a block matching its counters and locator can repair the source.
-        if _stored_counters(r, rid) == values:
-            r.con.execute("UPDATE responses SET source_id=? WHERE session_key=? AND response_id=?"
-                          " AND ordinal_num=? AND ts IS ?",
-                          (r.src.source_id, r.session_key, rid, ordinal, ts))
-        return
     if final:
+        r.final_location = (ordinal, ts)
         payload = json.dumps(dict(values, model=model), sort_keys=True)
         r.con.execute("INSERT OR IGNORE INTO claude_final_observations VALUES(?,?,?,?)",
                       (r.session_key, rid, r.src.source_id, payload))
@@ -907,14 +868,14 @@ def _ingest_usage_row(r: _Reader, obj: dict, ordinal: int, ts, mid: str,
     # arrived): the latest native block is the authority, across imports as
     # well. Final rows never reach this update path.
     updated = r.con.execute(
-        "UPDATE responses SET source_id=?, ordinal_num=?, ts=?,"
+        "UPDATE responses SET source_id=?, turn_id=?, ordinal_num=?, ts=?,"
         " model=COALESCE(?, model), effort=COALESCE(?, effort),"
         " input_tokens=?, cached_input_tokens=?,"
         " cache_write_input_tokens=?, output_tokens=?,"
         " reasoning_output_tokens=?, total_tokens=?,"
         " cache_write_5m_tokens=?, cache_write_1h_tokens=?"
         " WHERE session_key=? AND response_id=?",
-        (r.src.source_id, ordinal, ts, model, obj.get("effort"),
+        (r.src.source_id, r.turn, ordinal, ts, model, obj.get("effort"),
          values["input_tokens"], values["cached_input_tokens"],
          values["cache_write_input_tokens"], values["output_tokens"],
          values["reasoning_output_tokens"], values["total_tokens"],
@@ -978,9 +939,6 @@ def _assistant(r: _Reader, obj: dict, ordinal: int, ts) -> None:
                     fingerprint=text_hash(text),
                     detail={"excerpt": excerpt} if excerpt else None)
 
-    final = _final_stop(message)
-    if mid and final and model != "<synthetic>":
-        r.final_location = (ordinal, ts)
     if mid and "usage" in message and model != "<synthetic>":
         usage_raw = message.get("usage")
         if usage_raw is None or (isinstance(usage_raw, dict) and not usage_raw):
@@ -989,7 +947,8 @@ def _assistant(r: _Reader, obj: dict, ordinal: int, ts) -> None:
             # Validated before any SQL; malformed buckets quarantine here and
             # never finalize, so a later valid block still inserts normally.
             values = _usage_values(usage_raw)
-            _ingest_usage_row(r, obj, ordinal, ts, mid, model, values, final)
+            _ingest_usage_row(r, obj, ordinal, ts, mid, model, values,
+                              _final_stop(message))
 
 
 def _submission(r: _Reader, native_id, ordinal, ts, kind: str, text: str,
@@ -1414,7 +1373,7 @@ def _prepare_ancestry(r):
     r.con.execute("CREATE INDEX IF NOT EXISTS claude_event_observation_source ON claude_event_observations(source_id)")
     r.con.execute("""CREATE TABLE IF NOT EXISTS claude_source_turns (
         source_id INTEGER PRIMARY KEY REFERENCES sources(id),turn_id TEXT)""")
-    if r.src.row["claude_usage_version"] and r.src.row["claude_usage_version"] < 18:
+    if r.src.row["claude_usage_version"] and r.src.row["claude_usage_version"] < _IMPORT_VERSION:
         stale = _unsupported_projections(r.con,
             "(r.source_id=? OR (r.session_key,r.response_id) IN (SELECT session_key,response_id "
             "FROM claude_final_observations WHERE source_id=?))", (r.src.source_id, r.src.source_id))
@@ -1526,12 +1485,8 @@ def _record_ancestry(r, obj, rejected=None):
     if status != "absent":
         r.linked_sessions.add(r.session_key)
     if response_id and r.final_location is not None:
-        # Keep a source locator for diagnosis without letting the block
-        # authorize a measurement or ancestry reconstruction.
-        block_status = (_UNMEASURED_FINAL if rejected in {"missing_final_usage", "malformed_final_usage"}
-                        else status)
         r.con.execute("INSERT OR REPLACE INTO claude_final_blocks VALUES(?,?,?,?,?,?,?,?,?)",
-                      (r.session_key, response_id, r.src.source_id, uuid or "", parent or "", block_status,
+                      (r.session_key, response_id, r.src.source_id, uuid or "", parent or "", status,
                        r.turn, *r.final_location))
     if rejected and response_id:
         r.con.execute("INSERT OR IGNORE INTO claude_rejected_measurements VALUES(?,?,?,?,?,?)",
