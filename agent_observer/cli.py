@@ -1324,6 +1324,9 @@ def _print_diagnose_usage(payload):
             else:
                 observation = (f"{known(point['input_tokens'])} input tokens "
                                f"(response {point['response_id']}, {location})")
+                if gap := point.get("usage_gap"):
+                    observation += (f" (usage gap at source {gap['source_id']}, "
+                                    f"ordinal {known(gap['ordinal_num'])})")
             print(f"  {known(point['ts'])} turn {known(point['turn_id'])}: {observation}")
     print("Cache observations by harness and counter semantics")
     for item in payload["cache_observations"]:

@@ -17,7 +17,7 @@ import statistics
 from collections import defaultdict
 
 from . import codex_order
-from .adapters import opencode
+from .adapters import codex, codex_atomic, opencode
 
 TEST_COMMAND_RE = re.compile(
     r"(\bpytest\b|\bunittest\b|scripts/test\.py|\bnpm (run )?test\b|\bpnpm (run )?test\b"
@@ -589,7 +589,7 @@ def _opencode_context_rows(con, key, measured):
         rid = row["response_id"]
         gap = gaps.pop(rid, None)
         if gap is not None:
-            yield unknown_row(gap)
+            yield dict(unknown_row(row), usage_gap=dict(gap))
         else:
             yield dict(row, turn_id=row["turn_id"] or turn_id(rid, witnesses.get(rid, ())))
     for row in gaps.values():
@@ -615,6 +615,9 @@ def _diagnose_usage(con, sessions, since, until):
             "SELECT response_id, source_id, ordinal_num, ts, turn_id, harness, semantics,"
             " input_tokens, cached_input_tokens, cache_write_input_tokens"
             " FROM responses WHERE session_key=? AND is_overlap=0", (key,))
+        disputes = {}
+        if harness == "codex":
+            disputes, _, _ = codex_atomic.disputes(con, key, codex.SEMANTICS)
         if harness == "opencode":
             responses = _opencode_context_rows(con, key, responses)
         for row in responses:
@@ -622,9 +625,14 @@ def _diagnose_usage(con, sessions, since, until):
             if (since is not None and (ts is None or ts < since)
                     or until is not None and (ts is None or ts >= until)):
                 continue
+            if row["response_id"] in disputes:
+                row = dict(row, turn_id=None, input_tokens=None, cached_input_tokens=None,
+                           cache_write_input_tokens=None)
             cache[row["harness"], row["semantics"]].append(row)
             point = {field: row[field] for field in (
                 "response_id", "source_id", "ordinal_num", "ts", "turn_id", "semantics")}
+            if isinstance(row, dict) and "usage_gap" in row:
+                point["usage_gap"] = row["usage_gap"]
             timeline.append(dict(point, kind="input", input_tokens=_context_input(row)))
         for row in con.execute(
                 "SELECT id AS event_id, source_id, ordinal_num, ts, turn_id"

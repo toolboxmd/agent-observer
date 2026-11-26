@@ -8,8 +8,8 @@ import sqlite3
 from pathlib import Path
 
 from agent_observer import cli, db, native_response
-from agent_observer.adapters import opencode
-from tests.helpers import LedgerCase
+from agent_observer.adapters import codex, opencode
+from tests.helpers import LedgerCase, fixture
 from tests.test_opencode import T0, _msg, _tokens, build_native
 
 
@@ -122,6 +122,25 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertEqual([point["input_tokens"] for point in timeline], [60, 60])
         self.assertEqual([point["turn_id"] for point in timeline], ["opencode:prompt-1", None])
 
+    def test_codex_dispute_does_not_supply_input_or_cache_counters(self):
+        lines = Path(fixture("codex-mini.jsonl")).read_text().splitlines()
+        atom = next(json.loads(line) for line in lines if
+                    '"resp-mini-001"' in line and '"token_usage_record"' in line)
+        self.sync("codex-mini.jsonl")
+        atom["payload"]["usage"]["input_tokens"] += 7
+        copy = Path(self.tmp.name) / "rollout-copy.jsonl"
+        copy.write_text(lines[0] + "\n" + json.dumps(atom) + "\n")
+        codex.import_codex_file(self.con, str(copy))
+        result = self.run_diagnose("--harness", "codex")
+        timeline = result["context_growth"][0]["timeline"]
+        disputed = next(p for p in timeline if p.get("response_id") == "codex:resp-mini-001")
+        self.assertIsNone(disputed["input_tokens"])
+        self.assertTrue(any(p.get("input_tokens") for p in timeline))
+        native = next(group for group in result["cache_observations"] if
+                      group["semantics"] == codex.SEMANTICS)
+        self.assertIsNone(native["cached_input_share"])
+        self.assertIsNone(native["cached_input_tokens"])
+
     def test_opencode_import_surfaces_completed_response_without_counters(self):
         path = str(Path(self.tmp.name) / "opencode.db")
         build_native(path)
@@ -172,10 +191,13 @@ class DiagnoseUsageTest(LedgerCase):
             native.commit()
         opencode.sync(self.con, source=copied, full=True)
         result = self.run_diagnose("--session", "opencode:cache_gap",
+                                   "--since", str((T0 + 25) / 1000),
                                    "--until", str((T0 + 40) / 1000))
         timeline = result["context_growth"][0]["timeline"]
         self.assertEqual([p["response_id"] for p in timeline], ["opencode:cache_measured"])
         self.assertIsNone(timeline[0]["input_tokens"])
+        self.assertEqual(timeline[0]["ts"], (T0 + 30) / 1000)
+        self.assertNotEqual(timeline[0]["source_id"], timeline[0]["usage_gap"]["source_id"])
         cache, = result["cache_observations"]
         self.assertEqual(cache["responses"], 1)
         self.assertIsNone(cache["cached_input_share"])
