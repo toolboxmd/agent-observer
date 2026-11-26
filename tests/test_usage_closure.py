@@ -29,6 +29,7 @@ TABLES = {
     "provider_turns": "provider_turn_id,thread_id,provider_thread_id,run_attempt_id,node_id",
     "provider_threads": "provider_thread_id,thread_id,driver,provider,updated_at",
     "subagents": "subagent_id,thread_id,run_id,origin,driver,child_thread_id",
+    "turn_items": "turn_item_id,thread_id,run_id,provider_thread_id,provider_turn_id,type",
 }
 
 
@@ -101,6 +102,12 @@ class UsageClosureTest(LedgerCase):
             self.row("provider_threads", [pt, "t", driver, driver + "-custom", TIME], {
                 "id": pt, "appThreadId": "t", "driver": driver, "providerInstanceId": driver + "-custom",
                 "nativeThreadRef": strong(driver, "current")})
+
+    def provider_thread(self, pt, thread, driver="claudeAgent"):
+        self.row("threads", [thread, TIME], {"id": thread})
+        self.row("provider_threads", [pt, thread, driver, driver + "-custom", TIME], {
+            "id": pt, "appThreadId": thread, "driver": driver, "providerInstanceId": driver + "-custom",
+            "nativeThreadRef": strong(driver, "current")})
 
     def row(self, table, columns, payload):
         values = [*columns, json.dumps(payload)]
@@ -187,6 +194,8 @@ class UsageClosureTest(LedgerCase):
         self.assertEqual(rep["measured"]["attributed_responses"], ["claude:msg-1", "claude:msg-2"])
         self.assertEqual([c["status"] for c in native["turn_checks"]], ["reconciled"])
         self.assertEqual(native["coverage_gaps"], [])
+        self.assertEqual(native["rejected_rows"], [])
+        self.assertEqual(self.con.execute("SELECT count(*) FROM t3_purpose_rejects").fetchone()[0], 0)
         self.assertEqual(rep["total_cost"]["status"], "complete")
         self.assertIsNotNone(rep["total_cost"]["usd"])
         text = self.cli()
@@ -383,7 +392,7 @@ class UsageClosureTest(LedgerCase):
         self.hidden_turn("bad-turn", turn_payload=dict(nodeId="elsewhere"))
         rep = self.native_report()
         self.assertEqual(self.gaps(rep), {"expected_provider_turn_missing": (2, "attempts"),
-                                          "native_rows_unmirrored": (2, "runs")})
+                                          "native_rows_rejected": (2, "rows")})
         self.assertFalse(any(r["never_ran"] for r in rep["native_purpose"]["runs"] if r["run_id"].startswith("bad")))
         self.assertIn("unknown (observed priced subtotal", rep["total_cost"]["text"])
 
@@ -394,7 +403,7 @@ class UsageClosureTest(LedgerCase):
             id="turn-c1-b", nodeId="elsewhere", providerThreadId="pt-claudeAgent", runAttemptId="attempt-c1",
             status="completed", nativeInputs=[], turnTokenUsage=claude_usage(500, 50)))
         rep = self.native_report()
-        self.assertEqual(self.gaps(rep), {"native_rows_unmirrored": (1, "runs")})
+        self.assertEqual(self.gaps(rep), {"native_rows_rejected": (1, "rows")})
         self.native.execute(f"DELETE FROM {PREFIX}provider_turns WHERE provider_turn_id='turn-c1-b'")
         # An earlier attempt of the run is on another thread, so it is never mirrored.
         self.row("run_attempts", ["attempt-c1-0", "c1", "other-thread", "pt-claudeAgent", None, "node-0"], dict(
@@ -402,7 +411,7 @@ class UsageClosureTest(LedgerCase):
             providerInstanceId="claudeAgent-custom", nativeThreadId="s", providerTurnId=None,
             status="failed", startedAt=TIME))
         rep = self.native_report()
-        self.assertEqual(self.gaps(rep), {"native_rows_unmirrored": (1, "runs")})
+        self.assertEqual(self.gaps(rep), {"native_rows_rejected": (1, "rows")})
         self.assertIn("unknown (observed priced subtotal", rep["total_cost"]["text"])
 
     def test_a_started_run_whose_attempt_never_started_is_not_exempt(self):
@@ -517,16 +526,96 @@ class UsageClosureTest(LedgerCase):
         self.assertEqual(self.gaps(rep), {"native_final_usage_missing": (1, "turns")})
         self.assertIn("unknown (observed priced subtotal", rep["total_cost"]["text"])
 
+    # Rejected rows ------------------------------------------------------------
+
+    def legacy_child(self, status="running"):
+        payload = {"id": "kid", "threadId": "t", "runId": "c1", "driver": "claudeAgent", "origin": "app_owned",
+                   "childThreadId": "child-kid", "status": status,
+                   "purpose": dict(PURPOSE, scope=dict(type="unscoped", reason="legacy_no_intent"))}
+        self.row("subagents", ["kid", "t", "c1", "app_owned", "claudeAgent", "child-kid"], payload)
+        return payload
+
+    def test_a_child_row_that_fails_validation_keeps_the_task_unknown(self):
+        self.closed_turn()
+        payload = self.legacy_child()
+        self.assertEqual(self.gaps(self.native_report()), {"child_purpose_undeclared": (1, "children")})
+        for name, change in (
+                ("unreadable payload", "payload_json='{not json'"),
+                ("column/payload mismatch", "child_thread_id='another-child'"),
+                ("unknown origin", "payload_json=json_set(payload_json,'$.origin','remote_owned'),"
+                                   "origin='remote_owned'")):
+            with self.subTest(name):
+                self.native.execute(f"UPDATE {PREFIX}subagents SET payload_json=?, child_thread_id='child-kid',"
+                                    "origin='app_owned'", (json.dumps(payload),))
+                self.native.execute(f"UPDATE {PREFIX}subagents SET {change}")
+                rep = self.native_report()
+                self.assertEqual(self.gaps(rep), {"native_rows_rejected": (1, "rows")})
+                self.assertEqual([r["table_name"] for r in rep["native_purpose"]["rejected_rows"]], ["subagents"])
+                self.assertIn("unknown (observed priced subtotal", rep["total_cost"]["text"])
+
+    def test_a_child_delegated_to_another_environment_is_a_remote_child_not_a_reject(self):
+        self.closed_turn()
+        self.row("subagents", ["far", "t", "c1", "app_owned", "remote", None], {
+            "id": "far", "threadId": "t", "runId": "c1", "driver": "remote", "origin": "app_owned",
+            "childThreadId": None, "status": "completed",
+            "remoteChild": dict(environmentId="env-2", threadId="remote-thread", runId="remote-run")})
+        rep = self.native_report()
+        self.assertEqual(self.gaps(rep), {"remote_participation": (1, "children")})
+        self.assertEqual(rep["native_purpose"]["rejected_rows"], [])
+
+    def test_a_run_naming_the_task_whose_purpose_fails_validation_keeps_it_unknown(self):
+        self.closed_turn()
+        self.claude_transcript([claude_user("o-a", None, "other"), assistant("o1", "o-a", "msg-o1", 900, 90)],
+                               session="other-s")
+        self.provider_thread("pt-sib", "sibling")
+        self.run_turn("sib", "claudeAgent", "other-s", inputs=["o-a"], usage=claude_usage(900, 90),
+                      closure=CLOSED_CLAUDE, response_ids=["msg-o1"], thread="sibling", pt="pt-sib",
+                      purpose=dict(PURPOSE, provenance=dict(type="future_kind")))
+        rep = self.native_report()
+        self.assertEqual(self.gaps(rep), {"native_rows_rejected": (1, "rows")})
+        self.assertEqual(rep["native_purpose"]["rejected_rows"][0]["reason"], "invalid_purpose")
+        self.assertIn("unknown (observed priced subtotal", rep["total_cost"]["text"])
+
+    def test_a_turn_naming_a_missing_attempt_is_a_rejected_row(self):
+        self.closed_turn()
+        self.run_turn("never", "claudeAgent", "s", run_status="cancelled", started=None,
+                      attempt_started=None, turn=False)
+        self.row("provider_turns", ["turn-lost", "t", "pt-claudeAgent", "attempt-gone", "node-x"], dict(
+            id="turn-lost", nodeId="node-x", providerThreadId="pt-claudeAgent", runAttemptId="attempt-gone",
+            status="completed", nativeInputs=[], turnTokenUsage=claude_usage(500, 50)))
+        rep = self.native_report()
+        # The dangling turn could be the beside run's, so that run proves nothing either.
+        self.assertEqual(self.gaps(rep), {"native_rows_rejected": (1, "rows"),
+                                          "expected_provider_turn_missing": (1, "attempts")})
+        self.assertFalse(any(r["never_ran"] for r in rep["native_purpose"]["runs"]))
+        self.assertEqual(rep["native_purpose"]["rejected_rows"][0]["reason"], "attempt_unresolved")
+
+    def test_a_rejected_row_tied_to_nothing_keeps_every_task_of_its_source_unknown(self):
+        self.closed_turn()
+        self.row("runs", [None, None, "completed"], {"purpose": {}})
+        rep = self.native_report()
+        self.assertEqual(self.gaps(rep), {"native_rows_rejected": (1, "rows")})
+        self.assertIn("unknown (observed priced subtotal", rep["total_cost"]["text"])
+
+    def test_a_missing_projection_table_keeps_every_task_of_its_source_unknown(self):
+        self.closed_turn()
+        self.native.execute(f"DROP TABLE {PREFIX}subagents")
+        rep = self.native_report()
+        self.assertEqual(self.gaps(rep), {"native_rows_rejected": (1, "rows")})
+        self.assertEqual(rep["native_purpose"]["rejected_rows"][0]["reason"], "table_missing")
+
     # Upgrade ----------------------------------------------------------------
 
     def test_ledger_from_1_7_0_upgrades_on_sync_and_reads_stay_read_only(self):
         self.closed_turn()
         self.sync()
         # Recreate the 1.7.0 mirror: the new columns did not exist.
-        for table, column in (("runs", "never_ran"), ("runs", "raw_rows_json"),
-                              ("turns", "native_response_ids_json"), ("turns", "usage_closure_json")):
+        for table, column in (("runs", "never_ran"), ("turns", "native_response_ids_json"),
+                              ("turns", "usage_closure_json")):
             for prefix in ("t3_purpose_", "t3_source_"):
                 self.con.execute(f"ALTER TABLE {prefix}{table} DROP COLUMN {column}")
+        self.con.execute("DROP TABLE t3_purpose_rejects")
+        self.con.execute("DROP TABLE t3_source_rejects")
         self.con.commit()
         self.con.execute("PRAGMA query_only=ON")
         old = report.task_report(self.con, TASK)

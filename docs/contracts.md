@@ -535,13 +535,24 @@ re-read every sync; workload bindings are durable ledger rows.
   `uncountedCompactions` count, or as `open` with a snake_case reason; any
   other version, state, witness, key or malformed value is no statement.
   Listed response ids must all be distinct native identifiers.
-- Run inventory: before validating any row, the refresh records for each
-  run the ids of every raw attempt and provider turn that belongs to it,
-  and whether the raw rows prove the run never ran: terminal, an explicit
-  null `startedAt`, an active attempt that is null or one of its attempts,
-  and every attempt with a null `startedAt`, no named turn and no turn that
-  references it. An unreadable or disagreeing row proves nothing, and a
-  report treats any raw row missing from the mirror as a gap.
+- Rejected rows: every row of a projection table that decides completeness
+  (`runs`, `run_attempts`, `provider_turns`, `provider_threads` with their
+  native operations and pending background tasks, `subagents`, subagent
+  `turn_items`, native segments) is either mirrored, out of scope by a named
+  rule (a readable run without `purpose` and the rows that belong to it,
+  provider turns of native child threads), or recorded in
+  `t3_purpose_rejects` with the run, thread and task references it still
+  carries. A run whose purpose fails validation is mirrored and also
+  rejected. Copies that disagree on a row's identity, a missing table, and a
+  reference to a row that does not exist are rejects too. A report keeps
+  unknown every task a reject is tied to by task, run or thread, and every
+  task of the source when it is tied to nothing (`native_rows_rejected`).
+- Never ran: the refresh decides from raw rows before validation whether a
+  run never ran: terminal, an explicit null `startedAt`, an active attempt
+  that is null or one of its attempts, and every attempt with a null
+  `startedAt`, no named turn and no turn that references it. An unreadable
+  row, or a turn naming an attempt with no row, proves nothing for any run
+  of the source.
 - Codex compaction: one native compaction writes a `compacted` record,
   whose event keeps the native response and turn, and a `ContextCompaction`
   marker tagged with the same turn. A closed turn's compactions must each

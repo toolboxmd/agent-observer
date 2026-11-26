@@ -24,8 +24,7 @@ class NativeOutcomeTest(LedgerCase):
         self.con.execute("INSERT INTO tasks(task_id,project,title,created_at)"
                          " VALUES(?,?,?,0)", (self.task, "example/repo", self.task))
         self.con.execute("INSERT INTO t3_purpose_runs(run_id,thread_id,task_id,scope,kind,"
-                         "status,active_attempt_id,raw_rows_json) VALUES('a','planner',?,'single','issue',"
-                         "'completed','aa','{\"attempts\":[\"aa\"],\"turns\":[\"ta\"]}')",
+                         "status,active_attempt_id) VALUES('a','planner',?,'single','issue','completed','aa')",
                          (self.task,))
         self.con.execute("INSERT INTO t3_purpose_sessions VALUES('a',?)", (self.session,))
         self.con.execute("INSERT INTO t3_purpose_inputs(run_id,session_key,native_id,kind,validation,"

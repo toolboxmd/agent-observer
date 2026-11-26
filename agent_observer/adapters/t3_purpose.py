@@ -22,7 +22,7 @@ from .. import db
 TABLES = {
     "runs": """run_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, task_id TEXT,
         scope TEXT NOT NULL, reason TEXT, host TEXT, repository TEXT, kind TEXT, number INTEGER,
-        provenance_json TEXT, status TEXT, version INTEGER, active_attempt_id TEXT, never_ran TEXT, raw_rows_json TEXT""",
+        provenance_json TEXT, status TEXT, version INTEGER, active_attempt_id TEXT, never_ran TEXT""",
     "sessions": """run_id TEXT NOT NULL, session_key TEXT NOT NULL,
         PRIMARY KEY(run_id,session_key)""",
     "inputs": """run_id TEXT NOT NULL, session_key TEXT NOT NULL, native_id TEXT NOT NULL,
@@ -52,13 +52,19 @@ TABLES = {
         attempt INTEGER, agent_id TEXT, child_thread_id TEXT, state TEXT, total_tokens INTEGER""",
     "participants": """run_id TEXT, thread_id TEXT NOT NULL, kind TEXT NOT NULL, participant_id TEXT,
         child_thread_id TEXT, child_run_id TEXT, environment_id TEXT, status TEXT, group_id TEXT, availability TEXT, declaration_json TEXT""",
+    # A raw row Observer read to decide completeness but could not validate and
+    # mirror, with the references it still carries. Never an absence.
+    "rejects": """origin TEXT NOT NULL, table_name TEXT NOT NULL, reason TEXT NOT NULL, row_id TEXT,
+        run_id TEXT, thread_id TEXT, task_id TEXT""",
 }
 COLUMNS = {table: re.findall(r"(\w+) (?:TEXT|INTEGER)", spec) for table, spec in TABLES.items()}
 # Columns added after the first release of a mirror table. A ledger written by
 # an earlier version gains them on its next refresh; readers treat a missing
 # column as no statement.
-ADDED = {"runs": ("never_ran", "raw_rows_json"), "turns": ("native_response_ids_json", "usage_closure_json")}
+ADDED = {"runs": ("never_ran",), "turns": ("native_response_ids_json", "usage_closure_json")}
 PROJECTION = "orchestration_v2_projection_"
+# Projection tables whose rows decide whether a task's usage is complete.
+COMPLETENESS_TABLES = ("runs", "run_attempts", "provider_turns", "provider_threads", "subagents", "turn_items")
 ID = re.compile(r"[a-zA-Z0-9._:%/@+~=,-]{1,8192}", re.ASCII)
 HOST = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]+)?", re.I | re.ASCII)
 REPO = re.compile(r"[a-z0-9_.-]+/[a-z0-9_.-]+", re.I | re.ASCII)
@@ -239,6 +245,12 @@ class Snapshot(NamedTuple):
     def task(self, ref):
         return _task(self.con, ref)
 
+    def reject(self, table, reason, row_id=None, run=None, thread=None, purpose=None):
+        """Record a raw row that was read for completeness but not mirrored."""
+        ref = _reference(_obj(_obj(_obj(purpose).get("scope")).get("reference")))
+        self.insert("rejects", self.path, table, reason, _id(row_id), _id(run), _id(thread),
+                    task_id(self.con, ref) if ref else None)
+
 
 def _participant(snapshot, run, thread, kind, participant, *, child=None, child_run=None, remote=None,
                  status=None, group=None, declaration=None):
@@ -317,75 +329,75 @@ def _raw(native, tables, name):
         yield row, payload if isinstance(payload, dict) else None
 
 
-def _raw_runs(native, tables):
-    """Facts about each run read from the raw projection, before any row validation.
+def _never_ran(native, tables):
+    """Runs the raw projection proves never ran, decided before any row validation.
 
-    Returns the runs proven never to have run, and for each run the ids of
-    every raw attempt and provider turn that belongs to it (None when a row
-    that could belong to it is unreadable). The consumer compares the mirror
-    against those ids, so a row dropped by validation stays visible as a gap.
-
-    A run is proven never to have run only when it is terminal with an
-    explicit null start, its active attempt is null or one of its raw
-    attempts, and each raw attempt has an explicit null start, names no
-    provider turn, and is referenced by no raw provider turn.
+    A run qualifies only when it is terminal with an explicit null start, its
+    active attempt is null or one of its raw attempts, and each raw attempt
+    has an explicit null start, names no provider turn, and is referenced by
+    no raw provider turn. An unreadable row, or a turn naming an attempt with
+    no row, proves nothing for any run of the source.
     """
     if not all(PROJECTION + t in tables for t in ("runs", "run_attempts", "provider_turns")):
-        return set(), {}
-    attempts, spoiled, unreadable, run_of = defaultdict(set), set(), set(), defaultdict(set)
-    named = defaultdict(set)
+        return set()
+    attempts, spoiled, run_of = defaultdict(set), set(), defaultdict(set)
     for row, p in _raw(native, tables, "run_attempts"):
         aid, run = row.get("attempt_id"), row.get("run_id")
         owners = {run, (p or {}).get("runId")} - {None}
         if not owners:
-            return set(), {}  # An attempt no run can be ruled out from owning.
+            return set()
         for owner in owners:
             attempts[owner].add(aid)
             run_of[aid].add(owner)
-            if p is None or p.get("id") != aid or len(owners) != 1:
-                unreadable.add(owner)
-            for turn in {row.get("provider_turn_id"), (p or {}).get("providerTurnId")} - {None}:
-                named[owner].add(turn)
-            if (p is None or "startedAt" not in p or p["startedAt"] is not None
+            if (p is None or p.get("id") != aid or len(owners) != 1
+                    or "startedAt" not in p or p["startedAt"] is not None
                     or "providerTurnId" not in p or p["providerTurnId"] is not None
                     or row.get("provider_turn_id") is not None):
                 spoiled.add(owner)
-    turns = defaultdict(set)
+    turned = set()
     for row, p in _raw(native, tables, "provider_turns"):
         refs = {row.get("run_attempt_id"), (p or {}).get("runAttemptId")} - {None}
         if p is None and not refs:
-            return set(), {}  # A turn whose attempt cannot be read could be any run's.
+            return set()  # A turn whose attempt cannot be read could be any run's.
         for aid in refs:
-            for owner in run_of[aid]:
-                turns[owner].add(row.get("provider_turn_id"))
-                if p is None or p.get("id") != row.get("provider_turn_id"):
-                    unreadable.add(owner)
-    proven, seen, inventory = set(), set(), {}
+            if not run_of[aid]:
+                return set()  # A turn naming an attempt with no row.
+            turned |= run_of[aid]
+    proven, seen = set(), set()
     for row, p in _raw(native, tables, "runs"):
         run = row.get("run_id")
         ok = (p is not None and p.get("id") == run and row.get("status") in TERMINAL
               and p.get("status") == row.get("status") and "startedAt" in p and p["startedAt"] is None
               and "activeAttemptId" in p and (p["activeAttemptId"] is None or p["activeAttemptId"] in attempts[run])
-              and run not in spoiled and run not in unreadable and not turns[run])
+              and run not in spoiled and run not in turned)
         if ok and run not in seen:
             proven.add(run)
         elif not ok:
             proven.discard(run)
         seen.add(run)
-        inventory[run] = None if run in unreadable or None in attempts[run] | turns[run] else _json(
-            dict(attempts=sorted(attempts[run]), turns=sorted(turns[run] | named[run])))
-    return proven, inventory
+    return proven
 
 
 def _runs(snapshot, native, tables):
-    runs = {}
-    never_ran, inventory = _raw_runs(native, tables)
+    """Mirror purpose-era runs. Returns them and the ids of legacy runs (out of scope)."""
+    runs, legacy = {}, set()
+    never_ran = _never_ran(native, tables)
     for row, p in _rows(native, tables, "runs"):
         run, thread = _id(row.get("run_id")), _id(row.get("thread_id"))
-        if not run or not thread or (p and "purpose" not in p):
-            continue  # A readable pre-v1 run keeps its existing legacy treatment.
+        if p and "purpose" not in p:
+            # Out of scope: a readable pre-purpose run keeps its legacy treatment.
+            legacy.add(row.get("run_id"))
+            continue
+        if not run or not thread:
+            snapshot.reject("runs", "invalid_identity", row.get("run_id"), row.get("run_id"),
+                            row.get("thread_id") or p.get("threadId"), p.get("purpose"))
+            continue
         purpose = _purpose(p.get("purpose")) if _matches(
             row, p, ("run_id", "id"), ("thread_id", "threadId")) else INVALID
+        if purpose == INVALID:
+            # Still mirrored as an invalid run; the reject ties it to its thread
+            # and, when its scope reference parses, to that task.
+            snapshot.reject("runs", "invalid_purpose", run, run, thread, p.get("purpose"))
         scope, reason, ref, provenance = purpose
         key = snapshot.task(ref) if ref else None
         coords = ref or {}
@@ -394,7 +406,7 @@ def _runs(snapshot, native, tables):
         snapshot.insert("runs", run, thread, key, scope, reason, coords.get("host"),
                 coords.get("repository"), coords.get("kind"), coords.get("number"),
                 _json(provenance), status, version if _number(version) else None,
-                _id(p.get("activeAttemptId")), "proven" if run in never_ran else None, inventory.get(run))
+                _id(p.get("activeAttemptId")), "proven" if run in never_ran else None)
         runs[run] = (thread, purpose)
         delivery = _obj(_obj(p.get("delegatedCompletion")).get("delivery"))
         for task in _list(delivery.get("taskIds")):
@@ -408,7 +420,7 @@ def _runs(snapshot, native, tables):
             category = _enum(work.get("kind"), ("subagent", "shell", "monitor", "task"))
             if category:
                 _participant(snapshot, run, thread, "cancelled_" + category, work.get("id"), status="cancelled")
-    return runs
+    return runs, legacy
 
 
 def _usage(value, context=False):
@@ -458,7 +470,7 @@ def _capabilities(snapshot, native, tables):
                     _enum(cap.get("nativeUsageFinality"), ("main_agent_only", "unavailable")))
 
 
-def _providers(snapshot, native, tables, runs, segments):
+def _providers(snapshot, native, tables, runs, legacy, segments):
     providers = {}
     for row, p in _rows(native, tables, "provider_threads"):
         pt = _id(row.get("provider_thread_id"))
@@ -466,6 +478,8 @@ def _providers(snapshot, native, tables, runs, segments):
         if (not pt or not thread or not driver or not _matches(row, p, ("provider_thread_id", "id"),
                 ("thread_id", "appThreadId")) or row.get("driver", driver) != driver
                 or row.get("provider_instance_id", p.get("providerInstanceId")) != p.get("providerInstanceId")):
+            # Its attempts, turns, native operations and pending tasks are lost.
+            snapshot.reject("provider_threads", "invalid_row", pt, thread=row.get("thread_id") or p.get("appThreadId"))
             continue
         providers[pt] = Provider(thread, driver, _id(p.get("providerInstanceId")), _id(p.get("providerSessionId")),
                          _strong(p.get("nativeThreadRef"), driver))
@@ -476,21 +490,32 @@ def _providers(snapshot, native, tables, runs, segments):
             if run in runs and runs[run][0] == thread and _id(task.get("taskId")):
                 _participant(snapshot, run, thread, "pending_background", task["taskId"],
                              child=task.get("childThreadId"), remote={"environmentId": task.get("childEnvironmentId")})
+            elif task.get("runId") not in legacy:
+                snapshot.reject("pending_background", "invalid_or_dangling", task.get("taskId"),
+                                task.get("runId"), thread)
     return providers
 
 
-def _subagents(snapshot, native, tables, runs, segments):
+def _subagents(snapshot, native, tables, runs, legacy, segments):
     children = {}
     for row, p in _rows(native, tables, "subagents"):
         child = _id(row.get("subagent_id"))
         thread, origin = _id(row.get("thread_id")), _enum(p.get("origin"), ("app_owned", "provider_native"))
         driver = _enum(p.get("driver"), DRIVERS)
+        # A child delegated to another environment has the driver "remote".
+        declared_driver = _enum(p.get("driver"), (*DRIVERS, "remote"))
+        raw_run = row.get("run_id") or p.get("runId")
         if (not child or not thread or not origin or not _matches(row, p, ("subagent_id", "id"),
                 ("thread_id", "threadId"), ("origin", "origin"), ("run_id", "runId"))
-                or row.get("driver", driver) != driver
+                or row.get("driver", declared_driver) != declared_driver
                 or row.get("child_thread_id") != p.get("childThreadId")):
+            snapshot.reject("subagents", "invalid_row", row.get("subagent_id"), raw_run,
+                            row.get("thread_id") or p.get("threadId"), p.get("purpose"))
             continue
         run = _id(row["run_id"])
+        if not (run in runs and runs[run][0] == thread) and raw_run not in legacy:
+            # A child with no run, a missing run or one on another thread.
+            snapshot.reject("subagents", "run_unresolved", child, raw_run, thread, p.get("purpose"))
         if run in runs and runs[run][0] == thread:
             remote = _obj(p.get("remoteChild"))
             _participant(snapshot, run, thread, origin, child, child=p.get("childThreadId"), remote=remote,
@@ -514,7 +539,7 @@ def _subagents(snapshot, native, tables, runs, segments):
     return children
 
 
-def _expected_children(snapshot, native, tables, runs):
+def _expected_children(snapshot, native, tables, runs, legacy):
     # A subagent turn item names the expected child even if its own projection
     # or the remote ledger is missing. Avoid reading unrelated text/tool items.
     for row, p in _rows(native, tables, "turn_items", " WHERE type='subagent'"):
@@ -523,17 +548,26 @@ def _expected_children(snapshot, native, tables, runs):
                 or not _matches(row, p, ("run_id", "runId"), ("thread_id", "threadId"),
                                 ("turn_item_id", "id"), ("type", "type"))
                 or not _id(p.get("subagentId"))):
+            if row.get("run_id") not in legacy:
+                snapshot.reject("turn_items", "invalid_subagent_item", row.get("turn_item_id"),
+                                row.get("run_id") or p.get("runId"), row.get("thread_id") or p.get("threadId"))
             continue
         remote = _obj(p.get("remoteChild"))
         _participant(snapshot, run, row["thread_id"], "subagent_item", p["subagentId"],
                      child=p.get("childThreadId"), remote=remote, status=p.get("status"))
 
 
-def _attempts(snapshot, native, tables, runs, providers):
-    attempts = {}
+def _attempts(snapshot, native, tables, runs, legacy, providers):
+    """Mirror run attempts. Returns the valid ones and each raw attempt's run."""
+    attempts, owners = {}, {}
     for row, p in _rows(native, tables, "run_attempts"):
         aid, run = _id(row.get("attempt_id")), _id(row.get("run_id"))
+        owners[row.get("attempt_id")] = row.get("run_id")
+        if row.get("run_id") in legacy:
+            continue  # Out of scope: an attempt of a legacy run.
         if not aid or run not in runs or row.get("thread_id") != runs[run][0]:
+            snapshot.reject("run_attempts", "invalid_or_dangling", row.get("attempt_id"),
+                            row.get("run_id") or p.get("runId"), row.get("thread_id"))
             continue
         pt = _id(row.get("provider_thread_id"))
         turn, root = _id(row.get("provider_turn_id")), _id(row.get("root_node_id"))
@@ -554,7 +588,7 @@ def _attempts(snapshot, native, tables, runs, providers):
             attempts[aid] = (run, provider.thread, pt, root, turn, driver, sid, "nativeThreadId" in p)
         snapshot.insert("attempts", aid, run, pt, turn, _enum(p.get("status"), STATES),
                 key, provider.session if valid else None)
-    return attempts
+    return attempts, owners
 
 
 def _grok_call_refs(snapshot, native, tables, owner, columns):
@@ -573,11 +607,20 @@ def _grok_call_refs(snapshot, native, tables, owner, columns):
             snapshot.insert("grok_calls", key, call, turn, row["turn_item_id"])
 
 
-def _turns(snapshot, native, tables, attempts):
+def _turns(snapshot, native, tables, attempts, owners, legacy):
     item_columns = {r[1] for r in native.execute("PRAGMA table_info(orchestration_v2_projection_turn_items)")}
-    for row, p in _rows(native, tables, "provider_turns", " WHERE run_attempt_id IS NOT NULL"):
+    for row, p in _rows(native, tables, "provider_turns"):
+        raw_attempt = row.get("run_attempt_id") or p.get("runAttemptId")
+        if raw_attempt is None:
+            continue  # Out of scope here: a native child thread's turn (see _child_turns).
+        owner = owners.get(raw_attempt)
+        if owner in legacy:
+            continue  # Out of scope: a turn of a legacy run.
         aid = _id(row.get("run_attempt_id"))
         if aid not in attempts:
+            # An attempt with no row, an invalid attempt, or a payload-only reference.
+            snapshot.reject("provider_turns", "attempt_unresolved", row.get("provider_turn_id"), owner,
+                            row.get("thread_id"))
             continue
         run, thread, pt, root, expected, driver, sid, has_destination = attempts[aid]
         turn = _id(row.get("provider_turn_id"))
@@ -585,6 +628,7 @@ def _turns(snapshot, native, tables, attempts):
                 or row.get("thread_id") != thread or row.get("provider_thread_id") != pt
                 or not _matches(row, p, ("node_id", "nodeId"), ("provider_turn_id", "id"),
                     ("run_attempt_id", "runAttemptId"), ("provider_thread_id", "providerThreadId"))):
+            snapshot.reject("provider_turns", "invalid_row", row.get("provider_turn_id"), run, thread)
             continue
         # A reusable provider thread's latest cursor cannot locate a historical input.
         turn_sid = _strong(p.get("nativeThreadRef"), driver)
@@ -658,6 +702,7 @@ def _segments(snapshot, rows, runs, children):
         kind = _enum(p.get("kind"), ("start", "resume", "workflow_member", "background"))
         if not (_v1(p) and sid and operation and segment and kind and p.get("usageFinality") == "unreconciled"
                 and p.get("status") in ("running", "ended", "roster_absent", "interrupted", "unknown")):
+            snapshot.reject("segments", "invalid_segment", p.get("id"), thread=thread, purpose=p.get("purpose"))
             continue
         key = thread, owner, segment
         data = Segment(subagent, driver, sid, operation, kind, p, _source(p.get("source")),
@@ -704,10 +749,14 @@ def _segments(snapshot, rows, runs, children):
         pending -= done
 
     for key, data in segments.items():
-        if data is None:
-            continue
         thread, owner, segment = key
+        if data is None:
+            snapshot.reject("segments", "conflicting_copies", segment, thread=thread)
+            continue
         subagent, driver, sid, operation, kind, p, source, purpose, boundary = data
+        if purpose == INVALID:
+            # Mirrored, but no task or run can own it.
+            snapshot.reject("segments", "invalid_purpose", segment, thread=thread, purpose=p.get("purpose"))
         child = _id(p.get("nativeChildId"))
         run = resolved.get(key)
         ref = purpose[2]
@@ -772,7 +821,7 @@ def _child_turns(snapshot, native, tables, boundaries, providers):
 # an object's immutable coordinates must agree. Different mutable readings
 # leave that field unknown until the snapshots agree again.
 MUTABLE = {
-    "runs": {"status", "active_attempt_id", "never_ran", "raw_rows_json"},
+    "runs": {"status", "active_attempt_id", "never_ran"},
     "attempts": {"status"},
     "turns": {"status", "usage_json", "context_usage_json", "native_response_ids_json", "usage_closure_json"},
     "segments": {"status", "observed_at", "notice_ids_json", "wake_dispositions_json"},
@@ -846,6 +895,20 @@ def _materialize(con, table):
                 f" FROM {source} GROUP BY {','.join(keys)}{having}")
 
 
+def _reject_disputed_copies(con):
+    # A row whose copies disagree on immutable coordinates has no mirror row.
+    # It is rejected with the references its copies carry, never absent.
+    for table, keys, run, thread, task in (
+            ("runs", ("run_id",), "run_id", "thread_id", "task_id"),
+            ("attempts", ("attempt_id",), "run_id", "NULL", "NULL"),
+            ("turns", ("provider_turn_id",), "run_id", "NULL", "NULL"),
+            ("segments", ("thread_id", "owner_id", "segment_id"), "run_id", "thread_id", "task_id")):
+        cols = ",".join(keys)
+        con.execute(f"""INSERT INTO t3_purpose_rejects SELECT DISTINCT s.source_path,?,'conflicting_copies',
+            s.{keys[-1]},s.{run},{'s.' + thread if thread != 'NULL' else 'NULL'},{'s.' + task if task != 'NULL' else 'NULL'}
+            FROM t3_source_{table} s WHERE ({cols}) NOT IN (SELECT {cols} FROM t3_purpose_{table})""", (table,))
+
+
 def _exclude_disputed_calls(con):
     # A turn item is immutable even when two copies disagree about its call
     # ID. Do not let either version establish a call-to-completion bridge.
@@ -900,15 +963,19 @@ def refresh(con, native, tables):
     con.execute("CREATE INDEX IF NOT EXISTS t3_purpose_inputs_run ON t3_purpose_inputs(run_id)")
     _upgrade_retained_run_keys(con)
     aware = _deliveries(snapshot, native, tables)
-    runs = _runs(snapshot, native, tables)
+    runs, legacy = _runs(snapshot, native, tables)
     if runs:
+        for table in COMPLETENESS_TABLES:
+            if PROJECTION + table not in tables:
+                # A table that is not there proves nothing; it keeps every task of the source unknown.
+                snapshot.reject(table, "table_missing")
         _capabilities(snapshot, native, tables)
         segments = []
-        providers = _providers(snapshot, native, tables, runs, segments)
-        attempts = _attempts(snapshot, native, tables, runs, providers)
-        _turns(snapshot, native, tables, attempts)
-        children = _subagents(snapshot, native, tables, runs, segments)
-        _expected_children(snapshot, native, tables, runs)
+        providers = _providers(snapshot, native, tables, runs, legacy, segments)
+        attempts, owners = _attempts(snapshot, native, tables, runs, legacy, providers)
+        _turns(snapshot, native, tables, attempts, owners, legacy)
+        children = _subagents(snapshot, native, tables, runs, legacy, segments)
+        _expected_children(snapshot, native, tables, runs, legacy)
         boundaries = _segments(snapshot, segments, runs, children)
         _child_turns(snapshot, native, tables, boundaries, providers)
     con.execute("CREATE TABLE IF NOT EXISTS t3_source_aware_threads("
@@ -917,6 +984,7 @@ def refresh(con, native, tables):
     con.executemany("INSERT INTO t3_source_aware_threads VALUES(?,?)", ((path, t) for t in aware))
     for table in TABLES:
         _materialize(con, table)
+    _reject_disputed_copies(con)
     _exclude_disputed_calls(con)
     _exclude_disputed_inputs(con)
     return {r[0] for r in con.execute(

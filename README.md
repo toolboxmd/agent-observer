@@ -537,11 +537,14 @@ Claude turn that lists its native response ids has exactly those responses.
 Every compaction the Codex rollout records in a turn must name a response
 of that turn (`compaction_response_id`), and the compactions must number what
 the closure states; their responses stay in the cost but outside the turn
-counter. Otherwise the total stays unknown, the
+counter. A compaction that no turn can own, such as one recorded by an older
+Codex without a window id, keeps every closed turn of that Codex session
+unknown. Otherwise the total stays unknown, the
 priced subtotal is shown, and `native coverage` names each reason with the
 number of turns, attempts, runs, segments, children, responses or sessions it
-affects. A run that the Chromeria records prove never ran adds nothing; a missing
-or unreadable record is a gap, never proof. A delegated child
+affects. A run that the Chromeria records prove never ran adds nothing. A Chromeria
+row that Observer cannot validate is a `native_rows_rejected` gap for every
+task it can be tied to, never an absence. A delegated child
 that declared another task, or was deliberately unscoped, is another task's
 cost; `not counted` says how many there were. Native child agents, children
 without a declared purpose, active or remote children, and unpriced models

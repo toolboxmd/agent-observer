@@ -512,6 +512,32 @@ def _children(con, task_id, run, gaps, not_counted):
             gaps.add("child_purpose_unknown", "children", child)
 
 
+def _rejected(con, native):
+    """Rejected Chromeria rows this task's evidence depends on.
+
+    A row is tied to the task by its task reference, one of the task's runs,
+    or a thread those runs live on. A row tied to nothing keeps every task of
+    its source unknown.
+    """
+    if not _has_table(con, "t3_purpose_rejects"):
+        return []
+    runs = {r["run_id"] for r in native["runs"]} | set(native["conflicting_source_runs"])
+    threads = {r["thread_id"] for r in native["runs"]}
+    origins = set()
+    if _has_table(con, "t3_source_runs") and runs:
+        origins = {r[0] for r in con.execute(
+            "SELECT DISTINCT source_path FROM t3_source_runs WHERE run_id IN (SELECT value FROM json_each(?))",
+            (json.dumps(sorted(runs)),))}
+    tied = []
+    for r in con.execute("SELECT * FROM t3_purpose_rejects ORDER BY table_name,reason,row_id"):
+        r = dict(r)
+        refs = (r["task_id"], r["run_id"], r["thread_id"])
+        if (r["task_id"] == native["task_id"] or r["run_id"] in runs or r["thread_id"] in threads
+                or (refs == (None, None, None) and r["origin"] in origins)):
+            tied.append({k: r[k] for k in ("table_name", "reason", "row_id", "run_id", "thread_id")})
+    return tied
+
+
 def check_inventory(con, native, rows):
     """Decide whether the task's native evidence is complete, naming each gap with a count.
 
@@ -585,14 +611,6 @@ def check_inventory(con, native, rows):
         if not run["never_ran"] and run["active_attempt_id"] not in {a["attempt_id"] for a in attempts}:
             gaps.add("expected_attempt_missing", "runs", run_id)
             main_gaps.add("expected_attempt_missing")
-        # Every raw attempt and provider turn of the run must be in the mirror:
-        # a row that validation or a disagreeing copy dropped is hidden work.
-        raw = json.loads(run.get("raw_rows_json") or "null")
-        if not run["never_ran"] and (
-                raw is None or not set(raw["attempts"]) <= {a["attempt_id"] for a in attempts}
-                or not set(raw["turns"]) <= {t["provider_turn_id"] for a in attempts for t in a["turns"]}):
-            gaps.add("native_rows_unmirrored", "runs", run_id)
-            main_gaps.add("native_rows_unmirrored")
         for a in attempts:
             turns = a.pop("turns")
             if not run["never_ran"] and (not turns or (
@@ -628,6 +646,9 @@ def check_inventory(con, native, rows):
         run["participants"] = [dict(r) for r in con.execute(
             "SELECT * FROM t3_purpose_participants WHERE run_id=? ORDER BY kind,participant_id", (run_id,))]
         _children(con, native["task_id"], run, gaps, not_counted)
+    native["rejected_rows"] = _rejected(con, native)
+    for item in native["rejected_rows"]:
+        gaps.add("native_rows_rejected", "rows", tuple(item.values()))
     if native["conflicting_reference_kinds"]:
         for run in native["runs"]:
             gaps.add("conflicting_reference_kinds", "runs", run["run_id"])
