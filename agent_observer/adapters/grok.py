@@ -1607,6 +1607,15 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                    if updates_path and os.path.isfile(updates_path) else None)
     events_src = (JsonlSource(con, HARNESS, events_path, full=replay)
                   if events_path and os.path.isfile(events_path) else None)
+    if updates_src is not None:
+        # grok_session_meta is shared by copies. Each old updates source must
+        # independently replay once, even when a different copy was upgraded.
+        con.execute("CREATE TABLE IF NOT EXISTS grok_bridge_sources"
+                    "(source_id INTEGER PRIMARY KEY REFERENCES sources(id))")
+        if not con.execute("SELECT 1 FROM grok_bridge_sources WHERE source_id=?",
+                           (updates_src.source_id,)).fetchone():
+            updates_src.start_offset = updates_src.end_offset = 0
+            updates_src.unchanged = False
     r.updates_src = updates_src
     r.events_src = events_src
     known_row = con.execute("SELECT 1 FROM sessions WHERE session_key=?",
@@ -1960,6 +1969,10 @@ def import_grok_session(con: sqlite3.Connection, session_dir: str,
                 "(SELECT version FROM agentsmd_versions WHERE sha256=sessions.instructions_sha256), ?)"
                 " WHERE session_key=?",
                 (json.dumps(evidence, sort_keys=True) if evidence else None, version, r.session_key))
+    if updates_records is not None and updates_src is not None:
+        _record_prompt_bridges(r, updates_src, updates_records)
+        con.execute("INSERT OR IGNORE INTO grok_bridge_sources VALUES(?)",
+                    (updates_src.source_id,))
     if not metadata_errors:
         _store_meta(con, r.session_key, summary_fp, chat_fp_current, chat, metadata_imported_at)
     else:
@@ -3076,3 +3089,124 @@ def _read_state(status):
     if status in ("failed", "error", "cancelled"):
         return "failed"
     return "pending" if status in ("in_progress", "pending", "running") else "attempted"
+
+
+def _record_prompt_bridges(r, src, records):
+    """Keep literal Grok input, tool call and completion witnesses per source."""
+    r.con.execute("""
+        CREATE TABLE IF NOT EXISTS grok_prompt_bridges (
+            session_key TEXT NOT NULL, prompt_id TEXT NOT NULL, input_ref TEXT NOT NULL,
+            source_id INTEGER NOT NULL REFERENCES sources(id),
+            PRIMARY KEY(session_key, prompt_id, input_ref, source_id)
+        ) WITHOUT ROWID""")
+    r.con.execute("CREATE INDEX IF NOT EXISTS grok_bridge_source ON grok_prompt_bridges(source_id)")
+    r.con.execute("DELETE FROM grok_prompt_bridges WHERE source_id=?", (src.source_id,))
+    witnesses = set()
+    for _, obj, _ in records:
+        if not isinstance(obj, dict) or obj.get("method") not in METHODS:
+            continue
+        params = obj.get("params")
+        if not isinstance(params, dict) or params.get("sessionId") != r.native_sid:
+            continue
+        update = params.get("update")
+        if not isinstance(update, dict):
+            continue
+        kind = update.get("sessionUpdate")
+        if kind == "turn_completed":
+            ids = {_valid_native_id(update[k]) for k in ("prompt_id", "promptId") if k in update}
+            if len(ids) == 1 and None not in ids:
+                pid, = ids
+                try:
+                    counters = _validated_usage_counters(update)
+                except _AdapterError:
+                    continue
+                row = r.con.execute("SELECT * FROM responses WHERE session_key=? AND response_id=?",
+                                    (r.session_key, f"{r.session_key}:{pid}")).fetchone()
+                if row and all(value is None or row[name] == value for name, value in counters.items()):
+                    witnesses.add((pid, ""))  # An accepted, scoped completion.
+        elif kind == "tool_call":
+            meta = params.get("_meta")
+            pid = _valid_native_id(meta.get("promptId")) if isinstance(meta, dict) else None
+            call = _valid_native_id(update.get("toolCallId"))
+            if pid and call:
+                witnesses.add((pid, "call:" + call))
+        elif kind == "user_message_chunk":
+            meta = update.get("_meta")
+            if not isinstance(meta, dict):
+                continue
+            index = meta.get("promptIndex")
+            if (type(index) is not int or not 0 <= index <= 2**53 - 1
+                    or meta.get("syntheticPrompt") is True or meta.get("hideFromScrollback") is True):
+                continue
+            for fields in (update, meta, params.get("_meta"), obj.get("_meta")):
+                if isinstance(fields, dict):
+                    for key in ("promptId", "prompt_id"):
+                        pid = _valid_native_id(fields.get(key))
+                        if pid:
+                            witnesses.add((pid, f"prompt:{index}"))
+    r.con.executemany("INSERT INTO grok_prompt_bridges VALUES(?,?,?,?)",
+                      ((r.session_key, pid, ref, src.source_id) for pid, ref in witnesses))
+
+
+def response_witnesses(con, session_key):
+    if not db._has_table(con, "grok_prompt_bridges"):
+        return {}, set(), set()
+    completed = set()
+    indexes = {}
+    calls = {}
+    for pid, ref in con.execute("SELECT DISTINCT prompt_id,input_ref FROM grok_prompt_bridges"
+                                " WHERE session_key=?", (session_key,)):
+        if ref.startswith("call:"):
+            calls.setdefault(ref[5:], set()).add(pid)
+        elif ref:
+            indexes.setdefault(ref, set()).add(pid)
+        else:
+            completed.add(pid)
+    disputed = set()
+    tool_witnesses = set()
+    if calls and db._has_table(con, "t3_purpose_grok_calls"):
+        projected = {}
+        for call, turn, index in con.execute(
+                "SELECT c.call_id,c.provider_turn_id,i.native_id FROM t3_purpose_grok_calls c "
+                "LEFT JOIN t3_purpose_inputs i ON i.session_key=c.session_key "
+                "AND i.provider_turn_id=c.provider_turn_id AND i.validation='grok_prompt_index' "
+                "WHERE c.session_key=?", (session_key,)):
+            projected.setdefault(call, set()).add((turn, index))
+        for call in calls.keys() & projected.keys():
+            pids, owners = calls[call], projected[call]
+            if len(pids) != 1 or len(owners) != 1:
+                disputed.update(pids)
+                continue
+            _, index = next(iter(owners))
+            if index is not None:
+                indexes.setdefault(index, set()).update(pids)
+                tool_witnesses.update(f"{session_key}:{pid}" for pid in pids)
+        if db._has_table(con, "t3_source_grok_calls"):
+            # A rejected projection cannot grant ownership, but its literal
+            # call still identifies which completion a competing capture must exclude.
+            for call, in con.execute(
+                    "SELECT DISTINCT s.call_id FROM t3_source_grok_calls s "
+                    "LEFT JOIN t3_purpose_grok_calls c USING(session_key,call_id,provider_turn_id) "
+                    "LEFT JOIN t3_source_inputs i ON i.source_path=s.source_path AND i.session_key=s.session_key "
+                    "AND i.provider_turn_id=s.provider_turn_id AND i.validation='grok_prompt_index' "
+                    "LEFT JOIN t3_purpose_inputs a ON a.session_key=i.session_key AND a.native_id=i.native_id "
+                    "AND a.provider_turn_id=i.provider_turn_id AND a.validation=i.validation "
+                    "WHERE s.session_key=? AND (c.call_id IS NULL OR (i.native_id IS NOT NULL AND a.native_id IS NULL))",
+                    (session_key,)):
+                disputed.update(calls.get(call, ()))
+    # One native index claiming two different prompt ids is contradictory,
+    # including when the two claims came from different copies.
+    disputed.update(pid for pids in indexes.values() if len(pids) > 1 for pid in pids)
+    eligible = completed - disputed
+    refs = {}
+    for ref, pids in indexes.items():
+        for pid in pids & eligible:
+            refs.setdefault(f"{session_key}:{pid}", set()).add(ref)
+    result = {rid: refs[rid] for rid, in con.execute(
+        "SELECT response_id FROM responses WHERE session_key=? AND is_overlap=0", (session_key,)
+    ) if rid in refs}
+    return result, tool_witnesses.intersection(result), {f"{session_key}:{pid}" for pid in disputed}
+
+
+def response_inputs(con, session_key):
+    return response_witnesses(con, session_key)[0]

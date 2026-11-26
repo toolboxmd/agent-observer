@@ -514,6 +514,30 @@ Intervention text, problem lines and session attributes stay on this machine:
 
 ## Ownership and tasks
 
+For a Chromeria run with a declared Issue or PR purpose, use its reference
+as the task ID. For example, `agent-observer task show --task owner/repo#12 --json`
+lists the native responses joined to that purpose, even before a delivery PR
+exists. On hosts other than github.com, use `forge.example/owner/repo/issue#12`
+or `forge.example/owner/repo/pr#12`. Historical IDs such as
+`forge.example/owner/repo#12` remain available for earlier captures. Observer
+keeps those captures under the original ID because they recorded no kind.
+The `native_purpose` section identifies each run, the input that joins
+a response to it, delivery PRs, provider counter checks, and gaps in coverage.
+A planner serving two Issues can have responses for each in the same session.
+For Grok, a session update can connect the prompt index to the completion ID.
+A tool call can also supply that connection when Chromeria and Grok record
+the same call ID for the turn. A tool-free response without either witness
+stays unplaced.
+
+A provider turn can reconcile while the full outcome cost remains unknown.
+Chromeria v1 records observed background causes for some drivers and has no
+background inventory for others. A missing child boundary or unavailable
+price leaves any priced work as a subtotal. The same scope appears in
+`publish --task`. For legacy PR links, `legacy_checkout_observations`
+shows which checkout Observer saw when it imported a tool call. The observation
+survives checkout retirement. A path can change hands before import, so a
+matching PR head alone leaves the response outside the bill.
+
 Put `observer_task_id` in related Router jobs' prepared task JSON to connect
 them to one Observer task. `sync` binds their dedicated worker and dispatcher
 sessions using Router records, preserving captured task metadata and outcomes.

@@ -115,9 +115,10 @@ class ClaudeQueueBindingTest(LedgerCase):
         with self.subTest(consumer='report.task_report'):
             actual = report.task_report(self.con, TASK, schedule=SCHEDULE)
             self.assertEqual(set(actual['scope_sessions']), keys)
-            self.assertEqual(actual['attributed']['responses'], 3 if current else 2)
-            self.assertEqual(actual['attributed']['total_tokens'], tokens)
-            self.assertAlmostEqual(actual['estimated_cost']['estimated_cost_usd_total'], tokens / 1e6)
+            self.assertEqual(actual['unplaced_shared']['responses'], 3 if current else 2)
+            self.assertEqual(actual['unplaced_shared']['total_tokens'], tokens)
+            self.assertEqual(actual['attributed']['responses'], 0)
+            self.assertIsNone(actual['estimated_cost']['estimated_cost_usd_total'])
         with self.subTest(consumer='dispatch.compare'):
             actual = dispatch.compare(self.con, self.state, schedule=SCHEDULE,
                                       approval=lambda _: {'approved_at': None, 'error': None})

@@ -174,6 +174,14 @@ def _text(payload) -> str:
             f"session span {r.get('time', {}).get('session_span_s')} "
             f"({r.get('time', {}).get('session_span_label')})",
         ]
+        native = r.get("native_purpose") or {}
+        if native.get("runs") or native.get("deliveries") or native.get("conflicting_source_runs"):
+            lines.append(f"  native purpose: {len(native['runs'])} runs, "
+                         f"{len(native['membership'])} joined responses")
+            if native.get("coverage_gaps"):
+                lines.append("  native coverage: " + ", ".join(native["coverage_gaps"]))
+            for pr in native["deliveries"]:
+                lines.append(f"  delivery PR: {pr['url']}")
         est = r.get("estimated_cost") or {}
         if est.get("schedule_source"):
             lines.append(
@@ -210,6 +218,8 @@ def _text(payload) -> str:
                  f"joined call_ids: {len(payload['join']['joined_call_ids'])}",
                  f"unmatched results: {len(payload['join']['unmatched_results'])}",
                  f"unanswered calls: {len(payload['join']['unanswered_calls'])}"]
+        if "native_response_count" in payload:
+            lines.append(f"native responses joined to this outcome: {payload['native_response_count']}")
         if payload.get("truncated"):
             lines[0] = (f"events: {payload['returned']} of {payload['total']} "
                         f"(truncated). {payload['truncation_hint']}")
@@ -1083,9 +1093,8 @@ def _sync(con, ns) -> int:
                     row[key] = (row.get(key) or 0) + value
                 elif key not in row:
                     row[key] = value
-    # Placement runs once, after every harness import and the T3 refresh,
-    # so sessions imported later in this run are visible (#80). The refresh
-    # merge must not add shared_sessions a second time.
+    # Native imports capture checkout diagnostics independently of T3 links.
+    # Count shared sessions after the T3 refresh.
     if "t3" in wanted:
         for row in results:
             if row.get("harness") == "t3" and "skipped" not in row:

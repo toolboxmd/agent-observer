@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.7.0] - 2026-11-25
+
+### Added
+
+- Report native Issue and PR response ownership and show incomplete outcome costs.
+
 ## [1.6.0] - 2026-11-25
 
 ### Added

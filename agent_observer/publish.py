@@ -102,6 +102,15 @@ def _safe_ref(value) -> str | None:
     return None
 
 
+def _task_label(task_id):
+    """GitHub outcome IDs use owner/repo#number. Other forges include their host."""
+    if isinstance(task_id, str):
+        repository, _, number = task_id.rpartition("#")
+        if number.isdecimal() and "/" in repository and not _REPO_RE.fullmatch(repository):
+            return "reference withheld"
+    return _safe_field(task_id)
+
+
 def _fmt(n) -> str:
     return "unknown" if n is None else f"{int(n):,}"
 
@@ -222,11 +231,14 @@ def summarize(con, session_keys: set, label: str, task_id: str | None = None,
             "time": rep["time"],
             "native_cost": rep["native_cost"],
             "native_cost_shared": rep["native_cost_shared"],
+            "native_cost_billed_shared": rep["native_cost_billed_shared"],
             "estimated_cost": rep["estimated_cost"],
             "estimated_cost_shared": rep["estimated_cost_shared"],
             "total_cost": rep["total_cost"],
             "subscription_note": rep["subscription_note"],
         })
+        if "native_purpose" in rep:
+            out["native_purpose"] = rep["native_purpose"]
     else:
         out.update({
             "scope_kind": "session",
@@ -430,6 +442,20 @@ def render(summary: dict, target: str | None = None) -> str:
     parts += [_counted(responses, "response", "responses"),
               _counted(sessions, "session", "sessions"), wall]
     lines = [MARKER, f"### {title}", "", " · ".join(parts), ""]
+    native = summary.get("native_purpose") or {}
+    task_label = _task_label(summary.get("task_id"))
+    if native.get("runs") or native.get("deliveries") or native.get("conflicting_source_runs"):
+        lines.append(f"Outcome: {task_label}.")
+        if native.get("coverage_gaps"):
+            lines.append("Full outcome cost unknown. Native coverage: " +
+                         ", ".join(_safe_field(g.replace("_", " ")) for g in native["coverage_gaps"]) + ".")
+        for pr in native["deliveries"]:
+            reference = _safe_ref(pr["url"])
+            if reference is not None:
+                lines.append(f"Delivery PR: {reference}")
+            else:
+                lines.append("Delivery PR: [reference withheld]")
+        lines.append("")
     if not task:
         lines += [f"_{_safe_field(summary.get('session_note') or 'Session scope only.')} "
                   f"Finished processes never imply an accepted task outcome._", ""]
@@ -449,7 +475,7 @@ def render(summary: dict, target: str | None = None) -> str:
     versions = ", ".join(_safe_field(v) for v in summary['agentsmd_versions']) or "unknown"
     if task:
         acceptance = summary.get("acceptance_state") or "unknown"
-        lines.append(f"- Task `{_safe_field(summary.get('task_id'))}`: outcome "
+        lines.append(f"- Task `{task_label}`: outcome "
                      f"{_safe_field(acceptance)} (recorded acceptance only; a finished "
                      f"process never implies it).")
         outcome = summary.get("outcome") or {}
@@ -475,12 +501,11 @@ def render(summary: dict, target: str | None = None) -> str:
                          f"so sums across PRs overlap.")
         unplaced = total.get("unplaced") or {}
         if unplaced.get("responses"):
-            lines.append(f"- Not counted: {unplaced['responses']:,} responses "
-                         f"({_safe_field(unplaced.get('text') or 'unknown')}) in sessions "
-                         f"shared with other PRs that worked in no single PR's checkout.")
+            lines.append(f"- Ownership is unresolved for {unplaced['responses']:,} responses "
+                         f"({_safe_field(unplaced.get('text') or 'unknown')}). They are excluded from this total.")
         if unplaced.get("other_task_responses"):
-            lines.append(f"- {unplaced['other_task_responses']:,} responses in these "
-                         f"sessions worked on other PRs and are counted there.")
+            lines.append(f"- {unplaced['other_task_responses']:,} responses belong to other tasks "
+                         "and are excluded from this total.")
         unassigned = (summary.get("unassigned_in_scope") or {}).get("responses", 0)
         if unassigned:
             lines.append(f"- {unassigned:,} responses in these sessions belong to no "
@@ -512,7 +537,7 @@ def render(summary: dict, target: str | None = None) -> str:
             lines.append("- Prices: no sourced price schedule, so the estimate is unknown.")
         if est.get("coverage_note"):
             lines.append(f"- {_safe_field(est['coverage_note'])}.")
-        natives = [summary.get("native_cost") or {}, summary.get("native_cost_shared") or {}]
+        natives = [summary.get("native_cost") or {}, summary.get("native_cost_billed_shared") or {}]
         known = sum(n.get("known_responses", 0) or 0 for n in natives)
         if not known:
             lines.append("- Harness-reported cost: none reported.")

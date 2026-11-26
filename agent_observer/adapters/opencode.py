@@ -14,12 +14,13 @@ response row, error or not.
 
 from __future__ import annotations
 
+from functools import partial
 import json
 import os
 import sqlite3
 import time
 
-from .. import db, privacy
+from .. import db, native_response, privacy
 from ..identity import SessionIdentity, skill_from_path
 from ..ingest import fingerprint, insert_event, iso_ts, text_hash
 from .discovery import path_info
@@ -174,10 +175,13 @@ def sync(con: sqlite3.Connection, root: str | None = None, full: bool = False,
             totals["failed"].append({"path": abs_path, "error": str(exc)})
             return totals
         for row in rows:
+            con.execute("SAVEPOINT opencode_session")
             try:
                 stats = import_session(con, native, abs_path, dict(row),
                                        full=full)
             except (OSError, sqlite3.DatabaseError) as exc:
+                con.execute("ROLLBACK TO opencode_session")
+                con.execute("RELEASE opencode_session")
                 totals["failed"].append(
                     {"path": f"{abs_path}#{row.get('id')}", "error": str(exc)})
                 continue
@@ -278,67 +282,151 @@ def _int_or_none(value):
         else None
 
 
-def _upsert_response(con: sqlite3.Connection, stats: dict, src_path: str,
-                     *, response_id: str, source_id, session_key, session_id,
-                     ordinal, ts, model, provider, effort, values: dict,
-                     total, semantics, cost_usd, line: str = "") -> None:
-    existing = con.execute(
-        "SELECT * FROM responses WHERE response_id=?",
-        (response_id,)).fetchone()
-    if existing is None:
-        con.execute(
-            "INSERT INTO responses(response_id, source_id, harness,"
-            " session_key, session_id, ordinal_num, ts, model, provider, effort,"
-            " input_tokens, cached_input_tokens, cache_write_input_tokens,"
-            " output_tokens, reasoning_output_tokens, total_tokens, semantics,"
-            " cost_usd) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (response_id, source_id, HARNESS, session_key,
-             session_id, ordinal, ts, model,
-             provider, effort,
-             values["input_tokens"], values["cached_input_tokens"],
-             values["cache_write_input_tokens"], values["output_tokens"],
-             values["reasoning_output_tokens"], total, semantics, cost_usd))
-        stats["responses_inserted"] = stats.get("responses_inserted", 0) + 1
+_MEASUREMENT_FIELDS = ("model", "provider", "effort", "input_tokens", "output_tokens",
+                       "cached_input_tokens", "cache_write_input_tokens", "reasoning_output_tokens",
+                       "total_tokens", "cost_usd")
+
+
+def _prepare_observations(con, session_key, source_id, *, identities_complete):
+    # A snapshot replaces only this store's observations. Keep the projection
+    # fields needed to restore a surviving copy when another store changes.
+    con.execute("""CREATE TABLE IF NOT EXISTS opencode_response_observations (
+        session_key TEXT NOT NULL, response_id TEXT NOT NULL, source_id INTEGER NOT NULL REFERENCES sources(id),
+        parent TEXT, measurement TEXT NOT NULL, ts REAL, ordinal_num INTEGER,
+        PRIMARY KEY(session_key,response_id,source_id)) WITHOUT ROWID""")
+    con.execute("CREATE INDEX IF NOT EXISTS opencode_observation_source ON opencode_response_observations(source_id)")
+    # Preserve the one payload a pre-upgrade ledger actually retained before
+    # another copy can replace its projection. Only its own edge accompanies it.
+    for row in con.execute(
+            "SELECT r.* FROM responses r JOIN sources s ON s.id=r.source_id WHERE r.session_key=? "
+            "AND r.source_id<>? AND s.sha256 NOT GLOB 'oc[3-8]:*' AND NOT EXISTS "
+            "(SELECT 1 FROM opencode_response_observations o WHERE o.session_key=r.session_key "
+            "AND o.response_id=r.response_id AND o.source_id=r.source_id)", (session_key, source_id)):
+        parent = con.execute(
+            "SELECT input_id FROM native_response_inputs WHERE session_key=? AND response_id=? AND source_id=?",
+            (session_key, row["response_id"], row["source_id"])).fetchone()
+        measurement = {name: row[name] for name in _MEASUREMENT_FIELDS}
+        _observe_response(con, session_key, row["response_id"], row["source_id"], parent[0] if parent else None,
+                          measurement, row["ts"], row["ordinal_num"])
+    if identities_complete:
+        con.execute("DELETE FROM opencode_response_observations WHERE source_id=?", (source_id,))
+    else:
+        # A row with no usable id could be any missing row from this store.
+        # Refresh the identifiable rows below; no old counters or parent win by default.
+        con.execute("UPDATE opencode_response_observations SET measurement=?,parent=NULL WHERE source_id=?",
+                    (json.dumps("unknown_message"), source_id))
+
+
+def _project_observations(con, stats, session_key, session_id):
+    # The path selects a stable locator only. Membership and measurements
+    # are usable together only where the copies agree (response_witnesses).
+    groups = {}
+    for row in con.execute(
+            "SELECT o.*,s.path FROM opencode_response_observations o JOIN sources s ON s.id=o.source_id "
+            "WHERE session_key=? ORDER BY response_id,s.path", (session_key,)):
+        groups.setdefault(row["response_id"], []).append(row)
+    for rid, copies in groups.items():
+        payloads = ((row, json.loads(row["measurement"])) for row in copies)
+        measured = [(row, data) for row, data in payloads if isinstance(data, dict)]
+        if not measured:
+            # An observed completed response whose current counters are invalid
+            # no longer has an atomic usage row. Its native identity survives.
+            con.execute("DELETE FROM responses WHERE session_key=? AND response_id=?", (session_key, rid))
+            continue
+        copy, data = measured[0]
+        for _, other in measured[1:]:
+            for field, value in other.items():
+                if data[field] != value:
+                    data[field] = None
+        _project_response(con, stats, rid, session_key, session_id, copy, data)
+    # Previously observed ids without a surviving copy retain their historical
+    # ledger row. Their input witness has been removed in this transaction.
+
+
+def response_witnesses(con, session_key):
+    """Resolve the parent and the measured payload as a single source observation."""
+    witnesses = {}
+    conflicts = set()
+    payload_sources = {}
+    observations = {}
+    unavailable = {rid: set() for rid, in con.execute(
+        "SELECT response_id FROM responses WHERE session_key=? AND is_overlap=0 AND total_tokens IS NULL",
+        (session_key,))}
+    measured = dict(con.execute("SELECT response_id,source_id FROM responses WHERE session_key=? AND is_overlap=0",
+                                (session_key,)))
+    if db._has_table(con, "opencode_response_observations"):
+        for rid, source, parent, measurement in con.execute(
+                "SELECT response_id,source_id,parent,measurement FROM opencode_response_observations "
+                "WHERE session_key=?", (session_key,)):
+            observations.setdefault(rid, set()).add((parent, measurement))
+            if measurement in _INVALID_OBSERVATIONS:
+                unavailable[rid] = set()
+            if rid in measured:
+                payload_sources.setdefault(rid, set()).add(source)
+        for rid, variants in observations.items():
+            if rid not in measured and rid not in unavailable:
+                continue
+            parents = {parent for parent, _ in variants if parent}
+            if rid in unavailable:
+                unavailable[rid] = parents
+            if rid in measured and parents:
+                witnesses[rid] = parents
+            if len(variants) > 1 and (any(parent is None for parent, _ in variants)
+                                      or len({payload for _, payload in variants}) > 1):
+                conflicts.add(rid)
+
+    # Old imports recorded edges but kept only the last copy's payload.
+    # An edge from a copy whose measurement was lost cannot vouch for it.
+    for rid, input_id, source, measured_source in native_response.stored_inputs(con, session_key):
+        if source not in payload_sources.get(rid, {measured_source}):
+            conflicts.add(rid)
+        witnesses.setdefault(rid, set()).add(input_id)
+    if db._has_table(con, "native_response_events"):
+        for rid, source in con.execute(
+                "SELECT DISTINCT e.response_id,e.source_id FROM native_response_events e "
+                "JOIN sources s ON s.id=e.source_id WHERE e.session_key=? AND s.sha256 NOT GLOB 'oc[4-8]:*'",
+                (session_key,)):
+            if rid in measured and source not in payload_sources.get(rid, {measured[rid]}):
+                conflicts.add(rid)
+    return witnesses, conflicts, unavailable
+
+
+def has_unlocated_usage_error(con, session_key):
+    # Older adapters quarantined a malformed usage record by ordinal only.
+    # Keep the session's cost open without guessing which message failed.
+    return con.execute(
+        "SELECT 1 FROM sources s WHERE s.harness=? AND s.session_id=? AND "
+        "(s.sha256 GLOB 'oc[4-8]:unlocated' OR (s.sha256 NOT GLOB 'oc[4-8]:*' AND EXISTS (SELECT 1 FROM import_errors e "
+        "WHERE e.harness=s.harness AND e.source_path=s.path AND e.error='malformed_usage' "
+        "AND instr(','||e.line_excerpt||',', ',tokens,')>0))) LIMIT 1",
+        (HARNESS, session_key.partition(":")[2])).fetchone() is not None
+
+
+def _project_response(con, stats, rid, session_key, session_id, locator, measurement):
+    fields = ("source_id", "ordinal_num", "ts", "semantics", *_MEASUREMENT_FIELDS)
+    values = (locator["source_id"], locator["ordinal_num"], locator["ts"], SEMANTICS,
+              *(measurement[k] for k in _MEASUREMENT_FIELDS))
+    # Identity was validated before the source observation was accepted.
+    columns = ",".join(fields)
+    row = con.execute(f"SELECT {columns} FROM responses WHERE response_id=?", (rid,)).fetchone()
+    if row and tuple(row) == values:
+        stats["responses_duplicate"] += 1
         return
-    # Immutable identity: the same response id must stay in its session.
-    if (existing["session_key"] != session_key
-            or existing["session_id"] != session_id):
-        _oops(con, stats, src_path, ordinal, "usage_conflict", line)
-        stats["responses_duplicate"] = stats.get("responses_duplicate", 0) + 1
-        return
-    new_fields = {
-        "ordinal_num": ordinal, "ts": ts, "model": model, "provider": provider,
-        "effort": effort, "input_tokens": values["input_tokens"],
-        "cached_input_tokens": values["cached_input_tokens"],
-        "cache_write_input_tokens": values["cache_write_input_tokens"],
-        "output_tokens": values["output_tokens"],
-        "reasoning_output_tokens": values["reasoning_output_tokens"],
-        "total_tokens": total, "semantics": semantics, "cost_usd": cost_usd,
-        "source_id": source_id,
-    }
-    changed = any(existing[col] != val for col, val in new_fields.items())
-    if not changed:
-        stats["responses_duplicate"] = stats.get("responses_duplicate", 0) + 1
-        return
-    con.execute(
-        "UPDATE responses SET source_id=?, ordinal_num=?, ts=?, model=?,"
-        " provider=?, effort=?, input_tokens=?, cached_input_tokens=?,"
-        " cache_write_input_tokens=?, output_tokens=?,"
-        " reasoning_output_tokens=?, total_tokens=?, semantics=?, cost_usd=?"
-        " WHERE response_id=?",
-        (source_id, ordinal, ts, model, provider, effort,
-         values["input_tokens"], values["cached_input_tokens"],
-         values["cache_write_input_tokens"], values["output_tokens"],
-         values["reasoning_output_tokens"], total, semantics, cost_usd,
-         response_id))
-    stats["responses_inserted"] = stats.get("responses_inserted", 0) + 1
+    if row:
+        con.execute(f"UPDATE responses SET ({columns})=({','.join('?' for _ in fields)}) WHERE response_id=?",
+                    (*values, rid))
+    else:
+        con.execute(f"INSERT INTO responses(response_id,harness,session_key,session_id,{columns}) "
+                    f"VALUES({','.join('?' for _ in range(4 + len(fields)))})",
+                    (rid, HARNESS, session_key, session_id, *values))
+    stats["responses_inserted"] += 1
 
 
 def _upsert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
                   session_key: str, family: str, native_id, ordinal=None,
                   ts=None, turn_id=None, name=None, target=None, status=None,
                   duration_ms=None, size_bytes=None, truncated=None,
-                  fingerprint=None, detail=None) -> None:
+                  fingerprint=None, detail=None, response_id=None) -> None:
     """Insert one event under its natural key; mutable rows update in place.
 
     Rule 6 via agent_observer/privacy.py for every protected field:
@@ -355,6 +443,8 @@ def _upsert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
     native = privacy.filter_native_id(family, native_id)
     if not native:
         raise ValueError(f"{family} event missing native identity")
+    if response_id:
+        native_response.record_event(con, source_id, session_key, family, native, response_id)
     safe_name = privacy.filter_event_name(family, name)
     safe_status = privacy.filter_event_status(family, status)
     safe_target = privacy.filter_target(target, family) or None
@@ -412,7 +502,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     session_key = f"{HARNESS}:{sess_id}"
     msg_n, msg_m = _count_max(native, "message", sess_id)
     part_n, part_m = _count_max(native, "part", sess_id)
-    fp = fingerprint(sess.get("time_updated"), msg_m, part_m, msg_n, part_n)
+    fp = "oc8:" + fingerprint(sess.get("time_updated"), msg_m, part_m, msg_n, part_n)
     row = con.execute(
         "SELECT * FROM sources WHERE harness=? AND path=?",
         (HARNESS, src_path)).fetchone()
@@ -459,6 +549,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
             " detail_json=NULL WHERE source_id=?",
             (source_id,))
     complete = True
+    messages_read = True
     try:
         messages = _fetch_dicts(
             native, "message",
@@ -468,7 +559,7 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     except sqlite3.Error:
         _oops(con, stats, src_path, None, "source_unreadable")
         messages = []
-        complete = False
+        messages_read = complete = False
     try:
         parts = _fetch_dicts(
             native, "part",
@@ -485,21 +576,27 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
         by_message.setdefault(part.get("message_id"), []).append(part)
     roles: dict[str, str | None] = {}
     parsed_messages: list[tuple] = []
+    identities_complete = messages_read and all(native_response.identifier(msg.get("id")) for msg in messages)
+    native_response.prepare(con, source_id, replace=identities_complete)
+    native_response.prepare_events(con, source_id, replace=complete)
+    _prepare_observations(con, session_key, source_id, identities_complete=identities_complete)
     for index, msg in enumerate(messages):
         raw = msg.get("data")
         msg_id = msg.get("id")
-        if not msg_id or raw is None:
-            _oops(con, stats, src_path, index, "schema_error")
+        if not native_response.identifier(msg_id):
+            _oops(con, stats, src_path, index, "missing_id")
             continue
+        error = "schema_error"
         try:
             data = json.loads(raw)
         except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
-            _oops(con, stats, src_path, index, "malformed_json",
-                  _record_line(raw))
-            continue
+            data = None
+            if raw is not None:
+                error = "malformed_json"
         if not isinstance(data, dict):
-            _oops(con, stats, src_path, index, "schema_error",
-                  _record_line(raw, data))
+            _oops(con, stats, src_path, index, error, _record_line(raw, data))
+            _observe_response(con, session_key, f"{HARNESS}:{msg_id}", source_id, None,
+                              "unknown_message", iso_ts(msg.get("time_created")), index)
             continue
         parsed_messages.append((index, msg, data))
         roles[msg_id] = data.get("role")
@@ -509,12 +606,12 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
         _ingest_message(con, native, stats, identity, src_path, source_id,
                         session_key, sess, msg, data, index, ordinal,
                         by_message.get(msg.get("id"), []),
-                        privacy_stale=privacy_stale)
+                        roles=roles, privacy_stale=privacy_stale)
+    _project_observations(con, stats, session_key, sess_id)
     for part in parts:
         ordinal += 1
         _ingest_part(con, stats, identity, src_path, source_id,
-                      session_key, sess, roles, part, ordinal,
-                      privacy_stale=privacy_stale)
+                      session_key, roles, part, ordinal)
     if sess.get("time_compacting") is not None:
         insert_event(con, stats, source_id=source_id,
                      session_key=session_key, family="compaction",
@@ -538,10 +635,13 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
     # Only a complete read advances the privacy version. An unreadable or
     # partially read source keeps its old version so the next sync retries.
     new_version = privacy.PRIVACY_VERSION if complete else stored_version
+    snapshot = fp if complete else ""
+    if not identities_complete:
+        snapshot = _UNLOCATED_SNAPSHOT
     con.execute(
         "UPDATE sources SET sha256=?, size_bytes=?, imported_at=?,"
         " import_ms=?, session_id=?, privacy_version=? WHERE id=?",
-        (fp, size_bytes, db.now(),
+        (snapshot, size_bytes, db.now(),
          int((time.monotonic() - started) * 1000), sess_id,
          new_version, source_id))
     con.commit()
@@ -551,13 +651,14 @@ def import_session(con: sqlite3.Connection, native: sqlite3.Connection,
 
 def _ingest_message(con, native, stats, identity, src_path, source_id,
                     session_key, sess, msg, data, index, ordinal,
-                    msg_parts, privacy_stale: bool = False) -> None:
+                    msg_parts, *, roles, privacy_stale: bool = False) -> None:
     msg_id = msg.get("id")
     timing = data.get("time") if isinstance(data.get("time"), dict) else {}
     completed = timing.get("completed")
     created = timing.get("created")
-    ts = iso_ts(completed if completed is not None else
-                (created if created is not None else msg.get("time_created")))
+    ts = _completion_time(completed)
+    if ts is None:
+        ts = iso_ts(created if created is not None else msg.get("time_created"))
     error = data.get("error")
     if isinstance(error, dict):
         detail = error.get("data") if isinstance(error.get("data"), dict) \
@@ -570,6 +671,7 @@ def _ingest_message(con, native, stats, identity, src_path, source_id,
         _upsert_event(con, stats, source_id=source_id,
                      session_key=session_key, family="lifecycle",
                      native_id=msg_id, ordinal=ordinal, ts=ts,
+                     response_id=_assistant_id(roles, msg_id),
                      name="turn_aborted" if error.get("name") == "MessageAbortedError" else "error",
                      status="interrupted" if error.get("name") == "MessageAbortedError" else
                      (str(code) if isinstance(code, int) and not isinstance(code, bool) else None),
@@ -577,21 +679,63 @@ def _ingest_message(con, native, stats, identity, src_path, source_id,
     role = data.get("role")
     if role == "assistant":
         _ingest_response(con, stats, src_path, source_id, session_key,
-                         sess, msg, data, index, ts, ordinal)
+                         sess, msg, data, index, ts, ordinal, roles)
     elif role == "user":
+        # A copy that calls this same message a user input contradicts an
+        # assistant observation, including when the user copy is imported first.
+        _observe_response(con, session_key, f"{HARNESS}:{msg_id}", source_id, None,
+                          "user_message", ts, index)
         _ingest_submission(con, stats, identity, src_path, source_id,
                            session_key, sess, msg, data, index, ts,
                            msg_parts, ordinal)
     else:
         _oops(con, stats, src_path, ordinal, "unknown_record",
               _record_line(msg.get("data"), data))
+        _observe_response(con, session_key, f"{HARNESS}:{msg_id}", source_id, None,
+                          "unknown_message", ts, index)
 
 
 def _ingest_response(con, stats, src_path, source_id, session_key, sess,
-                     msg, data, index, ts, ordinal) -> None:
+                     msg, data, index, ts, ordinal, roles) -> None:
+    parent = native_response.identifier(data.get("parentID"))
+    if roles.get(parent) != "user" or not native_response.identifier(msg["id"]):
+        parent = None
+    rid = f"{HARNESS}:{msg['id']}"
+    existing = con.execute("SELECT session_key,session_id FROM responses WHERE response_id=?", (rid,)).fetchone()
+    if existing and tuple(existing) != (session_key, sess.get("id")):
+        _oops(con, stats, src_path, ordinal, "usage_conflict", _record_line(msg.get("data"), data))
+        stats["responses_duplicate"] += 1
+        return
+    measurement = _measurement(data)
+    if measurement == _MALFORMED_USAGE:
+        _oops(con, stats, src_path, ordinal, "malformed_usage", _record_line(msg.get("data"), data))
+    _observe_response(con, session_key, rid, source_id, parent, measurement, ts, index)
+
+
+# The observation holds either the measured fields or a reason they are unavailable.
+_MAX_COUNTER = (1 << 63) - 1  # SQLite INTEGER.
+_UNLOCATED_SNAPSHOT = "oc8:unlocated"  # Never matches a complete snapshot fingerprint.
+_MALFORMED_USAGE = "malformed_usage"
+_INVALID_OBSERVATIONS = {"null", json.dumps(_MALFORMED_USAGE), json.dumps("unknown_message"),
+                         json.dumps("unfinished"), json.dumps("unmeasured")}
+
+
+def _completion_time(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        ts = iso_ts(value)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return ts if ts is not None and 0 <= ts < 253402300800 else None
+
+
+def _measurement(data):
     timing = data.get("time") if isinstance(data.get("time"), dict) else {}
     if timing.get("completed") is None:
-        return
+        return "unfinished"
+    if _completion_time(timing["completed"]) is None:
+        return _MALFORMED_USAGE
     raw_tokens = data.get("tokens")
     if raw_tokens is None:
         tokens: dict = {}
@@ -600,18 +744,14 @@ def _ingest_response(con, stats, src_path, source_id, session_key, sess,
     else:
         # A present non-object tokens block is malformed usage, never
         # silently unknown; quarantine before any response insert.
-        _oops(con, stats, src_path, ordinal, "malformed_usage",
-              _record_line(msg.get("data"), data))
-        return
+        return _MALFORMED_USAGE
     raw_cache = tokens.get("cache")
     if raw_cache is None:
         cache: dict = {}
     elif isinstance(raw_cache, dict):
         cache = raw_cache
     else:
-        _oops(con, stats, src_path, ordinal, "malformed_usage",
-              _record_line(msg.get("data"), data))
-        return
+        return _MALFORMED_USAGE
     # A present counter must be a non-boolean integer; only a missing
     # key stays unknown and maps to NULL. An explicitly present null,
     # bool, string, float, list or other non-integer quarantines the
@@ -628,27 +768,29 @@ def _ingest_response(con, stats, src_path, source_id, session_key, sess,
             values[field] = None
             continue
         raw = container[key]
-        if not isinstance(raw, int) or isinstance(raw, bool):
-            _oops(con, stats, src_path, ordinal, "malformed_usage",
-                  _record_line(msg.get("data"), data))
-            return
+        if type(raw) is not int or not 0 <= raw <= _MAX_COUNTER:
+            return _MALFORMED_USAGE
         values[field] = raw
-    if all(v == 0 for v in values.values()):
-        return
+    if not any(v is not None and v > 0 for v in values.values()):
+        return "unmeasured"
     total = None
     if all(v is not None for v in values.values()):
         total = sum(values.values())
+        if total > _MAX_COUNTER:
+            return _MALFORMED_USAGE
     cost = data.get("cost")
-    cost_usd = cost if isinstance(cost, (int, float)) \
+    cost_usd = float(cost) if isinstance(cost, (int, float)) \
         and not isinstance(cost, bool) else None
-    _upsert_response(
-        con, stats, src_path, response_id=f"{HARNESS}:{msg.get('id')}",
-        source_id=source_id, session_key=session_key,
-        session_id=sess.get("id"), ordinal=index, ts=ts,
-        model=data.get("modelID"), provider=data.get("providerID"),
-        effort=data.get("variant"), values=values, total=total,
-        semantics=SEMANTICS, cost_usd=cost_usd,
-        line=_record_line(msg.get("data"), data))
+    if any(data.get(k) is not None and not isinstance(data[k], str) for k in ("modelID", "providerID", "variant")):
+        return _MALFORMED_USAGE
+    return dict(values, total_tokens=total, model=data.get("modelID"), provider=data.get("providerID"),
+                effort=data.get("variant"), cost_usd=cost_usd)
+
+
+def _observe_response(con, session_key, rid, source_id, parent, measurement, ts, index):
+    con.execute("INSERT OR REPLACE INTO opencode_response_observations"
+                "(session_key,response_id,source_id,parent,measurement,ts,ordinal_num) VALUES(?,?,?,?,?,?,?)",
+                (session_key, rid, source_id, parent, json.dumps(measurement, sort_keys=True), ts, index))
 
 
 def _ingest_submission(con, stats, identity, src_path, source_id,
@@ -770,9 +912,14 @@ def _ingest_submission(con, stats, identity, src_path, source_id,
         stats["user_messages_inserted"] += 1
 
 
+def _assistant_id(roles, message_id):
+    if roles.get(message_id) == "assistant" and native_response.identifier(message_id):
+        return f"{HARNESS}:{message_id}"
+    return None
+
+
 def _ingest_part(con, stats, identity, src_path, source_id, session_key,
-                  sess, roles, part, ordinal,
-                  privacy_stale: bool = False) -> None:
+                  roles, part, ordinal) -> None:
     raw = part.get("data") if isinstance(part, dict) else None
     part_id = part.get("id") if isinstance(part, dict) else None
     if raw is None:
@@ -796,6 +943,8 @@ def _ingest_part(con, stats, identity, src_path, source_id, session_key,
         _oops(con, stats, src_path, ordinal, "missing_id",
               _record_line(raw, data))
         return
+    event = partial(_upsert_event, con, stats, source_id=source_id, session_key=session_key,
+                    response_id=_assistant_id(roles, part.get("message_id")), ordinal=ordinal, ts=ts)
     if ptype == "text":
         if roles.get(part.get("message_id")) != "assistant":
             return  # User text is indexed once under its message id.
@@ -812,25 +961,17 @@ def _ingest_part(con, stats, identity, src_path, source_id, session_key,
             (session_key, "assistant_message", native)).fetchone()
         if text or exists:
             excerpt = privacy.assistant_excerpt(text)
-            _upsert_event(con, stats, source_id=source_id, session_key=session_key,
-                          family="assistant_message", native_id=part_id,
-                          ordinal=ordinal, ts=ts, name="assistant_message",
-                          size_bytes=len(text), fingerprint=text_hash(text),
-                          detail={"excerpt": excerpt} if excerpt else None)
+            event(family="assistant_message", native_id=part_id,
+                  name="assistant_message",
+                  size_bytes=len(text), fingerprint=text_hash(text),
+                  detail={"excerpt": excerpt} if excerpt else None)
     elif ptype == "tool":
-        _ingest_tool(con, stats, identity, src_path, source_id,
-                      session_key, sess, roles, part, data, ordinal, ts,
-                      line=_record_line(raw, data))
+        _ingest_tool(con, stats, identity, src_path, event, data, ordinal,
+                     line=_record_line(raw, data))
     elif ptype == "patch":
-        _ingest_patch(con, stats, source_id, session_key, part, data,
-                      ordinal, ts)
+        _ingest_patch(event, part, data)
     elif ptype == "compaction":
-        # Rule 6 via the core writer: closed name set. update=True lets a
-        # privacy-stale re-import repopulate a cleared row in place.
-        insert_event(con, stats, source_id=source_id,
-                     session_key=session_key, family="compaction",
-                     native_id=part_id, ordinal=ordinal, ts=ts,
-                     name="compaction", update=privacy_stale)
+        event(family="compaction", native_id=part_id, name="compaction")
     elif isinstance(ptype, str) and ptype in _KNOWN_QUIET_PART_TYPES:
         # text, reasoning, step checkpoints and file data URLs carry no
         # ledger event: user text is handled per message, and file data,
@@ -847,8 +988,7 @@ def _ingest_part(con, stats, identity, src_path, source_id, session_key,
               _record_line(raw, data))
 
 
-def _ingest_tool(con, stats, identity, src_path, source_id, session_key,
-                  sess, roles, part, data, ordinal, ts,
+def _ingest_tool(con, stats, identity, src_path, event, data, ordinal,
                   line: str = "") -> None:
     # Native tool/call/skill names must be strings: dicts, lists,
     # booleans, numbers and other objects fall back to "unknown" and are
@@ -870,27 +1010,19 @@ def _ingest_tool(con, stats, identity, src_path, source_id, session_key,
                                               default=str)[:4000])
     except (TypeError, ValueError):
         arg_fp = fingerprint(tool)
-    # Rule 6: the tool_call family keeps no detail; the message linkage
-    # some older imports stored is dropped rather than persisted. The name
-    # passes through privacy.filter_event_name inside _upsert_event, so
-    # free-text tool names never persist.
-    _upsert_event(con, stats, source_id=source_id, session_key=session_key,
-                  family="tool_call", native_id=call_id, ordinal=ordinal,
-                  ts=ts, name=tool[:200], target=target,
-                  fingerprint=arg_fp, detail=None)
+    # The message identity belongs to the source witness. Tool detail stays empty.
+    event(family="tool_call", native_id=call_id, name=tool[:200], target=target,
+          fingerprint=arg_fp, detail=None)
     if status is None or (
             isinstance(status, str) and status in _INCOMPLETE_TOOL_STATUSES):
         # No terminal result yet; a later snapshot must add it.
         pass
     elif status in ("completed", "error"):
         result_status = "ok" if status == "completed" else "error"
-        _upsert_event(con, stats, source_id=source_id,
-                      session_key=session_key, family="tool_result",
-                      native_id=call_id, ordinal=ordinal, ts=ts,
-                      name=tool[:200], target=target,
-                      status=result_status, duration_ms=_duration_ms(state),
-                      size_bytes=_output_size(output),
-                      detail=None)
+        event(family="tool_result", native_id=call_id, name=tool[:200], target=target,
+              status=result_status, duration_ms=_duration_ms(state),
+              size_bytes=_output_size(output),
+              detail=None)
     elif isinstance(status, str):
         _oops(con, stats, src_path, ordinal, "unknown_record", line)
     else:
@@ -909,21 +1041,15 @@ def _ingest_tool(con, stats, identity, src_path, source_id, session_key,
             # Rule 6: skill_read target holds only the validated skill
             # identifier, never the installed path. The file path lives
             # only in detail skill_path.
-            _upsert_event(con, stats, source_id=source_id,
-                          session_key=session_key, family=family,
-                          native_id=call_id, ordinal=ordinal, ts=ts,
-                          name=os.path.basename(target)[:200], target=safe_skill,
-                          status="ok", size_bytes=_output_size(output),
-                          fingerprint=fingerprint(target),
-                          detail={"skill": raw_skill, "skill_path": target})
+            event(family=family, native_id=call_id, name=os.path.basename(target)[:200], target=safe_skill,
+                  status="ok", size_bytes=_output_size(output),
+                  fingerprint=fingerprint(target),
+                  detail={"skill": raw_skill, "skill_path": target})
         else:
-            _upsert_event(con, stats, source_id=source_id,
-                          session_key=session_key, family=family,
-                          native_id=call_id, ordinal=ordinal, ts=ts,
-                          name=os.path.basename(target)[:200], target=target,
-                          status="ok", size_bytes=_output_size(output),
-                          fingerprint=fingerprint(target),
-                          detail=None)
+            event(family=family, native_id=call_id, name=os.path.basename(target)[:200], target=target,
+                  status="ok", size_bytes=_output_size(output),
+                  fingerprint=fingerprint(target),
+                  detail=None)
     if tool == "skill":
         raw_name = tool_input.get("name")
         if isinstance(raw_name, str) and raw_name:
@@ -947,22 +1073,15 @@ def _ingest_tool(con, stats, identity, src_path, source_id, session_key,
         # Rule 6: skill_invoke target holds only the validated skill
         # identifier; the installed SKILL.md path lives only in detail
         # skill_path when the native invocation supplies a directory.
-        _upsert_event(con, stats, source_id=source_id,
-                      session_key=session_key, family="skill_invoke",
-                      native_id=call_id, ordinal=ordinal, ts=ts,
-                      name=safe_skill, target=safe_skill,
-                      detail={"skill_path": skill_path} if skill_path else None)
+        event(family="skill_invoke", native_id=call_id, name=safe_skill, target=safe_skill,
+              detail={"skill_path": skill_path} if skill_path else None)
     if tool in ("edit", "write", "patch") and target:
-        _upsert_event(con, stats, source_id=source_id,
-                      session_key=session_key, family="file_change",
-                      native_id=call_id, ordinal=ordinal, ts=ts,
-                      name=tool[:200], target=target,
-                      fingerprint=fingerprint(tool, target),
-                      detail=None)
+        event(family="file_change", native_id=call_id, name=tool[:200], target=target,
+              fingerprint=fingerprint(tool, target),
+              detail=None)
 
 
-def _ingest_patch(con, stats, source_id, session_key, part, data, ordinal,
-                  ts) -> None:
+def _ingest_patch(event, part, data) -> None:
     digest = data.get("hash")
     files = data.get("files")
     file_list = files if isinstance(files, list) else []
@@ -984,8 +1103,7 @@ def _ingest_patch(con, stats, source_id, session_key, part, data, ordinal,
     # Rule 6: the file_change family keeps only path lists, so an
     # arbitrary native hash is omitted, never coerced. The fingerprint
     # column keeps only our own fixed-format generated digest.
-    _upsert_event(con, stats, source_id=source_id, session_key=session_key,
-                  family="file_change", native_id=part_id,
-                  ordinal=ordinal, ts=ts, name="patch", target=target,
-                  fingerprint=fingerprint("patch", digest, file_list),
-                  detail={"paths": valid_paths} if valid_paths else None)
+    event(family="file_change", native_id=part_id,
+          name="patch", target=target,
+          fingerprint=fingerprint("patch", digest, file_list),
+          detail={"paths": valid_paths} if valid_paths else None)

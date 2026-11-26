@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 
 from agent_observer import db, lookup, report
 from agent_observer.adapters import grok, opencode
@@ -131,16 +132,33 @@ class SourceAvailabilityTest(LedgerCase):
         self.assertIn("ledger-only", text.stdout)
         self.assertNotIn(self.live, text.stdout)
 
+    def _own_session(self, session, task):
+        # Isolate source availability from the independent input-ownership gate.
+        self.con.execute("INSERT INTO session_assignments(session_key,task_id,evidence,created_at)"
+                         " VALUES(?,?,'explicit fixture ownership',0)", (session, task))
+
     def _bind_all(self, task):
         _setup_tasks(self, task)
         rows = self.con.execute("SELECT native_id FROM user_messages").fetchall()
         self.assertGreater(len(rows), 0)
         for row in rows:
             _assign(self, row["native_id"], task)
+        for row in self.con.execute("SELECT DISTINCT session_key FROM user_messages"):
+            self._own_session(row[0], task)
 
-    def test_deleted_opencode_session_is_not_available(self):
+    def _completed_opencode_source(self):
         native_path = os.path.join(self.tmp.name, "opencode.db")
         build_native(native_path)
+        with closing(sqlite3.connect(native_path)) as native, native:
+            native.execute("UPDATE message SET data=json_set(data,'$.tokens.output',1) WHERE id='msg_a_err'")
+            native.execute("UPDATE message SET data=json_set(data,'$.time.completed',?) WHERE id='msg_a_unf'",
+                           (T0 + 60,))
+            native.execute("UPDATE part SET data=json_set(data,'$.state.status','completed','$.state.time.end',?) "
+                           "WHERE id='p_run1'", (T0 + 59,))
+        return native_path
+
+    def test_deleted_opencode_session_is_not_available(self):
+        native_path = self._completed_opencode_source()
         opencode.sync(self.con, source=native_path)
         self.con.commit()
         self._bind_all("T-OC")
@@ -227,6 +245,7 @@ class SourceAvailabilityTest(LedgerCase):
             (child,))]
         self.assertGreater(len(child_messages), 0)
         _setup_tasks(self, "T-CHILD")
+        self._own_session(child, "T-CHILD")
         for native_id in child_messages:
             _assign(self, native_id, "T-CHILD")
         source = self.con.execute(
@@ -301,6 +320,7 @@ class SourceAvailabilityTest(LedgerCase):
             "SELECT native_id FROM user_messages WHERE session_key=?",
             (session_key,)).fetchone()["native_id"]
         _setup_tasks(self, "T-QUIET")
+        self._own_session(session_key, "T-QUIET")
         _assign(self, native_id, "T-QUIET")
         source = self.con.execute(
             "SELECT * FROM sources WHERE path=?", (live,)).fetchone()
@@ -431,8 +451,7 @@ class SourceAvailabilityTest(LedgerCase):
         self.assertNotEqual(mid["snapshot_id"], after["snapshot_id"])
 
     def test_eventless_gap_makes_a_mixed_task_partial(self):
-        native_path = os.path.join(self.tmp.name, "opencode.db")
-        build_native(native_path)
+        native_path = self._completed_opencode_source()
         opencode.sync(self.con, source=native_path)
         self.con.commit()
         self._bind_all("T-MIX")

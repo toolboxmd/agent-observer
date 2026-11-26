@@ -1,14 +1,17 @@
-"""A session shared by several PRs splits per response by checkout (#43)."""
+"""Legacy T3 checkout gaps and native Codex occurrence retention."""
 
+import hashlib
 import io
 import json
 import os
 import shutil
 import subprocess
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
+from unittest.mock import patch
 
 from agent_observer import cli, db, placement, report
 from agent_observer.adapters import t3 as t3_adapter
+from agent_observer.adapters.claude import import_claude_file
 from agent_observer.adapters.codex import import_codex_file
 from tests.helpers import LedgerCase
 
@@ -44,148 +47,188 @@ class PlacementTest(LedgerCase):
                 " head_branch) VALUES('t','pr','github.com',?,?,?,?)",
                 (f"o/{repo}", n, f"https://github.com/o/{repo}/pull/{n}", branch))
 
-    def session(self, harness, calls):
-        """calls: (response ordinal, tool-call ordinal, target) per response."""
-        key = f"{harness}:s"
-        db.upsert_session(self.con, key, harness, "s", None, project_dir="/nowhere")
-        for task in ("o/alpha#1", "o/beta#2"):
-            self.con.execute("INSERT INTO session_assignments(session_key, task_id,"
-                             " evidence, created_at) VALUES(?,?,'t3',0)", (key, task))
-        for i, (resp, call, target) in enumerate(calls):
-            self.con.execute(
-                "INSERT INTO responses(response_id, source_id, harness, session_key,"
-                " ordinal_num, model, input_tokens, output_tokens, total_tokens)"
-                " VALUES(?,?,?,?,?,'m',100,10,110)",
-                (f"r{i}", self.source, harness, key, resp))
-            if target is not None:
-                self.con.execute(
-                    "INSERT INTO events(source_id, session_key, ordinal_num, family,"
-                    " native_id, name, target) VALUES(?,?,?,'tool_call',?,'Bash',?)",
-                    (self.source, key, call, f"e{i}", target))
-        return key
+    def _assign(self, key, task, evidence="t3"):
+        self.con.execute(
+            "INSERT INTO session_assignments(session_key,task_id,evidence,created_at)"
+            " VALUES(?,?,?,0)", (key, task, evidence))
 
-    def claude_session(self):
-        a, b = self.checkouts["alpha"], self.checkouts["beta"]
-        return self.session("claude", [
-            (1, 2, f"cd {a} && git status"),        # alpha
-            (3, 4, f"python3 {b}/x.py"),             # beta
-            (5, 6, f"diff {a}/f {b}/f"),             # both: unplaced
-            (7, 8, "gh pr list"),                    # none: unplaced
-            (9, None, None),                         # no tool call: unplaced
-        ])
+    def _assert_unplaced(self, con, responses):
+        alpha = report.task_report(con, "o/alpha#1", schedule=SCHEDULE)
+        beta = report.task_report(con, "o/beta#2", schedule=SCHEDULE)
+        for task in (alpha, beta):
+            self.assertEqual(task["measured"]["unplaced_responses"], responses)
+            self.assertEqual(task["measured"]["attributed_responses"], [])
+            self.assertEqual(task["total_cost"]["responses"], 0)
+            self.assertTrue(task["reconciles"])
 
-    def test_each_pr_counts_only_its_own_responses_and_totals_reconcile(self):
-        self.claude_session()
-        alpha = report.task_report(self.con, "o/alpha#1", schedule=SCHEDULE)
-        beta = report.task_report(self.con, "o/beta#2", schedule=SCHEDULE)
-        self.assertEqual(alpha["measured"]["attributed_responses"], ["r0"])
-        self.assertEqual(beta["measured"]["attributed_responses"], ["r1"])
-        self.assertEqual(alpha["measured"]["unplaced_responses"], ["r2", "r3", "r4"])
-        self.assertEqual(alpha["measured"]["other_task_responses"], ["r1"])
-        self.assertEqual(alpha["shared_joint"]["responses"], 0)
-        self.assertEqual(alpha["total_cost"]["responses"], 1)
-        self.assertEqual(alpha["total_cost"]["unplaced"]["responses"], 3)
-        self.assertTrue(alpha["reconciles"])
-        self.assertTrue(beta["reconciles"])
+    def test_first_import_after_path_reuse_leaves_claude_call_unplaced(self):
+        key = "claude:delayed"
+        path = os.path.join(self.tmp.name, "delayed.jsonl")
+        root = self.checkouts["alpha"]
+        native = [
+            {"type": "assistant", "sessionId": "delayed", "cwd": root, "gitBranch": "fix/a",
+             "message": {"id": "before", "model": "m", "usage": {"input_tokens": 10,
+                                                                "output_tokens": 2},
+                         "content": [{"type": "tool_use", "id": "call-before", "name": "Bash",
+                                      "input": {"command": f"cd {root} && gh pr edit 1"
+                                                           " --repo o/alpha --title Revised"}}]}},
+            {"type": "user", "sessionId": "delayed", "uuid": "result",
+             "message": {"content": [{"type": "tool_result", "tool_use_id": "call-before",
+                                      "content": "https://github.com/o/alpha/pull/1"}]},
+             "toolUseResult": {"gitOperation": {"pr": {"action": "edited", "number": 1,
+                                                        "url": "https://github.com/o/alpha/pull/1"}}}},
+            {"type": "pr-link", "sessionId": "delayed", "prNumber": 1,
+             "prRepository": "o/alpha", "prUrl": "https://github.com/o/alpha/pull/1"},
+        ]
+        with open(path, "w") as stream:
+            for row in native:
+                stream.write(json.dumps(row) + "\n")
 
-    def test_codex_calls_belong_to_the_next_response(self):
-        a, b = self.checkouts["alpha"], self.checkouts["beta"]
-        self.session("codex", [(2, 1, f"ls {a}"), (4, 3, f"ls {b}")])
-        placed = placement.place_session(self.con, "codex:s")
-        self.assertEqual(placed, {"r0": "o/alpha#1", "r1": "o/beta#2"})
-
-    def test_removed_worktree_still_places_from_recorded_checkouts(self):
-        self.claude_session()
+        _git("-C", root, "checkout", "-q", "-b", "fix/b")
+        _git("-C", root, "remote", "set-url", "origin", "git@github.com:o/beta.git")
+        self._assign(key, "o/alpha#1")
+        self.assertEqual(import_claude_file(self.con, path)["malformed"], 0)
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) FROM events WHERE family='tool_call'").fetchone()[0], 1)
+        observed = {"claude:before": [{"host": "github.com", "repository": "o/beta",
+                                      "branch": "fix/b", "candidate_tasks": []}]}
+        self.assertEqual(placement.checkout_observations(self.con, key), observed)
+        self._assign(key, "o/beta#2")
         self.assertEqual(placement.record_shared_checkouts(self.con), 1)
-        for root in self.checkouts.values():
-            shutil.rmtree(root)
-        placed = placement.place_session(self.con, "claude:s")
-        self.assertEqual((placed["r0"], placed["r1"]), ("o/alpha#1", "o/beta#2"))
-
-    def test_without_head_branches_the_session_stays_shared_whole(self):
-        self.claude_session()
-        self.con.execute("UPDATE t3_links SET head_branch=NULL")
-        alpha = report.task_report(self.con, "o/alpha#1", schedule=SCHEDULE)
-        self.assertEqual(alpha["shared_joint"]["responses"], 5)
-        self.assertEqual(alpha["attributed"]["responses"], 0)
-
-    def test_unsupported_harness_stays_shared_whole(self):
-        self.session("opencode", [(1, 2, f"ls {self.checkouts['alpha']}")])
-        self.assertIsNone(placement.place_session(self.con, "opencode:s"))
-
-    def test_detached_checkout_matches_no_pr(self):
-        root = self.checkouts["alpha"]
-        _git("-C", root, "checkout", "-q", "--detach")
-        self.assertEqual(placement.checkout_of(self.con, root), ("o/alpha", None))
-
-    def test_reused_checkout_path_is_read_live_not_from_its_record(self):
-        # Review of 8e20c4b: a recorded root later holding another branch.
-        self.claude_session()
-        placement.record_shared_checkouts(self.con)
-        _git("-C", self.checkouts["alpha"], "checkout", "-q", "-b", "fix/b")
-        _git("-C", self.checkouts["alpha"], "remote", "set-url", "origin",
-             "git@github.com:o/beta.git")
-        placed = placement.place_session(self.con, "claude:s")
-        self.assertEqual(placed["r0"], "o/beta#2")
-        self.assertEqual(placement.checkout_of(self.con, self.checkouts["alpha"]),
-                         ("o/beta", "fix/b"))
-
-    def test_checkout_without_origin_forgets_its_old_record(self):
-        # Second review of 382552e: no origin now, removed later.
-        root = self.checkouts["alpha"]
-        self.assertEqual(placement.checkout_of(self.con, root), ("o/alpha", "fix/a"))
-        _git("-C", root, "remote", "remove", "origin")
-        self.assertIsNone(placement.checkout_of(self.con, root))
+        _git("-C", root, "checkout", "-q", "fix/a")
+        _git("-C", root, "remote", "set-url", "origin", "git@github.com:o/alpha.git")
+        # Replaying after reuse never changes what was first observed.
+        with patch.object(subprocess, "run", side_effect=AssertionError("replay ran Git")):
+            self.assertEqual(import_claude_file(self.con, path, full=True)["malformed"], 0)
+            self._assert_unplaced(self.con, ["claude:before"])
+        observed["claude:before"][0]["candidate_tasks"] = ["o/beta#2"]
         shutil.rmtree(root)
-        self.assertIsNone(placement.checkout_of(self.con, root))
+        with closing(db.connect_read_only(self.db_path)) as ro, patch.object(
+                subprocess, "run", side_effect=AssertionError("report ran Git")):
+            self.assertEqual(placement.checkout_observations(ro, key), observed)
+            self._assert_unplaced(ro, ["claude:before"])
 
-    def test_read_only_ledger_still_splits(self):
-        # publish and task open the ledger read-only (cli.py).
-        self.claude_session()
-        placement.record_shared_checkouts(self.con)
+    def test_codex_session_git_and_literal_pr_target_leave_call_unplaced(self):
+        key = "codex:target"
+        root = self.checkouts["alpha"]
+        path = os.path.join(self.tmp.name, "target.jsonl")
+        command = "gh pr view 1 --repo github.com/o/alpha"
+        rows = [
+            {"type": "session_meta", "payload": {
+                "id": "target", "cwd": root, "thread_source": "user", "git": {
+                    "repository_url": "https://github.com/o/alpha.git",
+                    "branch": "fix/a", "commit_hash": "a" * 40}}},
+            {"type": "turn_context", "payload": {"cwd": root, "model": "m"}},
+            {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                "type": "CommandExecution", "id": "call-target", "cwd": root,
+                "command": ["/bin/bash", "-lc", command], "exit_code": 0,
+                "status": "completed", "parsed_cmd": [],
+            }}},
+            {"type": "token_usage_record", "payload": {
+                "response_id": "target-r", "thread_id": "target",
+                "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}}},
+        ]
+        with open(path, "w") as stream:
+            for row in rows:
+                stream.write(json.dumps(row) + "\n")
+        self._assign(key, "o/alpha#1")
+        self._assign(key, "o/beta#2")
+        with patch.object(subprocess, "run", side_effect=AssertionError("import ran Git")):
+            self.assertEqual(import_codex_file(self.con, path)["events_inserted"], 1)
+            self._assert_unplaced(self.con, ["codex:target-r"])
+
+    def test_old_and_hostless_observations_stay_out_of_diagnostics_and_totals(self):
+        key = "claude:s"
+        db.upsert_session(self.con, key, "claude", "s", self.source)
+        for task in ("o/alpha#1", "o/beta#2"):
+            self._assign(key, task)
+        self.con.execute(
+            "INSERT INTO responses(response_id,source_id,harness,session_key,ordinal_num,"
+            " model,input_tokens,output_tokens,total_tokens) VALUES('r0',?,'claude',?,1,'m',10,2,12)",
+            (self.source, key))
+        root = self.checkouts["alpha"]
+        target = root + "/file"
+        event = self.con.execute(
+            "INSERT INTO events(source_id,session_key,ordinal_num,family,native_id,name,target)"
+            " VALUES(?,?,2,'tool_call','call-a','Bash',?)", (self.source, key, "cat " + target))
+        digest = hashlib.sha256(target.encode()).digest()
+        self.con.execute("INSERT INTO checkouts(root,repository,branch,seen_at)"
+                         " VALUES(?,'o/alpha','fix/a',0)", (root,))
+        self.con.execute("CREATE TABLE response_checkouts(event_id,path_digest,response_id,"
+                         " host,repository,branch)")
+        self.con.execute("INSERT INTO response_checkouts VALUES(?,?,'r0','github.com','o/alpha','fix/a')",
+                         (event.lastrowid, digest))
+        self.con.execute("CREATE TABLE event_checkouts(event_id,path_digest,host,repository,branch)")
+        self.con.execute("INSERT INTO event_checkouts VALUES(?,?,NULL,'o/alpha','fix/a')",
+                         (event.lastrowid, digest))
         self.con.commit()
-        ro = db.connect_read_only(self.db_path)
-        try:
-            alpha = report.task_report(ro, "o/alpha#1", schedule=SCHEDULE)
-        finally:
-            ro.close()
-        self.assertEqual(alpha["measured"]["attributed_responses"], ["r0"])
-
-    def test_read_only_report_keeps_its_snapshot_across_git(self):
-        # A concurrent sync commits during live git. The reader opened
-        # with BEGIN must not COMMIT, or scope totals see the new row
-        # while attributed rows stay on the old snapshot.
-        self.claude_session()
-        self.con.commit()
-        ro = db.connect_read_only(self.db_path)
-        real = placement._git
-        bumped = []
-
-        def wrapped(checkout, *args):
-            if not bumped:
-                bumped.append(checkout)
-                self.con.execute(
-                    "UPDATE responses SET input_tokens=1100, total_tokens=1110"
-                    " WHERE response_id='r0'")
-                self.con.commit()
-            return real(checkout, *args)
-
-        placement._git = wrapped
-        try:
-            alpha = report.task_report(ro, "o/alpha#1", schedule=SCHEDULE)
+        shutil.rmtree(root)
+        with closing(db.connect_read_only(self.db_path)) as ro, patch.object(
+                subprocess, "run", side_effect=AssertionError("report ran Git")):
+            statements = []
+            ro.set_trace_callback(statements.append)
+            self.assertEqual(placement.checkout_observations(ro, key), {})
+            self._assert_unplaced(ro, ["r0"])
             self.assertTrue(ro.in_transaction)
-        finally:
-            placement._git = real
-            ro.close()
-        self.assertTrue(bumped)
-        self.assertTrue(alpha["reconciles"])
-        self.assertEqual(alpha["attributed"]["total_tokens"], 110)
-        self.assertEqual(alpha["scope"]["total_tokens"], 550)
+            self.assertEqual({sql.split()[0].upper() for sql in statements}
+                             - {"SELECT", "WITH", "PRAGMA"}, set())
 
-    def test_repeated_usage_keeps_the_first_response_on_its_task(self):
-        # An exact later copy of the first response must not take its
-        # chronology. Placement then assigns both calls to one response
-        # and both task reports lose their attributed response.
+    def test_non_legacy_assignments_and_unsupported_harness_keep_caller_behavior(self):
+        for harness, evidence in (("claude", "router:job"), ("opencode", "t3")):
+            key = f"{harness}:s"
+            db.upsert_session(self.con, key, harness, "s", self.source)
+            self._assign(key, "o/alpha#1", evidence)
+            self._assign(key, "o/beta#2")
+            self.assertIsNone(placement.read_placements(self.con, key))
+
+    def test_shared_links_without_pr_heads_stay_context(self):
+        key = "claude:no-head"
+        db.upsert_session(self.con, key, "claude", "no-head", self.source)
+        for task in ("o/alpha#1", "o/beta#2"):
+            self._assign(key, task)
+        self.con.execute("UPDATE t3_links SET head_branch=NULL")
+        self.assertIsNone(placement.read_placements(self.con, key))
+
+    def test_diagnostics_keep_same_head_candidates_separate_by_forge(self):
+        key = "codex:placement-review"
+        hosted_root = self.checkouts["beta"]
+        _git("-C", hosted_root, "checkout", "-q", "-b", "fix/a")
+        _git("-C", hosted_root, "remote", "set-url", "origin",
+             "https://forge.example/o/alpha.git")
+        path, _ = self._continuation_files("forge")
+        import_codex_file(self.con, path)
+        # PR links can arrive after the native import. Same-head PRs on one
+        # forge remain visible as multiple candidates, without task credit.
+        self._assign(key, "o/alpha#1")
+        for host, number, task in (("github.com", 3, "o/alpha#3"),
+                                   ("forge.example", 1, "forge.example/o/alpha#1")):
+            self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES(?,0)", (task,))
+            self._assign(key, task)
+            self.con.execute(
+                "INSERT INTO t3_links(thread_id,kind,host,repository,number,url,head_branch)"
+                " VALUES('t','pr',?,'o/alpha',?,?,'fix/a')",
+                (host, number, f"https://{host}/o/alpha/pull/{number}"))
+        for kind in ("pr", "issue"):
+            task = f"forge.example/o/alpha/{kind}#1"
+            self.con.execute("INSERT INTO tasks(task_id,created_at) VALUES(?,0)", (task,))
+            self._assign(key, task)
+        self.assertEqual(placement.checkout_observations(self.con, key), {
+            "codex:r1": [{"host": "github.com", "repository": "o/alpha",
+                          "branch": "fix/a", "candidate_tasks": ["o/alpha#1", "o/alpha#3"]}],
+            "codex:r2": [{"host": "forge.example", "repository": "o/alpha",
+                          "branch": "fix/a", "candidate_tasks": ["forge.example/o/alpha#1",
+                                                               "forge.example/o/alpha/pr#1"]}],
+        })
+        self.con.execute("INSERT INTO t3_links(thread_id,kind,host,repository,number,url)"
+                         " VALUES('t','issue','forge.example','o/alpha',1,'https://forge.example/o/alpha/issues/1')")
+        self.assertEqual(placement.checkout_observations(self.con, key)["codex:r2"][0]["candidate_tasks"],
+                         ["forge.example/o/alpha/pr#1"])
+        for task in ("o/alpha#1", "o/alpha#3", "forge.example/o/alpha#1"):
+            result = report.task_report(self.con, task, schedule=SCHEDULE)
+            self.assertEqual(result["measured"]["unplaced_responses"], ["codex:r1", "codex:r2"])
+            self.assertEqual(result["total_cost"]["responses"], 0)
+
+    def test_repeated_usage_keeps_the_first_response_position(self):
         alpha = self.checkouts["alpha"]
         beta = self.checkouts["beta"]
         path = os.path.join(self.tmp.name, "placement.jsonl")
@@ -227,14 +270,6 @@ class PlacementTest(LedgerCase):
             stored = dict(self.con.execute(
                 "SELECT response_id, ordinal_num FROM responses"))
             self.assertEqual(stored, {"codex:r1": 3, "codex:r2": 6})
-            self.assertEqual(placement.place_session(self.con, key), {
-                "codex:r1": "o/alpha#1", "codex:r2": "o/beta#2"})
-            alpha_report = report.task_report(self.con, "o/alpha#1", schedule=SCHEDULE)
-            beta_report = report.task_report(self.con, "o/beta#2", schedule=SCHEDULE)
-            self.assertEqual(alpha_report["measured"]["attributed_responses"],
-                             ["codex:r1"])
-            self.assertEqual(beta_report["measured"]["attributed_responses"],
-                             ["codex:r2"])
         # A privacy reimport still adopts the original file position once,
         # and the exact repeat later in the same file does not move it again.
         self.con.execute("UPDATE sources SET privacy_version=8")
@@ -244,8 +279,6 @@ class PlacementTest(LedgerCase):
         self.assertEqual(self.con.execute(
             "SELECT ordinal_num FROM responses WHERE response_id='codex:r1'"
         ).fetchone()[0], 3)
-        self.assertEqual(placement.place_session(self.con, key), {
-            "codex:r1": "o/alpha#1", "codex:r2": "o/beta#2"})
 
     def test_repeated_fallback_snapshot_keeps_its_first_position(self):
         path = os.path.join(self.tmp.name, "fallback.jsonl")
@@ -274,10 +307,7 @@ class PlacementTest(LedgerCase):
                 ("codex:fallback-review:tc:100",)).fetchone()
             self.assertEqual(tuple(row), (2, "model-a"))
 
-    def test_repeated_tool_call_keeps_the_first_call_on_its_task(self):
-        # A brand-new source is privacy-stale. An exact later copy of the
-        # same tool call must not take the original call's chronology, or
-        # the call falls after every response and the task report loses it.
+    def test_repeated_tool_call_keeps_the_first_call_position(self):
         alpha = self.checkouts["alpha"]
         beta = self.checkouts["beta"]
         path = os.path.join(self.tmp.name, "calls.jsonl")
@@ -320,14 +350,6 @@ class PlacementTest(LedgerCase):
             stored = dict(self.con.execute(
                 "SELECT native_id, ordinal_num FROM events"))
             self.assertEqual(stored, {"call-a": 2, "call-b": 5})
-            self.assertEqual(placement.place_session(self.con, key), {
-                "codex:r1": "o/alpha#1", "codex:r2": "o/beta#2"})
-            alpha_report = report.task_report(self.con, "o/alpha#1", schedule=SCHEDULE)
-            beta_report = report.task_report(self.con, "o/beta#2", schedule=SCHEDULE)
-            self.assertEqual(alpha_report["measured"]["attributed_responses"],
-                             ["codex:r1"])
-            self.assertEqual(beta_report["measured"]["attributed_responses"],
-                             ["codex:r2"])
         event = self.con.execute(
             "SELECT id, source_id FROM events WHERE native_id='call-a'").fetchone()
         self.con.execute(
@@ -344,13 +366,8 @@ class PlacementTest(LedgerCase):
         self.assertEqual(self.con.execute(
             "SELECT intervention_id FROM verdicts").fetchone()[0],
             f"ev:{key}/tool_call/call-a")
-        self.assertEqual(placement.place_session(self.con, key)["codex:r1"],
-                         "o/alpha#1")
 
     def test_continuation_keeps_the_original_call_and_response(self):
-        # The same native call in a second rollout of this session is not
-        # a new occurrence. Its file position must not replace the call
-        # that already owns the first response.
         alpha = self.checkouts["alpha"]
         beta = self.checkouts["beta"]
         path = os.path.join(self.tmp.name, "calls.jsonl")
@@ -412,16 +429,6 @@ class PlacementTest(LedgerCase):
                              (3, "calls.jsonl"))
             self.assertEqual(owned("responses", "response_id", "codex:r2"),
                              (6, "calls.jsonl"))
-            self.assertEqual(placement.place_session(self.con, key), {
-                "codex:r1": "o/alpha#1", "codex:r2": "o/beta#2"})
-            alpha_report = report.task_report(
-                self.con, "o/alpha#1", schedule=SCHEDULE)
-            beta_report = report.task_report(
-                self.con, "o/beta#2", schedule=SCHEDULE)
-            self.assertEqual(alpha_report["measured"]["attributed_responses"],
-                             ["codex:r1"])
-            self.assertEqual(beta_report["measured"]["attributed_responses"],
-                             ["codex:r2"])
             self.assertEqual(self.con.execute(
                 "SELECT COUNT(*) FROM import_errors").fetchone()[0], 0)
 
@@ -474,20 +481,11 @@ class PlacementTest(LedgerCase):
                 fh.write(json.dumps(rec) + "\n")
         return path, continuation
 
-    def _assert_public_placement(self, con):
-        key = "codex:placement-review"
+    def _assert_occurrences(self, con):
         self.assertEqual(con.execute(
             "SELECT COUNT(*) FROM events WHERE native_id='call-a'").fetchone()[0], 1)
         self.assertEqual(con.execute(
             "SELECT COUNT(*) FROM responses WHERE is_overlap=0").fetchone()[0], 2)
-        self.assertEqual(placement.place_session(con, key), {
-            "codex:r1": "o/alpha#1", "codex:r2": "o/beta#2"})
-        alpha_report = report.task_report(con, "o/alpha#1", schedule=SCHEDULE)
-        beta_report = report.task_report(con, "o/beta#2", schedule=SCHEDULE)
-        self.assertEqual(alpha_report["measured"]["attributed_responses"],
-                         ["codex:r1"])
-        self.assertEqual(beta_report["measured"]["attributed_responses"],
-                         ["codex:r2"])
         for table, column, native in (
                 ("events", "native_id", "call-a"),
                 ("events", "native_id", "call-b"),
@@ -509,7 +507,7 @@ class PlacementTest(LedgerCase):
                 (row["source_id"], kind, row_key, row["ordinal_num"])).fetchone()
             self.assertIsNotNone(seen)
 
-    def test_reverse_continuation_still_places_the_original_response(self):
+    def test_reverse_continuation_preserves_native_occurrences(self):
         # The duplicate-only file is imported first. Its call has no
         # response after it, so it cannot take the original response.
         path, continuation = self._continuation_files("reverse")
@@ -517,143 +515,13 @@ class PlacementTest(LedgerCase):
         for full in (False, True, False):
             import_codex_file(self.con, continuation, full=full)
             import_codex_file(self.con, path, full=full)
-            self._assert_public_placement(self.con)
+            self._assert_occurrences(self.con)
             calls = report.timeline(
                 self.con, session_key=key, family="tool_call", limit=1)
             self.assertEqual(
                 [event["native_id"] for event in calls["events"]], ["call-a"])
             self.assertEqual(self.con.execute(
                 "SELECT COUNT(*) FROM import_errors").fetchone()[0], 0)
-        self.assertTrue(key)
-
-    def test_competing_response_witnesses_leave_the_call_unplaced(self):
-        # Each file pairs the same call with a different response. Neither
-        # import order picks one of those responses.
-        alpha = self.checkouts["alpha"]
-
-        def call():
-            return {"type": "response_item", "payload": {
-                "type": "function_call", "call_id": "call-a", "name": "exec_command",
-                "arguments": json.dumps({"cmd": "cat " + os.path.join(alpha, "x.py")})}}
-
-        def usage(name, total):
-            return {"type": "token_usage_record", "payload": {
-                "response_id": name, "thread_id": "placement-review",
-                "usage": {"input_tokens": total - 2, "output_tokens": 2,
-                          "total_tokens": total}}}
-
-        def write(name, response, total):
-            path = os.path.join(self.tmp.name, name)
-            rows = [
-                {"type": "session_meta", "payload": {
-                    "id": "placement-review", "thread_source": "user", "cwd": "/w"}},
-                {"type": "turn_context", "payload": {"model": "model-a"}},
-                call(),
-                usage(response, total),
-            ]
-            for ordinal, rec in enumerate(rows):
-                rec["ordinal"] = ordinal
-            with open(path, "w") as fh:
-                for rec in rows:
-                    fh.write(json.dumps(rec) + "\n")
-            return path
-
-        first = write("compete-a.jsonl", "r1", 12)
-        second = write("compete-b.jsonl", "r2", 22)
-        key = self._bind_placement_tasks(self.con)
-        other = db.connect(os.path.join(self.tmp.name, "compete-reverse.db"))
-        self.addCleanup(other.close)
-        db.init_db(other)
-        t3_adapter._ensure_tables(other)
-        for n, (repo, branch) in enumerate((("alpha", "fix/a"), ("beta", "fix/b")), 1):
-            task = f"o/{repo}#{n}"
-            other.execute("INSERT INTO tasks(task_id, project, title, created_at)"
-                          " VALUES(?,?,?,0)", (task, f"o/{repo}", task))
-            other.execute(
-                "INSERT INTO t3_links(thread_id, kind, host, repository, number, url,"
-                " head_branch) VALUES('t','pr','github.com',?,?,?,?)",
-                (f"o/{repo}", n, f"https://github.com/o/{repo}/pull/{n}", branch))
-        self._bind_placement_tasks(other)
-        for con, order in ((self.con, (first, second)), (other, (second, first))):
-            for full in (False, True, False):
-                for path in order:
-                    import_codex_file(con, path, full=full)
-                self.assertEqual(placement.place_session(con, key), {
-                    "codex:r1": None, "codex:r2": None})
-
-    def test_shared_checkout_is_resolved_once_per_sync(self):
-        # Two shared sessions in one record_shared_checkouts share a root.
-        # A per-session roots map would ask git twice for that root.
-        root = self.checkouts["alpha"]
-        for n in (1, 2):
-            key = f"claude:s{n}"
-            db.upsert_session(self.con, key, "claude", f"s{n}", None,
-                              project_dir="/nowhere")
-            for task in ("o/alpha#1", "o/beta#2"):
-                self.con.execute(
-                    "INSERT INTO session_assignments(session_key, task_id,"
-                    " evidence, created_at) VALUES(?,?,'t3',0)", (key, task))
-            self.con.execute(
-                "INSERT INTO responses(response_id, source_id, harness,"
-                " session_key, ordinal_num, model, input_tokens,"
-                " output_tokens, total_tokens)"
-                " VALUES(?,?,?,?,?,'m',100,10,110)",
-                (f"once{n}", self.source, "claude", key, 1))
-            self.con.execute(
-                "INSERT INTO events(source_id, session_key, ordinal_num,"
-                " family, native_id, name, target)"
-                " VALUES(?,?,?,'tool_call',?,'Bash',?)",
-                (self.source, key, 2, f"once-e{n}", f"ls {root}"))
-        calls = []
-        real = placement._git
-
-        def wrapped(checkout, *args):
-            calls.append((checkout, args))
-            return real(checkout, *args)
-
-        placement._git = wrapped
-        try:
-            self.assertEqual(placement.record_shared_checkouts(self.con), 2)
-        finally:
-            placement._git = real
-        self.assertEqual(
-            [c for c in calls if c == (root, ("remote", "get-url", "origin"))],
-            [(root, ("remote", "get-url", "origin"))])
-        self.assertEqual(
-            [c for c in calls if c == (root, ("rev-parse", "--abbrev-ref", "HEAD"))],
-            [(root, ("rev-parse", "--abbrev-ref", "HEAD"))])
-        row = self.con.execute(
-            "SELECT repository, branch FROM checkouts WHERE root=?",
-            (root,)).fetchone()
-        self.assertEqual((row["repository"], row["branch"]), ("o/alpha", "fix/a"))
-
-    def test_live_git_runs_outside_an_open_write(self):
-        self.con.execute(
-            "INSERT INTO checkouts(root, repository, branch, seen_at)"
-            " VALUES(?,?,?,0)", ("/tmp/seed-open-write", "o/seed", "main"))
-        self.assertTrue(self.con.in_transaction)
-        flags = []
-        real = placement._git
-
-        def wrapped(checkout, *args):
-            flags.append(self.con.in_transaction)
-            return real(checkout, *args)
-
-        placement._git = wrapped
-        try:
-            found = placement.checkout_of(self.con, self.checkouts["alpha"])
-        finally:
-            placement._git = real
-        self.assertEqual(found, ("o/alpha", "fix/a"))
-        self.assertEqual(flags, [False, False])
-        other = db.connect(self.db_path)
-        try:
-            row = other.execute(
-                "SELECT repository, branch FROM checkouts WHERE root=?",
-                (self.checkouts["alpha"],)).fetchone()
-        finally:
-            other.close()
-        self.assertEqual((row["repository"], row["branch"]), ("o/alpha", "fix/a"))
 
     def test_sync_records_shared_sessions_once_after_refresh(self):
         calls = []
@@ -681,7 +549,7 @@ class PlacementTest(LedgerCase):
         ns = type("NS", (), {})()
         ns.harness = ["t3", "codex"]
         ns.source = None
-        ns.root = None
+        ns.root = self.tmp.name
         ns.full = False
         ns.agentsmd_repo = os.path.join(self.tmp.name, "no-such-repo")
         ns.as_json = True

@@ -536,17 +536,19 @@ re-read every sync; workload bindings are durable ledger rows.
   (backfilled rows gain their turn but no excerpt). Scaffolding, command
   and interrupt verdicts fail closed; unlisted records (typed prompts,
   Router `sdk-cli` workers) never move; unknown stays unknown.
-- Thread trees: `sub.<parent>.<suffix>` ids (nesting allowed) group under
-  their root. Each linked PR or Issue becomes one `repo#N` task
+- Legacy thread trees: `sub.<parent>.<suffix>` ids (nesting allowed) group under
+  their root. Each linked PR or Issue becomes one task (on github.com,
+  `owner/repo#N`; elsewhere, `host/owner/repo/issue#N` or `host/owner/repo/pr#N`)
   (`origin='t3'`); every ledger session in the tree (cursor sessions plus
   Claude subagent children plus rotated sessions found by turn uuid) binds
-  whole to every tree task. One-link trees attribute exclusively.
-  In a multi-link tree, a Claude or Codex response belongs to one PR when
-  the paths its tool calls name lie in a checkout of that PR's repository
-  on its head branch (T3 snapshot `headBranch`; checkouts recorded in
-  `checkouts` at sync so removed worktrees still match). A response
-  matching no PR or several stays unplaced and outside every headline.
-  Other harnesses, and links without a head branch, keep whole sharing.
+  whole to every tree task as historical session context. A thread link alone cannot place a response.
+  For new Claude or Codex events, the importer can observe the forge,
+  repository and branch of a checkout named by a tool path. Reports join
+  those observations to individual responses and list matching PR heads in
+  `legacy_checkout_observations`. A path can change owners before its first
+  import. These observations establish which checkout Observer saw at sync.
+  Billing requires independent evidence of the response's owner.
+  Whole-session sharing from links stays visible outside the outcome cost.
   Ghostty bodies and unknown cursor shapes are skipped.
 - Outcomes come from the PR snapshot (`merged` completes); exit codes are
   never read.

@@ -371,15 +371,20 @@ class T3SyncTest(LedgerCase):
         self.assertEqual(shared["shared_joint"]["responses"], 4)
         self.assertEqual(shared["unassigned_in_scope"]["responses"], 0)
         self.assertTrue(shared["reconciles"])
-        # Never divided: the same whole responses sit under both tasks.
+        # Without PR head evidence both tasks show the same session context.
+        # Neither outcome bills these four responses.
         other = report.task_report(self.con, "example/alpha#3",
                                    schedule=shared["price_schedule"])
         self.assertEqual(
-            sorted(shared["measured"]["shared_responses"]),
-            sorted(other["measured"]["shared_responses"]))
+            shared["measured"]["shared_responses"], other["measured"]["shared_responses"])
+        self.assertEqual(other["total_cost"]["shared_responses"], 0)
+        self.assertIsNone(shared["total_cost"]["usd"])
         solo = report.task_report(self.con, "example/alpha#9",
                                   schedule=shared["price_schedule"])
-        self.assertEqual(solo["attributed"]["responses"], 1)
+        self.assertEqual(solo["attributed"]["responses"], 0)
+        self.assertEqual(solo["unplaced_shared"]["responses"], 1)
+        self.assertEqual(solo["total_cost"]["text"], "unknown")
+        self.assertEqual(shared["total_cost"]["responses"], 0)
         self.assertEqual(solo["shared_joint"]["responses"], 0)
 
     def test_changed_link_drops_stale_t3_bindings_only(self):
@@ -703,6 +708,11 @@ class UnboundUsageTest(LedgerCase):
         self.assertEqual(rep["unbound_usage"], ["codex:unbound-sess"])
         self.assertEqual(rep["coverage"]["unbound_usage"],
                          ["codex:unbound-sess"])
+
+        self.assertFalse(rep["coverage"]["complete"])
+        self.assertIsNone(rep["estimated_cost"]["estimated_cost_usd_total"])
+        self.assertIsNone(rep["native_cost"]["total_usd"])
+        self.assertEqual(rep["total_cost"]["text"], "unknown")
 
     def test_unbound_usage_is_a_visible_cli_failure(self):
         self.con.execute(

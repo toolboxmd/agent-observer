@@ -17,7 +17,8 @@ import math
 import os
 import sqlite3
 
-from .. import db, privacy
+from .. import db, native_response, placement, privacy
+from . import codex_atomic
 from ..identity import SessionIdentity, skill_from_path
 from ..ingest import (JsonlSource, MissingNativeId, fingerprint, insert_event,
                       iso_ts, stored_path, text_hash)
@@ -61,6 +62,7 @@ def _occurrences_ready(row) -> bool:
 
 
 HARNESS = "codex"
+_CONTEXT_VERSION = 10  # Recover atoms deferred while a formerly incomplete source was growing.
 SEMANTICS = "codex:input_includes_cached,output_includes_reasoning"
 # Older rollouts carry usage only in token_count events: last_token_usage per
 # response and a cumulative total that repeats when nothing new happened.
@@ -371,6 +373,8 @@ class _Reader:
         self.con = con
         self.src = src
         self.stats = stats
+        self.first_new_ordinal = src.first_new_ordinal()
+        self.checkout_events = []
         self.session_id = src.row["session_id"]
         self.thread_id = src.row["thread_id"]
         self.thread_source = src.row["thread_source"]
@@ -482,7 +486,10 @@ class _Reader:
                      native_id=native_id, ordinal=self.record_position,
                      ts=iso_ts(obj.get("timestamp")),
                      update=self.src.privacy_stale and same_source,
-                     migrate_ordinal=first and same_source, **kw)
+                     migrate_ordinal=first and same_source,
+                     checkout_events=self.checkout_events
+                     if self.first_new_ordinal is not None
+                     and self.record_position >= self.first_new_ordinal else None, **kw)
         event_id = prior["id"] if prior is not None else None
         if event_id is None:
             stored = self.con.execute(
@@ -761,10 +768,10 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         "events_duplicate": 0, "compactions": 0, "malformed": 0,
     }
     src = JsonlSource(con, HARNESS, path, full=full)
-    if (src.row["codex_context_version"] != 6
+    predecessor = codex_atomic.relocated_source(src)
+    if (predecessor is not None or src.row["codex_context_version"] != _CONTEXT_VERSION
             or src.row["codex_context_offset"] != src.row["read_offset"]):
-        # Replay older indexes once, including search extensions previously
-        # discarded from otherwise unchanged sources (#94).
+        # Replay older indexes once to recover literal turn witnesses from copies.
         src.start_offset = 0
         src.end_offset = 0
         src.unchanged = False
@@ -811,7 +818,12 @@ def import_codex_file(con: sqlite3.Connection, path: str,
             "session_key": session_key,
         })
         return stats
+    if src.incremental and db._has_table(con, "codex_incomplete_sources") and con.execute(
+            "SELECT 1 FROM codex_incomplete_sources WHERE source_id=? AND replay", (src.source_id,)).fetchone():
+        src.start_offset = src.end_offset = 0
     reader = _Reader(con, src, stats)
+    codex_atomic.prepare(reader)
+    native_response.prepare(con, src.source_id, replace=not src.incremental)
     _ensure_cumulative_table(con)
     own = _first_meta(path)
     boundary = _history_file_boundary(path, own) if own is not None else None
@@ -882,6 +894,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
     for ordinal, obj, line in src.records():
         stats["lines"] += 1
         if obj is None or not isinstance(obj, dict):
+            reader.unreadable_atomic = True
             stats["malformed"] += 1
             src.error(ordinal,
                       "malformed_json" if obj is None else "unknown_record",
@@ -906,10 +919,18 @@ def import_codex_file(con: sqlite3.Connection, path: str,
             src.error(ordinal, "missing_id", line)
             continue
         except _UnsupportedSchema:
+            if (not isinstance(obj.get("type"), str) or
+                    isinstance(obj.get("payload"), dict) and "response_id" in obj["payload"]):
+                reader.unreadable_atomic = True
             stats["malformed"] += 1
             src.error(ordinal, "unsupported_schema", line)
             continue
         except (KeyError, TypeError, ValueError, AttributeError):
+            if obj.get("type") == "token_usage_record":
+                if isinstance(obj.get("payload"), dict):
+                    codex_atomic.observe(reader, obj, None)
+                else:
+                    reader.unreadable_atomic = True
             stats["malformed"] += 1
             src.error(ordinal, "schema_error", line)
             continue
@@ -917,6 +938,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         if ts is not None:
             reader.first_ts = ts if reader.first_ts is None else min(reader.first_ts, ts)
             reader.last_ts = ts if reader.last_ts is None else max(reader.last_ts, ts)
+    codex_atomic.finish(reader, predecessor)
     _flush_token_counts(reader)
     _resolve_legacy_user_messages(reader)
     if not src.privacy_stale:
@@ -961,9 +983,9 @@ def import_codex_file(con: sqlite3.Connection, path: str,
                             thread_source=reader.thread_source))
     backfill = 1 if _backfill_complete(
         con, src.source_id, getattr(src, "last_ordinal", None)) else 0
-    con.execute("UPDATE sources SET codex_context_version=6,codex_context_offset=?,"
+    con.execute("UPDATE sources SET codex_context_version=?,codex_context_offset=?,"
                 "codex_model=?,codex_effort=?,occurrence_backfill=? WHERE id=?",
-                (src.end_offset, reader.model, reader.effort, backfill,
+                (_CONTEXT_VERSION, src.end_offset, reader.model, reader.effort, backfill,
                  src.source_id))
     for key, (native, lost_rows) in settle.items():
         _settle(con, key, native, lost_rows)
@@ -971,6 +993,7 @@ def import_codex_file(con: sqlite3.Connection, path: str,
         stats["moved_rows_with"] = sorted(settle)
     stats["session_key"] = reader.session_key
     con.commit()
+    placement.observe_new_checkouts(con, reader.checkout_events)
     return stats
 
 
@@ -1592,14 +1615,23 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
     u_raw = p.get("usage")
     tt_raw = p.get("turn_token_usage")
     th_raw = p.get("thread_token_usage")
-    _validate_bucket(u_raw)
-    _validate_bucket(tt_raw)
-    _validate_bucket(th_raw)
+    try:
+        for bucket in (u_raw, tt_raw, th_raw):
+            _validate_bucket(bucket)
+            if bucket and any(v is not None and not 0 <= v < 2**63
+                              for v in (bucket.get(k) for k in _CODEX_BUCKET_KEYS)):
+                raise _MalformedUsage("invalid atomic counter")
+    except _MalformedUsage:
+        codex_atomic.observe(r, obj, None)
+        raise
     u = u_raw if isinstance(u_raw, dict) else {}
     tt = tt_raw if isinstance(tt_raw, dict) else {}
     th = th_raw if isinstance(th_raw, dict) else {}
     rid = f"{HARNESS}:{p['response_id']}"
     turn_id = f"{HARNESS}:{p['turn_id']}" if p.get("turn_id") else None
+    want = {k: u.get(k) for k in _CODEX_BUCKET_KEYS}
+    want.update(turn_total_tokens=tt.get("total_tokens"), thread_total_tokens=th.get("total_tokens"))
+    codex_atomic.observe(r, obj, want)
     cur = r.con.execute(
         "INSERT OR IGNORE INTO responses(response_id, source_id, harness,"
         " session_key, thread_id, turn_id, root_turn_id, session_id,"
@@ -1624,14 +1656,6 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
             " total_tokens, turn_total_tokens, thread_total_tokens"
             " FROM responses WHERE response_id=?", (rid,)).fetchone()
         seen = dict(existing) if existing is not None else {}
-        want = {"input_tokens": u.get("input_tokens"),
-                "cached_input_tokens": u.get("cached_input_tokens"),
-                "cache_write_input_tokens": u.get("cache_write_input_tokens"),
-                "output_tokens": u.get("output_tokens"),
-                "reasoning_output_tokens": u.get("reasoning_output_tokens"),
-                "total_tokens": u.get("total_tokens"),
-                "turn_total_tokens": tt.get("total_tokens"),
-                "thread_total_tokens": th.get("total_tokens")}
         if seen != want:
             raise _UsageConflict("usage conflict")
         _migrate_response_position(r, rid, r.record_position)
@@ -1642,6 +1666,11 @@ def _ingest_usage(r: _Reader, obj: dict) -> None:
         r.usage_context_seen.add(rid)
         r.stats["responses_inserted"] += 1
         _note_occurrence(r, "response", rid, obj, model=r.model, effort=r.effort)
+    native_turn = native_response.identifier(p.get("turn_id"))
+    if (native_turn and (r.thread_id or r.session_id)
+            and native_response.identifier(p.get("response_id"))
+            and p.get("thread_id") in (None, r.thread_id)):
+        native_response.record(r.con, r.src.source_id, r.session_key, rid, native_turn)
     if turn_id:
         r.con.execute(
             "INSERT OR IGNORE INTO turns(turn_id, source_id, session_key,"
@@ -2192,3 +2221,24 @@ def _function_read(r, obj, call_id, path, state, turn_id):
     r.event(obj, family, call_id, turn_id=turn_id, name=os.path.basename(path),
             target=skill if family == "skill_read" else path, status=state,
             detail={"skill": skill, "skill_path": path} if family == "skill_read" else None)
+
+
+def legacy_response_inputs(con, session_key):
+    """Atomic records imported before per-occurrence evidence still have
+    their literal turn_id. Retouch touches Claude exclusively. Fallback
+    token_count records have a separate semantics and no native response id.
+    """
+    columns = {row[1] for row in con.execute("PRAGMA table_info(sources)")}
+    old = (" AND COALESCE(s.codex_context_version,0)<7"
+           if "codex_context_version" in columns else "")
+    for rid, turn in con.execute(
+        "SELECT r.response_id,r.turn_id FROM responses r JOIN sources s ON s.id=r.source_id"
+        " WHERE r.harness='codex' AND r.session_key=? AND r.semantics=? AND r.is_overlap=0"
+        " AND (r.thread_id IS NULL OR 'codex:'||r.thread_id=r.session_key)" + old,
+        (session_key, SEMANTICS)
+    ):
+        if (isinstance(turn, str) and turn.startswith("codex:")
+                and native_response.identifier(turn[6:])
+                and isinstance(rid, str) and rid.startswith("codex:")
+                and native_response.identifier(rid[6:])):
+            yield rid, turn[6:]

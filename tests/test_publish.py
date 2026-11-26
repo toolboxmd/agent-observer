@@ -95,6 +95,30 @@ class PublishTest(LedgerCase):
         self.assertIn("| unknown (claude) | 1 | unknown |", body)
         self.assertIn("| claude-fable-5-1 (claude) | 2 | >=1,234 (lower bound) |", body)
 
+    def test_delivery_reference_privacy_and_excluded_cost_in_a_task_publication(self):
+        summary = publish.summarize(self.con, {"claude:s1"}, "task T")
+        summary.update(scope_kind="task", task_id="org/repo#1",
+                       native_cost_shared={"known_responses": 2, "known_subtotal_usd": 84},
+                       native_cost_billed_shared={"known_responses": 0},
+                       native_purpose={"runs": [{}], "deliveries": [
+                           {"url": "https://internal.example/private/project/pull/42"},
+                           {"url": "https://github.com/org/repo/pull/12"}]})
+        body = publish.render(summary)
+        self.assertNotIn("internal.example", body)
+        self.assertIn("Delivery PR: https://github.com/org/repo/pull/12", body)
+        self.assertIn("Harness-reported cost: none reported.", body)
+        self.assertNotIn("$84", body)
+        summary["task_id"] = "internal.example/team/private-repo#11"
+        private = publish.render(summary)
+        self.assertNotIn("internal.example", private)
+        self.assertNotIn("private-repo", private)
+        self.assertIn("Outcome: reference withheld", private)
+        summary["total_cost"] = {"unplaced": {"responses": 2, "other_task_responses": 3}}
+        scoped = publish.render(summary)
+        self.assertIn("Ownership is unresolved for 2 responses", scoped)
+        self.assertIn("3 responses belong to other tasks", scoped)
+        self.assertNotIn("checkout", scoped)
+
     def test_second_publish_edits_the_same_owned_comment(self):
         gh = PublishGh([])
         with mock.patch.object(publish, "_gh", gh):

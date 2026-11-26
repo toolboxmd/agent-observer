@@ -27,6 +27,7 @@ import time
 from . import privacy
 from .command_status import pending_pr_checks
 from .db import now
+from .placement import CHECKOUT_EVENT_FAMILIES
 
 TAIL_BYTES = 4096
 
@@ -93,6 +94,7 @@ class JsonlSource:
             "SELECT * FROM sources WHERE harness=? AND path=?",
             (harness, path)).fetchone()
         self.row = row
+        self.new_source = row is None
         self.start_offset = 0
         self.unchanged = False
         stored_version = (row["privacy_version"]
@@ -119,6 +121,7 @@ class JsonlSource:
             self.row = row
         self.source_id = row["id"]
         self.end_offset = self.start_offset
+        self.incomplete_record = False
 
     def _check_at(self, row, size: int, mtime_ns: int,
                   ino: int) -> tuple[int, bool]:
@@ -215,6 +218,22 @@ class JsonlSource:
     def incremental(self) -> bool:
         return self.start_offset > 0
 
+    def first_new_ordinal(self) -> int | None:
+        """First record eligible for import-time diagnostics, even during a replay."""
+        if self.new_source:
+            return 0
+        offset = self.start_offset
+        if not offset:
+            # Full, privacy and parser replays can still include a verified append.
+            offset, _ = self._check_at(self.row, self.size, self.mtime_ns, self.ino)
+        if offset:
+            return self.row["ordinal_max"] + 1
+        if (self.row["read_offset"] == 0 and self.row["ordinal_max"] == -1
+                and self.row["ino"] == self.ino and self.row["mtime_ns"] is not None
+                and self.size >= self.row["size_bytes"]):
+            return 0  # The same file previously contained no complete records.
+        return None
+
     def records(self):
         """Yield (ordinal, obj, raw_line) for complete lines after the start.
 
@@ -227,6 +246,7 @@ class JsonlSource:
             position = self.start_offset
             for raw in fh:
                 if not raw.endswith(b"\n"):
+                    self.incomplete_record = True
                     break
                 position += len(raw)
                 text = raw.decode("utf-8", "replace")
@@ -313,7 +333,7 @@ def insert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
                  duration_ms=None, size_bytes=None, truncated=None,
                  fingerprint=None, detail=None, update: bool = False,
                  migrate_ordinal: bool = False,
-                 reconcile: bool = False) -> None:
+                 reconcile: bool = False, checkout_events: list | None = None) -> None:
     """Insert one event under its natural key; a repeat is a no-op.
 
     Every protected field passes through agent_observer/privacy.py rule 6:
@@ -399,6 +419,8 @@ def insert_event(con: sqlite3.Connection, stats: dict, *, source_id: int,
             stats["events_duplicate"] = stats.get("events_duplicate", 0) + 1
     else:
         stats["events_inserted"] = stats.get("events_inserted", 0) + 1
+        if checkout_events is not None and safe_target and family in CHECKOUT_EVENT_FAMILIES:
+            checkout_events.append((cur.lastrowid, safe_target))
 
 
 def fingerprint(*parts: object) -> str:
