@@ -106,7 +106,7 @@ def _valid_counter(value) -> bool:
 
 _FINALITY_TABLE = "claude_response_finality"
 _NATIVE_KINDS_TABLE = "claude_native_kinds"
-_IMPORT_VERSION = 19  # Retain locators for finals without usable counters.
+_IMPORT_VERSION = 20  # Recover locators for copied provisional measurements.
 _UNMEASURED_FINAL = "unmeasured_final"
 _FINAL_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens",
                  "reasoning_output_tokens", "total_tokens", "cache_write_5m_tokens", "cache_write_1h_tokens", "model")
@@ -355,12 +355,21 @@ def import_claude_file(con: sqlite3.Connection, path: str,
              "events_duplicate": 0, "compactions": 0, "malformed": 0}
     src = JsonlSource(con, HARNESS, path, full=full)
     prior_usage = src.row["claude_usage_version"]
+    streaming_locations = set()
+    if prior_usage in (18, 19) and src.unchanged and db._has_table(con, "claude_response_ancestry"):
+        streaming_locations = {rid for rid, in con.execute(
+            "SELECT DISTINCT a.response_id FROM claude_response_ancestry a"
+            " JOIN responses r USING(session_key,response_id)"
+            f" WHERE a.source_id=? AND NOT EXISTS (SELECT 1 FROM {_FINALITY_TABLE} f"
+            " WHERE f.response_id=a.response_id) AND EXISTS (SELECT 1 FROM claude_response_ancestry b"
+            " WHERE b.session_key=a.session_key AND b.response_id=a.response_id AND b.source_id<>a.source_id)",
+            (src.source_id,))}
     replay_unmeasured = (prior_usage == 18 and db._has_table(con, "claude_rejected_measurements")
                          and con.execute(
                              "SELECT 1 FROM claude_rejected_measurements WHERE source_id=?"
                              " AND reason IN ('missing_final_usage','malformed_final_usage') LIMIT 1",
                              (src.source_id,)).fetchone())
-    if (prior_usage not in (18, _IMPORT_VERSION) or replay_unmeasured
+    if (prior_usage not in (18, 19, _IMPORT_VERSION) or replay_unmeasured or streaming_locations
             or src.row["claude_usage_offset"] != src.row["read_offset"]):
         src.start_offset = src.end_offset = 0
         src.unchanged = False
@@ -405,6 +414,7 @@ def import_claude_file(con: sqlite3.Connection, path: str,
         # together, including when the writer merely finishes its last line.
         src.start_offset = src.end_offset = 0
     r = _Reader(con, src, stats)
+    r.recover_streaming_locations = streaming_locations
     _ensure_finality_table(con)
     _ensure_native_kinds(con)
     _seed_queue_identity(r)
@@ -819,6 +829,15 @@ def _ingest_usage_row(r: _Reader, obj: dict, ordinal: int, ts, mid: str,
     disagreements between measured counters are quarantined. A
     malformed final block never reaches here, so it never finalizes."""
     rid = f"{HARNESS}:{mid}"
+    if (not final and rid in r.recover_streaming_locations
+            and ordinal <= r.src.row["ordinal_max"]):
+        # Upgrade replays keep the previous streaming measurement. Only
+        # a block matching its counters and locator can repair the source.
+        if _stored_counters(r, rid) == values:
+            r.con.execute("UPDATE responses SET source_id=? WHERE session_key=? AND response_id=?"
+                          " AND ordinal_num=? AND ts IS ?",
+                          (r.src.source_id, r.session_key, rid, ordinal, ts))
+        return
     if final:
         payload = json.dumps(dict(values, model=model), sort_keys=True)
         r.con.execute("INSERT OR IGNORE INTO claude_final_observations VALUES(?,?,?,?)",

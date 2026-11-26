@@ -405,7 +405,7 @@ class DiagnoseUsageTest(LedgerCase):
                   "timestamp": "2026-10-01T12:00:01Z", "message": message}
         provisional = Path(self.tmp.name) / "provisional.jsonl"
         provisional.write_text(json.dumps(record) + "\n")
-        claude.import_claude_file(self.con, str(provisional))
+        first = claude.import_claude_file(self.con, str(provisional))["source_id"]
         record.update(uuid="final", timestamp="2026-10-01T12:00:02Z")
         if finalized:
             message.update(stop_reason="end_turn")
@@ -419,6 +419,17 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertEqual((point["input_tokens"], point["source_id"], point["ordinal_num"]),
                          (100, second, 1))
         if not finalized:
+            self.con.execute("UPDATE responses SET source_id=? WHERE response_id='claude:copy-response'",
+                             (first,))
+            self.con.execute("UPDATE sources SET claude_usage_version=18 WHERE id IN (?,?)",
+                             (first, second))
+            self.assertGreater(claude.import_claude_file(self.con, str(provisional))["lines"], 0)
+            self.assertEqual(self.con.execute(
+                "SELECT cached_input_tokens FROM responses WHERE response_id='claude:copy-response'"
+            ).fetchone()[0], 80)
+            self.assertGreater(claude.import_claude_file(self.con, str(final))["lines"], 0)
+            self.assertEqual(claude.import_claude_file(self.con, str(final))["lines"], 0)
+            self.assertEqual(self.run_diagnose("--session", f"claude:{session}"), result)
             return
         copy = Path(self.tmp.name) / "z-final-copy.jsonl"
         shutil.copyfile(final, copy)
