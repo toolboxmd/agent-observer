@@ -159,6 +159,19 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertIsNone(cache["cached_input_share"])
         self.assertEqual(cache["unlocated_usage_sessions"], 1)
 
+    def test_codex_fallback_quarantine_uses_filename_when_native_identity_is_missing(self):
+        fixture_lines = Path(fixture("codex-precompaction-conflict.jsonl")).read_text().splitlines()
+        source = Path(self.tmp.name) / "rollout-no-session-meta.jsonl"
+        source.write_text("\n".join(fixture_lines[1:]) + "\n")
+        codex.import_codex_file(self.con, str(source))
+        result = self.run_diagnose("--session", f"codex:file:{source.name}")
+        session, = result["context_growth"]
+        self.assertEqual([p["input_tokens"] for p in session["timeline"] if p["kind"] == "input"],
+                         [None, None])
+        cache, = result["cache_observations"]
+        self.assertEqual(cache["unlocated_usage_sessions"], 1)
+        self.assertIsNone(cache["cached_input_share"])
+
     def test_codex_unidentified_atomic_error_preserves_clean_fallback_counters(self):
         lines = [json.loads(line) for line in
                  Path(fixture("codex-precompaction-conflict.jsonl")).read_text().splitlines()]

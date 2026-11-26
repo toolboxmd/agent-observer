@@ -1407,6 +1407,13 @@ def _repair_usage_context(r: _Reader, rid: str, obj: dict, model, effort,
 
 def has_unlocated_fallback_usage(con, session_key):
     """Fallback quarantine does not retain the cumulative response identity."""
+    native = "COALESCE(NULLIF(s.thread_id,''),NULLIF(s.session_id,''))"
+    identity = f"'codex:'||{native}=?"
+    params = [session_key]
+    if session_key.startswith("codex:file:"):
+        suffix = "/" + session_key.removeprefix("codex:file:")
+        identity += f" OR ({native} IS NULL AND substr(s.path,?)=?)"
+        params.extend((-len(suffix), suffix))
     atoms = ""
     if db._has_table(con, "codex_atomic_observations"):
         atoms = (" AND NOT EXISTS (SELECT 1 FROM codex_atomic_observations a"
@@ -1418,9 +1425,9 @@ def has_unlocated_fallback_usage(con, session_key):
     return con.execute(
         "SELECT 1 FROM sources s JOIN import_errors e"
         " ON e.harness=s.harness AND e.source_path=s.path"
-        " WHERE s.harness='codex' AND 'codex:'||COALESCE(s.thread_id,s.session_id)=?"
+        f" WHERE s.harness='codex' AND ({identity})"
         " AND e.error IN ('malformed_usage','usage_conflict')" + atoms + " LIMIT 1",
-        (session_key,)).fetchone() is not None
+        params).fetchone() is not None
 
 
 def _flush_token_counts(r: _Reader) -> None:
