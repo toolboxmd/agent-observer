@@ -572,8 +572,8 @@ class UsageClosureTest(LedgerCase):
                       closure=CLOSED_CLAUDE, response_ids=["msg-o1"], thread="sibling", pt="pt-sib",
                       purpose=dict(PURPOSE, provenance=dict(type="future_kind")))
         rep = self.native_report()
-        self.assertEqual(self.gaps(rep), {"native_rows_rejected": (1, "rows")})
-        self.assertEqual(rep["native_purpose"]["rejected_rows"][0]["reason"], "invalid_purpose")
+        self.assertEqual(self.gaps(rep), {"native_run_invalid": (1, "runs")})
+        self.assertEqual(rep["native_purpose"]["invalid_runs"], ["sib"])
         self.assertIn("unknown (observed priced subtotal", rep["total_cost"]["text"])
 
     def test_a_turn_naming_a_missing_attempt_is_a_rejected_row(self):
@@ -609,16 +609,17 @@ class UsageClosureTest(LedgerCase):
         self.assigned_outside_chromeria()
         rep = self.native_report()
         self.assertEqual(rep["total_cost"]["status"], "complete")
-        for name, run, payload in (
-                ("unknown provenance", "rejected", dict(PURPOSE, provenance=dict(type="future_kind"))),
-                ("unparseable run id", "not a valid id", PURPOSE)):
+        for name, run, payload, gap in (
+                ("unknown provenance", "rejected", dict(PURPOSE, provenance=dict(type="future_kind")),
+                 ("native_run_invalid", (1, "runs"))),
+                ("unparseable run id", "not a valid id", PURPOSE, ("native_rows_rejected", (1, "rows")))):
             with self.subTest(name):
                 self.native.execute(f"DELETE FROM {PREFIX}runs WHERE run_id NOT IN ('other')")
                 self.row("runs", [run, "t", "completed"], dict(id=run, threadId="t", purpose=payload,
                                                                status="completed", startedAt=TIME))
                 rep = self.native_report()
                 self.assertNotEqual(rep["total_cost"]["status"], "complete")
-                self.assertEqual(self.gaps(rep)["native_rows_rejected"], (1, "rows"))
+                self.assertEqual(self.gaps(rep)[gap[0]], gap[1])
                 self.assertIn("native coverage: ", self.cli())
 
     def test_a_rejected_segment_naming_a_task_with_no_valid_run_keeps_it_unknown(self):
@@ -738,18 +739,96 @@ class UsageClosureTest(LedgerCase):
         self.assertEqual(self.gaps(rep), {"native_rows_rejected": (2, "rows")})
         self.assertNotEqual(rep["total_cost"]["status"], "complete")
 
-    def test_a_ledger_without_the_run_record_cannot_tell_a_thread_deleted_before_it(self):
+    def test_an_upgraded_ledger_seeds_the_record_from_the_runs_it_already_mirrors(self):
         self.two_thread_task()
         self.native_report()
-        # An upgraded ledger: the record did not exist, and the thread was deleted before this sync.
+        # A ledger written before the record existed, whose source then deleted a thread.
         self.con.execute("DROP TABLE IF EXISTS t3_seen_runs")
         self.con.commit()
         self.delete_thread("t-cx")
         rep = self.native_report()
-        # The surviving rows name a run the ledger never recorded: every task of the source is unknown.
         self.assertNotEqual(rep["total_cost"]["status"], "complete")
-        self.assertNotIn("native_run_deleted", self.gaps(rep))
-        self.assertEqual(self.gaps(rep)["native_rows_rejected"], (2, "rows"))
+        self.assertEqual(self.gaps(rep)["native_run_deleted"], (1, "runs"))
+
+    def raw_run(self, run, thread, payload, attempt=True):
+        """A raw run row with an attempt and a provider turn, as the projection keeps them."""
+        self.row("runs", [run, thread, "completed"], payload)
+        if not attempt:
+            return
+        att, turn = "attempt-" + run, "turn-" + run
+        self.row("run_attempts", [att, run, thread, "pt-claudeAgent", turn, "node-" + run], dict(
+            id=att, runId=run, providerThreadId="pt-claudeAgent", rootNodeId="node-" + run,
+            providerInstanceId="claudeAgent-custom", providerTurnId=turn, status="completed", startedAt=TIME))
+        self.row("provider_turns", [turn, thread, "pt-claudeAgent", att, "node-" + run], dict(
+            id=turn, nodeId="node-" + run, providerThreadId="pt-claudeAgent", runAttemptId=att,
+            status="completed", nativeInputs=[], turnTokenUsage=claude_usage(500, 50)))
+
+    def test_deleting_a_legacy_thread_affects_no_task(self):
+        self.closed_turn()
+        self.raw_run("old", "t-old", dict(id="old", threadId="t-old", status="completed"))
+        self.assertEqual(self.native_report()["total_cost"]["status"], "complete")
+        self.delete_thread("t-old")
+        for _ in range(2):
+            rep = self.native_report()
+            self.assertEqual(rep["native_purpose"]["coverage_gaps"], [])
+            self.assertEqual(rep["total_cost"]["status"], "complete")
+
+    def test_deleting_an_unscoped_run_thread_affects_no_task(self):
+        self.closed_turn()
+        unscoped = dict(PURPOSE, scope=dict(type="unscoped", reason="deliberate"))
+        self.raw_run("free", "t-free", dict(id="free", threadId="t-free", purpose=unscoped, status="completed",
+                                            startedAt=TIME, activeAttemptId="attempt-free"))
+        self.assertEqual(self.native_report()["total_cost"]["status"], "complete")
+        self.delete_thread("t-free")
+        rep = self.native_report()
+        self.assertEqual(rep["native_purpose"]["coverage_gaps"], [])
+
+    def untied_invalid_run(self, payload, unreadable=False):
+        self.closed_turn()
+        self.raw_run("bad", "t-bad", payload)
+        if unreadable:
+            self.native.execute(f"UPDATE {PREFIX}runs SET payload_json='{{not json' WHERE run_id='bad'")
+        for state in ("present", "deleted"):
+            if state == "deleted":
+                self.delete_thread("t-bad")
+            rep = self.native_report()
+            self.assertNotEqual(rep["total_cost"]["status"], "complete", state)
+            self.assertEqual(self.gaps(rep)["native_run_invalid"], (1, "runs"), state)
+
+    def test_a_run_with_an_unreadable_payload_keeps_every_task_of_the_source_unknown(self):
+        self.untied_invalid_run({}, unreadable=True)
+
+    def test_a_run_with_an_unknown_scope_type_keeps_every_task_of_the_source_unknown(self):
+        self.untied_invalid_run(dict(id="bad", threadId="t-bad", status="completed",
+                                     purpose=dict(PURPOSE, scope=dict(type="multiple"))))
+
+    def test_an_invalid_run_naming_the_task_keeps_only_that_task_unknown(self):
+        self.closed_turn()
+        self.provider_thread("pt-o", "t-o")
+        self.claude_transcript([claude_user("o-a", None, "other"), assistant("o1", "o-a", "msg-o1")],
+                               session="other-s")
+        self.run_turn("o1", "claudeAgent", "other-s", inputs=["o-a"], usage=claude_usage(10, 5),
+                      closure=CLOSED_CLAUDE, response_ids=["msg-o1"], thread="t-o", pt="pt-o", purpose=OTHER)
+        self.raw_run("bad", "t-bad", dict(id="bad", threadId="t-bad", status="completed",
+                                          purpose=dict(PURPOSE, provenance=dict(type="future_kind"))))
+        for state in ("present", "deleted"):
+            if state == "deleted":
+                self.delete_thread("t-bad")
+            rep = self.native_report()
+            self.assertEqual(self.gaps(rep)["native_run_invalid"], (1, "runs"), state)
+            other = report.task_report(self.con, "example/project#8")
+            self.assertEqual(other["total_cost"]["status"], "complete", state)
+
+    def test_a_recorded_run_that_reappears_under_another_task_is_a_conflict_for_both(self):
+        self.closed_turn()
+        self.native_report()
+        self.native.execute(f"UPDATE {PREFIX}runs SET payload_json=json_set(payload_json,"
+                            "'$.purpose.scope.reference.number',8) WHERE run_id='c1'")
+        self.native_report()
+        for task in (TASK, "example/project#8"):
+            rep = report.task_report(self.con, task)
+            self.assertIn("conflicting_native_run_records", rep["native_purpose"]["coverage_gaps"], task)
+            self.assertNotEqual(rep["total_cost"]["status"], "complete", task)
 
     # Upgrade ----------------------------------------------------------------
 

@@ -3,6 +3,7 @@
 from collections import defaultdict
 from dataclasses import dataclass, field
 import json
+from typing import NamedTuple
 
 from . import native_response
 from .db import _has_table
@@ -30,7 +31,8 @@ def active(con, task_id):
 def purpose_evidence(native):
     """Whether Chromeria purpose evidence decides this task: runs, deliveries or rejects."""
     return bool(native and (native["runs"] or native["deliveries"] or native["conflicting_source_runs"]
-                            or native.get("rejected_rows") or native.get("deleted_runs")))
+                            or native.get("rejected_rows") or native.get("deleted_runs")
+                            or native.get("invalid_runs")))
 
 
 def legacy_link(evidence):
@@ -113,16 +115,20 @@ def evidence(con, task_id, scope):
             continue
         _session_ownership(con, key, task_id, by_run, reference_conflict, result, members)
 
-    # A run this ledger recorded for the task that is no longer in its source
-    # was deleted there; one now recorded under another task is a conflict.
-    deleted, changed = _recorded_runs(con, task_id)
+    # The run record classes every run this ledger has seen; deleted, invalid
+    # and conflicting runs, and rejected rows, reach the task through it. It
+    # is read here, before any gate, so a task with no valid run still sees it.
+    record = RunRecord.read(con)
+    deleted, invalid, changed = _recorded_runs(con, task_id, record)
     disputed_runs = sorted(set(disputed_runs) | changed)
-    # A rejected Chromeria row tied to this task is Chromeria evidence for it
-    # even when no valid purpose run exists, so it is read here, before any gate.
-    rejected = _rejected(con, {"runs": runs, "conflicting_source_runs": disputed_runs, "task_id": task_id})
-    if runs or deliveries or session_runs or disputed_runs or rejected or deleted:
+    origins = record.origins(task_id)
+    if _has_table(con, "t3_source_runs"):
+        origins |= {r[0] for r in con.execute(
+            "SELECT DISTINCT source_path FROM t3_source_runs WHERE task_id=?", (task_id,))}
+    rejected = _rejected(con, {"task_id": task_id}, record, origins)
+    if runs or deliveries or session_runs or disputed_runs or rejected or deleted or invalid:
         result.native = {"version": 1, "task_id": task_id, "runs": runs, "deliveries": deliveries,
-                         "rejected_rows": rejected, "deleted_runs": deleted,
+                         "rejected_rows": rejected, "deleted_runs": deleted, "invalid_runs": invalid,
                          "membership": members, "sessions": session_runs,
                          "unavailable_response_usage": sorted(result.unavailable_usage),
                          "unlocated_usage_sessions": sorted(result.unlocated_usage_sessions),
@@ -526,59 +532,90 @@ def _children(con, task_id, run, gaps, not_counted):
             gaps.add("child_purpose_unknown", "children", child)
 
 
-def _recorded_runs(con, task_id):
-    """Runs recorded for the task that their source no longer holds, or holds under another task."""
-    if not (_has_table(con, "t3_seen_runs") and _has_table(con, "t3_source_runs")):
-        return [], set()
-    deleted, changed = [], set()
-    for path, run, current in con.execute(
-            "SELECT s.source_path,s.run_id,r.task_id FROM t3_seen_runs s LEFT JOIN t3_source_runs r"
-            " ON r.source_path=s.source_path AND r.run_id=s.run_id WHERE s.task_id=? ORDER BY s.run_id",
-            (task_id,)):
-        if current is None and not con.execute(
-                "SELECT 1 FROM t3_source_runs WHERE source_path=? AND run_id=?", (path, run)).fetchone():
-            deleted.append(run)
-        elif current != task_id:
-            changed.add(run)
-    return sorted(set(deleted)), changed
+class RunRecord(NamedTuple):
+    """The run record of every source, read once: (class, task, thread) per run."""
+    runs: dict
+    threads: dict
+
+    @classmethod
+    def read(cls, con):
+        runs, threads = defaultdict(dict), defaultdict(lambda: defaultdict(list))
+        if _has_table(con, "t3_seen_runs") and "class" in {
+                r[1] for r in con.execute("PRAGMA table_info(t3_seen_runs)")}:
+            for path, run, thread, kind, task in con.execute(
+                    "SELECT source_path,run_id,thread_id,class,task_id FROM t3_seen_runs"):
+                runs[path][run] = (kind, task, thread)
+                threads[path][thread].append((kind, task))
+        return cls(runs, threads)
+
+    def origins(self, task_id):
+        """Sources in which this task has a recorded task or invalid run."""
+        return {path for path, runs in self.runs.items()
+                if any(task == task_id for kind, task, _ in runs.values() if kind in ("task", "invalid"))}
+
+    def reaches(self, origin, run, thread, task_id, origins):
+        """Whether a row of `origin` naming this run or thread reaches the task.
+
+        By class: a task run reaches its task; an invalid run with a task
+        reference reaches that task; an invalid run without one, or a run in
+        no class (never seen), reaches every task of its source; unscoped and
+        legacy runs reach no task.
+        """
+        if run is not None:
+            entries = [self.runs[origin][run][:2]] if run in self.runs[origin] else None
+        else:
+            entries = self.threads[origin].get(thread) if thread is not None else None
+        if not entries:
+            return origin in origins
+        return any((kind in ("task", "invalid") and task == task_id)
+                   or (kind == "invalid" and task is None and origin in origins) for kind, task in entries)
 
 
-def _rejected(con, native):
-    """Rejected Chromeria rows this task's evidence depends on.
+def _recorded_runs(con, task_id, record):
+    """The task's runs as the record classes them, compared with their sources now.
 
-    A row is tied to the task by its task reference, or by a run or thread
-    the task has now or had when this ledger recorded it. A row whose
-    references match no run or thread this ledger has ever recorded for its
-    source belongs to a run it never saw: it keeps every task of that source
-    unknown.
+    Returns runs deleted from their source, invalid runs that reach the task
+    (present or deleted), and runs whose current record disagrees with their
+    recorded class or task. Assumption: a Chromeria run's purpose is fixed
+    when the run is created, so any disagreement is a conflict for both tasks.
+    """
+    if not _has_table(con, "t3_source_runs"):
+        return [], [], set()
+    origins = record.origins(task_id) | {r[0] for r in con.execute(
+        "SELECT DISTINCT source_path FROM t3_source_runs WHERE task_id=?", (task_id,))}
+    current = {(r[0], r[1]): (r[2], r[3]) for r in con.execute(
+        "SELECT source_path,run_id,scope,task_id FROM t3_source_runs WHERE source_path IN "
+        "(SELECT value FROM json_each(?))", (json.dumps(sorted(origins)),))}
+    deleted, invalid, changed = set(), set(), set()
+    for path in origins:
+        for run, (kind, task, _) in record.runs[path].items():
+            now = current.get((path, run))
+            if kind == "invalid" and (task == task_id or task is None):
+                invalid.add(run)
+            elif kind == "task" and task == task_id and now is None:
+                deleted.add(run)
+            elif kind in ("task", "unscoped") and now is not None and (
+                    (now[1] == task_id) != (kind == "task" and task == task_id)):
+                changed.add(run)
+    return sorted(deleted), sorted(invalid), changed
+
+
+def _rejected(con, native, record, origins):
+    """Rejected Chromeria rows that reach this task through the run record.
+
+    A row reaches the task by its own task reference, or by the class of the
+    run or thread it names (RunRecord.reaches). A rejected run row is
+    represented by its recorded class instead.
     """
     if not _has_table(con, "t3_purpose_rejects"):
         return []
-    task = native["task_id"]
-    runs = {r["run_id"] for r in native["runs"]} | set(native["conflicting_source_runs"])
-    threads = {r["thread_id"] for r in native["runs"]}
-    origins, known = set(), defaultdict(lambda: (set(), set()))
-    if _has_table(con, "t3_source_runs"):
-        for path, run, thread, owner in con.execute("SELECT source_path,run_id,thread_id,task_id FROM t3_source_runs"):
-            known[path][0].add(run)
-            known[path][1].add(thread)
-            if run in runs:
-                origins.add(path)
-    if _has_table(con, "t3_seen_runs"):
-        for path, run, thread, owner in con.execute("SELECT source_path,run_id,thread_id,task_id FROM t3_seen_runs"):
-            known[path][0].add(run)
-            known[path][1].add(thread)
-            if owner == task:
-                runs.add(run)
-                threads.add(thread)
-                origins.add(path)
     tied = []
     for r in con.execute("SELECT * FROM t3_purpose_rejects ORDER BY table_name,reason,row_id"):
         r = dict(r)
-        seen_runs, seen_threads = known[r["origin"]]
-        unknown = r["task_id"] is None and r["run_id"] not in seen_runs and r["thread_id"] not in seen_threads
-        if (r["task_id"] == task or r["run_id"] in runs or r["thread_id"] in threads
-                or (unknown and r["origin"] in origins)):
+        if r["table_name"] == "runs" and r["run_id"] in record.runs[r["origin"]]:
+            continue
+        if r["task_id"] == native["task_id"] or record.reaches(
+                r["origin"], r["run_id"], r["thread_id"], native["task_id"], origins):
             tied.append({k: r[k] for k in ("table_name", "reason", "row_id", "run_id", "thread_id")})
     return tied
 
@@ -693,6 +730,8 @@ def check_inventory(con, native, rows):
         _children(con, native["task_id"], run, gaps, not_counted)
     for run_id in native.get("deleted_runs") or []:
         gaps.add("native_run_deleted", "runs", run_id)
+    for run_id in native.get("invalid_runs") or []:
+        gaps.add("native_run_invalid", "runs", run_id)
     for item in native.get("rejected_rows") or []:
         gaps.add("native_rows_rejected", "rows", tuple(item.values()))
     if native["conflicting_reference_kinds"]:

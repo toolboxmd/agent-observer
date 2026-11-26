@@ -63,6 +63,11 @@ COLUMNS = {table: re.findall(r"(\w+) (?:TEXT|INTEGER)", spec) for table, spec in
 # column as no statement.
 ADDED = {"runs": ("never_ran",), "turns": ("native_response_ids_json", "usage_closure_json")}
 PROJECTION = "orchestration_v2_projection_"
+# Every raw run row with a readable id is recorded once in t3_seen_runs with
+# exactly one class: "task" (valid single-task purpose), "unscoped" (valid
+# unscoped purpose), "legacy" (readable, no purpose key) or "invalid"
+# (anything else, keeping its task reference when one still parses).
+RUN_CLASSES = ("task", "unscoped", "legacy", "invalid")
 # Projection tables whose rows decide whether a task's usage is complete.
 COMPLETENESS_TABLES = ("runs", "run_attempts", "provider_turns", "provider_threads", "subagents", "turn_items")
 ID = re.compile(r"[a-zA-Z0-9._:%/@+~=,-]{1,8192}", re.ASCII)
@@ -245,6 +250,11 @@ class Snapshot(NamedTuple):
     def task(self, ref):
         return _task(self.con, ref)
 
+    def record(self, run, thread, cls, task=None):
+        """Record a raw run's class once; a later refresh never rewrites it."""
+        self.con.execute("INSERT OR IGNORE INTO t3_seen_runs VALUES(?,?,?,?,?)",
+                         (self.path, run, _id(thread), cls, task))
+
     def reject(self, table, reason, row_id=None, run=None, thread=None, purpose=None):
         """Record a raw row that was read for completeness but not mirrored."""
         ref = _reference(_obj(_obj(_obj(purpose).get("scope")).get("reference")))
@@ -384,11 +394,18 @@ def _runs(snapshot, native, tables):
     never_ran = _never_ran(native, tables)
     for row, p in _rows(native, tables, "runs"):
         run, thread = _id(row.get("run_id")), _id(row.get("thread_id"))
+        # Every raw run gets exactly one class (see RUN_CLASSES), recorded once.
         if p and "purpose" not in p:
             # Out of scope: a readable pre-purpose run keeps its legacy treatment.
             legacy.add(row.get("run_id"))
+            if run:
+                snapshot.record(run, row.get("thread_id"), "legacy")
             continue
+        reference = _reference(_obj(_obj(_obj(p.get("purpose")).get("scope")).get("reference")))
         if not run or not thread:
+            if run:
+                snapshot.record(run, row.get("thread_id") or p.get("threadId"), "invalid",
+                                task_id(snapshot.con, reference) if reference else None)
             snapshot.reject("runs", "invalid_identity", row.get("run_id"), row.get("run_id"),
                             row.get("thread_id") or p.get("threadId"), p.get("purpose"))
             continue
@@ -397,9 +414,12 @@ def _runs(snapshot, native, tables):
         if purpose == INVALID:
             # Still mirrored as an invalid run; the reject ties it to its thread
             # and, when its scope reference parses, to that task.
+            snapshot.record(run, thread, "invalid", task_id(snapshot.con, reference) if reference else None)
             snapshot.reject("runs", "invalid_purpose", run, run, thread, p.get("purpose"))
         scope, reason, ref, provenance = purpose
         key = snapshot.task(ref) if ref else None
+        if purpose != INVALID:
+            snapshot.record(run, thread, "task" if scope == "single" else "unscoped", key)
         coords = ref or {}
         status = _enum(row.get("status"), STATES)
         version = _obj(p.get("purpose")).get("version")
@@ -862,7 +882,28 @@ def _source_tables(con, path):
             if old_path and old_path != path:
                 extra = ",NULL" if table == "grok_calls" else ""
                 con.execute(f"INSERT INTO {source} SELECT ?,*{extra} FROM {mirror}", (old_path,))
-        con.execute(f"DELETE FROM {source} WHERE source_path=?", (path,))
+
+
+def _run_record(con):
+    """Create the run record and seed it from the runs the ledger already mirrors.
+
+    Seeding runs before this refresh replaces its source's rows, so a ledger
+    written by 1.7.0 still knows the runs it mirrored. A record from an
+    unreleased earlier head, without classes, is rebuilt from the same rows.
+    """
+    if db._has_table(con, "t3_seen_runs") and "class" not in {
+            r[1] for r in con.execute("PRAGMA table_info(t3_seen_runs)")}:
+        con.execute("DROP TABLE t3_seen_runs")
+    con.execute("CREATE TABLE IF NOT EXISTS t3_seen_runs(source_path TEXT NOT NULL, run_id TEXT NOT NULL,"
+                " thread_id TEXT, class TEXT NOT NULL, task_id TEXT, PRIMARY KEY(source_path,run_id))")
+    con.execute("""INSERT OR IGNORE INTO t3_seen_runs SELECT source_path,run_id,thread_id,
+        CASE WHEN scope='single' AND task_id IS NOT NULL THEN 'task' WHEN scope='unscoped' THEN 'unscoped'
+        ELSE 'invalid' END, CASE WHEN scope='single' THEN task_id END FROM t3_source_runs""")
+
+
+def _clear_source(con, path):
+    for table in TABLES:
+        con.execute(f"DELETE FROM t3_source_{table} WHERE source_path=?", (path,))
 
 
 def _upgrade_retained_run_keys(con):
@@ -880,10 +921,6 @@ def _upgrade_retained_run_keys(con):
                 SELECT 1 FROM t3_source_runs r WHERE r.source_path=s.source_path
                 AND r.run_id=s.run_id AND r.task_id=s.task_id AND r.kind=?)""", args)
         con.execute("UPDATE t3_source_runs SET task_id=? WHERE task_id=? AND kind=?", args)
-        # The same key migration, not a change of purpose.
-        con.execute("""UPDATE t3_seen_runs AS s SET task_id=? WHERE task_id=? AND EXISTS (
-            SELECT 1 FROM t3_source_runs r WHERE r.source_path=s.source_path AND r.run_id=s.run_id
-            AND r.kind=?)""", args)
 
 
 def _materialize(con, table):
@@ -974,15 +1011,12 @@ def refresh(con, native, tables):
     con.execute("CREATE INDEX IF NOT EXISTS t3_purpose_inputs_native"
                 " ON t3_purpose_inputs(session_key,native_id)")
     con.execute("CREATE INDEX IF NOT EXISTS t3_purpose_inputs_run ON t3_purpose_inputs(run_id)")
-    # Every run this ledger has mirrored, kept across refreshes and never
-    # rewritten, so a run its source later deletes still names its task.
-    con.execute("CREATE TABLE IF NOT EXISTS t3_seen_runs(source_path TEXT NOT NULL, run_id TEXT NOT NULL,"
-                " thread_id TEXT NOT NULL, task_id TEXT, PRIMARY KEY(source_path,run_id))")
     _upgrade_retained_run_keys(con)
+    # Record the runs already mirrored (key migration first), then replace this source.
+    _run_record(con)
+    _clear_source(con, path)
     aware = _deliveries(snapshot, native, tables)
     runs, legacy = _runs(snapshot, native, tables)
-    con.execute("INSERT OR IGNORE INTO t3_seen_runs SELECT source_path,run_id,thread_id,task_id"
-                " FROM t3_source_runs WHERE source_path=?", (path,))
     if runs:
         for table in COMPLETENESS_TABLES:
             if PROJECTION + table not in tables:

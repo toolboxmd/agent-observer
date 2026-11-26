@@ -546,25 +546,34 @@ re-read every sync; workload bindings are durable ledger rows.
   `t3_purpose_rejects` with the run, thread and task references it still
   carries. A run whose purpose fails validation is mirrored and also
   rejected. Copies that disagree on a row's identity, a missing table, and a
-  reference to a row that does not exist are rejects too. A report keeps
-  unknown every task a reject is tied to by task reference, or by a run or
-  thread the task has now or had when the ledger recorded it, including a
-  task with no valid purpose run (`native_rows_rejected`). A reject whose
-  references match no run or thread the ledger has ever recorded for its
-  source belongs to a run it never saw and keeps every task of that source
-  unknown.
-- Deleted runs: `t3_seen_runs` records, per source, every run the ledger has
-  mirrored with its thread and task. A refresh only adds rows to it; read
-  commands never write it. Chromeria's thread deletion removes a thread's
-  runs, subagents and turn items and keeps its attempts and provider turns;
-  a recorded run that is no longer in its source keeps its task unknown on
-  every later sync (`native_run_deleted`), and the deleted run's surviving
-  rows stay tied to that task. Its responses lose their purpose witness, so
-  they leave the task's subtotal; the gap says that run's usage is missing.
-  A recorded run now held under another task is a conflict
-  (`conflicting_native_run_records`). A ledger only knows runs mirrored since
-  it first synced with this record, so surviving rows of a run deleted
-  before then belong to a run it never saw.
+  reference to a row that does not exist are rejects too.
+- Run classes: `t3_seen_runs` records every raw run row with a readable id
+  once, per source, with exactly one class; a refresh only inserts into it
+  and read commands never write it. Before a refresh replaces its source's
+  rows, the runs the ledger already mirrors are recorded too, so a ledger
+  written by 1.7.0 keeps the purpose runs it knew (it never mirrored
+  pre-purpose runs, so those are recorded from the first 1.8.0 sync on). The class decides, for a run that
+  is present and for one its source has since deleted (Chromeria's thread
+  deletion removes runs, subagents and turn items and keeps attempts and
+  provider turns):
+
+  | Class | Raw run | Present | Deleted from its source | Rows that name it |
+  | --- | --- | --- | --- | --- |
+  | `task` | valid single-task purpose | counted for its task | `native_run_deleted` for its task | reach its task |
+  | `unscoped` | valid unscoped purpose | no gap for any task | no gap | reach no task |
+  | `legacy` | readable, no `purpose` key | out of scope | no gap | reach no task |
+  | `invalid` with a task reference | any other run whose scope reference parses | `native_run_invalid` for that task | same | reach that task |
+  | `invalid` without one | any other run, including an unreadable payload | `native_run_invalid` for every task of the source | same | reach every task of the source |
+  | none (never seen) | a run the ledger never recorded | not applicable | not applicable | reach every task of the source |
+
+  A rejected row reaches a task by its own task reference or through the
+  class of the run, or the runs on the thread, it names
+  (`native_rows_rejected`); a rejected run row is represented by its class.
+  A recorded run whose source now holds it under another task or class is a
+  conflict for both tasks (`conflicting_native_run_records`), on the
+  assumption that a Chromeria run's purpose is fixed when the run is
+  created. A deleted run's responses lose their purpose witness and leave
+  the task's subtotal; the gap says that run's usage is missing.
 - Never ran: the refresh decides from raw rows before validation whether a
   run never ran: terminal, an explicit null `startedAt`, an active attempt
   that is null or one of its attempts, and every attempt with a null

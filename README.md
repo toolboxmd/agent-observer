@@ -546,9 +546,12 @@ affects. A run that the Chromeria records prove never ran adds nothing. A Chrome
 row that Observer cannot validate is a `native_rows_rejected` gap for every
 task it can be tied to, never an absence. When a Chromeria thread is
 deleted, a task that had a run there stays unknown (`native_run_deleted`) on
-every later sync. Observer remembers runs from the first sync with version
-1.8.0 on: rows left over from a thread deleted before that belong to a run it
-never saw, and they keep every Chromeria task of that source unknown. A delegated child
+every later sync; deleting a pre-purpose or unscoped thread affects no task.
+Observer remembers every run it has synced, including the purpose runs a
+1.7.0 ledger already held. Two kinds of run cannot be known: one created and
+deleted before any sync saw it, and a pre-purpose run deleted before the
+first sync with 1.8.0 (earlier versions did not record those). Their
+leftover rows keep every Chromeria task of that source unknown. A delegated child
 that declared another task, or was deliberately unscoped, is another task's
 cost; `not counted` says how many there were. Native child agents, children
 without a declared purpose, active or remote children, and unpriced models
