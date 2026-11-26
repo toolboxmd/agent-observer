@@ -94,16 +94,21 @@ class UsageClosureTest(LedgerCase):
 
     def run_turn(self, run, driver, session, *, inputs=(), usage=None, closure=None, response_ids=None,
                  status="completed", run_status="completed", started=TIME, attempt_started=TIME,
-                 purpose=PURPOSE, provenance=None, turn=True, thread="t"):
-        pt, att, turn_id, root = "pt-" + driver, "attempt-" + run, "turn-" + run, "node-" + run
+                 purpose=PURPOSE, provenance=None, turn=True, thread="t", pt=None,
+                 attempt=True, names_turn=None):
+        pt = pt or "pt-" + driver
+        att, turn_id, root = "attempt-" + run, "turn-" + run, "node-" + run
         instance = driver + "-custom"
         purpose = dict(purpose, provenance=provenance) if provenance else purpose
+        named = turn_id if (turn if names_turn is None else names_turn) else None
         self.row("runs", [run, thread, run_status], dict(
             id=run, threadId=thread, providerThreadId=pt, providerInstanceId=instance, purpose=purpose,
             status=run_status, startedAt=started, activeAttemptId=att))
-        self.row("run_attempts", [att, run, thread, pt, turn_id if turn else None, root], dict(
+        if not attempt:
+            return
+        self.row("run_attempts", [att, run, thread, pt, named, root], dict(
             id=att, runId=run, providerThreadId=pt, rootNodeId=root, providerInstanceId=instance,
-            nativeThreadId=session, providerTurnId=turn_id if turn else None, status=run_status,
+            nativeThreadId=session, providerTurnId=named, status=run_status,
             startedAt=attempt_started))
         if not turn:
             return
@@ -141,8 +146,10 @@ class UsageClosureTest(LedgerCase):
 
     # Claude ---------------------------------------------------------------
 
-    def claude_transcript(self, rows):
-        path = Path(self.tmp.name, "s.jsonl")
+    def claude_transcript(self, rows, session="s"):
+        for row in rows:
+            row["sessionId"] = session
+        path = Path(self.tmp.name, session + ".jsonl")
         write_records(path, rows)
         claude.import_claude_file(self.con, str(path), full=True)
 
@@ -266,6 +273,19 @@ class UsageClosureTest(LedgerCase):
         self.assertIn("usage closure missing (2 turns), usage closure open (1 turn)", body)
         self.assertNotIn("subagent_observed", body)
 
+    def test_closure_or_response_list_with_unexpected_shape_is_no_statement(self):
+        self.claude_transcript([claude_user("u-a", None, "a"), assistant("r1", "u-a", "msg-1"),
+                                claude_user("u-b", "r1", "b"), assistant("r2", "u-b", "msg-2")])
+        self.run_turn("x", "claudeAgent", "s", inputs=["u-a"], usage=claude_usage(10, 5),
+                      closure=dict(CLOSED_CLAUDE, qualifier="x"), response_ids=["msg-1"])
+        self.run_turn("y", "claudeAgent", "s", inputs=["u-b"], usage=claude_usage(10, 5),
+                      closure=dict(version=1, state="open", reason="subagent_observed", witness="process_ledger"),
+                      response_ids=["msg-2", "msg-2"])
+        rep = self.native_report()
+        self.assertEqual(self.gaps(rep), {"usage_closure_missing": (2, "turns")})
+        turns = dict(self.con.execute("SELECT provider_turn_id,native_response_ids_json FROM t3_purpose_turns"))
+        self.assertEqual(turns, {"turn-x": '["msg-1"]', "turn-y": None})
+
     # Run rule ---------------------------------------------------------------
 
     def closed_turn(self):
@@ -281,6 +301,21 @@ class UsageClosureTest(LedgerCase):
         rep = self.native_report()
         self.assertEqual(rep["native_purpose"]["coverage_gaps"], [])
         self.assertEqual(rep["total_cost"]["status"], "complete")
+
+    def test_unseen_turn_or_active_attempt_is_not_proof_that_a_run_never_started(self):
+        self.closed_turn()
+        # The attempt names a provider turn the record does not hold.
+        self.run_turn("named", "claudeAgent", "s", run_status="cancelled", started=None,
+                      attempt_started=None, turn=False, names_turn=True)
+        # The run names an active attempt the record does not hold.
+        self.run_turn("ghost", "claudeAgent", "s", run_status="cancelled", started=None, attempt=False)
+        rep = self.native_report()
+        gaps = self.gaps(rep)
+        self.assertEqual(gaps["expected_provider_turn_missing"], (1, "attempts"))
+        self.assertEqual(gaps["expected_attempt_missing"], (1, "runs"))
+        self.assertFalse(any(r["never_started"] for r in rep["native_purpose"]["runs"]
+                             if r["run_id"] in ("named", "ghost")))
+        self.assertIn("unknown (observed priced subtotal", rep["total_cost"]["text"])
 
     def test_run_without_a_start_time_is_judged_by_its_turn(self):
         self.closed_turn()
@@ -361,6 +396,31 @@ class UsageClosureTest(LedgerCase):
         self.assertEqual(gaps["child_active"], (1, "children"))
         self.assertEqual(gaps["child_runs_missing"], (1, "children"))
         self.assertNotIn("child_inventory_requires_reconciliation", gaps)
+        self.assertIn("unknown (observed priced subtotal", rep["total_cost"]["text"])
+
+    def test_same_task_child_that_ran_is_counted_through_its_own_turn(self):
+        self.closed_turn()
+        self.row("subagents", ["kid", "t", "c1", "app_owned", "claudeAgent", "child-kid"], {
+            "id": "kid", "threadId": "t", "runId": "c1", "driver": "claudeAgent", "origin": "app_owned",
+            "childThreadId": "child-kid", "status": "completed", "purpose": PURPOSE})
+        self.row("threads", ["child-kid", TIME], {"id": "child-kid"})
+        self.row("provider_threads", ["pt-kid", "child-kid", "claudeAgent", "claudeAgent-custom", TIME], {
+            "id": "pt-kid", "appThreadId": "child-kid", "driver": "claudeAgent",
+            "providerInstanceId": "claudeAgent-custom", "nativeThreadRef": strong("claudeAgent", "current")})
+        self.claude_transcript([claude_user("k-a", None, "child prompt"), assistant("k1", "k-a", "msg-k1", 30, 7)],
+                               session="kid-s")
+        self.run_turn("kid-run", "claudeAgent", "kid-s", inputs=["k-a"], usage=claude_usage(30, 7),
+                      closure=CLOSED_CLAUDE, response_ids=["msg-k1"], thread="child-kid", pt="pt-kid")
+        rep = self.native_report()
+        native = rep["native_purpose"]
+        self.assertEqual(sorted(c["status"] for c in native["turn_checks"]), ["reconciled", "reconciled"])
+        self.assertIn("claude:msg-k1", rep["measured"]["attributed_responses"])
+        self.assertEqual(native["coverage_gaps"], [])
+        self.assertEqual(rep["total_cost"]["status"], "complete")
+        self.native.execute(f"UPDATE {PREFIX}provider_turns SET payload_json=json_remove(payload_json,"
+                            "'$.turnTokenUsage') WHERE provider_turn_id='turn-kid-run'")
+        rep = self.native_report()
+        self.assertEqual(self.gaps(rep), {"native_final_usage_missing": (1, "turns")})
         self.assertIn("unknown (observed priced subtotal", rep["total_cost"]["text"])
 
     # Upgrade ----------------------------------------------------------------

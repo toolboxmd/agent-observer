@@ -72,6 +72,8 @@ STATES = ("pending", "preparing", "queued", "starting", "running", "waiting", "c
 INVALID = ("invalid", "invalid_purpose", None, None)
 WITNESSES = {"claudeAgent": "process_ledger", "codex": "event_stream"}
 REASON = re.compile(r"[a-z][a-z0-9_]{0,63}", re.ASCII)
+# Each closure variant has exactly these keys; any other key is no statement.
+CLOSURE_KEYS = ({"version", "state", "witness", "uncountedCompactions"}, {"version", "state", "reason"})
 
 
 def _id(value):
@@ -120,7 +122,7 @@ def _start(payload):
 def _closure(value, driver):
     """Parse a v1 usage closure strictly. Anything else is no statement (None)."""
     c = _obj(value)
-    if not _v1(c):
+    if not _v1(c) or set(c) not in CLOSURE_KEYS:
         return None
     if (c.get("state") == "main_agent_only" and c.get("witness") == WITNESSES.get(driver)
             and _number(c.get("uncountedCompactions"))):
@@ -133,10 +135,11 @@ def _closure(value, driver):
 
 
 def _response_ids(value, driver):
-    """Claude's listed main-agent response ids; malformed lists are no statement."""
-    if driver != "claudeAgent" or not isinstance(value, list) or not all(_id(i) for i in value):
+    """Claude's listed main-agent response ids; malformed or repeated ids are no statement."""
+    if (driver != "claudeAgent" or not isinstance(value, list) or not all(_id(i) for i in value)
+            or len(set(value)) != len(value)):
         return None
-    return _json(sorted(set(value)))
+    return _json(sorted(value))
 
 
 def _json(value):

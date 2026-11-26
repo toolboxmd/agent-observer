@@ -533,8 +533,8 @@ re-read every sync; workload bindings are durable ledger rows.
   version 1 closure only as `main_agent_only` with the driver's witness
   (`process_ledger` for Claude, `event_stream` for Codex) and its
   `uncountedCompactions` count, or as `open` with a snake_case reason; any
-  other version, state, witness or malformed value is no statement. Listed
-  response ids must all be native identifiers. Runs and attempts keep only
+  other version, state, witness, key or malformed value is no statement.
+  Listed response ids must all be distinct native identifiers. Runs and attempts keep only
   whether `startedAt` was set, explicitly null, or absent.
 
 - Turn origin: `thread.turn-start-requested` `actor_kind` (`client` human,

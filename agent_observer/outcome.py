@@ -558,10 +558,13 @@ def check_inventory(con, native, rows):
             a["turns"] = [dict(r) for r in con.execute(
                 "SELECT * FROM t3_purpose_turns WHERE attempt_id=? ORDER BY provider_turn_id", (a["attempt_id"],))]
         # A terminal run that never started, and none of whose attempts
-        # started or reached a provider turn, used no model.
+        # started, named a provider turn or reached one, used no model. An
+        # active attempt or a named turn the record does not hold is unknown,
+        # never proof of absence.
         run["never_started"] = (run["status"] in TERMINAL and run.get("start_state") == "not_started"
-                                and all(a.get("start_state") == "not_started" and not a["turns"]
-                                        for a in attempts))
+                                and run["active_attempt_id"] in {None, *(a["attempt_id"] for a in attempts)}
+                                and all(a.get("start_state") == "not_started" and a["provider_turn_id"] is None
+                                        and not a["turns"] for a in attempts))
         if run["status"] not in TERMINAL:
             gaps.add("run_not_terminal", "runs", run_id)
         if not run["never_started"] and run["active_attempt_id"] not in {a["attempt_id"] for a in attempts}:
@@ -570,7 +573,7 @@ def check_inventory(con, native, rows):
         for a in attempts:
             turns = a.pop("turns")
             unstarted = a.get("start_state") == "not_started"
-            if (not turns and not unstarted) or (a["provider_turn_id"] is not None and turns and
+            if (not turns and not unstarted) or (a["provider_turn_id"] is not None and
                                                  a["provider_turn_id"] not in {t["provider_turn_id"] for t in turns}):
                 gaps.add("expected_provider_turn_missing", "attempts", a["attempt_id"])
                 main_gaps.add("expected_provider_turn_missing")
