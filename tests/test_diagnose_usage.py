@@ -239,6 +239,26 @@ class DiagnoseUsageTest(LedgerCase):
                     self.run_diagnose("--harness", "codex")["cache_observations"]}
         self.assertEqual(replayed, groups)
 
+    def test_codex_cross_session_atom_collision_remains_an_unknown_sample(self):
+        lines = [json.loads(line) for line in Path(fixture("codex-mini.jsonl")).read_text().splitlines()]
+        atoms = [row for row in lines if row["type"] == "token_usage_record"]
+        first = Path(self.tmp.name) / "rollout-owner.jsonl"
+        first.write_text("\n".join(map(json.dumps, (lines[0], atoms[0]))) + "\n")
+        codex.import_codex_file(self.con, str(first))
+        sid = "sess-fixture-other"
+        lines[0]["payload"]["session_id"] = sid
+        for atom in atoms[:2]:
+            atom["payload"]["session_id"] = sid
+            atom["payload"]["thread_id"] = sid
+        other = Path(self.tmp.name) / "rollout-other.jsonl"
+        other.write_text("\n".join(map(json.dumps, (lines[0], *atoms[:2]))) + "\n")
+        codex.import_codex_file(self.con, str(other))
+        result = self.run_diagnose("--session", f"codex:{sid}")
+        timeline = result["context_growth"][0]["timeline"]
+        readings = {point["response_id"]: point["input_tokens"] for point in timeline}
+        self.assertEqual(readings, {"codex:resp-mini-001": None, "codex:resp-mini-002": 2000})
+        self.assertIsNone(result["cache_observations"][0]["cached_input_share"])
+
     def test_codex_unindexed_atom_keeps_same_source_compaction_order(self):
         lines = [json.loads(line) for line in Path(fixture("codex-mini.jsonl")).read_text().splitlines()]
         valid = next(row for row in lines if row["type"] == "token_usage_record")

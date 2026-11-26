@@ -299,13 +299,13 @@ def _reconcile(con, rid, refreshing):
 
 
 def unmeasured_locations(con, session_key):
-    """Identified native atoms with unusable measurements and no usage row."""
+    """Identified native atoms without a usage row in this session."""
     if db._has_table(con, "codex_atomic_observations"):
         yield from con.execute(
             "SELECT o.response_id,o.source_id,NULLIF(o.position,-1) AS ordinal_num,o.ts,"
             " CASE WHEN o.input_id<>'' THEN 'codex:'||o.input_id END AS turn_id"
             " FROM codex_atomic_observations o JOIN sources s ON s.id=o.source_id"
-            " WHERE o.session_key=? AND o.measurement='' AND NOT EXISTS (SELECT 1 FROM responses r"
+            " WHERE o.session_key=? AND NOT EXISTS (SELECT 1 FROM responses r"
             " WHERE r.session_key=o.session_key AND r.response_id=o.response_id)"
             " ORDER BY s.path,o.position", (session_key,))
 
