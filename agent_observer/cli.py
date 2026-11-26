@@ -1340,6 +1340,8 @@ def _print_diagnose_usage(payload):
               f"cached input share {percent}, "
               f"creation {known(item['cache_write_input_tokens'])} vs "
               f"reads {known(item['cached_input_tokens'])} tokens")
+        if item["unlocated_usage_sessions"]:
+            print(f"  Usage could not be located in {item['unlocated_usage_sessions']} sessions.")
 
 
 def _publish(con, ns) -> int:

@@ -17,7 +17,7 @@ import statistics
 from collections import defaultdict
 from itertools import chain
 
-from . import codex_order
+from . import codex_order, db
 from .adapters import claude, codex, codex_atomic, opencode
 
 TEST_COMMAND_RE = re.compile(
@@ -532,10 +532,10 @@ def _context_input(response):
     return None
 
 
-def _cache_observation(harness, semantics, rows):
+def _cache_observation(harness, semantics, rows, unlocated_sessions):
     def total(counter):
         values = [row[counter] for row in rows]
-        return sum(values) if values and None not in values else None
+        return sum(values) if values and not unlocated_sessions and None not in values else None
 
     reads = total("cached_input_tokens")
     writes = total("cache_write_input_tokens")
@@ -546,6 +546,7 @@ def _cache_observation(harness, semantics, rows):
         for row, size in zip(rows, inputs))
     input_total = sum(inputs) if valid else None
     return {"harness": harness, "semantics": semantics, "responses": len(rows),
+            "unlocated_usage_sessions": unlocated_sessions,
             "cached_input_tokens": reads, "cache_write_input_tokens": writes,
             "cached_input_share": reads / input_total if input_total else None}
 
@@ -635,6 +636,7 @@ def _diagnose_usage(con, sessions, since, until):
         bounds.append(until)
     context = []
     cache = defaultdict(list)
+    unlocated = defaultdict(int)
     for session in sorted(sessions, key=lambda row: row["session_key"]):
         key, harness = session["session_key"], session["harness"]
         args = (key, *bounds)
@@ -645,15 +647,27 @@ def _diagnose_usage(con, sessions, since, until):
             " FROM responses WHERE session_key=? AND is_overlap=0", (key,))
         disputes = set()
         gaps = ()
+        incomplete_semantics = None
         if harness == "codex":
-            conflicts, _, _ = codex_atomic.disputes(con, key, codex.SEMANTICS)
+            conflicts, incomplete, _ = codex_atomic.disputes(con, key, codex.SEMANTICS)
             disputes.update(conflicts)
             gaps = _unmeasured_rows(codex_atomic.unmeasured_locations(con, key), harness, codex.SEMANTICS)
+            if incomplete:
+                incomplete_semantics = codex.SEMANTICS
         elif harness == "claude":
             disputes = claude.conflicting_final_measurements(con, key)
             gaps = _unmeasured_rows(claude.unmeasured_final_locations(con, key), harness, claude.SEMANTICS)
+            if db._has_table(con, "claude_unreadable_sources") and con.execute(
+                    "SELECT 1 FROM claude_unreadable_sources WHERE session_key=? LIMIT 1", (key,)).fetchone():
+                incomplete_semantics = claude.SEMANTICS
         elif harness == "opencode":
             responses = _opencode_context_rows(con, key, responses)
+            if opencode.has_unlocated_usage_error(con, key):
+                incomplete_semantics = opencode.SEMANTICS
+        if incomplete_semantics:
+            group = (harness, incomplete_semantics)
+            unlocated[group] += 1
+            cache.setdefault(group, [])
         for row in chain(responses, gaps):
             ts = row["ts"]
             if ts is not None and (since is not None and ts < since
@@ -683,7 +697,7 @@ def _diagnose_usage(con, sessions, since, until):
     measured = {harness for harness, _ in cache}
     for harness in {row["harness"] for row in sessions} - measured:
         cache[harness, None] = []
-    observations = [_cache_observation(harness, semantics, cache[harness, semantics])
+    observations = [_cache_observation(harness, semantics, cache[harness, semantics], unlocated[harness, semantics])
                     for harness, semantics in sorted(cache, key=lambda group: (group[0], group[1] or ""))]
     return context, observations
 

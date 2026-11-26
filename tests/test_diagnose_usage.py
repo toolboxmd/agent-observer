@@ -318,3 +318,24 @@ class DiagnoseUsageTest(LedgerCase):
                 self.assertEqual(cache["responses"], 1)
                 self.assertIsNone(cache["cached_input_tokens"])
                 self.assertIsNone(cache["cached_input_share"])
+
+    def test_opencode_unlocated_usage_qualifies_cache_without_removing_measurement(self):
+        path = str(Path(self.tmp.name) / "unlocated.db")
+        build_native(path)
+        with contextlib.closing(sqlite3.connect(path)) as native:
+            native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                           ("unlocated", None, "/fixture", "Gap", "1", None,
+                            "build", T0, T0 + 1000, None))
+            data = _msg("assistant", T0 + 20, T0 + 30, _tokens(0, 1, 0, 40, 0))
+            native.executemany("INSERT INTO message VALUES(?,'unlocated',?,?,?)",
+                               [("measured", T0 + 20, T0 + 30, data),
+                                ("", T0 + 20, T0 + 30, data)])
+            native.commit()
+        opencode.sync(self.con, source=path)
+        result = self.run_diagnose("--session", "opencode:unlocated")
+        point, = result["context_growth"][0]["timeline"]
+        self.assertEqual(point["input_tokens"], 40)
+        cache, = result["cache_observations"]
+        self.assertEqual(cache["responses"], 1)
+        self.assertIsNone(cache["cached_input_share"])
+        self.assertEqual(cache["unlocated_usage_sessions"], 1)
