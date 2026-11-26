@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import sqlite3
 from collections import defaultdict
 
 from .. import db, lookup, native_response
@@ -67,14 +68,28 @@ def source_columns(con, table):
     return refs | {c[1] for c in con.execute(f'PRAGMA table_info("{table}")') if c[1] == "source_id"}
 
 
-def _source_keyed(con, table, column):
-    """Whether a row's identity includes its source, so a replay rewrites it."""
+class UnclassifiedTable(sqlite3.DatabaseError):
+    """A table names a source but has no key that says how to fold its rows."""
+
+
+def _fold_action(con, table, column):
+    """How a folded source's rows in ``table`` are handed to the adopted row.
+
+    A row whose primary or unique key includes the source column belongs to
+    that source's import and is deleted: the replay writes it again. A row
+    with a key of its own is re-pointed. A table with no primary or unique key
+    cannot be classified, so the fold stops instead of guessing: deleting
+    could lose rows the replay never writes again, and re-pointing could
+    duplicate rows it does.
+    """
     keys = [[c[1] for c in sorted(con.execute(f'PRAGMA table_info("{table}")'), key=lambda c: c[5]) if c[5]]]
     for index in con.execute(f'PRAGMA index_list("{table}")'):
         if index[2]:
             keys.append([c[2] for c in con.execute(f'PRAGMA index_info("{index[1]}")')])
     keys = [k for k in keys if k]
-    return not keys or any(column in k for k in keys)
+    if not keys:
+        raise UnclassifiedTable(f"cannot fold {table}.{column}: the table has no primary or unique key")
+    return "delete" if any(column in k for k in keys) else "repoint"
 
 
 def adopt_moved_source(con, path):
@@ -91,14 +106,21 @@ def adopt_moved_source(con, path):
     versions is not adopted.
 
     A released version may already have imported the new path as its own
-    source. That source is removed: rows whose key includes it are deleted
-    because the replay rewrites them, and other rows are handed to the adopted
-    row, keyed by the schema so a later table is covered too. Three things
-    cannot return to the in-place state. Its AUTOINCREMENT event and
-    import-error ids are never reused, so ``event show`` and trace ids stay
-    stable. Rows only it added stay with the adopted row, since assignments,
-    delegations and intervention evidence may reference them. Session-keyed
-    rows without a source column stay, since nothing names their writer.
+    source. That source is folded into the adopted row by the schema (see
+    ``_fold_action``) and removed, and its Codex import errors at the new path
+    are dropped for the replay to record again. Four things cannot return to
+    the in-place state, so they stay as the separate import left them:
+
+    - Its AUTOINCREMENT event and import-error ids are never reused, so
+      ``event show`` and trace ids stay stable.
+    - Rows only it added stay with the adopted row, since assignments,
+      delegations and intervention evidence reference user messages.
+    - Session-keyed rows without a source column stay, since nothing names
+      their writer.
+    - Checkout diagnostics it captured for events the older import lacked
+      stay. The replay cannot capture them again, because the records are
+      not new, and checkout diagnostics cannot grant ownership
+      (``placement.read_placements``).
     """
     full = os.path.abspath(path)
     if not any(part in full for part in ("/sessions/", "/archived_sessions/")):
@@ -118,23 +140,21 @@ def adopt_moved_source(con, path):
         return None
     kept, old_path = matches[0]["id"], matches[0]["path"]
     current = con.execute("SELECT id FROM sources WHERE harness='codex' AND path=?", (path,)).fetchone()
-    tables = [t for t, in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name!='sources' "
-                                      "AND name NOT LIKE 'sqlite_%'")]
     if current is not None:
         gone = current[0]
-        for table in tables:
-            for column in source_columns(con, table):
-                if _source_keyed(con, table, column):
-                    con.execute(f'DELETE FROM "{table}" WHERE "{column}"=?', (gone,))
-                else:
-                    con.execute(f'UPDATE "{table}" SET "{column}"=? WHERE "{column}"=?', (kept, gone))
-        for table in tables:
-            if "source_path" in {c[1] for c in con.execute(f'PRAGMA table_info("{table}")')}:
-                con.execute(f'DELETE FROM "{table}" WHERE source_path=?', (path,))
+        tables = [t for t, in con.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                                          "AND name!='sources' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        # Classify every table before the first write.
+        plan = [(table, column, _fold_action(con, table, column))
+                for table in tables for column in sorted(source_columns(con, table))]
+        for table, column, action in plan:
+            if action == "delete":
+                con.execute(f'DELETE FROM "{table}" WHERE "{column}"=?', (gone,))
+            else:
+                con.execute(f'UPDATE "{table}" SET "{column}"=? WHERE "{column}"=?', (kept, gone))
+        con.execute("DELETE FROM import_errors WHERE harness='codex' AND source_path=?", (path,))
         con.execute("DELETE FROM sources WHERE id=?", (gone,))
-    for table in tables:
-        if "source_path" in {c[1] for c in con.execute(f'PRAGMA table_info("{table}")')}:
-            con.execute(f'UPDATE "{table}" SET source_path=? WHERE source_path=?', (path, old_path))
+    con.execute("UPDATE import_errors SET source_path=? WHERE harness='codex' AND source_path=?", (path, old_path))
     con.execute("UPDATE sources SET path=? WHERE id=?", (path, kept))
     return kept
 

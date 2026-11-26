@@ -337,7 +337,7 @@ class Ledger:
         return next(json.loads(row) for row in (path or self.original).read_text().splitlines()
                     if f'"{rid}"' in row and '"token_usage_record"' in row)
 
-    def snapshot(self, released=False):
+    def snapshot(self, released=False, where=None):
         """Every table, with source ids and moved paths written as what they stand for.
 
         ``released`` compares a ledger a released sync touched first. Its
@@ -379,7 +379,10 @@ class Ledger:
                                        "AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall():
             refs = source_columns(self.con, table)
             rows = []
-            for row in self.con.execute(f'SELECT * FROM "{table}"'):
+            if where is not None and table not in where:
+                continue
+            condition, params = where[table] if where is not None else ("1", ())
+            for row in self.con.execute(f'SELECT * FROM "{table}" WHERE {condition}', params):
                 item = {}
                 for key in row.keys():
                     if key in IGNORED or (table == "sources" and key == "id"):
@@ -448,13 +451,49 @@ class Ledger:
 
         def stop(con, harness, path, *args, **kwargs):
             if os.path.basename(path) == self.original.name:
-                taken.append({False: self.snapshot(False), True: self.snapshot(True)})
+                taken.append({False: self.snapshot(False), True: self.snapshot(True),
+                              "owned": self.snapshot(True, where=self.owned_rows(path))})
                 raise OSError("stopped before the replay")
             return real(con, harness, path, *args, **kwargs)
 
         with self.homes(), patch.object(codex, "JsonlSource", side_effect=stop):
             codex.sync(self.con)
         return taken[0]
+
+    def owned_rows(self, path):
+        """Per table, the rows the source at ``path`` owns directly or through a
+        chain of foreign-key parents, as SQL conditions."""
+        source = self.con.execute("SELECT id FROM sources WHERE path=?", (str(path),)).fetchone()
+        if source is None:
+            return {}
+        tables = [t for t, in self.con.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                                               "AND name NOT LIKE 'sqlite_%'")]
+        owned = {}
+        for table in tables:
+            refs = sorted(source_columns(self.con, table))
+            if refs:
+                owned[table] = ("(" + " OR ".join(f'"{c}"=?' for c in refs) + ")", (source[0],) * len(refs))
+        for _ in range(len(tables)):
+            grown = dict(owned)
+            for table in tables:
+                links = {}
+                for fk in self.con.execute(f'PRAGMA foreign_key_list("{table}")'):
+                    links.setdefault((fk[0], fk[2]), []).append((fk[3], fk[4]))
+                for (_, parent), pairs in links.items():
+                    if parent == "sources" or parent not in owned:
+                        continue
+                    targets = [to or c[1] for (_, to), c in zip(pairs, [
+                        c for c in self.con.execute(f'PRAGMA table_info("{parent}")') if c[5]] or [(0, "rowid")])]
+                    clause = (f'({",".join(chr(34) + c + chr(34) for c, _ in pairs)}) IN '
+                              f'(SELECT {",".join(chr(34) + t + chr(34) for t in targets)} FROM "{parent}" '
+                              f'WHERE {owned[parent][0]})')
+                    mine = grown.get(table, ("0", ()))
+                    if clause not in mine[0]:
+                        grown[table] = (f"({mine[0]} OR {clause})", mine[1] + owned[parent][1])
+            if grown == owned:
+                break
+            owned = grown
+        return owned
 
     def kinds(self):
         """For each table: its source columns, or "session" for a session-keyed table without one."""
@@ -485,8 +524,12 @@ class MoveEqualsInPlaceReplayTest(unittest.TestCase):
         built.con.commit()
         if order != "in place":
             built.original.rename(built.archived)
+        built.folded_events = set()
         if order == "moved after a released sync":
             built.sync(adopt=False)
+            built.folded_events = {f"event {r[0]} {r[1]} {r[2]}" for r in built.con.execute(
+                "SELECT e.session_key,e.family,e.native_id FROM events e JOIN sources s ON s.id=e.source_id "
+                "WHERE s.path=?", (str(built.archived),))}
         return built
 
     def assert_pair(self, arrange=lambda l: l.downgrade(), files=None, later=None, tail_only=False):
@@ -501,15 +544,18 @@ class MoveEqualsInPlaceReplayTest(unittest.TestCase):
         for order in ORDERS:
             for released in (False, True):
                 self.assertNotIn("<dangling", json.dumps(before[order][released]), order)
+        owned = before[ORDERS[2]]["owned"]
         with self.subTest(order=ORDERS[1], step="before replay"):
             self.assertEqual(before[ORDERS[1]][False], before["in place"][False])
         with self.subTest(order=ORDERS[2], step="before replay"):
-            self.assert_only_folded(before[ORDERS[2]][True], before["in place"][True], kinds)
+            self.assert_only_folded(before[ORDERS[2]][True], before["in place"][True], kinds, owned)
 
         steps = {order: [] for order in ORDERS}
         work = {order: [] for order in ORDERS}
+        folded = {}
         for order in ORDERS:
             built = self.ledger(files, order, arrange)
+            folded[order] = built.folded_events
             built.sync()
             steps[order].append(built.views())
             if later is not None:
@@ -531,28 +577,42 @@ class MoveEqualsInPlaceReplayTest(unittest.TestCase):
             steps[order].append(built.views())
             for view in steps[order]:
                 self.assertNotIn("<dangling", json.dumps(view), order)
+        self.kept_checkouts = 0
         for order in ORDERS[1:]:
             released = order == ORDERS[2]
             self.assertEqual(work[order], work["in place"], order)
             for step, (actual, expected) in enumerate(zip(steps[order], steps["in place"])):
+                actual = actual[released]
+                if released and "event_checkouts" in actual:
+                    actual = dict(actual, event_checkouts=self.without_folded_checkouts(
+                        actual.get("event_checkouts", []), expected[released].get("event_checkouts", []),
+                        folded[order]))
                 with self.subTest(order=order, step=step):
-                    self.assertEqual(actual[released], expected[released])
+                    self.assertEqual(actual, expected[released])
         return steps["moved"][-1][False]
+
+    def without_folded_checkouts(self, have, want, folded):
+        """Checkout diagnostics a separate archive import captured for events
+        the older import lacked stay: the replay cannot capture them again and
+        they cannot grant ownership. Only those rows are accepted."""
+        kept = [row for row in have if row not in want and row["event_id"] in folded]
+        self.kept_checkouts = max(self.kept_checkouts, len(kept))
+        return [row for row in have if row not in kept]
 
     moved = f"2026/09/10/{NAME}"
 
-    def assert_only_folded(self, actual, expected, kinds):
+    def assert_only_folded(self, actual, expected, kinds, owned):
         """Before the replay of a ledger a released sync touched first, the only
         rows beyond the in-place ledger are rows its separate archive import
-        wrote that either belong to the adopted source (user assignments,
-        delegations and intervention evidence may reference them) or sit in a
-        session-keyed table without a source column. Nothing is missing."""
+        wrote that either belong to the adopted source, directly or through a
+        chain of foreign-key parents (user assignments, delegations and
+        intervention evidence may reference them), or sit in a session-keyed
+        table without a source column. Nothing is missing."""
         for table in sorted(set(actual) | set(expected)):
             have, want = actual.get(table, []), expected.get(table, [])
             missing = [row for row in want if row not in have]
-            kind = kinds.get(table, set())
             extra = [row for row in have if row not in want
-                     and not (kind == "session" or (kind and any(row.get(c) == "<file>" for c in kind)))]
+                     and not (kinds.get(table) == "session" or row in owned.get(table, []))]
             self.assertEqual((missing, extra), ([], []), table)
 
     def test_all_counters_agree(self):
@@ -687,6 +747,26 @@ class MoveEqualsInPlaceReplayTest(unittest.TestCase):
             l.append(json.dumps(atom) + "\n", path)
         self.assert_pair(later=later)
 
+    def test_events_the_older_import_lacked(self):
+        def arrange(l):
+            l.downgrade()
+            for event, in l.con.execute("SELECT id FROM events ORDER BY id DESC LIMIT 3").fetchall():
+                l.con.execute("DELETE FROM event_checkouts WHERE event_id=?", (event,))
+                l.con.execute("DELETE FROM codex_occurrences WHERE row_kind='event' AND row_key=?", (str(event),))
+                l.con.execute("DELETE FROM events WHERE id=?", (event,))
+        self.assert_pair(arrange)
+        # The released import captured one checkout the replay cannot: exception 4.
+        self.assertEqual(self.kept_checkouts, 1)
+
+    def test_user_message_the_older_import_lacked(self):
+        def arrange(l):
+            l.downgrade()
+            message = "codex:msg-mini-sub-02"
+            l.con.execute("DELETE FROM intervention_prompt_evidence WHERE native_id=?", (message,))
+            l.con.execute("DELETE FROM codex_occurrences WHERE row_kind='user' AND row_key=?", (message,))
+            l.con.execute("DELETE FROM user_messages WHERE native_id=?", (message,))
+        self.assert_pair(arrange)
+
     def test_fallback_only_session(self):
         self.moved = "2026/09/12/rollout-2026-09-12T10-00-00-legacy.jsonl"
         self.assert_pair(files={self.moved: Path(fixture("codex-legacy-a.jsonl")).read_text()})
@@ -733,6 +813,49 @@ class FoldCoversEveryTableTest(unittest.TestCase):
         self.assertNotEqual(kept, archive)
         self.assertEqual(list(map(tuple, built.con.execute("SELECT source_id FROM later_rows"))), [(kept,)])
         self.assertEqual(built.con.execute("SELECT COUNT(*) FROM later_snapshots").fetchone()[0], 0)
+
+
+class FoldGuardTest(unittest.TestCase):
+    def released(self):
+        built = Ledger({f"2026/09/10/{NAME}": Path(fixture("codex-mini.jsonl")).read_text()}, f"2026/09/10/{NAME}")
+        self.addCleanup(built.close)
+        built.sync()
+        built.downgrade()
+        built.con.commit()
+        return built
+
+    def test_a_keyless_table_naming_a_source_stops_the_fold(self):
+        built = self.released()
+        built.con.execute("CREATE TABLE later_log (source_id INTEGER REFERENCES sources(id), note TEXT)")
+        built.con.commit()
+        built.original.rename(built.archived)
+        built.sync(adopt=False)
+        built.con.execute("INSERT INTO later_log VALUES(?, 'written by the released import')",
+                          (built.source(built.archived),))
+        built.con.commit()
+        before = list(built.con.iterdump())
+        totals = built.sync()
+        self.assertEqual([(f["path"], f["error"]) for f in totals["failed"]],
+                         [(str(built.archived), "cannot fold later_log.source_id: the table has no primary or unique key")])
+        self.assertEqual(list(built.con.iterdump()), before)
+
+    def test_only_codex_import_errors_follow_the_path(self):
+        built = self.released()
+        built.con.execute("CREATE TABLE other_adapter (id INTEGER PRIMARY KEY, source_path TEXT)")
+        for path in (built.original, built.archived):
+            built.con.execute("INSERT INTO other_adapter(source_path) VALUES(?)", (str(path),))
+            built.con.execute("INSERT INTO import_errors(harness,source_path,ordinal_num,error,line_excerpt,created_at)"
+                              " VALUES('claude',?,1,'other harness','',0)", (str(path),))
+        built.con.commit()
+        untouched = ("SELECT source_path FROM other_adapter UNION ALL "
+                     "SELECT source_path FROM import_errors WHERE harness='claude' ORDER BY 1")
+        expected = built.con.execute(untouched).fetchall()
+        older = built.source()
+        built.original.rename(built.archived)
+        built.sync(adopt=False)
+        built.sync()
+        self.assertEqual(built.source(built.archived), older)  # The older row was adopted.
+        self.assertEqual(built.con.execute(untouched).fetchall(), expected)
 
 
 class AdoptionIsOneTransactionTest(unittest.TestCase):
