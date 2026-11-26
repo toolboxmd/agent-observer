@@ -341,7 +341,13 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertEqual(cache["unlocated_usage_sessions"], 1)
 
     def test_grok_quarantined_usage_qualifies_cache_without_removing_measurement(self):
-        sid = "01fixture3-cccc-4b5c-8d6e-000000000003"
+        cases = (("malformed", "400", 400), (None, 400, 400), ("measured", 500, None))
+        for index, (prompt, tokens, expected) in enumerate(cases, 1):
+            with self.subTest(prompt=prompt, tokens=tokens):
+                self.check_grok_quarantine(index, prompt, tokens, expected)
+
+    def check_grok_quarantine(self, index, prompt, tokens, expected):
+        sid = f"01fixture3-cccc-4b5c-8d6e-{index:012d}"
         source = Path(self.tmp.name) / sid
         source.mkdir()
         (source / "summary.json").write_text(json.dumps({
@@ -349,18 +355,18 @@ class DiagnoseUsageTest(LedgerCase):
             "created_at": "2026-09-01T15:00:00Z"}))
         (source / "events.jsonl").touch()
         records = []
-        for prompt, tokens in (("measured", 400), ("malformed", "400")):
+        for prompt_id, input_tokens in (("measured", 400), (prompt, tokens)):
             records.append({"timestamp": 1788807100, "method": "_x.ai/session/update",
                             "params": {"sessionId": sid, "update": {
-                                "sessionUpdate": "turn_completed", "prompt_id": prompt,
-                                "usage": {"inputTokens": tokens, "outputTokens": 40,
-                                          "totalTokens": 440, "cachedReadTokens": 300,
+                                "sessionUpdate": "turn_completed", "prompt_id": prompt_id,
+                                "usage": {"inputTokens": input_tokens, "outputTokens": 40,
+                                          "totalTokens": int(input_tokens) + 40, "cachedReadTokens": 300,
                                           "cacheCreationTokens": 5}}}})
         (source / "updates.jsonl").write_text("\n".join(map(json.dumps, records)) + "\n")
         grok.import_grok_session(self.con, str(source))
         result = self.run_diagnose("--session", f"grok:{sid}")
         point, = result["context_growth"][0]["timeline"]
-        self.assertEqual(point["input_tokens"], 400)
+        self.assertEqual(point["input_tokens"], expected)
         cache, = result["cache_observations"]
         self.assertEqual(cache["responses"], 1)
         self.assertIsNone(cache["cached_input_share"])

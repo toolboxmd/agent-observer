@@ -203,6 +203,8 @@ include cached input in their input counter. Claude Code and OpenCode
 report fresh input, cache reads, and cache creation separately. The report
 shows cache creation and reads side by side. Missing counters and shares
 with an unavailable or zero denominator display as unknown (`null` in JSON).
+When Grok records a counter conflict without identifying the affected
+response, input measurements for that session stay unknown.
 
 Comparisons are observational: groups differ in period, projects and task
 mix, so differences are leads to inspect, not causal effects. Detector

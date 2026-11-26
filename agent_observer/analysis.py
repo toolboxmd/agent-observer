@@ -648,6 +648,7 @@ def _diagnose_usage(con, sessions, since, until):
         disputes = set()
         gaps = ()
         incomplete_semantics = None
+        session_usage_disputed = False
         if harness == "codex":
             conflicts, incomplete, _ = codex_atomic.disputes(con, key, codex.SEMANTICS)
             disputes.update(conflicts)
@@ -664,8 +665,11 @@ def _diagnose_usage(con, sessions, since, until):
             responses = _opencode_context_rows(con, key, responses)
             if opencode.has_unlocated_usage_error(con, key):
                 incomplete_semantics = opencode.SEMANTICS
-        elif harness == "grok" and grok.has_unlocated_usage_error(con, session["native_id"]):
-            incomplete_semantics = grok.SEMANTICS
+        elif harness == "grok":
+            quarantine = grok.usage_quarantine(con, session["native_id"])
+            if quarantine:
+                incomplete_semantics = grok.SEMANTICS
+                session_usage_disputed = "usage_conflict" in quarantine
         if incomplete_semantics:
             group = (harness, incomplete_semantics)
             unlocated[group] += 1
@@ -677,6 +681,9 @@ def _diagnose_usage(con, sessions, since, until):
                 continue
             if row["response_id"] in disputes:
                 row = dict(row, turn_id=None, input_tokens=None, cached_input_tokens=None,
+                           cache_write_input_tokens=None)
+            elif session_usage_disputed:
+                row = dict(row, input_tokens=None, cached_input_tokens=None,
                            cache_write_input_tokens=None)
             cache_row = row
             if ts is None and bounds:
