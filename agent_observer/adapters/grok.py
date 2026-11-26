@@ -3148,6 +3148,15 @@ def _record_prompt_bridges(r, src, records):
                       ((r.session_key, pid, ref, src.source_id) for pid, ref in witnesses))
 
 
+def has_unlocated_usage_error(con, native_session_id):
+    """Usage quarantine locates a source but does not retain the prompt ID."""
+    return con.execute(
+        "SELECT 1 FROM sources s JOIN import_errors e"
+        " ON e.harness=s.harness AND e.source_path=s.path"
+        " WHERE s.harness=? AND s.session_id=? AND e.error IN ('malformed_usage','usage_conflict')"
+        " LIMIT 1", (HARNESS, native_session_id)).fetchone() is not None
+
+
 def response_witnesses(con, session_key):
     if not db._has_table(con, "grok_prompt_bridges"):
         return {}, set(), set()

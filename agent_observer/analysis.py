@@ -18,7 +18,7 @@ from collections import defaultdict
 from itertools import chain
 
 from . import codex_order, db
-from .adapters import claude, codex, codex_atomic, opencode
+from .adapters import claude, codex, codex_atomic, grok, opencode
 
 TEST_COMMAND_RE = re.compile(
     r"(\bpytest\b|\bunittest\b|scripts/test\.py|\bnpm (run )?test\b|\bpnpm (run )?test\b"
@@ -664,6 +664,8 @@ def _diagnose_usage(con, sessions, since, until):
             responses = _opencode_context_rows(con, key, responses)
             if opencode.has_unlocated_usage_error(con, key):
                 incomplete_semantics = opencode.SEMANTICS
+        elif harness == "grok" and grok.has_unlocated_usage_error(con, session["native_id"]):
+            incomplete_semantics = grok.SEMANTICS
         if incomplete_semantics:
             group = (harness, incomplete_semantics)
             unlocated[group] += 1

@@ -8,7 +8,7 @@ import sqlite3
 from pathlib import Path
 
 from agent_observer import cli, db, native_response
-from agent_observer.adapters import claude, codex, opencode
+from agent_observer.adapters import claude, codex, grok, opencode
 from tests.helpers import LedgerCase, fixture
 from tests.test_opencode import T0, _msg, _tokens, build_native
 
@@ -338,4 +338,32 @@ class DiagnoseUsageTest(LedgerCase):
         cache, = result["cache_observations"]
         self.assertEqual(cache["responses"], 1)
         self.assertIsNone(cache["cached_input_share"])
+        self.assertEqual(cache["unlocated_usage_sessions"], 1)
+
+    def test_grok_quarantined_usage_qualifies_cache_without_removing_measurement(self):
+        sid = "01fixture3-cccc-4b5c-8d6e-000000000003"
+        source = Path(self.tmp.name) / sid
+        source.mkdir()
+        (source / "summary.json").write_text(json.dumps({
+            "info": {"id": sid, "cwd": "/fixture"},
+            "created_at": "2026-09-01T15:00:00Z"}))
+        (source / "events.jsonl").touch()
+        records = []
+        for prompt, tokens in (("measured", 400), ("malformed", "400")):
+            records.append({"timestamp": 1788807100, "method": "_x.ai/session/update",
+                            "params": {"sessionId": sid, "update": {
+                                "sessionUpdate": "turn_completed", "prompt_id": prompt,
+                                "usage": {"inputTokens": tokens, "outputTokens": 40,
+                                          "totalTokens": 440, "cachedReadTokens": 300,
+                                          "cacheCreationTokens": 5}}}})
+        (source / "updates.jsonl").write_text("\n".join(map(json.dumps, records)) + "\n")
+        grok.import_grok_session(self.con, str(source))
+        result = self.run_diagnose("--session", f"grok:{sid}")
+        point, = result["context_growth"][0]["timeline"]
+        self.assertEqual(point["input_tokens"], 400)
+        cache, = result["cache_observations"]
+        self.assertEqual(cache["responses"], 1)
+        self.assertIsNone(cache["cached_input_share"])
+        self.assertIsNone(cache["cached_input_tokens"])
+        self.assertIsNone(cache["cache_write_input_tokens"])
         self.assertEqual(cache["unlocated_usage_sessions"], 1)
