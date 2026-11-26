@@ -356,7 +356,9 @@ def import_claude_file(con: sqlite3.Connection, path: str,
     src = JsonlSource(con, HARNESS, path, full=full)
     prior_usage = src.row["claude_usage_version"]
     streaming_locations = set()
-    if prior_usage in (18, 19) and src.unchanged and db._has_table(con, "claude_response_ancestry"):
+    # An appended source still has a trustworthy historical prefix.
+    if (prior_usage in (18, 19) and (src.unchanged or src.incremental)
+            and db._has_table(con, "claude_response_ancestry")):
         streaming_locations = {rid for rid, in con.execute(
             "SELECT DISTINCT a.response_id FROM claude_response_ancestry a"
             " JOIN responses r USING(session_key,response_id)"

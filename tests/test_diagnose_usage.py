@@ -427,6 +427,8 @@ class DiagnoseUsageTest(LedgerCase):
             self.assertEqual(self.con.execute(
                 "SELECT cached_input_tokens FROM responses WHERE response_id='claude:copy-response'"
             ).fetchone()[0], 80)
+            with final.open("a") as log:
+                log.write(json.dumps({"type": "pr-link", "sessionId": session}) + "\n")
             self.assertGreater(claude.import_claude_file(self.con, str(final))["lines"], 0)
             self.assertEqual(claude.import_claude_file(self.con, str(final))["lines"], 0)
             self.assertEqual(self.run_diagnose("--session", f"claude:{session}"), result)
