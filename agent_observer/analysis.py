@@ -15,6 +15,7 @@ import re
 import sqlite3
 import statistics
 from collections import defaultdict
+from itertools import chain
 
 from . import codex_order
 from .adapters import claude, codex, codex_atomic, opencode
@@ -596,6 +597,17 @@ def _opencode_context_rows(con, key, measured):
         yield unknown_row(row)
 
 
+def _unmeasured_rows(locations, harness, semantics):
+    identities = set()
+    for row in locations:
+        rid = row["response_id"]
+        if rid in identities:
+            continue
+        identities.add(rid)
+        yield dict(row, harness=harness, semantics=semantics, input_tokens=None,
+                   cached_input_tokens=None, cache_write_input_tokens=None)
+
+
 def _diagnose_usage(con, sessions, since, until):
     window = ""
     bounds = []
@@ -616,14 +628,17 @@ def _diagnose_usage(con, sessions, since, until):
             " input_tokens, cached_input_tokens, cache_write_input_tokens"
             " FROM responses WHERE session_key=? AND is_overlap=0", (key,))
         disputes = set()
+        gaps = ()
         if harness == "codex":
             conflicts, _, _ = codex_atomic.disputes(con, key, codex.SEMANTICS)
             disputes.update(conflicts)
+            gaps = _unmeasured_rows(codex_atomic.unmeasured_locations(con, key), harness, codex.SEMANTICS)
         elif harness == "claude":
             disputes = claude.conflicting_final_measurements(con, key)
+            gaps = _unmeasured_rows(claude.unmeasured_final_locations(con, key), harness, claude.SEMANTICS)
         elif harness == "opencode":
             responses = _opencode_context_rows(con, key, responses)
-        for row in responses:
+        for row in chain(responses, gaps):
             ts = row["ts"]
             if (since is not None and (ts is None or ts < since)
                     or until is not None and (ts is None or ts >= until)):

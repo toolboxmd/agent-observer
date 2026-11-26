@@ -129,12 +129,18 @@ class DiagnoseUsageTest(LedgerCase):
         self.sync("codex-mini.jsonl")
         atom["payload"]["usage"]["input_tokens"] += 7
         copy = Path(self.tmp.name) / "rollout-copy.jsonl"
-        copy.write_text(lines[0] + "\n" + json.dumps(atom) + "\n")
+        missing = json.loads(json.dumps(atom))
+        missing["payload"]["response_id"] = "missing-usage"
+        missing["payload"]["usage"] = {"input_tokens": -1}
+        copy.write_text("\n".join((lines[0], json.dumps(atom), json.dumps(missing))) + "\n")
         codex.import_codex_file(self.con, str(copy))
         result = self.run_diagnose("--harness", "codex")
         timeline = result["context_growth"][0]["timeline"]
         disputed = next(p for p in timeline if p.get("response_id") == "codex:resp-mini-001")
         self.assertIsNone(disputed["input_tokens"])
+        gap = next((p for p in timeline if p.get("response_id") == "codex:missing-usage"), None)
+        self.assertIsNotNone(gap)
+        self.assertIsNone(gap["input_tokens"])
         self.assertTrue(any(p.get("input_tokens") for p in timeline))
         native = next(group for group in result["cache_observations"] if
                       group["semantics"] == codex.SEMANTICS)
@@ -163,6 +169,30 @@ class DiagnoseUsageTest(LedgerCase):
                 cache, = result["cache_observations"]
                 self.assertIsNone(cache["cached_input_tokens"])
                 self.assertIsNone(cache["cached_input_share"])
+
+    def test_claude_final_without_usage_has_a_sourced_unknown_sample(self):
+        session = "claude-missing-final"
+        records = []
+        for index in (1, 2):
+            records.append({"type": "assistant", "sessionId": session, "uuid": f"block-{index}",
+                            "timestamp": f"2026-10-01T12:00:0{index}Z", "message": {
+                                "id": f"final-{index}", "model": "synthetic-model",
+                                "stop_reason": "end_turn", "content": []}})
+        records[0]["message"]["usage"] = {"input_tokens": 20, "output_tokens": 5,
+                                           "cache_creation_input_tokens": 0,
+                                           "cache_read_input_tokens": 80}
+        log = Path(self.tmp.name) / f"{session}.jsonl"
+        log.write_text("\n".join(map(json.dumps, records)) + "\n")
+        claude.import_claude_file(self.con, str(log))
+        result = self.run_diagnose("--session", f"claude:{session}")
+        timeline = result["context_growth"][0]["timeline"]
+        self.assertEqual([p["response_id"] for p in timeline], ["claude:final-1", "claude:final-2"])
+        self.assertEqual([p["input_tokens"] for p in timeline], [100, None])
+        self.assertIsNotNone(timeline[1]["source_id"])
+        self.assertIsNone(timeline[1]["ordinal_num"])
+        cache, = result["cache_observations"]
+        self.assertEqual(cache["responses"], 2)
+        self.assertIsNone(cache["cached_input_share"])
 
     def test_opencode_import_surfaces_completed_response_without_counters(self):
         path = str(Path(self.tmp.name) / "opencode.db")

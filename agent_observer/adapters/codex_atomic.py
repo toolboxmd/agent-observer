@@ -298,6 +298,18 @@ def _reconcile(con, rid, refreshing):
             native_response.record(con, o["source_id"], o["session_key"], rid, o["input_id"])
 
 
+def unmeasured_locations(con, session_key):
+    """Identified native atoms with unusable measurements and no usage row."""
+    if db._has_table(con, "codex_atomic_observations"):
+        yield from con.execute(
+            "SELECT o.response_id,o.source_id,NULLIF(o.position,-1) AS ordinal_num,o.ts,"
+            " CASE WHEN o.input_id<>'' THEN 'codex:'||o.input_id END AS turn_id"
+            " FROM codex_atomic_observations o JOIN sources s ON s.id=o.source_id"
+            " WHERE o.session_key=? AND o.measurement='' AND NOT EXISTS (SELECT 1 FROM responses r"
+            " WHERE r.session_key=o.session_key AND r.response_id=o.response_id)"
+            " ORDER BY s.path,o.position", (session_key,))
+
+
 def disputes(con, session_key, semantics):
     """Only current agreeing source measurements can support positive ownership."""
     if "codex_context_version" not in {c[1] for c in con.execute("PRAGMA table_info(sources)")}:

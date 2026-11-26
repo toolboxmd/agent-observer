@@ -728,6 +728,18 @@ def _unsupported_projections(con, scope, args):
                        "AND o.response_id=r.response_id) AND (" + " OR ".join(gaps) + ")", args)
 
 
+def unmeasured_final_locations(con, session_key):
+    """Expected finals without a usage row, including source-only evidence."""
+    if db._has_table(con, "claude_expected_finals") and db._has_table(con, "claude_final_blocks"):
+        yield from con.execute(
+            "SELECT e.response_id,e.source_id,b.ordinal_num,b.ts,b.turn_id"
+            " FROM claude_expected_finals e JOIN sources s ON s.id=e.source_id"
+            " LEFT JOIN claude_final_blocks b USING(session_key,response_id,source_id)"
+            " WHERE e.session_key=? AND NOT EXISTS (SELECT 1 FROM responses r"
+            " WHERE r.session_key=e.session_key AND r.response_id=e.response_id)"
+            " ORDER BY b.ordinal_num IS NULL,s.path,b.ordinal_num", (session_key,))
+
+
 def conflicting_final_measurements(con, session_key):
     """A task can bill a final row only when its source measurements agree."""
     if not db._has_table(con, "claude_final_observations"):
