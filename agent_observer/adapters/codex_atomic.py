@@ -36,12 +36,17 @@ def _prefix_digest(path, size):
 
 
 def relocated_source(src):
-    """Find an incomplete ledger source whose verified archive is this rollout."""
+    """Find an earlier ledger source whose verified move is this rollout.
+
+    It is either an incomplete source or one an older parser imported before
+    atomic observations, which still owns responses this rollout must replay.
+    """
     path = os.path.abspath(src.path)
-    if (not any(part in path for part in ("/sessions/", "/archived_sessions/"))
-            or not db._has_table(src.con, "codex_incomplete_sources")):
+    if not any(part in path for part in ("/sessions/", "/archived_sessions/")):
         return None
-    matches = []
+    matches = _moved_before_atoms(src, path)
+    if not db._has_table(src.con, "codex_incomplete_sources"):
+        return matches[0] if len(matches) == 1 else None
     for row in src.con.execute("""SELECT s.*,i.* FROM codex_incomplete_sources i
             JOIN sources s ON s.id=i.source_id WHERE s.id!=? AND s.read_offset>0""", (src.source_id,)):
         if os.path.basename(row["path"]) != os.path.basename(path) or not row["tail_sha256"]:
@@ -59,6 +64,31 @@ def relocated_source(src):
             continue
         matches.append(row)
     return matches[0] if len(matches) == 1 else None
+
+
+def _moved_before_atoms(src, path):
+    # Before context version 8 an import recorded no atomic observation, so
+    # its responses keep that source until it is replayed. Once Codex moved
+    # the file, only this rollout can replay it. The recorded inode and the
+    # bytes before the read offset identify the move, never the name alone.
+    con = src.con
+    if db._has_table(con, "codex_atomic_observations") and (src.row["codex_context_version"] or 0) >= 8:
+        pending = ("EXISTS (SELECT 1 FROM codex_atomic_observations o WHERE o.source_id=? "
+                   "AND o.response_id=r.response_id AND o.session_key=r.session_key)", (src.source_id,))
+    else:
+        pending = ("1", ())  # This rollout has not recorded which responses it holds.
+    matches = []
+    for row in con.execute(f"""SELECT s.*,'codex:'||COALESCE(s.thread_id,s.session_id) AS session_key
+            FROM sources s WHERE s.harness='codex' AND s.ino=? AND s.id!=? AND s.read_offset>0
+            AND s.tail_sha256 IS NOT NULL AND COALESCE(s.codex_context_version,0)<8
+            AND EXISTS (SELECT 1 FROM responses r WHERE r.source_id=s.id AND {pending[0]})""",
+                           (src.ino, src.source_id, *pending[1])):
+        if os.path.basename(row["path"]) != os.path.basename(path):
+            continue
+        resolved = lookup.resolve_source(row)
+        if resolved["reason"] == "relocated" and os.path.abspath(resolved["path"]) == path:
+            matches.append(dict(row, before_atoms=True))
+    return matches
 
 
 def prepare(r):
@@ -111,6 +141,7 @@ def observe(r, obj, counters):
 def finish(r, predecessor):
     con, src = r.con, r.src
     incomplete = r.unreadable_atomic or src.incomplete_record or src.end_offset < src.size
+    refreshing = {src.source_id}
     if incomplete:
         legacy = (src.row["codex_context_version"] == 7 and con.execute(
             "SELECT 1 FROM import_errors WHERE harness='codex' AND source_path=? AND error='usage_conflict' LIMIT 1",
@@ -124,10 +155,12 @@ def finish(r, predecessor):
                     (src.source_id, r.session_key, legacy, replay, src.size, _prefix_digest(src.path, src.size)))
     else:
         if predecessor is not None and predecessor["session_key"] == r.session_key and (
-                predecessor.get("prefix_digest") or _historical_atoms_survive(con, predecessor["id"], src.source_id)):
+                predecessor.get("before_atoms") or predecessor.get("prefix_digest")
+                or _historical_atoms_survive(con, predecessor["id"], src.source_id)):
             # The archive was read from the start. Its source now owns the current
             # observations, including withdrawals. Keep the old raw ledger locators.
             old = predecessor["id"]
+            refreshing.add(old)
             r.atomic_ids.update(rid for rid, in con.execute(
                 "SELECT DISTINCT response_id FROM codex_atomic_observations WHERE source_id=?", (old,)))
             con.execute("DELETE FROM codex_atomic_observations WHERE source_id=?", (old,))
@@ -146,7 +179,7 @@ def finish(r, predecessor):
             con.execute("INSERT OR IGNORE INTO codex_atomic_observations SELECT * FROM prior_codex_atoms")
         con.execute("DROP TABLE temp.prior_codex_atoms")
     for rid in r.atomic_ids:
-        _reconcile(con, rid, src.source_id)
+        _reconcile(con, rid, refreshing)
 
 
 def _historical_atoms_survive(con, original, archive):
@@ -172,7 +205,7 @@ def _reconcile(con, rid, refreshing):
     if row is None or row["session_key"] != first["session_key"]:
         return
     source = next((o for o in copies if o["source_id"] == row["source_id"]), first)
-    if source["source_id"] != row["source_id"] and row["source_id"] != refreshing and (row["version"] or 0) < 8:
+    if source["source_id"] != row["source_id"] and row["source_id"] not in refreshing and (row["version"] or 0) < 8:
         return  # The original pre-upgrade source has not been replayed.
     measured = json.loads(source["measurement"])
     same_source = source["source_id"] == row["source_id"]

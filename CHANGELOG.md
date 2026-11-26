@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.7.1] - 2026-11-26
+
+### Changed
+
+- Archived Codex rollouts an older version imported reconcile their responses after one ordinary sync (#152)
+
 ## [1.7.0] - 2026-11-25
 
 ### Added
