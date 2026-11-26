@@ -448,8 +448,11 @@ def render(summary: dict, target: str | None = None) -> str:
     if purpose_evidence(native):
         lines.append(f"Outcome: {task_label}.")
         if native.get("coverage_gaps"):
-            lines.append("Full outcome cost unknown. Native coverage: " +
-                         _safe_field(report.gap_text(native).replace("_", " ")) + ".")
+            coverage = _safe_field(report.gap_text(native).replace("_", " "))
+            if (summary.get("total_cost") or {}).get("status") == "lower_bound":
+                lines.append("Estimated cost is a lower bound. Native coverage: " + coverage + ".")
+            else:
+                lines.append("Full outcome cost unknown. Native coverage: " + coverage + ".")
         if any((native.get("children_not_counted") or {}).values()):
             lines.append("Not counted: " + _safe_field(report.not_counted_text(native["children_not_counted"])) + ".")
         for pr in native["deliveries"]:

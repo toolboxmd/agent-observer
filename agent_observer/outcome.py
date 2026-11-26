@@ -441,6 +441,66 @@ def _turn_check(turn, responses, finalized, listed=None, compactions=None):
     return "reconciled"
 
 
+# The only `_turn_check` state that means a turn has no final usage.
+# Interrupted and failed turns with this state are a priced lower bound.
+# Cancelled turns and completed turns whose usageStatus is not complete
+# share the state and stay unknown.
+FINAL_USAGE_MISSING = "native_final_usage_missing"
+LOWER_BOUND_TURN_STATUSES = frozenset({"interrupted", "failed"})
+# No closure on that same turn means the harness wrote no final statement.
+LOWER_BOUND_GAPS = frozenset({FINAL_USAGE_MISSING, "usage_closure_missing"})
+
+
+def interrupted_turn_bound(con, native):
+    """(interrupted count, failed count) when those turns are the only coverage gaps.
+
+    Returns None when any other gap is present. `native_final_usage_missing`
+    is required and is not enough: the turn's recorded status must be
+    interrupted or failed.
+    """
+    if not native:
+        return None
+    gaps = set(native.get("coverage_gaps") or [])
+    if not gaps or not gaps <= LOWER_BOUND_GAPS or FINAL_USAGE_MISSING not in gaps:
+        return None
+    checks = native.get("turn_checks") or []
+    ids = [c["provider_turn_id"] for c in checks]
+    statuses = {}
+    if ids and _has_table(con, "t3_purpose_turns"):
+        statuses = {row[0]: row[1] for row in con.execute(
+            "SELECT provider_turn_id, status FROM t3_purpose_turns WHERE provider_turn_id IN ("
+            + ",".join("?" * len(ids)) + ")", ids)}
+    interrupted = failed = 0
+    seen = set()
+    for check in checks:
+        turn_id = check["provider_turn_id"]
+        state = check["status"]
+        closure = check["usage_closure"]
+        turn_gaps = set()
+        if state != "reconciled":
+            turn_gaps.add(state)
+        if closure == "missing":
+            turn_gaps.add("usage_closure_missing")
+        elif closure != "main_agent_only":
+            turn_gaps.add("usage_closure_open")
+        if not turn_gaps:
+            continue
+        status = statuses.get(turn_id)
+        if (state != FINAL_USAGE_MISSING or status not in LOWER_BOUND_TURN_STATUSES
+                or not turn_gaps <= LOWER_BOUND_GAPS):
+            return None
+        if turn_id in seen:
+            continue
+        seen.add(turn_id)
+        if status == "interrupted":
+            interrupted += 1
+        else:
+            failed += 1
+    if not seen:
+        return None
+    return interrupted, failed
+
+
 def _compactions(con, turn, closure):
     """The compactions a Codex rollout records for one provider turn.
 
