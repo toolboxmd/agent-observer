@@ -715,6 +715,11 @@ def check_inventory(con, native, rows):
         # can prove a run never ran; absence in the mirror proves nothing.
         run["never_ran"] = run.get("never_ran") == "proven" and not any(
             a["turns"] or a["unsupported_turns"] for a in attempts)
+        # A native operation on a driver Observer cannot read, tied to this run.
+        if _has_table(con, "t3_purpose_unsupported_operations") and con.execute(
+                "SELECT 1 FROM t3_purpose_unsupported_operations WHERE run_id=? LIMIT 1", (run_id,)).fetchone():
+            gaps.add("provider_unsupported", "runs", run_id)
+            main_gaps.add("provider_unsupported")
         if run["status"] not in TERMINAL:
             gaps.add("run_not_terminal", "runs", run_id)
         if not run["never_ran"] and run["active_attempt_id"] not in {a["attempt_id"] for a in attempts}:
@@ -727,8 +732,8 @@ def check_inventory(con, native, rows):
                     a["provider_turn_id"] is not None and a["provider_turn_id"] not in seen)):
                 gaps.add("expected_provider_turn_missing", "attempts", a["attempt_id"])
                 main_gaps.add("expected_provider_turn_missing")
-            for turn in a["unsupported_turns"]:
-                gaps.add("provider_unsupported", "turns", turn["provider_turn_id"])
+            if a["unsupported_turns"]:
+                gaps.add("provider_unsupported", "runs", run_id)
                 main_gaps.add("provider_unsupported")
             for turn in turns:
                 closure = _closure(turn)

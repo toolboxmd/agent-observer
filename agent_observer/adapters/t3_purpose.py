@@ -59,6 +59,9 @@ TABLES = {
     # A provider turn on a driver Observer cannot read: it joins no response.
     "unsupported_turns": """provider_turn_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, run_id TEXT NOT NULL,
         driver TEXT NOT NULL, status TEXT""",
+    # A native operation on such a driver, tied to the run that started it.
+    "unsupported_operations": """thread_id TEXT NOT NULL, owner_id TEXT NOT NULL, segment_id TEXT NOT NULL,
+        run_id TEXT NOT NULL, driver TEXT NOT NULL, PRIMARY KEY(thread_id,owner_id,segment_id)""",
     "rejects": """origin TEXT NOT NULL, table_name TEXT NOT NULL, reason TEXT NOT NULL, row_id TEXT,
         run_id TEXT, thread_id TEXT, task_id TEXT""",
 }
@@ -515,6 +518,11 @@ def _providers(snapshot, native, tables, runs, legacy, segments):
         for segment in map(_obj, _list(p.get("nativeOperations"))):
             if driver in DRIVERS:
                 segments.append((thread, pt, None, driver, segment))
+                continue
+            source = _source(segment.get("source"))
+            run = source.get("runId")
+            if source["type"] == "app_run" and run in runs and runs[run][0] == thread and _id(segment.get("id")):
+                snapshot.insert("unsupported_operations", thread, pt, segment["id"], run, driver)
             else:
                 snapshot.reject("segments", "unsupported_driver", segment.get("id"), thread=thread,
                                 purpose=segment.get("purpose"))
@@ -926,9 +934,17 @@ def _run_record(con):
         con.execute("DROP TABLE t3_seen_runs")
     con.execute("CREATE TABLE IF NOT EXISTS t3_seen_runs(source_path TEXT NOT NULL, run_id TEXT NOT NULL,"
                 " thread_id TEXT, class TEXT NOT NULL, task_id TEXT, PRIMARY KEY(source_path,run_id))")
-    if db._has_table(con, "t3_source_classes"):
-        con.execute("INSERT OR IGNORE INTO t3_seen_runs SELECT source_path,run_id,thread_id,class,task_id"
-                    " FROM t3_source_classes")
+    con.execute("CREATE INDEX IF NOT EXISTS t3_source_classes_run ON t3_source_classes(source_path,run_id)")
+    # Every run a source path mirrors has a current class, including paths
+    # this code has not refreshed yet (retained or rotated sources): their
+    # classes come from the runs they mirror.
+    con.execute("""INSERT INTO t3_source_classes SELECT r.source_path,r.run_id,r.thread_id,
+        CASE WHEN r.scope='single' AND r.task_id IS NOT NULL THEN 'task' WHEN r.scope='unscoped' THEN 'unscoped'
+        ELSE 'invalid' END, CASE WHEN r.scope='single' THEN r.task_id END FROM t3_source_runs r
+        WHERE NOT EXISTS (SELECT 1 FROM t3_source_classes c WHERE c.source_path=r.source_path
+        AND c.run_id=r.run_id)""")
+    con.execute("INSERT OR IGNORE INTO t3_seen_runs SELECT source_path,run_id,thread_id,class,task_id"
+                " FROM t3_source_classes")
     con.execute("""INSERT OR IGNORE INTO t3_seen_runs SELECT source_path,run_id,thread_id,
         CASE WHEN scope='single' AND task_id IS NOT NULL THEN 'task' WHEN scope='unscoped' THEN 'unscoped'
         ELSE 'invalid' END, CASE WHEN scope='single' THEN task_id END FROM t3_source_runs""")
@@ -945,7 +961,7 @@ def _heal_invalid_runs(con, path):
     """
     con.execute("""UPDATE t3_seen_runs AS s SET class=c.class, task_id=c.task_id
         FROM t3_source_classes c WHERE s.source_path=? AND c.source_path=s.source_path
-        AND c.run_id=s.run_id AND s.class='invalid' AND c.class<>'invalid'
+        AND c.run_id=s.run_id AND s.class='invalid' AND c.class IN ('task','unscoped')
         AND (s.task_id IS NULL OR (c.class='task' AND c.task_id=s.task_id))""", (path,))
 
 

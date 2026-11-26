@@ -893,9 +893,66 @@ class UsageClosureTest(LedgerCase):
         self.run_turn("replay", "devReplay", "replay-s", usage=claude_usage(0, 0), thread="t-replay",
                       pt="pt-replay")
         rep = self.native_report()
-        self.assertEqual(self.gaps(rep), {"provider_unsupported": (1, "turns")})
+        self.assertEqual(self.gaps(rep), {"provider_unsupported": (1, "runs")})
         self.assertEqual(rep["native_purpose"]["rejected_rows"], [])
-        self.assertIn("provider_unsupported (1 turn)", self.cli())
+        self.assertIn("provider_unsupported (1 run)", self.cli())
+
+    def retained_source(self, drop):
+        """A ledger of an older shape whose first source is retained while a second copy is synced."""
+        self.closed_turn()
+        self.assertEqual(self.native_report()["total_cost"]["status"], "complete")
+        for table in drop:
+            self.con.execute(f"DROP TABLE IF EXISTS {table}")
+        self.con.commit()
+        other = os.path.join(self.tmp.name, "second-copy.sqlite")
+        copy = sqlite3.connect(other)
+        self.addCleanup(copy.close)
+        self.native.backup(copy)
+        copy.execute(f"DELETE FROM {PREFIX}runs")
+        copy.execute(f"DELETE FROM {PREFIX}run_attempts")
+        copy.execute(f"DELETE FROM {PREFIX}provider_turns")
+        copy.commit()
+        self.assertEqual(t3.sync(self.con, source=other)["failed"], [])
+        self.con.commit()
+        rep = report.task_report(self.con, TASK)
+        self.assertEqual(rep["native_purpose"]["coverage_gaps"], [])
+        self.assertEqual(rep["total_cost"]["status"], "complete")
+        # Every run a source path mirrors has a current class.
+        self.assertEqual(self.con.execute("""SELECT count(*) FROM t3_source_runs r WHERE NOT EXISTS (
+            SELECT 1 FROM t3_source_classes c WHERE c.source_path=r.source_path AND c.run_id=r.run_id)""").fetchone()[0], 0)
+
+    def test_a_retained_source_from_a_ledger_before_current_classes_stays_present(self):
+        self.retained_source(["t3_source_classes", "t3_purpose_classes", "t3_source_unsupported_turns",
+                              "t3_purpose_unsupported_turns"])
+
+    def test_a_retained_source_from_a_ledger_before_the_run_record_stays_present(self):
+        self.retained_source(["t3_source_classes", "t3_purpose_classes", "t3_seen_runs"])
+
+    def test_an_untied_invalid_run_that_reads_as_legacy_is_a_conflict_not_a_heal(self):
+        self.closed_turn()
+        self.raw_run("odd", "t-odd", {}, attempt=False)
+        self.native.execute(f"UPDATE {PREFIX}runs SET payload_json='{{not json' WHERE run_id='odd'")
+        self.assertEqual(self.gaps(self.native_report())["native_run_invalid"], (1, "runs"))
+        self.native.execute(f"UPDATE {PREFIX}runs SET payload_json=? WHERE run_id='odd'",
+                            (json.dumps(dict(id="odd", threadId="t-odd", status="completed")),))
+        rep = self.native_report()
+        self.assertIn("conflicting_native_run_records", rep["native_purpose"]["coverage_gaps"])
+        self.assertNotEqual(rep["total_cost"]["status"], "complete")
+
+    def test_a_native_operation_on_an_unsupported_driver_is_tied_to_its_run(self):
+        self.closed_turn()
+        # Another task's run on the same thread, on a driver Observer cannot read.
+        self.provider_thread("pt-replay", "t", "devReplay")
+        self.run_turn("replay", "devReplay", "replay-s", usage=claude_usage(0, 0), pt="pt-replay", purpose=OTHER)
+        operation = dict(self.segment("background", source_run="replay", child="shell"), purpose=OTHER)
+        self.native.execute(f"UPDATE {PREFIX}provider_threads SET payload_json=json_set(payload_json,"
+                            "'$.nativeOperations',json(?)) WHERE provider_thread_id='pt-replay'",
+                            (json.dumps([operation]),))
+        rep = self.native_report()
+        self.assertEqual(rep["native_purpose"]["coverage_gaps"], [])
+        self.assertEqual(rep["total_cost"]["status"], "complete")
+        other = report.task_report(self.con, "example/project#8")
+        self.assertEqual(self.gaps(other), {"provider_unsupported": (1, "runs")})
 
     # Upgrade ----------------------------------------------------------------
 
