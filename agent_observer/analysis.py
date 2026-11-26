@@ -17,7 +17,7 @@ import statistics
 from collections import defaultdict
 
 from . import codex_order
-from .adapters import codex, codex_atomic, opencode
+from .adapters import claude, codex, codex_atomic, opencode
 
 TEST_COMMAND_RE = re.compile(
     r"(\bpytest\b|\bunittest\b|scripts/test\.py|\bnpm (run )?test\b|\bpnpm (run )?test\b"
@@ -615,10 +615,13 @@ def _diagnose_usage(con, sessions, since, until):
             "SELECT response_id, source_id, ordinal_num, ts, turn_id, harness, semantics,"
             " input_tokens, cached_input_tokens, cache_write_input_tokens"
             " FROM responses WHERE session_key=? AND is_overlap=0", (key,))
-        disputes = {}
+        disputes = set()
         if harness == "codex":
-            disputes, _, _ = codex_atomic.disputes(con, key, codex.SEMANTICS)
-        if harness == "opencode":
+            conflicts, _, _ = codex_atomic.disputes(con, key, codex.SEMANTICS)
+            disputes.update(conflicts)
+        elif harness == "claude":
+            disputes = claude.conflicting_final_measurements(con, key)
+        elif harness == "opencode":
             responses = _opencode_context_rows(con, key, responses)
         for row in responses:
             ts = row["ts"]

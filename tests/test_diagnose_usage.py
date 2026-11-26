@@ -8,7 +8,7 @@ import sqlite3
 from pathlib import Path
 
 from agent_observer import cli, db, native_response
-from agent_observer.adapters import codex, opencode
+from agent_observer.adapters import claude, codex, opencode
 from tests.helpers import LedgerCase, fixture
 from tests.test_opencode import T0, _msg, _tokens, build_native
 
@@ -140,6 +140,29 @@ class DiagnoseUsageTest(LedgerCase):
                       group["semantics"] == codex.SEMANTICS)
         self.assertIsNone(native["cached_input_share"])
         self.assertIsNone(native["cached_input_tokens"])
+
+    def test_claude_disputed_cache_reads_stay_unknown_in_both_import_orders(self):
+        for index, reads in enumerate(((20, 80), (80, 20))):
+            with self.subTest(reads=reads):
+                session = f"claude-cache-{index}"
+                for copy, read in enumerate(reads):
+                    record = {"type": "assistant", "sessionId": session,
+                              "uuid": f"{session}-assistant", "message": {
+                                  "id": f"{session}-response", "model": "synthetic-model",
+                                  "stop_reason": "end_turn",
+                                  "usage": {"input_tokens": 20, "output_tokens": 5,
+                                            "cache_creation_input_tokens": 0,
+                                            "cache_read_input_tokens": read},
+                                  "content": [{"type": "text", "text": "Fixture"}]}}
+                    path = Path(self.tmp.name) / f"{session}-{copy}.jsonl"
+                    path.write_text(json.dumps(record) + "\n")
+                    claude.import_claude_file(self.con, str(path))
+                result = self.run_diagnose("--session", f"claude:{session}")
+                point, = result["context_growth"][0]["timeline"]
+                self.assertIsNone(point["input_tokens"])
+                cache, = result["cache_observations"]
+                self.assertIsNone(cache["cached_input_tokens"])
+                self.assertIsNone(cache["cached_input_share"])
 
     def test_opencode_import_surfaces_completed_response_without_counters(self):
         path = str(Path(self.tmp.name) / "opencode.db")
