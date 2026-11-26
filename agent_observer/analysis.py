@@ -15,8 +15,10 @@ import re
 import sqlite3
 import statistics
 from collections import defaultdict
+from itertools import chain
 
 from . import codex_order, native_response
+from .adapters import opencode
 
 TEST_COMMAND_RE = re.compile(
     r"(\bpytest\b|\bunittest\b|scripts/test\.py|\bnpm (run )?test\b|\bpnpm (run )?test\b"
@@ -548,6 +550,28 @@ def _cache_observation(harness, semantics, rows):
             "cached_input_share": reads / input_total if input_total else None}
 
 
+def _sort_context(con, key, harness, timeline):
+    if timeline and harness == "codex":
+        by_identity = {
+            ("response", point["response_id"]) if point["kind"] == "input"
+            else ("event", str(point["event_id"])): point for point in timeline}
+        state, groups, _ = codex_order.resolve(con, key, set(by_identity))
+        if state == "known":
+            timeline[:] = [by_identity[identity] for group in groups for identity in sorted(group)]
+            return "native"
+        if state == "absent" and len({point["source_id"] for point in timeline}) == 1 and all(
+                point["source_id"] is not None and point["ordinal_num"] is not None
+                for point in timeline):
+            timeline.sort(key=lambda point: (
+                point["ordinal_num"], point["kind"], point.get("response_id", point.get("event_id"))))
+            return "native"
+    timeline.sort(key=lambda point: (
+        point["ts"] is None, point["ts"] or 0,
+        point["source_id"] or 0, point["ordinal_num"] or 0,
+        point["kind"], point.get("response_id", point.get("event_id"))))
+    return "timestamp"
+
+
 def _diagnose_usage(con, sessions, since, until):
     window = ""
     bounds = []
@@ -567,8 +591,19 @@ def _diagnose_usage(con, sessions, since, until):
             "SELECT response_id, source_id, ordinal_num, ts, turn_id, harness, semantics,"
             " input_tokens, cached_input_tokens, cache_write_input_tokens"
             " FROM responses WHERE session_key=? AND is_overlap=0" + window, args)
-        inputs = native_response.inputs(con, key) if harness == "opencode" else {}
-        for row in responses:
+        inputs = {}
+        missing = []
+        if harness == "opencode":
+            inputs = native_response.inputs(con, key)
+            for row in opencode.unprojected_usage(con, key):
+                ts = row["ts"]
+                if (since is not None and (ts is None or ts < since)
+                        or until is not None and (ts is None or ts >= until)):
+                    continue
+                missing.append(dict(row, harness=harness, semantics=opencode.SEMANTICS, turn_id=None,
+                                    input_tokens=None, cached_input_tokens=None,
+                                    cache_write_input_tokens=None))
+        for row in chain(responses, missing):
             cache[row["harness"], row["semantics"]].append(row)
             point = {field: row[field] for field in (
                 "response_id", "source_id", "ordinal_num", "ts", "turn_id", "semantics")}
@@ -580,11 +615,8 @@ def _diagnose_usage(con, sessions, since, until):
                 "SELECT id AS event_id, source_id, ordinal_num, ts, turn_id"
                 " FROM events WHERE session_key=? AND family='compaction'" + window, args):
             timeline.append(dict(row, kind="compaction"))
-        timeline.sort(key=lambda point: (
-            point["ts"] is None, point["ts"] or 0,
-            point["source_id"] or 0, point["ordinal_num"] or 0,
-            point["kind"], point.get("response_id", point.get("event_id"))))
-        context.append({"session": key, "harness": harness, "timeline": timeline})
+        order = _sort_context(con, key, harness, timeline)
+        context.append({"session": key, "harness": harness, "order": order, "timeline": timeline})
 
     measured = {harness for harness, _ in cache}
     for harness in {row["harness"] for row in sessions} - measured:

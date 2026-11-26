@@ -191,8 +191,9 @@ the exact interventions:
 `diagnose --session <key>` also shows input samples over time, labeled with
 the recorded turn and interleaved with compaction events. Multiple usage
 records in a turn give separate samples. The report includes response or
-event IDs and source locators. Equal or missing timestamps leave relative
-order uncertain.
+event IDs and source locators. Codex uses recorded source order when
+available. Equal or missing timestamps leave relative order uncertain
+when the report uses timestamp order.
 
 Cache observations are grouped by harness and counter semantics. Cached
 input share divides cache reads by total input. Codex and Grok already

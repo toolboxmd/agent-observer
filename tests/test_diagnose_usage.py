@@ -3,9 +3,13 @@
 import contextlib
 import io
 import json
+import sqlite3
+from pathlib import Path
 
 from agent_observer import cli, db, native_response
+from agent_observer.adapters import opencode
 from tests.helpers import LedgerCase
+from tests.test_opencode import T0, _msg, _tokens, build_native
 
 
 class DiagnoseUsageTest(LedgerCase):
@@ -46,12 +50,12 @@ class DiagnoseUsageTest(LedgerCase):
         self.response(session, "next", 30, "turn-2", sem, 50, 20)
         boundary = self.con.execute(
             "INSERT INTO events(session_key,source_id,family,native_id,turn_id,ts,ordinal_num)"
-            " VALUES(?,?,'compaction','boundary','turn-1',20,20)", session).lastrowid
+            " VALUES(?,?,'compaction','boundary','turn-1',NULL,20)", session).lastrowid
 
         result = self.run_diagnose()
         timeline = result["context_growth"][0]["timeline"]
         self.assertEqual(result["context_growth"][0]["session"], key)
-        self.assertEqual([point["ts"] for point in timeline], [12, 18, 20, 25, 27, 30])
+        self.assertEqual([point["ts"] for point in timeline], [12, 18, None, 25, 27, 30])
         self.assertEqual([point["turn_id"] for point in timeline],
                          ["turn-1", "turn-1", "turn-1", "turn-1", None, "turn-2"])
         self.assertEqual([point.get("input_tokens") for point in timeline],
@@ -116,3 +120,30 @@ class DiagnoseUsageTest(LedgerCase):
         timeline = self.run_diagnose()["context_growth"][0]["timeline"]
         self.assertEqual([point["input_tokens"] for point in timeline], [60, 60])
         self.assertEqual([point["turn_id"] for point in timeline], ["opencode:prompt-1", None])
+
+    def test_opencode_import_surfaces_completed_response_without_counters(self):
+        path = str(Path(self.tmp.name) / "opencode.db")
+        build_native(path)
+        with contextlib.closing(sqlite3.connect(path)) as native:
+            native.execute("INSERT INTO session VALUES(?,?,?,?,?,?,?,?,?,?)",
+                           ("cache_gap", None, "/fixture", "Gap", "1", None,
+                            "build", T0, T0 + 1000, None))
+            prompt = _msg("user", T0 + 10)
+            measured = _msg("assistant", T0 + 20, T0 + 30, _tokens(0, 1, 0, 40, 0))
+            missing = _msg("assistant", T0 + 50, T0 + 60)
+            native.executemany("INSERT INTO message VALUES(?,'cache_gap',?,?,?)", [
+                ("cache_user", T0 + 10, T0 + 10, prompt),
+                ("cache_measured", T0 + 20, T0 + 30, measured),
+                ("cache_missing", T0 + 50, T0 + 60, missing),
+            ])
+            native.commit()
+        opencode.sync(self.con, source=path)
+        result = self.run_diagnose("--session", "opencode:cache_gap")
+        timeline = result["context_growth"][0]["timeline"]
+        self.assertEqual([p["response_id"] for p in timeline],
+                         ["opencode:cache_measured", "opencode:cache_missing"])
+        self.assertEqual([p["input_tokens"] for p in timeline], [40, None])
+        cache, = result["cache_observations"]
+        self.assertEqual(cache["responses"], 2)
+        self.assertIsNone(cache["cached_input_share"])
+        self.assertIsNone(cache["cached_input_tokens"])

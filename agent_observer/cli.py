@@ -1312,9 +1312,9 @@ def _print_diagnose_usage(payload):
         return "unknown" if value is None else str(value)
 
     print("Context growth by session (input samples labeled with their recorded turns).")
-    print("Timestamps are Unix seconds. Equal or unknown timestamps leave relative order uncertain.")
+    print("Timestamps are Unix seconds. In timestamp order, ties and missing times leave order uncertain.")
     for session in payload["context_growth"]:
-        print(f"- {session['session']}")
+        print(f"- {session['session']} ({session['order']} order)")
         if not session["timeline"]:
             print("  No recorded input or compaction in scope.")
         for point in session["timeline"]:
