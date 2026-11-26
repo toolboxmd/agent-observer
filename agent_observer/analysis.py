@@ -648,8 +648,8 @@ def _diagnose_usage(con, sessions, since, until):
         disputes = set()
         agreed_turns = {}
         gaps = ()
-        incomplete_semantics = None
-        session_usage_disputed = False
+        incomplete_semantics = set()
+        disputed_semantics = set()
         if harness == "codex":
             conflicts, incomplete, _ = codex_atomic.disputes(con, key, codex.SEMANTICS)
             disputes.update(conflicts)
@@ -657,24 +657,28 @@ def _diagnose_usage(con, sessions, since, until):
                 agreed_turns = codex_atomic.agreed_turn_ids(con, key)
             gaps = _unmeasured_rows(codex_atomic.unmeasured_locations(con, key), harness, codex.SEMANTICS)
             if incomplete:
-                incomplete_semantics = codex.SEMANTICS
+                incomplete_semantics.add(codex.SEMANTICS)
+            if codex.has_unlocated_fallback_usage(con, key):
+                incomplete_semantics.add(codex.TOKEN_COUNT_SEMANTICS)
+                disputed_semantics.add(codex.TOKEN_COUNT_SEMANTICS)
         elif harness == "claude":
             disputes = claude.conflicting_final_measurements(con, key)
             gaps = _unmeasured_rows(claude.unmeasured_final_locations(con, key), harness, claude.SEMANTICS)
             if db._has_table(con, "claude_unreadable_sources") and con.execute(
                     "SELECT 1 FROM claude_unreadable_sources WHERE session_key=? LIMIT 1", (key,)).fetchone():
-                incomplete_semantics = claude.SEMANTICS
+                incomplete_semantics.add(claude.SEMANTICS)
         elif harness == "opencode":
             responses = _opencode_context_rows(con, key, responses)
             if opencode.has_unlocated_usage_error(con, key):
-                incomplete_semantics = opencode.SEMANTICS
+                incomplete_semantics.add(opencode.SEMANTICS)
         elif harness == "grok":
             quarantine = grok.usage_quarantine(con, session["native_id"])
             if quarantine:
-                incomplete_semantics = grok.SEMANTICS
-                session_usage_disputed = "usage_conflict" in quarantine
-        if incomplete_semantics:
-            group = (harness, incomplete_semantics)
+                incomplete_semantics.add(grok.SEMANTICS)
+                if "usage_conflict" in quarantine:
+                    disputed_semantics.add(grok.SEMANTICS)
+        for semantics in incomplete_semantics:
+            group = (harness, semantics)
             unlocated[group] += 1
             cache.setdefault(group, [])
         for row in chain(responses, gaps):
@@ -686,7 +690,7 @@ def _diagnose_usage(con, sessions, since, until):
                 turn = agreed_turns.get(row["response_id"]) if harness == "codex" else row["turn_id"]
                 row = dict(row, turn_id=turn, input_tokens=None, cached_input_tokens=None,
                            cache_write_input_tokens=None)
-            elif session_usage_disputed:
+            elif row["semantics"] in disputed_semantics:
                 row = dict(row, input_tokens=None, cached_input_tokens=None,
                            cache_write_input_tokens=None)
             cache_row = row

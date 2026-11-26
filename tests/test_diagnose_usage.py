@@ -147,6 +147,18 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertIsNone(native["cached_input_share"])
         self.assertIsNone(native["cached_input_tokens"])
 
+    def test_codex_fallback_quarantine_keeps_timeline_input_and_share_unknown(self):
+        self.sync("codex-precompaction-conflict.jsonl")
+        result = self.run_diagnose("--harness", "codex")
+        timeline = result["context_growth"][0]["timeline"]
+        points = [point for point in timeline if point["kind"] == "input"]
+        self.assertEqual(len(points), 2)
+        self.assertTrue(all(point["input_tokens"] is None for point in points))
+        cache, = result["cache_observations"]
+        self.assertEqual(cache["semantics"], codex.TOKEN_COUNT_SEMANTICS)
+        self.assertIsNone(cache["cached_input_share"])
+        self.assertEqual(cache["unlocated_usage_sessions"], 1)
+
     def test_codex_unindexed_atom_keeps_same_source_compaction_order(self):
         lines = [json.loads(line) for line in Path(fixture("codex-mini.jsonl")).read_text().splitlines()]
         valid = next(row for row in lines if row["type"] == "token_usage_record")

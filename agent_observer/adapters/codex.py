@@ -1398,6 +1398,22 @@ def _repair_usage_context(r: _Reader, rid: str, obj: dict, model, effort,
              iso_ts(obj.get("timestamp"))))
 
 
+def has_unlocated_fallback_usage(con, session_key):
+    """Fallback quarantine does not retain the cumulative response identity."""
+    atoms = ""
+    if db._has_table(con, "codex_atomic_observations"):
+        atoms = (" AND NOT EXISTS (SELECT 1 FROM codex_atomic_observations a"
+                 " WHERE a.source_id=s.id AND a.position=e.ordinal_num)")
+    return con.execute(
+        "SELECT 1 FROM sources s JOIN import_errors e"
+        " ON e.harness=s.harness AND e.source_path=s.path"
+        " WHERE s.harness='codex' AND 'codex:'||COALESCE(s.thread_id,s.session_id)=?"
+        " AND e.error IN ('malformed_usage','usage_conflict')" + atoms +
+        " AND EXISTS (SELECT 1 FROM responses r WHERE r.session_key=?"
+        " AND r.semantics=? AND r.is_overlap=0) LIMIT 1",
+        (session_key, session_key, TOKEN_COUNT_SEMANTICS)).fetchone() is not None
+
+
 def _flush_token_counts(r: _Reader) -> None:
     """Count token_count usage snapshots for rollouts without full usage cover.
 
