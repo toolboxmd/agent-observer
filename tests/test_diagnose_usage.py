@@ -390,6 +390,28 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertEqual(claude.import_claude_file(self.con, str(log))["lines"], 0)
         self.assertEqual(self.run_diagnose("--session", f"claude:{session}"), result)
 
+    def test_claude_final_locator_follows_measurement_across_source_files(self):
+        session = "claude-stream-copy"
+        message = {"id": "copy-response", "model": "synthetic-model", "content": [],
+                   "usage": {"input_tokens": 20, "output_tokens": 5,
+                             "cache_creation_input_tokens": 0, "cache_read_input_tokens": 20}}
+        record = {"type": "assistant", "sessionId": session, "uuid": "provisional",
+                  "timestamp": "2026-10-01T12:00:01Z", "message": message}
+        provisional = Path(self.tmp.name) / "provisional.jsonl"
+        provisional.write_text(json.dumps(record) + "\n")
+        claude.import_claude_file(self.con, str(provisional))
+        record.update(uuid="final", timestamp="2026-10-01T12:00:02Z")
+        message.update(stop_reason="end_turn")
+        message["usage"]["cache_read_input_tokens"] = 80
+        final = Path(self.tmp.name) / "final.jsonl"
+        final.write_text(json.dumps({"type": "pr-link", "sessionId": session})
+                         + "\n" + json.dumps(record) + "\n")
+        second = claude.import_claude_file(self.con, str(final))["source_id"]
+        result = self.run_diagnose("--session", f"claude:{session}")
+        point, = result["context_growth"][0]["timeline"]
+        self.assertEqual((point["input_tokens"], point["source_id"], point["ordinal_num"]),
+                         (100, second, 1))
+
     def test_opencode_import_surfaces_completed_response_without_counters(self):
         path = str(Path(self.tmp.name) / "opencode.db")
         build_native(path)

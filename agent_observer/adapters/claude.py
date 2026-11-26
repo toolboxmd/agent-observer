@@ -736,17 +736,15 @@ def _unsupported_projections(con, scope, args):
                        "AND o.response_id=r.response_id) AND (" + " OR ".join(gaps) + ")", args)
 
 
-def final_locations(con, session_key, *, unprojected_only=True):
+def final_locations(con, session_key):
     """Expected final locations, including source-only evidence."""
     if db._has_table(con, "claude_expected_finals") and db._has_table(con, "claude_final_blocks"):
-        unprojected = (" AND NOT EXISTS (SELECT 1 FROM responses r"
-                       " WHERE r.session_key=e.session_key AND r.response_id=e.response_id)")
         yield from con.execute(
-            "SELECT e.response_id,e.source_id,b.ordinal_num,b.ts,b.turn_id"
+            "SELECT e.response_id,e.source_id,b.ordinal_num,b.ts,b.turn_id,b.link_status<>? AS measured"
             " FROM claude_expected_finals e JOIN sources s ON s.id=e.source_id"
             " LEFT JOIN claude_final_blocks b USING(session_key,response_id,source_id)"
-            " WHERE e.session_key=?" + (unprojected if unprojected_only else "") +
-            " ORDER BY b.ordinal_num IS NULL,s.path,b.ordinal_num", (session_key,))
+            " WHERE e.session_key=?"
+            " ORDER BY b.ordinal_num IS NULL,s.path,b.ordinal_num", (_UNMEASURED_FINAL, session_key))
 
 
 def conflicting_final_measurements(con, session_key):

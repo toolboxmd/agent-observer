@@ -650,6 +650,13 @@ def _native_context_rows(measured, locations, disputes, harness, semantics, sinc
     for row in measured:
         rid = row["response_id"]
         others = copies.pop(rid, [])
+        if harness == "claude":
+            # A final block in another copy can update the projected time
+            # and ordinal while the response retains its provisional source.
+            sources = {copy["source_id"] for copy in others if copy["measured"]
+                       and (copy["ts"], copy["ordinal_num"]) == (row["ts"], row["ordinal_num"])}
+            if len(sources) == 1:
+                row = dict(row, source_id=next(iter(sources)))
         if rid in disputes and not _in_usage_window(row["ts"], since, until):
             place = _select_usage_location([row, *others], since, until)
             if place is not None:
@@ -702,7 +709,7 @@ def _diagnose_usage(con, sessions, since, until):
                 disputed_semantics.add(codex.TOKEN_COUNT_SEMANTICS)
         elif harness == "claude":
             disputes = claude.conflicting_final_measurements(con, key)
-            locations = claude.final_locations(con, key, unprojected_only=not (disputes and bounds))
+            locations = claude.final_locations(con, key)
             responses = _native_context_rows(responses, locations, disputes, harness,
                                             claude.SEMANTICS, since, until)
             if db._has_table(con, "claude_unreadable_sources") and con.execute(
