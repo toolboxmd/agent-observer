@@ -16,6 +16,7 @@ import subprocess
 from datetime import datetime, timezone
 
 from . import analysis, report
+from .outcome import purpose_evidence
 from .gh import structured_env
 
 MARKER = "<!-- agent-observer:summary v1 -->"
@@ -444,11 +445,13 @@ def render(summary: dict, target: str | None = None) -> str:
     lines = [MARKER, f"### {title}", "", " · ".join(parts), ""]
     native = summary.get("native_purpose") or {}
     task_label = _task_label(summary.get("task_id"))
-    if native.get("runs") or native.get("deliveries") or native.get("conflicting_source_runs"):
+    if purpose_evidence(native):
         lines.append(f"Outcome: {task_label}.")
         if native.get("coverage_gaps"):
             lines.append("Full outcome cost unknown. Native coverage: " +
-                         ", ".join(_safe_field(g.replace("_", " ")) for g in native["coverage_gaps"]) + ".")
+                         _safe_field(report.gap_text(native).replace("_", " ")) + ".")
+        if any((native.get("children_not_counted") or {}).values()):
+            lines.append("Not counted: " + _safe_field(report.not_counted_text(native["children_not_counted"])) + ".")
         for pr in native["deliveries"]:
             reference = _safe_ref(pr["url"])
             if reference is not None:

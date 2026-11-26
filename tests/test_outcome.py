@@ -44,7 +44,7 @@ class NativeOutcomeTest(LedgerCase):
         self.assertEqual(rep["native_purpose"]["turn_checks"][0]["status"], "reconciled")
         self.assertFalse(rep["complete"])
         self.assertIsNone(rep["total_cost"]["usd"])
-        self.assertIn("background_inventory_unavailable", rep["native_purpose"]["coverage_gaps"])
+        self.assertEqual(rep["native_purpose"]["coverage_gaps"], ["usage_closure_missing"])
         self.con.execute("DELETE FROM responses WHERE response_id='codex:resp-mini-002'")
         late = report.task_report(self.con, self.task)
         self.assertEqual(late["native_purpose"]["turn_checks"][0]["status"], "counter_mismatch")

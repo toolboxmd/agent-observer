@@ -529,10 +529,40 @@ A tool call can also supply that connection when Chromeria and Grok record
 the same call ID for the turn. A tool-free response without either witness
 stays unplaced.
 
-A provider turn can reconcile while the full outcome cost remains unknown.
-Chromeria v1 records observed background causes for some drivers and has no
-background inventory for others. A missing child boundary or unavailable
-price leaves any priced work as a subtotal. The same scope appears in
+`task show` prints a known estimated cost only when every Claude and Codex
+provider turn of the task carries a closed usage closure and its final
+counters reconcile with the joined responses. Chromeria writes the closure on
+each finished turn, so turns recorded before it did keep the total unknown. A
+Claude turn that lists its native response ids has exactly those responses.
+Every compaction the Codex rollout records in a turn must name a response
+of that turn (`compaction_response_id`), and the compactions must number what
+the closure states; their responses stay in the cost but outside the turn
+counter. A compaction that no turn can own, such as one recorded by an older
+Codex without a window id, keeps every closed turn of that Codex session
+unknown. Otherwise the total stays unknown, the
+priced subtotal is shown, and `native coverage` names each reason with the
+number of turns, attempts, runs, segments, children, responses or sessions it
+affects. A run that the Chromeria records prove never ran adds nothing. A Chromeria
+row that Observer cannot validate is a `native_rows_rejected` gap for every
+task it can be tied to, never an absence. When a Chromeria thread is
+deleted, a task that had a run there stays unknown (`native_run_deleted`) on
+every later sync; deleting a pre-purpose or unscoped thread affects no task.
+Observer remembers every run it has synced, including the purpose runs a
+1.7.0 ledger already held. Two kinds of run cannot be known: one created and
+deleted before any sync saw it, and a pre-purpose run deleted before the
+first sync with 1.8.0 (earlier versions did not record those). Their
+leftover rows keep every Chromeria task of that source unknown. A 1.7.0
+ledger also kept no task reference for runs it could not parse: such a run
+keeps every task of its source unknown until a sync sees it valid in its
+source, or for good once it is deleted. A run that a newer Chromeria wrote
+in a shape Observer did not yet read heals the same way once Observer
+reads it. A run whose turns or native operations are on a provider
+Observer cannot read (such as `devReplay`) is a `provider_unsupported` gap,
+counted in runs. A delegated child
+that declared another task, or was deliberately unscoped, is another task's
+cost; `not counted` says how many there were. Native child agents, children
+without a declared purpose, active or remote children, and unpriced models
+still leave any priced work as a subtotal. The same scope appears in
 `publish --task`. For legacy PR links, `legacy_checkout_observations`
 shows which checkout Observer saw when it imported a tool call. The observation
 survives checkout retirement. A path can change hands before import, so a

@@ -164,7 +164,7 @@ An adapter is `agent_observer/adapters/<harness>.py` with `HARNESS`,
 | `skill_read` | Read under an installed Skill directory | validated skill identifier in `target` (never a title or directory path); installed file path only in detail `skill_path`; skill name and AgentsMD version from the path |
 | `skill_invoke` | Explicit Skill invocation (for example Claude's `Skill` tool) | validated skill identifier in `target`; installed `SKILL.md` path only in detail `skill_path` when the native record supplies a directory |
 | `file_change` | Edit or write by the agent | path, change kind, content size and hash |
-| `compaction` | Context compaction boundary | trigger, before and after sizes when recorded |
+| `compaction` | Context compaction boundary | trigger, before and after sizes when recorded; Codex native `compaction_response_id` and `turn_id` in detail |
 | `lifecycle` | Turn start, completion, abort, subagent activity, stop reasons | duration, reason |
 | `assistant_message` | Native assistant text | last 400 characters per Claude block, Codex message, Grok chunk or OpenCode text part |
 | `permission` | Permission request or denial | tool, outcome; Claude's denial kind (`user-rejected`, `permission-rule`, `automode-blocked`, `interrupted`) in detail `denial` |
@@ -528,6 +528,87 @@ re-read every sync; workload bindings are durable ledger rows.
   Native Claude uuid evidence takes precedence. Legacy copies of V1
   messages (`user` from `server`) are no evidence. No prompt text or hash
   is used for attribution. Prompts classified at import keep their excerpt.
+- Usage closure: a finished Claude or Codex provider turn may carry
+  `usageClosure` and, for Claude, `nativeResponseIds`. The mirror keeps a
+  version 1 closure only as `main_agent_only` with the driver's witness
+  (`process_ledger` for Claude, `event_stream` for Codex) and its
+  `uncountedCompactions` count, or as `open` with a snake_case reason; any
+  other version, state, witness, key or malformed value is no statement.
+  Listed response ids must all be distinct native identifiers.
+- Rejected rows: every row of a projection table that decides completeness
+  (`runs`, `run_attempts`, `provider_turns`, `provider_threads` with their
+  native operations and pending background tasks, `subagents`, subagent
+  `turn_items` selected by their `type` column, which Chromeria writes with
+  the payload in one statement, native segments) is either
+  mirrored, out of scope by a named rule (a readable run without `purpose`
+  and the rows that belong to it, provider turns without an attempt on a
+  provider-native child's provider thread), or recorded in
+  `t3_purpose_rejects` with the run, thread and task references it still
+  carries. A run whose purpose fails validation is mirrored and also
+  rejected. Copies that disagree on a row's identity, a missing table, and a
+  reference to a row that does not exist are rejects too.
+- Run classes: `t3_seen_runs` records every raw run row with a readable id
+  once, per source, with exactly one class, and `t3_source_classes` holds the
+  class each run has in its source now. Every refresh first gives every run a
+  source path mirrors a current class, including retained paths this code
+  has not refreshed (from the runs they mirror), so a mirrored run is never
+  read as absent. A refresh inserts a run's recorded
+  class once and changes it only to heal an `invalid` record (below); read
+  commands never write it. Before a refresh replaces its source's
+  rows, the runs the ledger already mirrors are recorded too, so a ledger
+  written by 1.7.0 keeps the purpose runs it knew (it never mirrored
+  pre-purpose runs, so those are recorded from the first 1.8.0 sync on). The class decides, for a run that
+  is present and for one its source has since deleted (Chromeria's thread
+  deletion removes runs, subagents and turn items and keeps attempts and
+  provider turns):
+
+  | Class | Raw run | Present | Deleted from its source | Rows that name it |
+  | --- | --- | --- | --- | --- |
+  | `task` | valid single-task purpose | counted for its task | `native_run_deleted` for its task | reach its task |
+  | `unscoped` | valid unscoped purpose | no gap for any task | no gap | reach no task |
+  | `legacy` | readable, no `purpose` key | out of scope | no gap | reach no task |
+  | `invalid` with a task reference | any other run whose scope reference parses | `native_run_invalid` for that task | same | reach that task |
+  | `invalid` without one | any other run, including an unreadable payload | `native_run_invalid` for every task of the source | same | reach every task of the source |
+  | none (never seen) | a run the ledger never recorded | not applicable | not applicable | reach every task of the source |
+
+  A rejected row reaches a task by its own task reference or through the
+  class of the run, or the runs on the thread, it names
+  (`native_rows_rejected`); a rejected run row is represented by its class,
+  and a run or attempt row whose run id cannot be read names a run in no
+  class. Chromeria refuses to change a run's purpose once it exists, so for
+  a run present in its source now:
+  - A recorded `invalid` run that now parses as `task` or `unscoped` heals to
+    that class when it has no stored task reference, or when its reference
+    names the task it now parses under. Only the parser can have changed.
+  - Any other difference between the recorded and current class or task,
+    including an `invalid` run whose reference names another task than it
+    now parses under, an `invalid` run that now reads as `legacy`, and a
+    `legacy` run that gains a purpose, is a conflict for both tasks, or for
+    every task of the source when the recorded `invalid` run has no
+    reference (`conflicting_native_run_records`).
+  A run absent from its source keeps its recorded class. A deleted run's responses lose their purpose witness and leave
+  the task's subtotal; the gap says that run's usage is missing.
+- Unsupported providers: a provider thread whose driver is a well-formed
+  name Observer cannot read (for example `devReplay`, `acpRegistry`,
+  `cursor`) is mirrored. Its runs' provider turns are kept as
+  `t3_purpose_unsupported_turns`, and its native operations whose source is
+  one of its runs, with the same purpose, as
+  `t3_purpose_unsupported_operations`. They join no response, and each run
+  with either is a `provider_unsupported` run. A native operation on such a
+  driver whose declared purpose disagrees with its run is rejected, tied to
+  that run and to the task it declares; one whose run cannot be resolved is
+  rejected, tied to its thread.
+- Never ran: the refresh decides from raw rows before validation whether a
+  run never ran: terminal, an explicit null `startedAt`, an active attempt
+  that is null or one of its attempts, and every attempt with a null
+  `startedAt`, no named turn and no turn that references it. An unreadable
+  row, or a turn naming an attempt with no row, proves nothing for any run
+  of the source.
+- Codex compaction: one native compaction writes a `compacted` record,
+  whose event keeps the native response and turn, and a `ContextCompaction`
+  marker tagged with the same turn. A closed turn's compactions must each
+  name a joined response and must number what the closure states; a
+  compaction no turn can own leaves the session's closed turns unresolved.
 
 - Turn origin: `thread.turn-start-requested` `actor_kind` (`client` human,
   `server` dispatch) joins the native Claude user-message uuid through

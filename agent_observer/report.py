@@ -706,7 +706,7 @@ def task_report(con: sqlite3.Connection, task_id: str,
             unmeasured_attributed.add(key)
         elif subs:
             unmeasured_shared.add(key)
-    has_purpose = native and (canonical or native["deliveries"] or native["conflicting_source_runs"])
+    has_purpose = outcome.purpose_evidence(native)
     inventory_gaps = outcome.check_inventory(con, native, attributed) if has_purpose else False
     unresolved_usage = bool(unplaced or unassigned or ownership.unavailable_usage or ownership.unlocated_usage_sessions)
     unavailable_usage = bool(unresolved_usage or conflicts or inventory_gaps or legacy_links
@@ -948,6 +948,28 @@ def task_report(con: sqlite3.Connection, task_id: str,
         "other_task_responses": len(elsewhere),
     }
     return report
+
+
+def _counted(n: int, unit: str) -> str:
+    return f"{n} {unit[:-1] if n == 1 else unit}"
+
+
+def gap_text(native: dict) -> str:
+    """Each coverage gap with the number of turns, runs or children it affects."""
+    counts = native.get("coverage_gap_counts") or {}
+    return ", ".join(f"{name} ({_counted(counts[name]['count'], counts[name]['unit'])})" if name in counts
+                     else name for name in native.get("coverage_gaps") or [])
+
+
+def not_counted_text(children: dict) -> str:
+    """Delegated children whose usage belongs to no part of this task's total."""
+    parts = []
+    if children.get("declared_elsewhere"):
+        n = children["declared_elsewhere"]
+        parts.append(f"{n} delegated {'child' if n == 1 else 'children'} declared another task")
+    if children.get("deliberately_unscoped"):
+        parts.append(f"{children['deliberately_unscoped']} deliberately unscoped")
+    return ", ".join(parts)
 
 
 def _place(con, session_key: str):
