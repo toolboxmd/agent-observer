@@ -209,6 +209,29 @@ class DiagnoseUsageTest(LedgerCase):
         session, = self.run_diagnose("--harness", "codex")["context_growth"]
         self.assertEqual(session["order"], "timestamp")
 
+    def test_codex_source_local_quarantine_markers_cannot_conflict_across_copies(self):
+        session = self.session("codex", "source-local")
+        key, source = session
+        copied = self.con.execute(
+            "INSERT INTO sources(harness,path,sha256,imported_at)"
+            " VALUES('codex','/fixture/copied','copied',0)").lastrowid
+        self.response(session, "measured", 15, "turn", codex.SEMANTICS, 10, 0)
+        boundary = self.con.execute(
+            "INSERT INTO events(session_key,source_id,family,native_id,ordinal_num)"
+            " VALUES(?,?,'compaction','shared',1)", session).lastrowid
+        self.con.executemany(
+            "INSERT INTO codex_occurrences(source_id,session_key,row_kind,row_key,record_position)"
+            " VALUES(?,?,?,?,?)", [
+                (source, key, "event", str(boundary), 1),
+                (source, key, "atomic_usage_error", "2", 2),
+                (source, key, "response", "measured", 3),
+                (copied, key, "atomic_usage_error", "2", 2),
+                (copied, key, "event", str(boundary), 3),
+            ])
+        report, = self.run_diagnose("--session", key)["context_growth"]
+        self.assertEqual(report["order"], "native")
+        self.assertEqual([p["kind"] for p in report["timeline"]], ["compaction", "input"])
+
     def test_claude_disputed_cache_reads_stay_unknown_in_both_import_orders(self):
         for index, reads in enumerate(((20, 80), (80, 20))):
             with self.subTest(reads=reads):

@@ -21,7 +21,8 @@ def _groups(con, session_key: str) -> list:
         return []
     rows = con.execute(
         "SELECT source_id, row_kind, row_key, record_position"
-        " FROM codex_occurrences WHERE session_key=?"
+        # Quarantine markers denote file offsets, not cross-source identities.
+        " FROM codex_occurrences WHERE session_key=? AND row_kind<>'atomic_usage_error'"
         " ORDER BY source_id, record_position",
         (session_key,)).fetchall()
     sources = []
