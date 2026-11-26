@@ -391,6 +391,12 @@ class DiagnoseUsageTest(LedgerCase):
         self.assertEqual(self.run_diagnose("--session", f"claude:{session}"), result)
 
     def test_claude_final_locator_follows_measurement_across_source_files(self):
+        self.check_claude_copy_locator(finalized=True)
+
+    def test_claude_streaming_locator_follows_measurement_across_source_files(self):
+        self.check_claude_copy_locator(finalized=False)
+
+    def check_claude_copy_locator(self, *, finalized):
         session = "claude-stream-copy"
         message = {"id": "copy-response", "model": "synthetic-model", "content": [],
                    "usage": {"input_tokens": 20, "output_tokens": 5,
@@ -401,7 +407,8 @@ class DiagnoseUsageTest(LedgerCase):
         provisional.write_text(json.dumps(record) + "\n")
         claude.import_claude_file(self.con, str(provisional))
         record.update(uuid="final", timestamp="2026-10-01T12:00:02Z")
-        message.update(stop_reason="end_turn")
+        if finalized:
+            message.update(stop_reason="end_turn")
         message["usage"]["cache_read_input_tokens"] = 80
         final = Path(self.tmp.name) / "final.jsonl"
         final.write_text(json.dumps({"type": "pr-link", "sessionId": session})
@@ -411,6 +418,8 @@ class DiagnoseUsageTest(LedgerCase):
         point, = result["context_growth"][0]["timeline"]
         self.assertEqual((point["input_tokens"], point["source_id"], point["ordinal_num"]),
                          (100, second, 1))
+        if not finalized:
+            return
         copy = Path(self.tmp.name) / "z-final-copy.jsonl"
         shutil.copyfile(final, copy)
         third = claude.import_claude_file(self.con, str(copy))["source_id"]
