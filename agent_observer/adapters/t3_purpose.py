@@ -542,12 +542,11 @@ def _subagents(snapshot, native, tables, runs, legacy, segments):
 def _expected_children(snapshot, native, tables, runs, legacy):
     # A subagent turn item names the expected child even if its own projection
     # or the remote ledger is missing. Avoid reading unrelated text/tool items.
-    # Select on the row type or the payload type, then validate, so a row
-    # whose two types disagree is rejected rather than skipped.
-    # SQLite tests the payload type itself (one parse, cached across both
-    # calls); an unreadable payload with another row type names no child.
-    for row, p in _rows(native, tables, "turn_items", " WHERE type='subagent' OR CASE WHEN"
-                        " json_valid(payload_json) THEN payload_json->>'$.type'='subagent' END"):
+    # The type column selects: Chromeria writes it and payload_json from one
+    # event payload in one statement (ProjectionStore.ts turn-item upsert), so
+    # another row type with a subagent payload is not a producer state. Every
+    # selected row is validated; an unreadable or other-type payload is rejected.
+    for row, p in _rows(native, tables, "turn_items", " WHERE type='subagent'"):
         run = _id(row.get("run_id"))
         if (run not in runs or runs[run][0] != row.get("thread_id")
                 or not _matches(row, p, ("run_id", "runId"), ("thread_id", "threadId"),

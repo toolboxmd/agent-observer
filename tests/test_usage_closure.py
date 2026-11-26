@@ -642,13 +642,20 @@ class UsageClosureTest(LedgerCase):
         self.assertEqual(self.gaps(rep), {"native_rows_rejected": (1, "rows")})
         self.assertEqual(rep["native_purpose"]["rejected_rows"][0]["reason"], "attempt_missing")
 
-    def test_a_subagent_item_whose_row_and_payload_types_disagree_is_a_rejected_row(self):
+    def test_a_subagent_row_whose_payload_is_unreadable_or_another_type_is_a_rejected_row(self):
         self.closed_turn()
-        self.row("turn_items", ["item-1", "t", "c1", "pt-claudeAgent", "turn-c1", "text"], dict(
+        self.row("turn_items", ["item-1", "t", "c1", "pt-claudeAgent", "turn-c1", "subagent"], dict(
             id="item-1", threadId="t", runId="c1", type="subagent", subagentId="job"))
-        rep = self.native_report()
-        self.assertEqual(self.gaps(rep), {"native_rows_rejected": (1, "rows")})
-        self.assertEqual(rep["native_purpose"]["rejected_rows"][0]["table_name"], "turn_items")
+        self.assertEqual(self.gaps(self.native_report()), {"expected_child_missing": (1, "children")})
+        for name, change in (("unreadable payload", "payload_json='{not json'"),
+                             ("another payload type", "payload_json=json_set(payload_json,'$.type','text')")):
+            with self.subTest(name):
+                self.native.execute(f"UPDATE {PREFIX}turn_items SET payload_json=?", (json.dumps(dict(
+                    id="item-1", threadId="t", runId="c1", type="subagent", subagentId="job")),))
+                self.native.execute(f"UPDATE {PREFIX}turn_items SET {change}")
+                rep = self.native_report()
+                self.assertEqual(self.gaps(rep), {"native_rows_rejected": (1, "rows")})
+                self.assertEqual(rep["native_purpose"]["rejected_rows"][0]["table_name"], "turn_items")
 
     def test_a_missing_projection_table_keeps_every_task_of_its_source_unknown(self):
         self.closed_turn()

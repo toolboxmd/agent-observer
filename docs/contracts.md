@@ -538,7 +538,8 @@ re-read every sync; workload bindings are durable ledger rows.
 - Rejected rows: every row of a projection table that decides completeness
   (`runs`, `run_attempts`, `provider_turns`, `provider_threads` with their
   native operations and pending background tasks, `subagents`, subagent
-  `turn_items` selected by row or payload type, native segments) is either
+  `turn_items` selected by their `type` column, which Chromeria writes with
+  the payload in one statement, native segments) is either
   mirrored, out of scope by a named rule (a readable run without `purpose`
   and the rows that belong to it, provider turns without an attempt on a
   provider-native child's provider thread), or recorded in
