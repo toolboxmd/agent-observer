@@ -135,6 +135,13 @@ class DiagnoseUsageTest(LedgerCase):
         timeline = self.run_diagnose("--session", key)["context_growth"][0]["timeline"]
         self.assertEqual([p["turn_id"] for p in timeline], [None, "codex:turn-legacy-aaa"])
 
+    def test_legacy_codex_usage_is_attributed_during_an_active_turn(self):
+        codex.import_codex_file(self.con, str(FIXTURES / "codex-transition-a.jsonl"))
+        result = self.run_diagnose("--session", "codex:sess-fixture-trans-01")
+        timeline = result["context_growth"][0]["timeline"]
+        self.assertEqual([(p["input_tokens"], p["turn_id"]) for p in timeline],
+                         [(400, "codex:turn-trans-aaa"), (600, "codex:turn-trans-aaa")])
+
     def test_explicit_session_can_select_grok_subagent(self):
         grok.sync(self.con, root=str(FIXTURES / "grok"))
         key = "grok:01fixture2-bbbb-4b5c-8d6e-000000000002"

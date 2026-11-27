@@ -585,8 +585,9 @@ def _cache_observation(harness, semantics, rows):
 def _legacy_codex_turns(con, key):
     by_source = defaultdict(list)
     for turn in con.execute(
-            "SELECT source_id, turn_id, started_at, completed_at FROM turns"
-            " WHERE session_key=? AND started_at IS NOT NULL AND completed_at IS NOT NULL", (key,)):
+            "SELECT source_id, turn_id, started_at, completed_at,"
+            " LEAD(started_at) OVER (PARTITION BY source_id ORDER BY started_at, turn_id) AS next_start"
+            " FROM turns WHERE session_key=? AND started_at IS NOT NULL", (key,)):
         by_source[turn["source_id"]].append(turn)
     return by_source
 
@@ -622,8 +623,11 @@ def _diagnose_usage(con, sessions, since, until):
                     and row["ts"] is not None:
                 if legacy_turns is None:
                     legacy_turns = _legacy_codex_turns(con, key)
+                timestamp = row["ts"]
                 matches = [turn["turn_id"] for turn in legacy_turns.get(row["source_id"], ())
-                           if turn["started_at"] <= row["ts"] <= turn["completed_at"]]
+                           if turn["started_at"] <= timestamp and (
+                               timestamp <= turn["completed_at"] if turn["completed_at"] is not None
+                               else turn["next_start"] is None or timestamp < turn["next_start"])]
                 if len(matches) == 1:
                     point["turn_id"] = matches[0]
             known = row["response_id"] not in disputed
