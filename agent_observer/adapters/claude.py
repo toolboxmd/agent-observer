@@ -867,19 +867,21 @@ def _ingest_usage_row(r: _Reader, obj: dict, ordinal: int, ts, mid: str,
     # The message is still streaming and non-final (or its final block just
     # arrived): the latest native block is the authority, across imports as
     # well. Final rows never reach this update path.
-    r.con.execute(
-        "UPDATE responses SET ordinal_num=?, ts=?,"
+    updated = r.con.execute(
+        "UPDATE responses SET source_id=?, turn_id=?, ordinal_num=?, ts=?,"
         " model=COALESCE(?, model), effort=COALESCE(?, effort),"
         " input_tokens=?, cached_input_tokens=?,"
         " cache_write_input_tokens=?, output_tokens=?,"
         " reasoning_output_tokens=?, total_tokens=?,"
         " cache_write_5m_tokens=?, cache_write_1h_tokens=?"
-        " WHERE response_id=?",
-        (ordinal, ts, model, obj.get("effort"),
+        " WHERE session_key=? AND response_id=?",
+        (r.src.source_id, r.turn, ordinal, ts, model, obj.get("effort"),
          values["input_tokens"], values["cached_input_tokens"],
          values["cache_write_input_tokens"], values["output_tokens"],
          values["reasoning_output_tokens"], values["total_tokens"],
-         values["cache_write_5m_tokens"], values["cache_write_1h_tokens"], rid))
+         values["cache_write_5m_tokens"], values["cache_write_1h_tokens"], r.session_key, rid))
+    if not updated.rowcount:
+        raise _UsageConflict("usage conflict")
     r.stats["responses_updated"] += 1
     if final:
         _mark_finalized(r.con, rid)

@@ -188,6 +188,19 @@ the exact interventions:
 | `human_correction` (heuristic for wording) | interrupts, permission denials, and prompts that open with a correction |
 | `large_tool_output` | tool results of 50 KB or more, or truncated |
 
+`diagnose --session <key>` also shows input samples over time, labeled with
+the recorded turn and interleaved with compaction events. Multiple usage
+records in a turn give separate samples. The report includes response or
+event IDs and source locators. Codex uses native order when its sources
+establish it. Equal or missing timestamps leave timestamp order uncertain.
+
+Cache observations are grouped by harness and counter semantics. Cached
+input share divides cache reads by total input. Codex and Grok already
+include cached input in their input counter. Claude Code and OpenCode
+report fresh input, cache reads, and cache creation separately. The report
+shows cache creation and reads side by side. Missing counters and shares
+with an unavailable or zero denominator display as unknown (`null` in JSON).
+
 Comparisons are observational: groups differ in period, projects and task
 mix, so differences are leads to inspect, not causal effects. Detector
 output is a candidate list with evidence, not a verdict.

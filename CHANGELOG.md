@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.10.0] - 2026-11-26
+
+### Added
+
+- Report context growth and native cache observations in diagnose
+
 ## [1.9.1] - 2026-11-26
 
 ### Changed

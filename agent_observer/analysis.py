@@ -17,6 +17,7 @@ import statistics
 from collections import defaultdict
 
 from . import codex_order
+from .adapters import claude, codex, codex_atomic, opencode
 
 TEST_COMMAND_RE = re.compile(
     r"(\bpytest\b|\bunittest\b|scripts/test\.py|\bnpm (run )?test\b|\bpnpm (run )?test\b"
@@ -92,8 +93,8 @@ def _passed(row) -> bool:
 
 
 def _session_filter(since=None, until=None, project=None, harness=None,
-                    agentsmd_version=None, session=None):
-    where = ["(s.role IS NULL OR s.role != 'subagent')"]
+                    agentsmd_version=None, session=None, include_subagents=False):
+    where = ["1=1"] if include_subagents else ["(s.role IS NULL OR s.role != 'subagent')"]
     args: list = []
     if session:
         where.append("s.session_key = ?")
@@ -516,10 +517,143 @@ def _large_outputs(session, events) -> list:
                                                  or e["truncated"])]
 
 
+def _context_input(response):
+    """Input represented by one usage record under its counter semantics."""
+    semantics = (response["semantics"] or "").partition(";")[0].partition(":")[2]
+    meaning = semantics.partition(",")[0]
+    tokens = response["input_tokens"]
+    read = response["cached_input_tokens"]
+    write = response["cache_write_input_tokens"]
+    if meaning == "input_includes_cached":
+        return tokens
+    if meaning == "input_excludes_cache" and None not in (tokens, read, write):
+        return tokens + read + write
+    return None
+
+
+def _sort_usage_timeline(con, session, timeline):
+    if session["harness"] == "codex" and timeline:
+        by_identity = {
+            ("response", point["response_id"]) if point["kind"] == "input"
+            else ("event", str(point["event_id"])): point for point in timeline}
+        state, order, _ = codex_order.resolve(con, session["session_key"], set(by_identity))
+        if state == "known":
+            timeline[:] = [by_identity[ident] for group in order for ident in sorted(group)]
+            return "native"
+        if state == "absent" and len({p["source_id"] for p in timeline}) == 1 and all(
+                p["source_id"] is not None and p["ordinal_num"] is not None for p in timeline):
+            timeline[:] = [by_identity[ident] for ident in sorted(
+                by_identity, key=lambda ident: (by_identity[ident]["ordinal_num"], ident))]
+            return "native"
+    timeline.sort(key=lambda point: (
+        point["ts"] is None, point["ts"] or 0, point["source_id"] or 0,
+        point["ordinal_num"] or 0, point["kind"], point.get("response_id", point.get("event_id"))))
+    return "timestamp"
+
+
+def _usage_evidence(con, session):
+    key = session["session_key"]
+    if session["harness"] == "codex":
+        conflicts, _, _ = codex_atomic.disputes(con, key, codex.SEMANTICS)
+        return set(conflicts), {}
+    if session["harness"] == "claude":
+        return claude.conflicting_final_measurements(con, key), {}
+    if session["harness"] == "opencode":
+        inputs, conflicts, _ = opencode.response_witnesses(con, key)
+        return conflicts, inputs
+    return set(), {}
+
+
+def _cache_observation(harness, semantics, rows):
+    def total(counter):
+        values = [row[counter] for row in rows]
+        return sum(values) if values and None not in values else None
+
+    reads = total("cached_input_tokens")
+    writes = total("cache_write_input_tokens")
+    inputs = [_context_input(row) for row in rows]
+    # Validate the subset for each record before adding the counters.
+    valid = reads is not None and all(
+        size is not None and 0 <= row["cached_input_tokens"] <= size
+        for row, size in zip(rows, inputs))
+    input_total = sum(inputs) if valid else None
+    return {"harness": harness, "semantics": semantics, "responses": len(rows),
+            "cached_input_tokens": reads, "cache_write_input_tokens": writes,
+            "cached_input_share": reads / input_total if input_total else None}
+
+
+def _legacy_codex_turns(con, key):
+    by_source = defaultdict(list)
+    for turn in con.execute(
+            "SELECT source_id, turn_id, started_at, completed_at,"
+            " LEAD(started_at) OVER (PARTITION BY source_id ORDER BY started_at, turn_id) AS next_start"
+            " FROM turns WHERE session_key=? AND started_at IS NOT NULL", (key,)):
+        by_source[turn["source_id"]].append(turn)
+    return by_source
+
+
+def _diagnose_usage(con, sessions, since, until):
+    window = ""
+    bounds = []
+    if since is not None:
+        window += " AND (ts IS NULL OR ts>=?)"
+        bounds.append(since)
+    if until is not None:
+        window += " AND (ts IS NULL OR ts<?)"
+        bounds.append(until)
+    context = []
+    cache = defaultdict(list)
+    for session in sorted(sessions, key=lambda row: row["session_key"]):
+        key, harness = session["session_key"], session["harness"]
+        args = (key, *bounds)
+        timeline = []
+        responses = con.execute(
+            "SELECT response_id, source_id, ordinal_num, ts, turn_id, harness, semantics,"
+            " input_tokens, cached_input_tokens, cache_write_input_tokens"
+            " FROM responses WHERE session_key=? AND is_overlap=0" + window, args)
+        disputed, inputs = _usage_evidence(con, session)
+        legacy_turns = None
+        for row in responses:
+            point = {field: row[field] for field in (
+                "response_id", "source_id", "ordinal_num", "ts", "turn_id", "semantics")}
+            parents = inputs.get(row["response_id"], ())
+            if point["turn_id"] is None and len(parents) == 1 and row["response_id"] not in disputed:
+                point["turn_id"] = f"opencode:{next(iter(parents))}"
+            if point["turn_id"] is None and row["semantics"] == codex.TOKEN_COUNT_SEMANTICS \
+                    and row["ts"] is not None:
+                if legacy_turns is None:
+                    legacy_turns = _legacy_codex_turns(con, key)
+                timestamp = row["ts"]
+                matches = [turn["turn_id"] for turn in legacy_turns.get(row["source_id"], ())
+                           if turn["started_at"] <= timestamp and (
+                               timestamp <= turn["completed_at"] if turn["completed_at"] is not None
+                               else turn["next_start"] is None or timestamp < turn["next_start"])]
+                if len(matches) == 1:
+                    point["turn_id"] = matches[0]
+            known = row["response_id"] not in disputed
+            timeline.append(dict(point, kind="input", input_tokens=_context_input(row) if known else None))
+            if not known or (bounds and row["ts"] is None):
+                row = dict(row, input_tokens=None, cached_input_tokens=None, cache_write_input_tokens=None)
+            cache[row["harness"], row["semantics"]].append(row)
+        for row in con.execute(
+                "SELECT id AS event_id, source_id, ordinal_num, ts, turn_id"
+                " FROM events WHERE session_key=? AND family='compaction'" + window, args):
+            timeline.append(dict(row, kind="compaction"))
+        order = _sort_usage_timeline(con, session, timeline)
+        context.append({"session": key, "harness": harness, "order": order, "timeline": timeline})
+
+    measured = {harness for harness, _ in cache}
+    for harness in {row["harness"] for row in sessions} - measured:
+        cache[harness, None] = []
+    observations = [_cache_observation(harness, semantics, cache[harness, semantics])
+                    for harness, semantics in sorted(cache, key=lambda group: (group[0], group[1] or ""))]
+    return context, observations
+
+
 def diagnose(con, detectors=None, limit=200, **filters) -> dict:
     wanted = set(detectors or DETECTORS)
     incidents = []
-    sessions = sessions_in_scope(con, **filters)
+    sessions = sessions_in_scope(con, include_subagents=bool(filters.get("session")), **filters)
     since, until = filters.get("since"), filters.get("until")
     for s in sessions:
         incidents += [i for i in detect_session(con, s) if i["detector"] in wanted]
@@ -533,8 +667,10 @@ def diagnose(con, detectors=None, limit=200, **filters) -> dict:
     counts: dict = defaultdict(int)
     for i in incidents:
         counts[i["detector"]] += 1
+    context, cache = _diagnose_usage(con, sessions, since, until)
     return {"sessions": len(sessions), "counts": dict(counts),
             "incidents": incidents[:limit], "truncated": len(incidents) > limit,
+            "context_growth": context, "cache_observations": cache,
             "note": "Candidates with evidence, not verdicts. Heuristic detectors are marked."}
 
 

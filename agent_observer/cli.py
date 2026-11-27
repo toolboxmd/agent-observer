@@ -373,11 +373,11 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument("--agentsmd-version", default=None)
         parser.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
 
-    dg = sub.add_parser("diagnose", help="find repeated work and behavior incidents")
+    dg = sub.add_parser("diagnose", help="report incidents, context growth and cache observations")
     dg.add_argument("--detector", action="append", default=None,
                     choices=list(_analysis.DETECTORS))
     dg.add_argument("--session", default=None)
-    dg.add_argument("--limit", type=int, default=50)
+    dg.add_argument("--limit", type=int, default=50, help="maximum number of incidents")
     _scope(dg)
 
     cp = sub.add_parser("compare", help="compare behavior across groups")
@@ -1280,6 +1280,7 @@ def _analyze(con, ns) -> int:
             print(f"- {i['detector']}{mark} {i['session']} "
                   f"[{os.path.basename(i['project'] or '?')}] {i['summary']}")
         print(payload["note"])
+        _print_diagnose_usage(payload)
         return 0
     payload = _analysis.compare(con, by=ns.by, **filters)
     if ns.as_json:
@@ -1304,6 +1305,34 @@ def _analyze(con, ns) -> int:
         print(line + (f"; {extras}" if extras else ""))
     print(payload["note"])
     return 0
+
+
+def _print_diagnose_usage(payload):
+    def known(value):
+        return "unknown" if value is None else str(value)
+
+    print("Context growth by session (input samples labeled with their recorded turns).")
+    print("Timestamps are Unix seconds. In timestamp order, ties and missing times leave order uncertain.")
+    for session in payload["context_growth"]:
+        print(f"- {session['session']} ({session['order']} order)")
+        if not session["timeline"]:
+            print("  No recorded input or compaction in scope.")
+        for point in session["timeline"]:
+            location = f"source {known(point['source_id'])}, ordinal {known(point['ordinal_num'])}"
+            if point["kind"] == "compaction":
+                observation = f"compaction (event {point['event_id']}, {location})"
+            else:
+                observation = (f"{known(point['input_tokens'])} input tokens "
+                               f"(response {point['response_id']}, {location})")
+            print(f"  {known(point['ts'])} turn {known(point['turn_id'])}: {observation}")
+    print("Cache observations by harness and counter semantics")
+    for item in payload["cache_observations"]:
+        share = item["cached_input_share"]
+        percent = "unknown" if share is None else f"{share:.1%}"
+        print(f"- {item['harness']} [{known(item['semantics'])}], {item['responses']} responses: "
+              f"cached input share {percent}, "
+              f"creation {known(item['cache_write_input_tokens'])} vs "
+              f"reads {known(item['cached_input_tokens'])} tokens")
 
 
 def _publish(con, ns) -> int:
